@@ -665,9 +665,15 @@ int main(int argc, char** argv) {
         }
     }
     std::vector<char>().swap(seed);  // the driver has copied the seed; it can be several GiB
+    // Guards shader-module and pipeline creation: ordinary modules share it, modules larger than
+    // --large-module-bytes and the cache writer below take it exclusively.
+    std::shared_mutex compile_gate;
     auto save_cache = [&](bool final_save) {
         if (cache_path.empty()) return true;
         try {
+            // vkGetPipelineCacheData concurrent with vkCreate*Pipelines deadlocked the AMD Windows driver
+            // (32.0.32029.2010) once the cache reached ~900 MB, so no pipeline is in flight while we snapshot.
+            std::unique_lock<std::shared_mutex> gate(compile_gate);
             const auto data = pipeline_cache_snapshot([&](size_t* size, void* dest) {
                 return vkGetPipelineCacheData(dev, cache, size, dest);
             });
@@ -686,7 +692,6 @@ int main(int argc, char** argv) {
                  work.size(), lo, hi, stage_filter.c_str(), jobs);
 
     std::mutex mu;  // guards counters, stdout, stub cache and in-flight table
-    std::shared_mutex compile_gate;  // large modules exclude other shader and pipeline work
     size_t isolated_modules = 0;
     std::map<std::string, uint32_t> modules_ok, modules_bad, big_skipped;
     std::map<std::string, StageStats> stats;
@@ -801,7 +806,8 @@ int main(int argc, char** argv) {
                 continue;
             }
             // Enter before reading the module: creation can also enter the driver. Hold until its pipeline and
-            // module have been destroyed, including on failure. The watchdog and cache writer don't take this lock.
+            // module have been destroyed, including on failure. The cache writer takes the same lock exclusively
+            // before it snapshots (see save_cache); the watchdog does not.
             const bool isolated = large_module_bytes && std::cmp_greater(file_size, large_module_bytes);
             std::unique_lock exclusive(compile_gate, std::defer_lock);
             std::shared_lock parallel(compile_gate, std::defer_lock);
@@ -1034,7 +1040,13 @@ int main(int argc, char** argv) {
     };
     std::vector<std::thread> pool;
     for (uint32_t t = 0; t < jobs; t++) pool.emplace_back(worker);
-    // Watchdog: names every compile running past 60 s (about once a minute) and saves the cache every 10 minutes.
+    // Watchdog: names every compile running past 60 s (about once a minute) and checkpoints the cache every
+    // LEONIDA_CACHE_SAVE_SECONDS (600 by default; the value exists so the save path can be exercised quickly).
+    // The save holds compile_gate exclusively: vkGetPipelineCacheData concurrent with vkCreate*Pipelines deadlocked
+    // the AMD Windows driver (32.0.32029.2010) at ~900 MB of cache.
+    long save_seconds = 600;
+    if (const char* s = std::getenv("LEONIDA_CACHE_SAVE_SECONDS"))
+        if (const long v = std::atol(s); v > 0) save_seconds = v;
     std::condition_variable watch_cv;
     bool all_done = false;
     std::thread watch([&] {
@@ -1047,7 +1059,7 @@ int main(int argc, char** argv) {
                 const double s = std::chrono::duration<double>(now - job.second).count();
                 if (s > 60 && int(s) % 60 < 5) std::fprintf(stderr, "  still compiling %s after %.0fs\n", job.first.c_str(), s);
             }
-            if (now - last_save > std::chrono::minutes(10)) {
+            if (now - last_save > std::chrono::seconds(save_seconds)) {
                 g.unlock();
                 save_cache(false);
                 g.lock();
