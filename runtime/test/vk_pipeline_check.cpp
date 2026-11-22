@@ -14,6 +14,11 @@
 //   --start I --count N   check only index entries [I, I+N) (sorted by name)
 //   --slow SEC    print pipelines slower than SEC (default 30); compiles past 60 s are named while running
 //   --max-bytes N skip modules whose .spv is larger than N bytes (0 = no limit; names every skip)
+//   --min-bytes N check only modules whose .spv is at least N bytes (0 = no limit)
+//   --shard I/N   check only entries where position % N == I, taken after --stage/--min-bytes and before
+//                 --start/--count. The AMD Windows driver serializes pipeline compilation inside one process, so a
+//                 slice is compiled by N processes that each write their own cache file; vk_cache_merge joins them.
+//   --only FILE   check only the shaders named in FILE (one per line); names missing from the index are reported
 //   --stage S     which stages to check: all (default), cs, or graphics (aliases: --compute-only, --graphics-only)
 //   --stats FILE  write the driver's statistics for each translated shader (VK_KHR_pipeline_executable_properties:
 //                 instructions, registers, spills, scratch, waves...) as CSV rows name,stage,statistic,value. Only
@@ -381,14 +386,15 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
             "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC] "
-            "[--max-bytes N] [--large-module-bytes N] [--stage all|cs|graphics | --compute-only | --graphics-only] "
-            "[--stats FILE] [--cache-feedback]\n");
+            "[--min-bytes N] [--max-bytes N] [--shard I/N] [--only FILE] [--large-module-bytes N] "
+            "[--stage all|cs|graphics | --compute-only | --graphics-only] [--stats FILE] [--cache-feedback]\n");
         return 2;
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
-    std::string dir = argv[1], cache_path, stats_path;
+    std::string dir = argv[1], cache_path, stats_path, only_path;
     uint32_t jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
-    size_t start = 0, count = 0, max_bytes = 0;
+    size_t start = 0, count = 0, max_bytes = 0, min_bytes = 0;
+    size_t shard_index = 0, shard_count = 1;
     size_t large_module_bytes = 4 * 1024 * 1024;
     double slow = 30.0;
     std::string stage_filter = "all";
@@ -404,6 +410,21 @@ int main(int argc, char** argv) {
         else if (a == "--compute-only") stage_filter = "cs";
         else if (a == "--graphics-only") stage_filter = "graphics";
         else if (a == "--max-bytes") max_bytes = std::stoull(val());
+        else if (a == "--min-bytes") min_bytes = std::stoull(val());
+        else if (a == "--shard") {
+            const std::string spec = val();
+            const auto slash = spec.find('/');
+            if (slash == std::string::npos || slash == 0 || slash + 1 == spec.size()) {
+                std::fprintf(stderr, "--shard requires I/N (for example 3/12)\n");
+                return 2;
+            }
+            shard_index = std::stoull(spec.substr(0, slash));
+            shard_count = std::stoull(spec.substr(slash + 1));
+            if (shard_count == 0 || shard_index >= shard_count) {
+                std::fprintf(stderr, "--shard %s: I must be below N\n", spec.c_str());
+                return 2;
+            }
+        }
         else if (a == "--large-module-bytes") {
             const std::string_view value = i + 1 < argc ? argv[++i] : "";
             const auto end = value.data() + value.size();
@@ -414,6 +435,7 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--stats") stats_path = val();
+        else if (a == "--only") only_path = val();
         else if (a == "--cache-feedback") cache_feedback = true;
         else cache_path = a;
     }
@@ -430,13 +452,50 @@ int main(int argc, char** argv) {
     }
     std::fprintf(stderr, "%zu shaders in index\n", index.size());
 
-    // Build work list: index order (sorted by name), optionally filtered by stage, then [start, start + count).
+    // --only: an explicit name list, one per line (trailing CR kept out so a Windows editor's file works).
+    std::set<std::string> only;
+    if (!only_path.empty()) {
+        std::ifstream f(only_path);
+        for (std::string line; std::getline(f, line);) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            if (!line.empty()) only.insert(line);
+        }
+        if (only.empty()) {
+            std::fprintf(stderr, "--only %s: no names\n", only_path.c_str());
+            return 2;
+        }
+    }
+    // Build work list: index order (sorted by name), optionally filtered by stage and by a lower size bound, then
+    // every shard_count-th entry, then [start, start + count).
     using Item = std::pair<const std::string*, const ShaderMeta*>;
     std::vector<Item> all;
+    size_t small_excluded = 0;
     for (auto& [name, meta] : index) {
+        if (!only.empty() && !only.contains(name)) continue;
         if (stage_filter == "cs" && meta.stage != "cs") continue;
         if (stage_filter == "graphics" && !is_graphics_stage(meta.stage)) continue;
+        if (min_bytes) {
+            std::ifstream f(dir + "/" + name + ".spv", std::ios::binary | std::ios::ate);
+            const std::streamoff size = f.tellg();
+            // A missing file stays in the list so the worker reports it as a module failure.
+            if (size >= 0 && static_cast<unsigned long long>(size) < min_bytes) { ++small_excluded; continue; }
+        }
         all.push_back({&name, &meta});
+    }
+    if (min_bytes)
+        std::fprintf(stderr, "--min-bytes %zu: %zu smaller modules left out, %zu in the slice\n",
+                     min_bytes, small_excluded, all.size());
+    if (!only.empty()) {
+        std::fprintf(stderr, "--only %s: %zu names, %zu kept by the filters\n", only_path.c_str(), only.size(), all.size());
+        for (const auto& name : only)
+            if (index.find(name) == index.end()) std::fprintf(stderr, "warning: %s is not in the index\n", name.c_str());
+    }
+    if (shard_count > 1) {
+        std::vector<Item> picked;
+        for (size_t pos = 0; pos < all.size(); pos++)
+            if (pos % shard_count == shard_index) picked.push_back(all[pos]);
+        std::fprintf(stderr, "--shard %zu/%zu: %zu of %zu modules\n", shard_index, shard_count, picked.size(), all.size());
+        all.swap(picked);
     }
     const auto [lo, hi] = shader_slice(all.size(), start, count);
     const std::vector<Item> work(all.begin() + lo, all.begin() + hi);
