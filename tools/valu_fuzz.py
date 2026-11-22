@@ -849,7 +849,7 @@ def translate(progs, work, emulate):
         cmd = mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
         if p.wave == 64:
             cmd.append("-mattr=+wavefrontsize64,-wavefrontsize32")
-        r = mc_command.run(cmd, input=text, capture_output=True, text=True)
+        r = mc_command.run(cmd, input=text, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if r.returncode or "error:" in r.stderr:
             raise RuntimeError(f"{p.name} did not assemble:\n{r.stderr}")
         code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
@@ -858,7 +858,7 @@ def translate(progs, work, emulate):
     cmd = [sys.executable, "-I", os.path.join(HERE, "rdna2spirv.py"), str(disasm), "--out", str(spirv)]
     if emulate:
         cmd.append("--wave64-emulate")
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     index = spirv / "index.json"
     if not index.exists():
         raise RuntimeError(f"rdna2spirv.py exited {r.returncode} without an index.json:\n{(r.stdout + r.stderr)[-2000:]}")
@@ -878,7 +878,7 @@ def run_gpu(p, spv, build, index_entry, emulate, dump):
         env["VKC_SUBGROUP_SIZE"] = "32"
     if index_entry.get("subgroup_size") and not emulate:
         env["VKC_SUBGROUP_SIZE"] = str(index_entry["subgroup_size"])
-    r = subprocess.run(args, capture_output=True, text=True, env=env)
+    r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
     return r.returncode, (r.stdout + r.stderr).strip()
 
 

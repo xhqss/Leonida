@@ -50,7 +50,7 @@ def probe(mcpu: str) -> None:
     """Disassemble one s_endpgm first, so a missing tool or AMDGPU target fails now and not per shader."""
     try:
         p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}"],
-                           input=PROBE, capture_output=True, text=True,
+                           input=PROBE, capture_output=True, text=True, encoding="utf-8", errors="replace",
                            creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
     except OSError as e:
         fail(f"'{MC[0]}' could not be started: {e}. Put llvm-mc on PATH or set LLVM_MC to it (on Windows,\n"
@@ -69,7 +69,7 @@ def disasm(code: bytes, mcpu: str):
     text = " ".join(f"0x{b:02x}" for b in code)
     try:
         p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
-                           input=text, capture_output=True, text=True,
+                           input=text, capture_output=True, text=True, encoding="utf-8", errors="replace",
                            creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
     except OSError as e:
         return "", 0, str(e)

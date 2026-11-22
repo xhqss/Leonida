@@ -103,7 +103,7 @@ def translate_tests(work, names):
             cmd.append(f"-mattr={mattr}")
         cmd.append("-show-encoding")
         # Feed the text on stdin: an LLVM_MC command that runs in WSL cannot open a Windows path argument.
-        r = mc_command.run(cmd, input=raw, capture_output=True, text=True)
+        r = mc_command.run(cmd, input=raw, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if r.returncode or "error:" in r.stderr:
             sys.exit(f"{n}.asm did not assemble:\n{r.stderr}")
         # rdna2spirv.py rejects assembler directives such as the "\t.text" llvm-mc prints first.

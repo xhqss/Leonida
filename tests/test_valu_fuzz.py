@@ -330,7 +330,8 @@ def test_gfx11_opcode_table_matches_llvm_mc():
     mc = _amd_tool("llvm-mc")
     for name, opcode in vf.GFX11_VOP3_OPCODE.items():
         r = subprocess.run([mc, "-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1150", "-show-encoding"],
-                           input=f"{name} v20, v21, v22\n", capture_output=True, text=True)
+                           input=f"{name} v20, v21, v22\n", capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
         got = [int(b, 16) for b in r.stdout.split("encoding: [")[1].split("]")[0].split(",")]
         w0, w1 = vf.vop3_words(opcode, 20, [21, 22], 0)
         want = [w0 & 255, w0 >> 8 & 255, w0 >> 16 & 255, w0 >> 24, w1 & 255, w1 >> 8 & 255, w1 >> 16 & 255, w1 >> 24]
@@ -348,7 +349,7 @@ def test_hw_kernels_assemble(family, arch):
         text = asm.module_text([k], arch, wave=p.wave)[0]
         r = subprocess.run([os.environ["LEONIDA_AMD_CLANG"], "--target=amdgcn-amd-amdhsa", f"-mcpu={arch}",
                             *(["-mwavefrontsize64"] if p.wave == 64 else []), "-x", "assembler", "-c", "-", "-o", os.devnull],
-                           input=text, capture_output=True, text=True)
+                           input=text, capture_output=True, text=True, encoding="utf-8", errors="replace")
         assert r.returncode == 0, (arch, p.name, r.stderr[-600:])
 
 
@@ -390,7 +391,7 @@ def _mc_accepts_f16_opsel(mc):
     """
     probe = "v_ashrrev_i16_e64 v0, v1, v2 op_sel:[0,0,0]\n"
     r = subprocess.run(mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"], input=probe,
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
     return r.returncode == 0 and "error:" not in r.stderr
 
 
@@ -412,7 +413,7 @@ def test_programs_assemble_for_gfx1013(family):
         cmd = mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
         if p.wave == 64:
             cmd.append("-mattr=+wavefrontsize64,-wavefrontsize32")
-        r = subprocess.run(cmd, input=p.asm(), capture_output=True, text=True)
+        r = subprocess.run(cmd, input=p.asm(), capture_output=True, text=True, encoding="utf-8", errors="replace")
         assert r.returncode == 0 and "error:" not in r.stderr, r.stderr[-800:]
 
 
