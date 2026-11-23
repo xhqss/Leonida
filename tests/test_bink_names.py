@@ -453,6 +453,14 @@ class TestCli(unittest.TestCase):
             xml_file = os.path.join(mount_dir, "list.xml")
             with open(xml_file, "w", encoding="utf-8") as fh:
                 fh.write(xml_text)
+            for folder in (src_dir, mount_dir):
+                reserved = os.path.join(folder, "index.json")
+                with self.subTest(folder=folder), contextlib.redirect_stderr(io.StringIO()) as err:
+                    with self.assertRaises(SystemExit) as cm:
+                        names_mod.main([src_dir, "--mount", mount_dir, "--out", reserved])
+                    self.assertEqual(cm.exception.code, 2)
+                    self.assertIn("carve manifest", err.getvalue())
+                    self.assertFalse(os.path.exists(reserved))
             for target in (stream_file, xml_file, src_dir):
                 with self.subTest(target=target):
                     with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:

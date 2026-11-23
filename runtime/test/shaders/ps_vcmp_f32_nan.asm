@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; f32 VOPC compares with a quiet NaN, inputs read from memory at run time (not inline constants, which the driver
 ; could fold): v_cmp_{ge,lg,neq,nge}_f32 (e32, VCC), v_cmp_{ngt,nle,nlt,tru}_f32 (e64, SGPR destination) and
 ; v_cmpx_{ge,lg,nge,nlt,neq,o,tru,f}_f32 (EXEC is copied out and put back after each one). None of these had a test.

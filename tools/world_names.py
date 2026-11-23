@@ -444,21 +444,23 @@ def load_rows(path: str) -> list[dict]:
 
 
 def resolve_maps(rows, dictionary: NameDictionary, *, include_derived: bool = False) -> dict:
-    map_rows = [row for row in rows if isinstance(row, dict) and row.get("kind") in (None, "map")]
-    names = {parse_u64(row.get("map_name", row.get("name"))) for row in map_rows}
-    names.discard(None)
+    names = set()
+    parents = collections.Counter()
     stats = {
         "rows": 0, "name_present": 0, "name_resolved": 0, "name_verified": 0,
         "name_derived": 0, "name_ambiguous": 0, "name_unconfirmed": 0, "name_unresolved": 0,
         "parent_present": 0, "parent_resolved": 0, "parent_ambiguous": 0,
         "parent_unresolved": 0, "parent_links": 0, "parent_links_resolved": 0,
     }
-    for row in map_rows:
+    for row in rows:
+        if not isinstance(row, dict) or row.get("kind") not in (None, "map"):
+            continue
         stats["rows"] += 1
         name = parse_u64(row.get("map_name", row.get("name")))
         parent = parse_u64(row.get("parent"))
         key = parse_u64(row.get("map_name64", row.get("name64")))
         if name is not None:
+            names.add(name)
             stats["name_present"] += 1
             match = dictionary.match(name, key, include_derived=include_derived)
             status = match["status"]
@@ -473,18 +475,20 @@ def resolve_maps(rows, dictionary: NameDictionary, *, include_derived: bool = Fa
             else:
                 stats["name_unresolved"] += 1
         if parent:
-            stats["parent_present"] += 1
-            match = dictionary.match(parent, include_derived=include_derived)
-            if match["status"] == "resolved":
-                stats["parent_resolved"] += 1
-            elif match["status"] == "ambiguous":
-                stats["parent_ambiguous"] += 1
-            else:
-                stats["parent_unresolved"] += 1
-            if parent in names:
-                stats["parent_links"] += 1
-                if match["status"] == "resolved":
-                    stats["parent_links_resolved"] += 1
+            parents[parent] += 1
+    for parent, count in parents.items():
+        stats["parent_present"] += count
+        status = dictionary.match(parent, include_derived=include_derived)["status"]
+        if status == "resolved":
+            stats["parent_resolved"] += count
+        elif status == "ambiguous":
+            stats["parent_ambiguous"] += count
+        else:
+            stats["parent_unresolved"] += count
+        if parent in names:
+            stats["parent_links"] += count
+            if status == "resolved":
+                stats["parent_links_resolved"] += count
     return stats
 
 
@@ -601,14 +605,9 @@ def _resolve(args) -> int:
     except ValueError as exc:
         raise ValueError(f"{args.dict}: {exc}") from None
     report = {"dictionary": dictionary.counts(), "maps": {}, "archetypes": {}}
-    maps = collections.Counter()
-    for path in args.maps:
-        rows = load_rows(path)
-        stats = resolve_maps(rows, dictionary, include_derived=args.include_derived)
-        for key, value in stats.items():
-            maps[key] += value
     if args.maps:
-        report["maps"] = dict(maps)
+        rows = (row for path in args.maps for row in load_rows(path))
+        report["maps"] = resolve_maps(rows, dictionary, include_derived=args.include_derived)
     archetypes = collections.Counter()
     for path in args.archetypes:
         try:

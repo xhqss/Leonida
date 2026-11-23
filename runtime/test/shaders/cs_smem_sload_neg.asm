@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; s_load with a soffset and a negative immediate: the immediate is sign-extended (21 bits) and truncated to a
 ; multiple of 4 on its own, soffset likewise, and both are added to the 4-truncated 64-bit pointer. Measured on an
 ; AMD Radeon RX 6800 (gfx1030) as a raw compute kernel, only with soffset + imm >= 0 (docs/design.md, Scalar/buffer

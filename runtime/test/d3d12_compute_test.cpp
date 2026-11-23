@@ -285,6 +285,20 @@ int main() {
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], "
                  "\"uses_code_base\": true, \"wave64\": false}}";
     }
+    // A second program whose only translation is in <library>/bvh/index.json, where make_game.py puts the programs
+    // of XboxBvhBuilder.dll (docs/embedded_shaders.md): the same container shape and the same key, another folder.
+    auto builder_fssm = fssm;
+    builder_fssm[4] ^= 0x40;  // another code word, so another hash
+    const auto builder_container = shader_container(builder_fssm);
+    std::filesystem::create_directories(library / "bvh");
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV),
+                                library / "bvh" / "BuilderProgram.spv"));
+    {
+        std::ofstream index(library / "bvh" / "index.json", std::ios::binary);
+        index << "{\"BuilderProgram\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << leonida::sha256_hex(builder_fssm)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], "
+                 "\"uses_code_base\": true, \"wave64\": false}}";
+    }
 
     constexpr UINT elements = 64, bytes = elements * 4;
     const std::uint32_t table_values[4] = {1000, 2000, 3000, 4000};
@@ -343,6 +357,14 @@ int main() {
         const auto other_container = shader_container(other);
         pso_desc.CS = {other_container.data(), other_container.size()};
         EXPECT(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&unknown.p)) == E_INVALIDARG && !unknown.p);
+        {
+            // XboxBvhBuilder.dll's call: slot 62 with a container whose program is translated in <library>/bvh.
+            Ref<ID3D12PipelineState> builder_pso;
+            pso_desc.CS = {builder_container.data(), builder_container.size()};
+            EXPECT(SUCCEEDED(reinterpret_cast<XboxComputePipelineFn>(slot(device.p, 62))(
+                device.p, &pso_desc, 0, 0, &pso_iid, reinterpret_cast<void**>(&builder_pso.p))));
+            EXPECT(builder_pso.p && builder_pso.p != pso.p);
+        }
         pso_desc.CS = {container.data(), container.size()};
 
         // The PSO through slot 67, compute pipeline from native code; maps to CreateComputePipelineState.

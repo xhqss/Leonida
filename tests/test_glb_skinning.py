@@ -10,6 +10,8 @@ values, the JSON report, and the input-alias guard.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import struct
 import subprocess
@@ -17,6 +19,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 TOOLS = ROOT / "tools"
@@ -234,6 +237,21 @@ class GlbSkinningTests(unittest.TestCase):
             capture_output=True, text=True, errors="replace", timeout=60,
         )
 
+    def test_inverse_bind_fourth_row_is_affine_not_the_translation_column(self):
+        doc, binary, _ = glb_skinning.parse_glb(make_glb())
+        accessor = doc["accessors"][doc["skins"][0]["inverseBindMatrices"]]
+        second = doc["bufferViews"][accessor["bufferView"]]["byteOffset"] + 64
+        data = bytearray(binary)
+        struct.pack_into("<3f", data, second + 12 * 4, 2.0, -3.0, 4.0)
+        self.assertTrue(glb_skinning.analyze_glb(build_glb(doc, data))["ok"])
+        for component in (3, 7, 11, 15):
+            with self.subTest(component=component):
+                invalid = bytearray(data)
+                struct.pack_into("<f", invalid, second + component * 4, 0.5)
+                proc = self.run_tool(self.write("projective.glb", build_glb(doc, invalid)))
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("inverseBindMatrices[1] fourth row", proc.stderr)
+
     def test_valid_two_joint_skinned_mesh(self):
         report = glb_skinning.analyze_glb(make_glb())
         self.assertTrue(report["ok"], report["errors"])
@@ -423,6 +441,30 @@ class GlbSkinningTests(unittest.TestCase):
                 self.assertEqual(1, len(lines), proc.stderr)
                 self.assertTrue(lines[0].startswith("ERROR: "), lines[0])
                 self.assertNotIn("Traceback", proc.stderr)
+
+    def test_json_decoder_recursion_is_a_container_error(self):
+        data = make_glb()
+        # Decoder depth limits differ between Python versions.
+        with mock.patch.object(glb_skinning.json, "loads", side_effect=RecursionError):
+            with self.assertRaisesRegex(glb_skinning.GlbSkinError, "nesting is too deep"):
+                glb_skinning.parse_glb(data)
+
+    def test_json_decoder_recursion_preserves_existing_report(self):
+        data = make_glb()
+        path = self.write("deep.glb", data)
+        previous = b"existing report\n"
+        out = self.write("report.json", previous)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(glb_skinning.json, "loads", side_effect=RecursionError):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = glb_skinning.main([str(path), "--json", str(out)])
+        self.assertEqual(1, status)
+        self.assertEqual("", stdout.getvalue())
+        self.assertEqual(
+            "ERROR: invalid GLB JSON chunk: nesting is too deep\n", stderr.getvalue()
+        )
+        self.assertEqual(previous, out.read_bytes())
+        self.assertEqual(data, path.read_bytes())
 
     def test_normalized_byte_and_short_weights(self):
         cases = {

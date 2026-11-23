@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; v_med3_f32 / v_min3_f32 / v_max3_f32 with a quiet-NaN operand, inputs read from memory at run time (not inline
 ; constants, which the driver could fold). The V# in s[0:3] points at 0x1000 (num_records 32); the test seeds
 ; 0x1000..0x1014 with a..f = 0x7fc10001 0x40e00000 0x40a00000 0x7fc10001 0x40600000 0xc0200000

@@ -54,6 +54,10 @@ written `0x…`. A swap is one step: a model swapped to another that is itself s
 again, so two mods cannot loop. `when` is `always`; a narrower condition (one mission, one cutscene) is
 refused until a hook provides the game's mission state, so a mod never silently does more than it says.
 
+`mod.json` is UTF-8. A byte-order mark in front is accepted (Notepad's "UTF-8 with BOM", Windows
+PowerShell 5.1's `-Encoding utf8`). A UTF-16 file, which PowerShell 5.1's `>` writes, is skipped with
+`mod.json is UTF-16; save it as UTF-8`.
+
 The format is in `runtime/src/mods.h`; `runtime/test/mods_test.cpp` (ctest `mods`) covers it.
 
 ## The Mandy mod (`mods/mandy_prison_intro`)
@@ -126,7 +130,7 @@ the engine, which shipped a first-person mode), a hit-reaction `RecoveryDirectio
 and a `firstpersonshooter_hud` UI texture. So the mod switches on a mode the engine has rather than building
 a camera. Whether the game exposes it to the player is not known.
 
-**Assumptions to confirm in the executable:** that the view mode is chosen through one getter of the form
+**ASSUMPTION:** three things to confirm in the executable: that the view mode is chosen through one getter of the form
 `mode = get(context)`, that context 0 is on foot, and that first person is enum value 4 (GTA V's
 `camViewModeSettings` order: third person near, medium, far, cinematic, first person). All three are
 settings in `mod.json`, so a different answer changes the manifest, not the runtime.

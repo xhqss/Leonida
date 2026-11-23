@@ -4,9 +4,13 @@
 
 Every fixture is synthetic: preload lists, visual-settings lines, fixed-stride 1,296-byte records, a compact
 3-region spatial grid blob, and minimal SGD5 databases.
+
+Set ``LEONIDA_GAMEDATA_BLOBS`` to another copy of the tool to use as a negative control; main's version fails
+the bad-index cases with a bare KeyError or a raw index.json path.
 """
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -16,7 +20,7 @@ from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
-TOOL = os.path.join(TOOLS, "gamedata_blobs.py")
+TOOL = os.environ.get("LEONIDA_GAMEDATA_BLOBS", os.path.join(TOOLS, "gamedata_blobs.py"))
 sys.path.insert(0, TOOLS)
 
 import gamedata_blobs  # noqa: E402
@@ -239,6 +243,51 @@ class GamedataBlobsTest(unittest.TestCase):
             self.assertEqual(r.returncode, 1)
             self.assertIn("error:", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
+
+
+class BadCarveIndexTest(unittest.TestCase):
+    """A folder that is not an rpf9_carve.py carve is one error line naming the index and the bad row."""
+
+    def run_tool(self, target):
+        return subprocess.run([sys.executable, "-I", TOOL, target],
+                              cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    def assert_one_error(self, result, *needles):
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        lines = result.stderr.strip().splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertTrue(lines[0].startswith("error:"), lines[0])
+        for needle in needles:
+            self.assertIn(needle, lines[0])
+
+    def make_folder(self, index_json=None):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        if index_json is not None:
+            with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as f:
+                f.write(index_json)
+        return folder
+
+    def test_no_index_json_names_the_folder(self):
+        folder = self.make_folder()
+        self.assert_one_error(self.run_tool(folder), folder, "no index.json")
+
+    def test_malformed_json_names_the_index(self):
+        folder = self.make_folder("{oops")
+        self.assert_one_error(self.run_tool(folder), "index.json", "is not valid JSON")
+
+    def test_index_without_files_names_the_key(self):
+        folder = self.make_folder("{}")
+        self.assert_one_error(self.run_tool(folder), "index.json", "no 'files' list")
+
+    def test_row_without_stored_names_the_row(self):
+        folder = self.make_folder(json.dumps({"files": [{"off": 0}]}))
+        self.assert_one_error(self.run_tool(folder), "index.json", "row 0", "'off'", "'stored'")
+
+    def test_missing_file_names_what_is_wrong(self):
+        folder = self.make_folder()
+        self.assert_one_error(self.run_tool(os.path.join(folder, "nope.rpf")), "nope.rpf", "no such file or folder")
 
 
 if __name__ == "__main__":

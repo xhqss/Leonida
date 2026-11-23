@@ -47,7 +47,7 @@ Leonida 是一个把 Xbox Series 版 Grand Theft Auto VI **静态重编译**到 
     构建脚本大约需要 20-40 分钟。
   - 如果你用 [conda](https://docs.conda.io/)，更快的办法是 `conda install -c conda-forge llvm-tools`（它的 Windows
     版本包含 AMDGPU target），然后把 `LLVM_MC` 设为安装好的 `llvm-mc.exe` 的完整路径（激活环境后用
-    `where llvm-mc` 查看）。
+    `where.exe llvm-mc` 查看；PowerShell 里单独的 `where` 是 `Where-Object`）。
   - Linux 上 `PATH` 里有 `llvm-mc` 即可。
 - **Visual Studio 2022**，勾选“使用 C++ 的桌面开发”和 **Windows SDK `10.0.26100` 或更新**
   （`runtime` 阶段需要，它使用 root signature 1.2）。

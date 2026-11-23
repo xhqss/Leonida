@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; SHADER-328: an s_buffer_load SGPR offset the translator can see as a constant gives what the same offset gives at run
 ; time. The rule (docs/design.md, Scalar/buffer memory): off = zext(soffset & ~3) + (imm & ~3) in 64 bits, and the
 ; dword is 0 when off + 4 > limit. #1686 folded a constant soffset as a 32-bit sum, so 0xfffffffc + 20 wrapped to 16

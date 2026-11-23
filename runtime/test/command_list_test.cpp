@@ -313,5 +313,53 @@ int main() {
     CHECK(query_fits_heap(h::so_statistics, q::so_statistics_stream3) && !query_fits_heap(6, q::occlusion));
     CHECK(query_result_size(q::occlusion) == 8 && query_result_size(q::timestamp) == 8);
     CHECK(query_result_size(q::pipeline_statistics) == 88 && query_result_size(q::so_statistics_stream0) == 16);
+
+    // Acceleration-structure commands: 256-byte AS/scratch alignment, 8-byte postbuild alignment,
+    // valid copy modes (0..4), valid postbuild info types (0..3), and PERFORM_UPDATE source checks.
+    CHECK(list.close());
+    CHECK(list.reset());
+    BuildAccelerationStructure build{};
+    build.dst_va = 0x1000;
+    build.scratch_va = 0x2000;
+    CHECK(list.build_acceleration_structure(build));
+    build.dst_va = 0;
+    CHECK(!list.build_acceleration_structure(build));
+    build.dst_va = 0x1080;  // misaligned
+    CHECK(!list.build_acceleration_structure(build));
+    build.dst_va = 0x1000;
+    build.scratch_va = 0;
+    CHECK(!list.build_acceleration_structure(build));
+    build.scratch_va = 0x2080;  // misaligned
+    CHECK(!list.build_acceleration_structure(build));
+    build.scratch_va = 0x2000;
+    build.update = true;
+    build.src_va = 0;
+    CHECK(!list.build_acceleration_structure(build));
+    build.src_va = 0x3080;  // misaligned update source
+    CHECK(!list.build_acceleration_structure(build));
+    build.src_va = 0x3000;
+    CHECK(list.build_acceleration_structure(build));
+    build.update = false;
+    build.src_va = 0x3080;  // ignored when not updating
+    CHECK(list.build_acceleration_structure(build));
+
+    CHECK(list.copy_acceleration_structure({0x1000, 0x2000, 0}));
+    CHECK(list.copy_acceleration_structure({0x1000, 0x2000, 4}));
+    CHECK(!list.copy_acceleration_structure({0x1000, 0x2000, 5}));
+    CHECK(!list.copy_acceleration_structure({0, 0x2000, 0}));
+    CHECK(!list.copy_acceleration_structure({0x1080, 0x2000, 0}));
+    CHECK(!list.copy_acceleration_structure({0x1000, 0, 0}));
+    CHECK(!list.copy_acceleration_structure({0x1000, 0x2080, 0}));
+
+    CHECK(list.acceleration_structure_postbuild({0x4000, 0, {0x1000}}));
+    CHECK(list.acceleration_structure_postbuild({0x4008, 3, {0x1000, 0x2000}}));
+    CHECK(!list.acceleration_structure_postbuild({0x4000, 4, {0x1000}}));
+    CHECK(!list.acceleration_structure_postbuild({0, 0, {0x1000}}));
+    CHECK(!list.acceleration_structure_postbuild({0x4004, 0, {0x1000}}));
+    CHECK(!list.acceleration_structure_postbuild({0x4000, 0, {}}));
+    CHECK(!list.acceleration_structure_postbuild({0x4000, 0, {0}}));
+    CHECK(!list.acceleration_structure_postbuild({0x4000, 0, {0x1080}}));
+    CHECK(list.close());
+    CHECK(list.commands().size() == 7);
     return 0;
 }

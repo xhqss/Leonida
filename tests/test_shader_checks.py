@@ -35,7 +35,7 @@ TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 14)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures,
+         + len(check.TEXTURE_CONSTANTS) + 15)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures,
          # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case) and cs_fmt_all
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
@@ -148,6 +148,8 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name == "cs_cvt_pk_u8":
                 return 0, "out[0..7] = " + " ".join(map(str, check.CVT_PK_U8_WORDS)) + "\n"
+            if name == "cs_pk_mul_lo_const":
+                return 0, "out[0..7] = " + " ".join(map(str, check.PK_MUL_LO_WORDS)) + "\n"
             if name == "cs_store":
                 return 0, "out[0..7] = " + " ".join(map(str, (check.CS_STORE + [0] * 8)[:8])) + "\n"
             if name == "cs_smem_soffset_imm":
@@ -1006,14 +1008,19 @@ class FmaFusedChecks(unittest.TestCase):
     """cs_fma_fused: strict single-rounded words under --fma khr, fused-or-split f32 under --fma glsl (Mesa RADV)."""
     RADV_SPLIT = [0x00000000, 0xA8800000, 0x3A000000, 0x00000000, 0x00000000, 0x00000000, 0x28800000, 0x00007351]
 
-    def run_fma(self, words, *, khr_index=False, code=0, raw_out=None):
+    def run_fma(self, words, *, khr_index=False, fma_mode=None, env_fma=None, code=0, raw_out=None):
         out = raw_out if raw_out is not None else "out[0..7] = " + " ".join(map(str, words)) + "\n"
         with tempfile.TemporaryDirectory() as tmp:
-            if khr_index:
+            if khr_index or fma_mode:
+                meta = {"features": ["shaderFmaFloat32"]} if khr_index else {}
+                if fma_mode:
+                    meta["fma"] = fma_mode
                 Path(tmp, "index.json").write_text(
-                    json.dumps({"cs_fma_fused": {"features": ["shaderFmaFloat32"]}}), encoding="utf-8")
+                    json.dumps({"cs_fma_fused": meta}), encoding="utf-8")
             with patch.dict(check.os.environ, {}, clear=False):
                 check.os.environ.pop("LEONIDA_FMA", None)
+                if env_fma:
+                    check.os.environ["LEONIDA_FMA"] = env_fma
                 with patch.object(check, "run", return_value=(code, out)) as run:
                     res = check.fma_fused_test("tools", tmp)
                 self.assertEqual(run.call_args.kwargs["env"]["VKC_SGPRS"], check.FMA_FUSED_ENV["VKC_SGPRS"])
@@ -1032,20 +1039,30 @@ class FmaFusedChecks(unittest.TestCase):
         self.assertIn("word 0", problem)
         self.assertIn("OpFmaKHR", problem)
 
-    def test_exact_is_as_strict_as_khr(self):
-        # SHADER-497: --fma exact builds the single rounding from plain f32 ops, so a split word is a failure there
-        # too, as under khr; only --fma glsl accepts it.
-        ok, detail = check.judge_fma_fused(check.FMA_FUSED, khr=False, exact=True)
-        self.assertTrue(ok)
-        self.assertIn("--fma exact", detail)
-        ok, detail = check.judge_fma_fused(self.RADV_SPLIT, khr=False, exact=True)
-        self.assertFalse(ok)
-        self.assertIn("word 0", detail)
-        self.assertIn("--fma exact", detail)
-        out = "out[0..7] = " + " ".join(map(str, self.RADV_SPLIT)) + "\n"
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(check.os.environ, {"LEONIDA_FMA": "exact"}), \
-                patch.object(check, "run", return_value=(0, out)):
-            problem = check.fma_fused_test("tools", tmp)
+    def test_fma_mode_recorded_in_index_is_honoured(self):
+        # TEST-1147: an --fma exact build has no FMAKHR capability, so without the recorded mode a fresh shell
+        # judges split words as a legal GLSL Fma result instead of a regression.
+        for mode in ("glsl", "khr", "exact"):
+            with tempfile.TemporaryDirectory() as tmp:
+                Path(tmp, "index.json").write_text(
+                    json.dumps({"cs_fma_fused": {"fma": mode}}), encoding="utf-8")
+                self.assertEqual(check.shader_fma_mode(tmp, "cs_fma_fused"), mode)
+        self.assertEqual(self.run_fma(check.FMA_FUSED, fma_mode="exact"), "")
+        problem = self.run_fma(self.RADV_SPLIT, fma_mode="exact")
+        self.assertIn("word 0", problem)
+        self.assertNotIn("LEONIDA_FMA=khr", check.judge_fma_fused(self.RADV_SPLIT, khr=True)[1])
+
+    def test_recorded_mode_overrides_stale_environment(self):
+        # When index.json records the mode it is authoritative; a leftover LEONIDA_FMA from the build shell
+        # must not switch a glsl build to strict judging (or an exact build back to lenient).
+        self.assertEqual(self.run_fma(self.RADV_SPLIT, fma_mode="glsl", env_fma="exact"), "")
+        problem = self.run_fma(self.RADV_SPLIT, fma_mode="exact", env_fma="glsl")
+        self.assertIn("word 0", problem)
+
+    def test_older_index_still_honors_exact_env(self):
+        # An index written before the fma field existed can only be judged strictly via the environment.
+        self.assertEqual(self.run_fma(check.FMA_FUSED, env_fma="exact"), "")
+        problem = self.run_fma(self.RADV_SPLIT, env_fma="exact")
         self.assertIn("word 0", problem)
         self.assertIn("--fma exact", problem)
 

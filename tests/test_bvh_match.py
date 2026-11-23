@@ -48,9 +48,13 @@ def write_obj(path, groups):
         f.write("\n".join(lines) + "\n")
 
 
-def item(offset, file, triangles, hashes=None):
-    """One manifest row, as tools/rpf9dump writes it: per geometry triangles and shader index."""
+def item(offset, file, triangles, hashes=None, buckets=None):
+    """One manifest row, as tools/rpf9dump writes it: per geometry triangles and shader index, and with `buckets`
+    one render bucket per material (None leaves the field out, as an older export does)."""
     materials = [{"ShaderIndex": i, "Shader": "%08X" % h} for i, h in enumerate(hashes or [])]
+    for material, bucket in zip(materials, buckets or []):
+        if bucket is not None:
+            material["RenderBucket"] = bucket
     return {"Offset": offset, "File": file, "Name": "drawable_at_%X" % offset, "Meshes": len(triangles),
             "Verts": 0, "Tris": sum(triangles), "MeshTris": list(triangles),
             "MeshModels": [0] * len(triangles), "MeshGeoms": list(range(len(triangles))),
@@ -103,7 +107,8 @@ class TestMatching(unittest.TestCase):
         self.assertEqual(status, 0, out)
         self.assertIn("triangles per geometry index: [2]", out)
         self.assertIn("1 of 1 scored candidates are consistent", out)
-        self.assertIn("model 0 geometry [1] | outside 0 of 1", out)
+        self.assertIn("model 0 geometry [1] (bucket rule not applied: a geometry has no render bucket) | outside 0 of 1",
+                      out)
 
     def test_a_geometry_with_other_triangle_counts_is_not_a_candidate(self):
         src, _, _ = build(LEAVES, bounds=BOUNDS)
@@ -136,6 +141,70 @@ class TestMatching(unittest.TestCase):
         status, out, _ = self.guide(src, [item(0x1000, "a.obj", [4, 2], hashes)], files,
                                     ["--skip-shaders", "%08X" % hashes[1]])
         self.assertEqual(status, 1, out)
+
+    def test_the_bucket_rule_leaves_buckets_1_and_2_out(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        hashes = [0x11110000, 0x22220000, 0x33330000, 0x44440000]
+        # Buckets 1 and 2 are left out, so geometry 3 (bucket 3) is index 1 and geometry 0 (bucket 0) index 0; the
+        # BLAS's one leaf uses index 0 with two triangles, which only the bucket-0 geometry has once 1 and 2 are out.
+        files = {"a.obj": [group(2), group(2), group(2), group(9)]}
+        rows = [item(0x1000, "a.obj", [2, 2, 2, 9], hashes, [0, 1, 2, 3])]
+        self.assertEqual([mesh[5] for mesh in M.model_geometries(rows[0])], [0, 1, 2, 3])
+        candidates = M.match_candidates(rows, [2, 9], frozenset(), 8)
+        self.assertEqual([[c["kept"][k][0] for k in c["used"]] for c in candidates], [[0, 3]])
+        # Without the rule, [2, 9] also embeds through geometries 1 and 2.
+        loose = M.match_candidates(rows, [2, 9], frozenset(), 8, buckets=False)
+        self.assertEqual(sorted([c["kept"][k][0] for k in c["used"]] for c in loose), [[0, 3], [1, 3], [2, 3]])
+        status, out, _ = self.guide(src, rows, files)
+        self.assertEqual(status, 0, out)
+        self.assertIn("1 candidates", out)
+        self.assertIn("model 0 geometry [0] | outside 0 of 1", out)
+
+    def test_the_bucket_rule_finds_what_the_signature_alone_cannot(self):
+        # Signature [2, 5]: geometries 0 and 2 (bucket 0 and 3); geometry 1 (bucket 2, 5 triangles) is a decal the
+        # BVH leaves out. Without the rule the ordered match would also take geometry 1 for the 5.
+        rows = [item(0x1000, "a.obj", [2, 5, 5], [1, 2, 3], [0, 2, 3])]
+        self.assertEqual([[c["kept"][k][0] for k in c["used"]] for c in M.match_candidates(rows, [2, 5], frozenset(), 8)],
+                         [[0, 2]])
+        self.assertEqual(len(M.match_candidates(rows, [2, 5], frozenset(), 8, buckets=False)), 2)
+        # A model all of whose geometries are left out has no candidate.
+        self.assertEqual(M.match_candidates([item(0x2000, "b.obj", [2], [1], [1])], [2], frozenset(), 8), [])
+
+    def test_the_bucket_rule_ignores_bit_7(self):
+        # 0x83 is bucket 3 with bit 7 set (kept); 0x82 is bucket 2 with bit 7 set (left out); 6 is left out.
+        rows = [item(0x1000, "a.obj", [4, 3, 3, 8], [1, 2, 3, 4], [0x83, 0x82, 6, 0x80])]
+        self.assertEqual([[c["kept"][k][0] for k in c["used"]] for c in M.match_candidates(rows, [4, 8], frozenset(), 8)],
+                         [[0, 3]])
+        self.assertEqual(M.match_candidates(rows, [4, 3], frozenset(), 8), [])
+
+    def test_the_bucket_rule_is_not_applied_without_every_bucket(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        # Geometry 1 has no bucket: the rule cannot be applied, so the bucket-1 geometry stays a candidate.
+        rows = [item(0x1000, "a.obj", [2, 7], [1, 2], [1, None])]
+        status, out, _ = self.guide(src, rows, {"a.obj": [group(2), group(7)]})
+        self.assertEqual(status, 0, out)
+        self.assertIn("model 0 geometry [0] (bucket rule not applied", out)
+
+    def test_no_bucket_rule_keeps_every_geometry(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        rows = [item(0x1000, "a.obj", [2], [1], [2])]
+        status, out, _ = self.guide(src, rows, {"a.obj": [group(2)]})
+        self.assertEqual(status, 1, out)
+        self.assertIn("0 candidates", out)
+        status, out, _ = self.guide(src, rows, {"a.obj": [group(2)]}, ["--no-bucket-rule"])
+        self.assertEqual(status, 0, out)
+        self.assertIn("model 0 geometry [0] | outside 0 of 1", out)
+
+    def test_bucket_kept(self):
+        self.assertEqual([M.bucket_kept(b) for b in (0, 1, 2, 3, 4, 5, 6, None)],
+                         [True, False, False, True, False, False, False, None])
+        # Bit 7 does not change the choice.
+        self.assertEqual([M.bucket_kept(b) for b in (0x80, 0x81, 0x82, 0x83)], [True, False, False, True])
+
+    def test_skip_shaders_still_applies_on_top_of_the_bucket_rule(self):
+        rows = [item(0x1000, "a.obj", [2, 2], [0xAAAA1111, 0xBBBB2222], [0, 0])]
+        candidates = M.match_candidates(rows, [2], frozenset([0xAAAA1111]), 8)
+        self.assertEqual([[c["kept"][k][0] for k in c["used"]] for c in candidates], [[1]])
 
     def test_the_instance_transform_decides(self):
         src, _, _ = build(LEAVES, bounds=(0.5, 0.0, 0.0, 1.5, 1.0, 0.0))

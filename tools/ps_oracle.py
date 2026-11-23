@@ -21,7 +21,8 @@ template's own ISA and that part of its metadata, so the code under test can fol
 Templates: `const` (no inputs), `interp2` (two smooth vec4 varyings: location 0 = (u, v, 0, 1) and location 1 =
 (u, v, 0, 0) with u, v = 0..2 across the screen, as scripts/run_gpu_tests.py's vs_tri), or --vs/--ps files
 (.spv, or .spvasm assembled with spirv-as). --format picks another color target (the driver then picks the export
-format for it, as for a game pipeline); the readback is that target's texels as stored.
+format for it, as for a game pipeline); the readback is that target's texels as stored. The selected format,
+including the default RGBA32F, takes precedence over a VKH_COLOR_FORMAT inherited from the shell.
 
 Checked on an AMD Radeon iGPU (gfx1036, Windows driver 26.10.1): the driver accepts a patched binary and the patched
 code runs as the pixel shader (no checksum over the code). The pixel stage there is compiled as wave64.
@@ -54,6 +55,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+from report_paths import same_report_path  # noqa: E402
 
 PS_SYMBOL = "_amdgpu_ps_main"
 S_CODE_END = struct.pack("<I", 0xBF9F0000)
@@ -610,9 +612,8 @@ FORMATS = {
 
 def run_harness(exe, vs, ps, out_raw, size, env_extra, fmt="rgba32f"):
     env = dict(os.environ, **env_extra)
-    if fmt != "rgba32f":
-        number, nbytes, _ = FORMATS[fmt]
-        env["VKH_COLOR_FORMAT"] = f"{number}:{nbytes}"
+    number, nbytes, _ = FORMATS[fmt]
+    env["VKH_COLOR_FORMAT"] = f"{number}:{nbytes}"
     r = subprocess.run([exe, vs, ps, out_raw, str(size[0]), str(size[1])], capture_output=True, text=True, env=env)
     if r.returncode == 77:
         raise Unavailable(r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "vk_harness: unsupported")
@@ -805,6 +806,10 @@ def main(argv=None):
         ap.error("nothing to do: give --asm and/or --show-template")
     if not all(0 < n <= 4096 for n in a.size):
         ap.error("--size must be 1..4096")
+    if a.json:                       # the report is written after the run, over whatever it names
+        for flag, path in (("--asm", a.asm), ("--ps", a.ps), ("--vs", a.vs)):
+            if path and same_report_path(a.json, path):
+                ap.error(f"--json would overwrite the {flag} input: {a.json}")
     try:
         lines = read_lines(a.asm) if a.asm else None
         sets = []

@@ -324,6 +324,61 @@ int main(int argc, char** argv) {
     check(rt::d3d12_xs::device_slot_hits(76) == 2, "slot 76 hit counter is 2");
     check(rt::d3d12_xs::device_slot_first_call_seen(76), "slot 76 first-call flag is set");
 
+    // Xbox device slots from the public HLE. On the Vulkan device the PC entries at 78/79 are
+    // CreateReservedResource2/CreateSampler2 and 80 is past the 80-slot table, so success here can only come from
+    // the routes: frame events return S_OK and a fresh token, CreateCommandQueueX returns a queue proxy and
+    // CreateCommandListX (desc, allocator, initialState, riid, out; no node mask) reaches PC CreateCommandList.
+    {
+        using SetFrameIntervalFn = HRESULT(WINAPI*)(void*, void*, UINT, UINT, UINT);
+        using ScheduleFrameEventFn = HRESULT(WINAPI*)(void*, UINT, UINT, void*, UINT);
+        using WaitFrameEventFn = HRESULT(WINAPI*)(void*, UINT, UINT, void*, UINT, UINT64*);
+        using CreateQueueXFn = HRESULT(WINAPI*)(void*, const D3D12_COMMAND_QUEUE_DESC*, const IID*, void**);
+        using CreateListXFn = HRESULT(WINAPI*)(void*, const void*, ID3D12CommandAllocator*, ID3D12PipelineState*,
+                                               const IID*, void**);
+
+        hr = reinterpret_cast<SetFrameIntervalFn>(proxy_vtbl[78])(device.Get(), nullptr, 16667, 1, 0);
+        check(hr == S_OK, "slot 78 SetFrameIntervalX returns S_OK");
+        hr = reinterpret_cast<ScheduleFrameEventFn>(proxy_vtbl[79])(device.Get(), 0, 0, nullptr, 0);
+        check(hr == S_OK, "slot 79 ScheduleFrameEventX returns S_OK");
+
+        std::uint64_t token = 0, token2 = 0;
+        hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, INFINITE, nullptr, 0, &token);
+        check(hr == S_OK && token != 0, "slot 80 WaitFrameEventX returns a non-zero token");
+        hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, 0, nullptr, 0, &token2);
+        check(hr == S_OK && token2 != 0 && token2 != token, "slot 80 returns a fresh token on the next wait");
+        hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, 0, nullptr, 0, nullptr);
+        check(hr == E_POINTER, "slot 80 refuses a null token with E_POINTER");
+        check(rt::d3d12_xs::device_slot_hits(78) == 1 && rt::d3d12_xs::device_slot_hits(79) == 1 &&
+                  rt::d3d12_xs::device_slot_hits(80) == 3,
+              "slots 78/79/80 hit counters are 1/1/3");
+
+        D3D12_COMMAND_QUEUE_DESC xbox_queue{};
+        xbox_queue.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        const IID iid_queue = __uuidof(ID3D12CommandQueue);
+        ComPtr<ID3D12CommandQueue> xbox_queue_proxy;
+        hr = reinterpret_cast<CreateQueueXFn>(proxy_vtbl[48])(device.Get(), &xbox_queue, &iid_queue,
+                                                               reinterpret_cast<void**>(xbox_queue_proxy.GetAddressOf()));
+        check(hr == S_OK && rt::d3d12_xs::is_queue_proxy(xbox_queue_proxy.Get()),
+              "slot 48 CreateCommandQueueX returns a queue proxy");
+        check(rt::d3d12_xs::device_slot_hits(48) == 1, "slot 48 hit counter is 1");
+
+        ComPtr<ID3D12CommandAllocator> xbox_allocator;
+        hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                            IID_PPV_ARGS(xbox_allocator.GetAddressOf()));
+        struct XboxCommandListDesc {
+            UINT Type;
+            UINT NodeMask;
+        } list_desc{D3D12_COMMAND_LIST_TYPE_DIRECT, 7};  // the node mask is ignored by the console call
+        const IID iid_list = __uuidof(ID3D12GraphicsCommandList);
+        ComPtr<ID3D12GraphicsCommandList> xbox_list;
+        hr = SUCCEEDED(hr) ? reinterpret_cast<CreateListXFn>(proxy_vtbl[73])(
+                                 device.Get(), &list_desc, xbox_allocator.Get(), nullptr, &iid_list,
+                                 reinterpret_cast<void**>(xbox_list.GetAddressOf()))
+                           : hr;
+        check(hr == S_OK && xbox_list != nullptr, "slot 73 CreateCommandListX returns a command list");
+        check(rt::d3d12_xs::device_slot_hits(73) == 1, "slot 73 hit counter is 1");
+    }
+
     // Slot 62: an empty root signature and a trivial compute shader through the Xbox signature. The PC entry at
     // slot 62 is CreateStateObject, so success here proves the override reached CreateComputePipelineState.
     D3D12_ROOT_SIGNATURE_DESC root_desc{};

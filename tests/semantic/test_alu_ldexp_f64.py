@@ -356,5 +356,56 @@ class LdexpF64Tests(unittest.TestCase):
             translate_lines(["v_ldexp_f64 v[0:1], v2, v4"])
 
 
+# --- wave64 coverage (SHADER-1039 follow-up) ------------------------------------------------------
+# run_fragment above always runs one invocation, so nothing here could see the upper 32 bits of EXEC
+# or VCC. The fixture declares its wave size in the FSSM header (0xD4 bit 5) and runs one full
+# subgroup, so a regression that drops the high half of either mask shows up.
+
+def run_cs_wave(lines, wave_size):
+    fssm = bytearray(0x148)
+    fssm[:4] = b"FSSM"
+    struct.pack_into("<I", fssm, 0xD4, 0x20 if wave_size == 32 else 0)
+    struct.pack_into("<4I", fssm, 0x138, 0x8088, wave_size, 1, 1)
+    from support import translate_lines as translate_with_fssm
+    spv = translate_with_fssm("cs_ldexp_f64_wave", lines + ["s_endpgm"], fssm=bytes(fssm))
+    return si.run_workgroup(spv, wave_size, wave_size,
+                            inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+                            push_constants=[0, 0, 0x1000, 0x31016FAC] + [0] * 28, memory={})
+
+
+class LdexpF64WaveTests(unittest.TestCase):
+    def check_vcc_and_inactive_lanes(self, wave_size, active_lanes, vcc_lanes):
+        vcc = "vcc_lo" if wave_size == 32 else "vcc"
+        restore_exec = "s_mov_b32 exec_lo, -1" if wave_size == 32 else "s_mov_b64 exec, -1"
+        lines = ["v_mov_b32_e32 v4, 0", "v_mov_b32_e32 v5, 0x3ff00000",
+                 f"v_mov_b32_e32 v6, {SENT_LO:#x}", f"v_mov_b32_e32 v7, {SENT_HI:#x}",
+                 f"v_cmp_gt_u32_e32 {vcc}, {vcc_lanes}, v0",
+                 f"v_cmpx_gt_u32_e32 {active_lanes}, v0",
+                 "v_ldexp_f64 v[6:7], v[4:5], v0",
+                 restore_exec,
+                 f"v_cndmask_b32_e64 v8, 0, 1, {vcc}",
+                 "v_lshlrev_b32_e32 v9, 4, v0",
+                 "buffer_store_dword v6, v9, s[0:3], 0 offen",
+                 "buffer_store_dword v7, v9, s[0:3], 0 offen offset:4",
+                 "buffer_store_dword v8, v9, s[0:3], 0 offen offset:8"]
+        mem = run_cs_wave(lines, wave_size)
+        for lane in range(wave_size):
+            lo, hi, vcc_bit = mem[16 * lane], mem[16 * lane + 4], mem[16 * lane + 8]
+            if lane < active_lanes:
+                want = d2u(2.0 ** lane)
+                self.assertEqual((lo, hi), (want & 0xFFFFFFFF, want >> 32), f"lane {lane}")
+            else:
+                self.assertEqual((lo, hi), (SENT_LO, SENT_HI), f"inactive lane {lane}")
+            self.assertEqual(vcc_bit, int(lane < vcc_lanes), f"vcc lane {lane}")
+
+    def test_vcc_and_inactive_lanes_wave32(self):
+        self.check_vcc_and_inactive_lanes(wave_size=32, active_lanes=16, vcc_lanes=3)
+
+    def test_vcc_and_inactive_lanes_wave64(self):
+        # Both masks change inside the high half, so dropping either high word cannot pass:
+        # without the EXEC mask lanes 43-63 change, and clearing vcc_hi changes lanes 32-34.
+        self.check_vcc_and_inactive_lanes(wave_size=64, active_lanes=43, vcc_lanes=35)
+
+
 if __name__ == "__main__":
     unittest.main()

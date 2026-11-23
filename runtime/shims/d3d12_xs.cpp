@@ -188,8 +188,8 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     size_t backend_length = 0;
     if (getenv_s(&backend_length, backend, "LEONIDA_D3D12") == 0 && std::strcmp(backend, "vulkan") == 0) {
         ID3D12Device* vulkan = nullptr;
-        HRESULT vhr = rt::d3d12::create_vulkan_device_standalone(__uuidof(ID3D12Device),
-                                                                 reinterpret_cast<void**>(&vulkan));
+        HRESULT vhr = rt::d3d12::create_vulkan_device_standalone(
+            __uuidof(ID3D12Device), reinterpret_cast<void**>(&vulkan), rt::d3d12::QueueTestSettings::ignore);
         if (FAILED(vhr)) {
             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: Vulkan device failed (hr=0x%08lx)\n",
                          static_cast<unsigned long>(vhr));
@@ -240,6 +240,11 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
 static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);
 static_assert(std::is_same_v<decltype(&create_root_signature_deserializer), DeserializerFn>);
 static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacySerializeFn>);
+
+// Measured call (RT-5, 1.0.2.1): the title calls it once at startup with one pointer to a zeroed 32-byte block whose
+// dword at +4 it sets (a count), and only checks the result for failure. The PC/Vulkan side owns virtual memory,
+// so the policy is accepted and ignored.
+HRESULT WINAPI configure_virtual_memory(void* /*desc*/) { return S_OK; }
 
 }  // namespace
 

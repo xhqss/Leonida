@@ -499,6 +499,21 @@ int main(int argc, char** argv) {
         // are compared within 1: drivers round the 0.5 tie differently (WARP 128, NVIDIA 127), and Intel's encodes
         // sRGB 1 off WARP in places (its own D3D12 driver stores the same bytes as the layer there); a wrong channel
         // order or a missing sRGB encoding is many steps off.
+        // A host that can't take a castable-format list (Windows 10's d3d12.dll has no ID3D12Device10; the in-box WARP
+        // 10.0.22621.5415 on Windows 11 23H2 reports RelaxedFormatCastingSupported = 0 and CreateCommittedResource3
+        // fails) clears a texture in the view's own format instead: the bytes are stored in the view's channel order
+        // and encoding either way, so the expected readback is the same. The layer still goes through the list.
+        bool host_casts = false;
+        {
+            Ref<ID3D12Device10> host10;
+            D3D12_FEATURE_DATA_D3D12_OPTIONS12 options12{};
+            host_casts = SUCCEEDED(host.p->QueryInterface(IID_PPV_ARGS(&host10.p))) &&
+                         SUCCEEDED(host.p->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &options12,
+                                                             sizeof(options12))) &&
+                         options12.RelaxedFormatCastingSupported;
+        }
+        if (!host_casts)
+            std::printf("castable-format clears: host has no relaxed format casting; WARP clears the view's format\n");
         struct CastFormat { DXGI_FORMAT resource, view; const char* name; };
         const CastFormat cast_formats[] = {
             {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, "R8G8B8A8_UNORM{B8G8R8A8_UNORM}"},
@@ -516,7 +531,9 @@ int main(int argc, char** argv) {
                 const auto& part = float_values[(i + 1) % nf];
                 std::vector<unsigned char> actual, expected;
                 if (!clear_and_read(ours.p, cf.resource, 4, full.data(), part.data(), actual, false, cf.view) ||
-                    !clear_and_read(host.p, cf.resource, 4, full.data(), part.data(), expected, false, cf.view)) {
+                    !(host_casts
+                          ? clear_and_read(host.p, cf.resource, 4, full.data(), part.data(), expected, false, cf.view)
+                          : clear_and_read(host.p, cf.view, 4, full.data(), part.data(), expected))) {
                     std::fprintf(stderr, "%s case %u: clear or readback failed\n", cf.name, i);
                     ++format_failures;
                     break;

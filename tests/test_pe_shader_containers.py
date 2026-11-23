@@ -277,5 +277,46 @@ class ReportPathTests(unittest.TestCase):
             self.assertEqual(f.read(), b"keep me")
 
 
+def psv0(stage_code: int) -> bytes:
+    """Build a minimal PSV0 chunk payload whose ShaderStage byte is `stage_code`."""
+    return struct.pack("<I", 48) + bytes(24) + bytes([stage_code]) + bytes(23)
+
+
+class Psv0StageTests(unittest.TestCase):
+    def test_psv0_stage_detection(self):
+        for code, expected in ((0, "ps"), (1, "vs"), (2, "gs"), (3, "hs"), (4, "ds"), (5, "cs"), (13, "ms"), (14, "as")):
+            with self.subTest(code=code):
+                self.assertEqual(psc.psv0_stage(psv0(code)), expected)
+        self.assertIsNone(psc.psv0_stage(psv0(99)))
+        self.assertIsNone(psc.psv0_stage(b""))
+        self.assertIsNone(psc.psv0_stage(bytes(20)))
+        self.assertIsNone(psc.psv0_stage(struct.pack("<I", 20) + bytes(28)))
+
+    def test_extract_writes_psv0_stage_to_index(self):
+        # Match the unnamed XBCH containers embedded in game_scarlett_master.exe (no ILDN, PSV0 present),
+        # plus a container without PSV0 to verify the "cs" fallback.
+        vs_blob = container([(b"PSV0", psv0(1)), (b"DXIL", dxil_payload("vs", xbch=True, bitcode=False))])
+        ps_blob = container([(b"PSV0", psv0(0)), (b"DXIL", dxil_payload("ps", xbch=True, bitcode=False))])
+        no_psv0 = container([(b"DXIL", dxil_payload("cs", xbch=True, bitcode=False))])
+        image_bytes = b"MZ" + vs_blob + ps_blob + no_psv0
+        records, rejected = psc.inspect(image_bytes, "fake.exe")
+        self.assertEqual(rejected, [])
+        self.assertEqual([r["stage"] for r in records], ["vs", "ps", None])
+        with tempfile.TemporaryDirectory() as tmp:
+            index = psc.extract(image_bytes, records, tmp)
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(index, f, indent=0)
+            with open(os.path.join(tmp, "index.json"), encoding="utf-8") as f:
+                loaded = json.load(f)
+            self.assertEqual(
+                loaded,
+                [
+                    {"name": "container_00", "file": "container_00.dxbc", "stage": "vs"},
+                    {"name": "container_01", "file": "container_01.dxbc", "stage": "ps"},
+                    {"name": "container_02", "file": "container_02.dxbc", "stage": "cs"},
+                ],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

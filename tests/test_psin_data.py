@@ -262,6 +262,83 @@ class TestMeasure(unittest.TestCase):
         self.assertEqual(stats["map 75 groups a power of two"], 0)
         self.assertEqual(stats["map 75 groups not a power of two"], 1)
 
+    def test_root_block_shorter_than_struct_is_rejected(self):
+        # 32-byte struct backed by a 16-byte root block (followed immediately by LSCH)
+        # must not read the LSCH header as struct fields.
+        schema = [(0xAAAA0010, 1, 32, 2, [
+            (joaat("a"), 0, 0x15, 0, 0, 0),
+            (joaat("b"), 16, 0x15, 0, 0, 0),
+        ])]
+        blob = make_container([(0xAAAA0010, struct.pack("<4I", 42, 0, 0, 0))], schema, [])
+        stats = __import__("collections").Counter()
+        tree = D.Walker(D.Container(blob), stats, keep=True).run()
+        self.assertIsNone(tree)
+        self.assertEqual(stats["root past block end"], 1)
+        self.assertEqual(stats["structs"], 0)
+        self.assertEqual(stats["bytes reached"], 0)
+
+        # A zero-byte root block shares its base offset with block 2; it must still be rejected.
+        blob_zero = make_container([(0xAAAA0010, b""), (0x15, b"\x11" * 32)], schema, [])
+        stats_zero = __import__("collections").Counter()
+        self.assertIsNone(D.Walker(D.Container(blob_zero), stats_zero, keep=True).run())
+        self.assertEqual(stats_zero["root past block end"], 1)
+        self.assertEqual(stats_zero["structs"], 0)
+
+    def test_embedded_struct_past_block_end_is_rejected(self):
+        schema = [
+            (0xAAAA0011, 1, 16, 2, [(joaat("sub"), 0, 0x05, 0, 0, 0xAAAA0012)]),
+            (0xAAAA0012, 2, 32, 2, [(joaat("x"), 16, 0x15, 0, 0, 0)]),
+        ]
+        blob = make_container([(0xAAAA0011, bytes(16))], schema, [])
+        stats = __import__("collections").Counter()
+        tree = D.Walker(D.Container(blob), stats, keep=True).run()
+        self.assertEqual(tree, {f"{joaat('sub'):08x}": None})
+        self.assertEqual(stats["structs"], 1)
+        self.assertEqual(stats["struct past block end"], 1)
+
+    def test_char_array_past_block_end_is_rejected(self):
+        schema = [(0xAAAA0013, 1, 16, 2, [(joaat("name"), 0, 0x40, 0, 0, 32)])]
+        blob = make_container([(0xAAAA0013, b"A" * 16)], schema, [])
+        stats = __import__("collections").Counter()
+        tree = D.Walker(D.Container(blob), stats, keep=True).run()
+        self.assertEqual(tree, {f"{joaat('name'):08x}": None})
+        self.assertEqual(stats["char arrays"], 0)
+        self.assertEqual(stats["member past block end"], 1)
+
+    def test_scalar_and_container_headers_past_block_end_are_rejected(self):
+        schema = [(0xAAAA0014, 1, 16, 2, [
+            (0x00000100, 0, 0x15, 0, 0, 0),                    # element 0: u32
+            (joaat("qword"), 12, 0x17, 0, 0, 0),                # 8 bytes at +12 -> past 16
+            (joaat("arr"), 8, 0x5C, 0, 0, 0),                   # 16-byte header at +8 -> past 16
+            (joaat("smap"), 4, 0x71, 0, 0, 0 | (0 << 16)),      # 20-byte header at +4 -> past 16
+            (joaat("inline"), 12, 0x54, 0, 0, 0),               # 8-byte header at +12 -> past 16
+        ])]
+        blob = make_container([(0xAAAA0014, bytes(16))], schema, [])
+        stats = __import__("collections").Counter()
+        self.assertTrue(D.measure(blob, stats))
+        self.assertEqual(stats["walk error"], 0)
+        self.assertEqual(stats["member past block end"], 3)
+        self.assertEqual(stats["inline array out of bounds"], 1)
+
+    def test_short_string_length_mismatch_and_oob_slot(self):
+        # Length byte claims 64 bytes in a 16-byte short-string slot: must return None, not read into LSCH.
+        schema = [(0xAAAA0015, 1, 16, 2, [(joaat("short"), 0, 0x44, 0, 0, 0)])]
+        payload = bytearray(b"A" * 15 + bytes([0x80 | 64]))
+        blob = make_container([(0xAAAA0015, bytes(payload))], schema, [])
+        stats = __import__("collections").Counter()
+        tree = D.Walker(D.Container(blob), stats, keep=True).run()
+        self.assertEqual(tree, {f"{joaat('short'):08x}": None})
+        self.assertEqual(stats["short string length mismatch"], 1)
+        self.assertEqual(stats["short strings in place"], 0)
+
+        # Short-string slot starting at +8 in a 16-byte block extends past the block end.
+        oob_schema = [(0xAAAA0016, 1, 16, 2, [(joaat("short"), 8, 0x44, 0, 0, 0)])]
+        blob2 = make_container([(0xAAAA0016, bytes(16))], oob_schema, [])
+        stats2 = __import__("collections").Counter()
+        tree2 = D.Walker(D.Container(blob2), stats2, keep=True).run()
+        self.assertEqual(tree2, {f"{joaat('short'):08x}": None})
+        self.assertEqual(stats2["member past block end"], 1)
+
 
 class TestCli(unittest.TestCase):
     def run_tool(self, *args):
@@ -303,6 +380,26 @@ class TestCli(unittest.TestCase):
             r = self.run_tool(path, "--dump")
             self.assertEqual(r.returncode, 2)
             self.assertIn("incomplete", r.stderr)
+
+    def test_a_single_file_without_the_magic_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "not-psin.bin")
+            with open(path, "wb") as f:
+                f.write(b"\x78\xda not psin")
+            r = self.run_tool(path, "--json")
+            self.assertEqual(r.returncode, 2)
+            self.assertEqual(r.stdout, "")
+            self.assertEqual(len(r.stderr.strip().splitlines()), 1)
+            self.assertIn("not a PSIN container", r.stderr)
+
+    def test_a_folder_still_skips_a_file_without_the_magic(self):
+        # the negative control: the same bytes inside a folder are skipped, not refused
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "000000003000.bin"), "wb") as f:
+                f.write(b"\x78\xda not psin")
+            r = self.run_tool(tmp, "--json")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(json.loads(r.stdout), {})
 
     def test_dump_missing_file_returns_2(self):
         with tempfile.TemporaryDirectory() as tmp:

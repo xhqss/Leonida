@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; SDWA source select on a float inline constant in an f16 op. Assemble with llvm-mc -mcpu=gfx1013 -show-encoding,
 ; translate, run with vk_harness. In a 16-bit float op an inline float constant is the f16 value in bits 15:0 over a
 ; zero high half (docs/design.md, "f16 inline constants"); SDWA src<i>_sel then narrows those 32 bits like a

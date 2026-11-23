@@ -16,6 +16,7 @@ import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOL = os.path.join(ROOT, "tools", "fspx_unpack.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import fspx_unpack  # noqa: E402
@@ -345,6 +346,95 @@ class Cli(unittest.TestCase):
             self.assertNotIn("Traceback", err)
             with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
                 self.assertEqual(json.load(f), [])
+
+
+class CliOutCollision(unittest.TestCase):
+    """--out must never be the folder the tool reads, including through another spelling of its name."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.folder = os.path.join(self.tmp.name, "input")
+        os.makedirs(self.folder)
+        self.src = os.path.join(self.folder, "sample.fspx")
+        with open(self.src, "wb") as f:
+            f.write(make_fspx([(0, kind0()), (6, program())]))
+        with open(self.src, "rb") as f:
+            self.contents = f.read()
+
+    def run_tool(self, *argv):
+        return subprocess.run([sys.executable, "-I", TOOL, *argv], capture_output=True, text=True, timeout=60)
+
+    def assert_refused(self, result):
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(result.stderr.count("ERROR:"), 1, result.stderr)
+        self.assertIn("input folder", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def assert_input_untouched(self):
+        with open(self.src, "rb") as f:
+            self.assertEqual(f.read(), self.contents)
+        self.assertFalse(os.path.exists(os.path.join(self.folder, "index.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.folder, "fspx")))
+
+    def test_out_equal_to_the_input_folder_is_refused_before_opening_it(self):
+        result = self.run_tool(self.folder, "--out", self.folder)
+        self.assert_refused(result)
+        self.assert_input_untouched()
+        self.assertEqual(os.listdir(self.folder), ["sample.fspx"])
+
+    def test_out_inside_the_input_folder_is_refused(self):
+        result = self.run_tool(self.folder, "--out", os.path.join(self.folder, "out"))
+        self.assert_refused(result)
+        self.assert_input_untouched()
+        self.assertFalse(os.path.exists(os.path.join(self.folder, "out")))
+
+    def test_out_equal_to_the_folder_holding_a_file_input_is_refused(self):
+        result = self.run_tool(self.src, "--out", self.folder)
+        self.assert_refused(result)
+        self.assert_input_untouched()
+
+    def test_an_alias_of_the_input_folder_is_refused(self):
+        alias = os.path.join(self.tmp.name, "alias")
+        try:
+            os.symlink(self.folder, alias, target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError) as e:
+            self.skipTest(f"directory symlinks unavailable: {e}")
+        result = self.run_tool(self.folder, "--out", alias)
+        self.assert_refused(result)
+        self.assert_input_untouched()
+
+    def test_a_hard_link_to_the_input_file_is_refused(self):
+        alias = os.path.join(self.tmp.name, "alias.fspx")
+        try:
+            os.link(self.src, alias)
+        except (OSError, NotImplementedError, AttributeError) as e:
+            self.skipTest(f"hard links unavailable: {e}")
+        result = self.run_tool(self.src, "--out", alias)
+        self.assert_refused(result)
+        self.assert_input_untouched()
+
+    def test_a_case_variant_of_the_input_folder_follows_the_volume(self):
+        alias = os.path.join(self.tmp.name, "INPUT")
+        insensitive = os.path.exists(alias)
+        result = self.run_tool(self.src, "--out", alias)
+        if insensitive:
+            self.assert_refused(result)
+        else:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_input_untouched()
+
+    def test_a_distinct_output_folder_still_works(self):
+        out = os.path.join(self.tmp.name, "out")
+        result = self.run_tool(self.src, "--out", out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("1 FSPX program(s)", result.stdout)
+        with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+            self.assertEqual([entry["file"] for entry in json.load(f)], ["sample.dxbc"])
+        with open(os.path.join(out, "fspx", "sample.code"), "rb") as f:
+            self.assertEqual(f.read(), program())
+        self.assert_input_untouched()
 
 
 class TranslatorSidecars(unittest.TestCase):

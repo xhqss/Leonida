@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; v_mul_i32_i24, v_alignbyte_b32, v_xnor_b32, v_ffbh_i32, v_swap_b32. Expected mrt0 bits: 0xbffffffa, 0x44660066, 0x44aabbcc, 16
 ; XOR bit 30 before export to encode the integer result as a finite RGBA32F value.
 v_mov_b32 v0, 0x00fffffe

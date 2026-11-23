@@ -7,6 +7,7 @@
 Each run renders offscreen in a fresh process and write overlay. Without --out the runs go to a temporary folder that is removed
 afterwards. The summary is printed first, and on failure the last run's log tails are printed too. Audio stays offline
 unless --play-audio sets LEONIDA_SCENE_AUDIO=winmm. The guest then plays the pulse synchronously with PlaySoundW.
+Run records distinguish a child exit, a deadline expiry and a launch failure.
 --negative-controls also runs a corrupted scene.bin and a corrupted checkpoint.bin, and each one must exit with 1.
 Exit code 0 means every check passed, 1 means a check failed and 2 means bad arguments.
 """
@@ -196,18 +197,28 @@ class Session:
         env = dict(os.environ, **env_set)
         self.last = [self.logs / f"{name}.stdout.log", self.logs / f"{name}.stderr.log"]
         start = time.monotonic()
+        rc, launch_error = None, None
         with self.last[0].open("xb") as so, self.last[1].open("xb") as se:
             try:
                 rc = subprocess.run(cmd, cwd=overlay, env=env, stdin=subprocess.DEVNULL, stdout=so, stderr=se,
                                     timeout=TIMEOUT).returncode
             except subprocess.TimeoutExpired:
-                rc = None
+                outcome = "timed_out"
+            except OSError as e:
+                outcome = "launch_failed"
+                launch_error = str(e)
+            else:
+                outcome = "exited"
         stdout, stderr = (p.read_bytes() for p in self.last)
-        rec = {"cmd": cmd, "cwd": str(overlay), "env": env_set, "returncode": rc, "timeout_s": TIMEOUT,
+        rec = {"cmd": cmd, "cwd": str(overlay), "env": env_set, "outcome": outcome, "returncode": rc, "timeout_s": TIMEOUT,
                "seconds": round(time.monotonic() - start, 3), "stdout_sha256": sha256(stdout),
                "stderr_sha256": sha256(stderr)}
+        if launch_error is not None:
+            rec["launch_error"] = launch_error
         write_new(self.logs / f"{name}.json", json.dumps(rec, indent=2).encode())
         self.runs[name] = rec
+        if launch_error is not None:
+            raise Fail(f"{name}: could not launch {cmd[0]}: {launch_error}")
         check(rc is not None, f"{name}: timed out after {TIMEOUT}s")
         return rc, [line.rstrip(b"\r") for line in stdout.splitlines()], stdout + stderr
 

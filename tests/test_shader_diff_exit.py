@@ -13,6 +13,26 @@ import shader_diff as sd  # noqa: E402
 from spirv_mini_interp import UnsupportedConstruct  # noqa: E402
 
 
+class ReplayIndex(unittest.TestCase):
+    def test_replays_exact_case_without_running_predecessors(self):
+        # Compare actual generated instructions, their last writers and the case name.
+        args = ["--seed", "7", "--max-ops", "4"]
+        with mock.patch.object(sd, "run_one", wraps=sd.run_one) as execute, mock.patch("sys.stdout"):
+            self.assertEqual(sd.main([*args, "--programs", "4"]), 0)
+            full_run = execute.call_args_list.copy()
+            for index in (0, 3):
+                execute.reset_mock()
+                self.assertEqual(sd.main([*args, "--program-index", str(index)]), 0)
+                self.assertEqual(execute.call_args_list, [full_run[index]])
+
+    def test_rejects_invalid_or_ambiguous_selection(self):
+        for args in (["--program-index", "-1"], ["--program-index", "2", "--limit", "1"],
+                     ["--program-index", "2", "--programs", "3"]):
+            with self.subTest(args=args), mock.patch("sys.stderr"), self.assertRaises(SystemExit) as caught:
+                sd.main(args)
+            self.assertEqual(caught.exception.code, 2)
+
+
 class HarnessErrorExit(unittest.TestCase):
     def test_harness_error_alone_exits_2(self):
         def boom(*_a):

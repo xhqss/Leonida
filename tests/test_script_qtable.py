@@ -185,7 +185,40 @@ class ScriptQtableTests(unittest.TestCase):
             self.assertEqual(p3.returncode, 2)
             self.assertIn("invalid hex", p3.stderr)
 
-    def test_exact_64k_qtable_does_not_absorb_trailing_opaque_row(self):
+    def test_missing_input_is_one_error_line_and_exit_2(self):
+        # A target the tool cannot open is a diagnostic, not a short census: the other tools exit 2 here.
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "no_such_container.bin")
+            p = subprocess.run(
+                [sys.executable, "-I", TOOL, missing],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+            lines = [line for line in p.stderr.splitlines() if line.strip()]
+            self.assertEqual(len(lines), 1, p.stderr)
+            self.assertEqual(lines[0], f"ERROR: {missing}: does not exist")
+            self.assertEqual(p.stdout, "")
+
+    def test_json_it_cannot_write_is_one_error_line_and_exit_2(self):
+        # The scan succeeds and then the report cannot be written; that is not a payload verdict (exit 1).
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = os.path.join(tmp, "qtable.bin")
+            with open(bin_path, "wb") as f:
+                f.write(build_synthetic_qtable())
+            blocker = os.path.join(tmp, "blocker")
+            with open(blocker, "wb") as f:
+                f.write(b"")
+            p = subprocess.run(
+                [sys.executable, "-I", TOOL, bin_path, "--json", os.path.join(blocker, "out.json")],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+            lines = [line for line in p.stderr.splitlines() if line.strip()]
+            self.assertEqual(len(lines), 1, p.stderr)
+            self.assertTrue(lines[0].startswith("ERROR: cannot write "), lines[0])
+            self.assertFalse(os.path.exists(os.path.join(blocker, "out.json")))
+
+
         exact = build_synthetic_qtable(pad_to_bytes=65536)
         self.assertEqual(len(exact), 65536)
         opaque = b"\x01\x02\x03\x04" * 4

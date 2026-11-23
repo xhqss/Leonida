@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; tbuffer_store_format_* and its d16 forms. Every expected word was measured by running this body natively on a Radeon
 ; 680M (gfx1035, RDNA2) through tools/hw_oracle's kernel wrapper, with s[0:3] set to the V# vk_compute_test passes;
 ; wave32 and wave64 gave the same 52 words. One thread runs.

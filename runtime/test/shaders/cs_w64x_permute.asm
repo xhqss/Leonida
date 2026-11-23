@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; SHADER-90: wave64 ds_permute_b32. Like ds_bpermute_b32 it runs as two independent wave32 halves (RDNA2 ISA 10.4.4): a
 ; source lane writes lane ((vAddr + offset) / 4) mod 32 of ITS OWN half, a destination nobody writes gets 0, and
 ; EXEC gates source and destination. v0 = lane 0..63, v2 = 7 * lane + 1 (data), v10..v13 start at 99.

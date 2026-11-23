@@ -2176,7 +2176,7 @@ def apply_ref_pairs_file(pairs_path, calibrators):
     if not os.path.isfile(pairs_path):
         raise CliError(f"reference pairs file not found: {pairs_path}")
     try:
-        with open(pairs_path, "r", encoding="utf-8") as fh:
+        with open(pairs_path, "r", encoding="utf-8-sig") as fh:
             data = json.load(fh)
     except (OSError, json.JSONDecodeError) as exc:
         raise CliError(f"{pairs_path}: {exc}")

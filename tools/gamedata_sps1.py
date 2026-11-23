@@ -336,6 +336,12 @@ def main(argv=None) -> int:
             ap.error("--preset-hash expects up to eight hexadecimal digits")
         target_hash = int(a.preset_hash, 16)
 
+    # A missing input path is a usage error (exit 2), not a failed run, as in BUILD-1046.
+    for path in (a.target, a.shaders):
+        if path is not None and not os.path.exists(path):
+            print(f"ERROR: {path} does not exist", file=sys.stderr)
+            return 2
+
     try:
         if a.json:
             check_report_path(a.json, a.target, a.shaders)

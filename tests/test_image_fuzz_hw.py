@@ -216,11 +216,12 @@ def test_run_hw_names_a_misaligned_texture(capsys):
     assert "not 256-byte aligned" in capsys.readouterr().out
 
 
-def test_negative_control_passes_on_a_hardware_that_follows_the_model(capsys):
-    cases = imf.make_cases(120, 2, list(imf.FORMATS))
+@pytest.mark.parametrize("programs,seed", [(8, 1), (120, 2)])
+def test_negative_control_passes_on_a_hardware_that_follows_the_model(capsys, programs, seed):
+    cases = imf.make_cases(programs, seed, list(imf.FORMATS))
     assert imf.negative_control(ModelOracle(cases), cases, Args()) == 0
     out = capsys.readouterr().out
-    assert "unperturbed model: 0 of 120 cases mismatch" in out
+    assert f"unperturbed model: 0 of {programs} cases mismatch" in out
     for name in imf.PERTURBATIONS:
         assert f"perturbation {name}" in out
     assert out.count("wrong T# FORMAT") == len(imf.FORMATS) and "NOT CAUGHT" not in out

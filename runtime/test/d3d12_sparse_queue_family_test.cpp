@@ -144,6 +144,8 @@ static bool run_case(ID3D12Device* dev, D3D12_COMMAND_LIST_TYPE map_type,
 }
 
 int main() {
+    // Unbuffered: the results must reach check_sparse_queue_family.py even if a layer crashes at vkDestroyDevice.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
         ComPtr<ID3D12Device> device;
         ok(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&device)),

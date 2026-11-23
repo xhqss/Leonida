@@ -2,7 +2,13 @@
 
 Standard library only; no GPU, no LLVM, no SPIRV-Tools, no game files.
 
-    python -m unittest discover -s tests/semantic -v
+    python -I scripts/run_semantic_tests.py tests/semantic        # one file per core: 26 s instead of 253 s on 16 cores
+    python -m unittest discover -s tests/semantic -v             # the same tests, one file after another
+
+The runner starts `python -m unittest <file>` for each file, several at a time, prints the output of the files that
+fail and one summary line; `-j N` sets how many run at once (`-j 1` is the discover command above) and `-v` prints
+every file's output. Files run side by side, so a test writes only into its own temporary folder (`tempfile`), never
+to a fixed path, and does not rely on another file having run first.
 
 Every file here must call `tools/rdna2spirv.py` (directly, through `support.py`, or by running the tool) and assert
 on what it emitted. A test that reimplements the instruction in Python passes whatever the translator does, so it is
@@ -113,6 +119,9 @@ instruction family per file; the list below describes some of them, not every fi
 - `test_wave32_pixel_subgroup64.py` translates wave32 pixel shaders with lane-specific inputs in each physical half
   and runs them as one 64-lane subgroup and as two 32-lane subgroups. `v_readfirstlane`, `v_readlane`,
   `v_writelane`, `ds_bpermute`, `ds_permute`, ballots, and both votes must produce the same per-half results.
+  The descriptor case makes the first quad of each half either not running (`run_workgroup(lanes=...)`) or helpers
+  left out of subgroup operations (`helpers=...`), and binds the descriptor hash table and an image array
+  (`resources=...`): each half must read its own image.
 - `test_w64x_scalar_load_order.py` translates wave64 programs with `--wave64-emulate` and checks the emitted rounds:
   no case of the round loop's switch reads or writes buffer memory after a write, or writes after a read, so a
   `buffer_store` and a later `s_load` / `s_buffer_load` of the wave (and a scalar load and a later store) run in

@@ -1,5 +1,6 @@
 """Exit codes of a built rpf9dump. Set RPF9DUMP_DLL to its Release DLL to run it."""
 
+import json
 import os
 from pathlib import Path
 import struct
@@ -136,6 +137,51 @@ class Rpf9dumpExitCodeTest(unittest.TestCase):
         self.assertIn("usage: rpf9dump", short.stdout)
         for mode in ("ttpf", "models", "textures", "audio", "xma"):
             self.assertIn(mode, short.stdout, f"usage does not list {mode}")
+
+    def test_start_past_eof_exits_2_before_creating_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "tiny.rpf"
+            src.write_bytes(bytes(16))
+            for mode in ("models", "textures"):
+                with self.subTest(mode=mode):
+                    out = root / f"out-{mode}"
+                    done = run(mode, src, out, "--start", "1024")
+                    self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+                    self.assertIn("--start", done.stderr)
+                    self.assertNotIn("Unhandled exception", done.stderr)
+                    self.assertFalse(out.exists(), f"{mode} left {out} behind on --start past EOF")
+
+    def test_start_plus_length_overflow_is_clamped_and_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "tiny.rpf"
+            src.write_bytes(bytes(16))
+            for mode in ("models", "textures"):
+                with self.subTest(mode=mode):
+                    out = root / f"out-{mode}"
+                    done = run(mode, src, out, "--start", "8", "--length", str((1 << 63) - 1))
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                    self.assertNotIn("Unhandled exception", done.stderr)
+                    manifest = json.loads((out / "tiny" / mode / "manifest.json").read_text(encoding="utf-8"))
+                    self.assertEqual(manifest["Count"], 0)
+                    self.assertEqual(manifest["Scan"]["Start"], 8)
+                    self.assertEqual(manifest["Scan"]["Length"], 8)
+
+    def test_short_source_under_64_bytes_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for size in (0, 16):
+                src = root / f"tiny_{size}.rpf"
+                src.write_bytes(bytes(size))
+                for mode in ("models", "textures"):
+                    with self.subTest(size=size, mode=mode):
+                        out = root / f"out-{mode}-{size}"
+                        done = run(mode, src, out)
+                        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                        self.assertNotIn("Unhandled exception", done.stderr)
+                        manifest = json.loads((out / f"tiny_{size}" / mode / "manifest.json").read_text(encoding="utf-8"))
+                        self.assertEqual(manifest["Count"], 0)
 
 
 if __name__ == "__main__":

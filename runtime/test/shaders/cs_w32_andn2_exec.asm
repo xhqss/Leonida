@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; s_andn2_saveexec_b32 and s_andn2_wrexec_b32 in a 32-thread wave32 (v0 = lane 0..31). Neither had a test.
 ; RDNA2 ISA:  s_andn2_saveexec_b32: D = EXEC; EXEC = S0 & ~EXEC; SCC = (EXEC != 0)
 ;             s_andn2_wrexec_b32:   EXEC = S0 & ~EXEC; D = EXEC; SCC = (EXEC != 0)   (D gets the new EXEC)

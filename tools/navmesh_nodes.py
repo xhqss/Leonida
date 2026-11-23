@@ -183,6 +183,11 @@ def tally_tile(tally, b, by_sector, nodes):
             tally["best"][n] = (found[0], found[1][1], found[1][2])
 
 
+def starts_resource(b):
+    """True when stream `b` opens a resource of its own (the check navmesh_links.py makes)."""
+    return len(b) >= nd.MIN_STREAM and nd.classify(b) != "other"
+
+
 def navmesh_resources(path):
     """Yield the assembled bytes of every navmesh tile in an RPF archive (the walk of navmesh_decode)."""
     with open(path, "rb") as fh:
@@ -205,7 +210,9 @@ def navmesh_resources(path):
                 cls = nd.classify(head)
                 buf, parts = bytearray(head), 1
                 while pending is not None and nd.wants_more(cls, buf, parts):
-                    if len(buf) + len(pending[2]) > nd.MAX_INFLATE:
+                    # A stream that opens a resource of its own is not this one's continuation: a resource whose
+                    # next stream is missing stays incomplete instead of swallowing the tile after it.
+                    if len(buf) + len(pending[2]) > nd.MAX_INFLATE or starts_resource(pending[2]):
                         break
                     buf.extend(pending[2])
                     parts += 1

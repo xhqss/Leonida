@@ -3,6 +3,7 @@
 Reports only counts, by default for every graphics shader in the index. With --manifest, use the
 same pipeline manifest as shader_link_check.py and also count each graphics pipeline's worst result.
 No SPIR-V binary is opened. A report is a subgroup-width assessment, not a Vulkan compile or draw.
+Usage: `python -I tools/wave64_pipeline_audit.py --help` lists the options.
 """
 from __future__ import annotations
 
@@ -151,7 +152,7 @@ def build_report(index, caps, chains=None):
 
 def load_json(path):
     try:
-        with path.open(encoding="utf-8") as source:
+        with path.open(encoding="utf-8-sig") as source:
             return json.load(source)
     except (OSError, ValueError) as exc:
         raise ValueError(f"cannot read JSON input {path}: {exc}") from exc

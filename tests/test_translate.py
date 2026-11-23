@@ -738,23 +738,28 @@ def test_wave64_bpermute_reads_zero_from_lanes_that_are_not_running(make_shader)
 def test_wave32_bpermute_zeroes_inactive_and_missing_source_lanes(make_shader):
     """Wave32 ds_bpermute (RDNA ISA 10.4.4): the source value is 0 where the source lane is off in EXEC, and the
     shuffle result is kept only where the source lane is running, as in the wave64 path."""
-    shader = make_shader("v_lshlrev_b32_e32 v1, 2, v0\nds_bpermute_b32 v2, v1, v0\ns_waitcnt lgkmcnt(0)\ns_endpgm\n",
-                         name="cs_bperm32_ci")
+    shader = make_shader(
+        "v_cmp_ne_u32_e32 vcc_lo, 0, v0\ns_and_saveexec_b32 s4, vcc_lo\n"
+        "v_lshlrev_b32_e32 v1, 2, v0\nds_bpermute_b32 v2, v1, v0\ns_waitcnt lgkmcnt(0)\ns_endpgm\n",
+        name="cs_bperm32_ci",
+    )
     asm = shader.translate()
     shader.validate(asm)
     assert not rdna2spirv.translate.last_gen.wave64
     shuffle = re.search(
-        r"(%t\d+) = OpLoad %bool %active\n\s*"
-        r"(%t\d+) = OpSelect %uint \1 %t\d+ %c0\n\s*"
+        r"(%t\d+) = OpSelect %uint (%t\d+) %t\d+ %c0\n\s*"
         r"(%t\d+) = OpGroupNonUniformBallot %v4uint_bal %c3 %true\n\s*"
         r"(%t\d+) = OpGroupNonUniformBallotBitExtract %bool %c3 \3 (%t\d+)\n\s*"
         r"(%t\d+) = OpSelect %uint \4 \5 %t\d+\n\s*"
-        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 \2 \6\n\s*"
+        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 \1 \6\n\s*"
         r"(%t\d+) = OpSelect %uint \4 %cffffffff %c0\n\s*"
         r"(?P<result>%t\d+) = OpBitwiseAnd %uint \7 \8\n",
         asm,
     )
     assert shuffle, "wave32 ds_bpermute must mask inactive and missing source lanes"
+    active_id = shuffle.group(2)
+    assert (f"{active_id} = OpLoad %bool %active" in asm or f"OpStore %active {active_id}" in asm), \
+        "source mask must read the active lane predicate"
     assert f"OpBitwiseAnd %uint {shuffle['result']} " in asm, "the destination write must also mask the shuffle"
 
 WQM_MASK = "s_mov_b64 exec, -1\nv_cmp_gt_u32_e32 vcc_lo, 16, v0\ns_wqm_b64 s[6:7], vcc\ns_bcnt1_i32_b64 s8, s[6:7]\ns_endpgm\n"

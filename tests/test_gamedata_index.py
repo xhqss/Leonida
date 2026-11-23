@@ -102,6 +102,22 @@ class GamedataIndexTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("--csv and --json must use different paths", result.stderr)
 
+    def test_a_report_cannot_land_on_a_carved_stream(self):
+        # A carve folder holds one <offset>.bin/.bk2 per stream; a report written over one would eat the input.
+        self.add(b"<a/>")
+        self.finish()
+        stream = os.path.join(self.carve, f"{self.rows[0]['off']:012x}.bin")
+        with open(stream, "rb") as f:
+            before = f.read()
+        for flag in ("--json", "--csv"):
+            with self.subTest(flag=flag):
+                p = self.run_tool(self.carve, flag, stream)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn("would overwrite the carved stream", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+        with open(stream, "rb") as f:
+            self.assertEqual(f.read(), before)
+
     def test_bad_targets_are_one_line(self):
         empty = os.path.join(self.root, "empty.rpf")
         open(empty, "wb").close()

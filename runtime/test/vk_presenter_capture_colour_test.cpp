@@ -38,6 +38,20 @@ int main() {
         EXPECT(!presenter_capture_matches_clear(good, width, height, bgra));
         good.resize(good.size() - 3);
         EXPECT(!presenter_capture_matches_clear(good, width, height, bgra));
+
+        const std::array<std::uint8_t, 4> green = bgra ? std::array<std::uint8_t, 4>{102, 204, 51, 255}
+                                                      : std::array<std::uint8_t, 4>{51, 204, 102, 255};
+        std::vector<std::uint8_t> composed;
+        for (std::uint32_t i = 0; i < width * height; ++i)
+            composed.insert(composed.end(), green.begin(), green.end());
+        constexpr std::array<int, 3> expected_green{51, 204, 102};
+        const auto edge_green = composed.size() - 3;
+        composed[edge_green] -= 12;
+        EXPECT(presenter_capture_matches_rgb(composed, width, height, bgra, expected_green, 12));
+        composed[edge_green] = clear[1];
+        EXPECT(!presenter_capture_matches_rgb(composed, width, height, bgra, expected_green, 12));
+        composed.resize(composed.size() - 4);
+        EXPECT(!presenter_capture_matches_rgb(composed, width, height, bgra, expected_green, 12));
     }
     return 0;
 }

@@ -414,6 +414,30 @@ class TestSpirvGsToComputeEmitBounds(unittest.TestCase):
         self.assertEqual(rec[3:], [sentinel_rec] * 3)
         self.assertEqual(meta[4:], [0xBEEF] * 4)
 
+    def test_emit_vertex_in_loop_header_before_loop_merge_rejected(self):
+        # An OpEmitVertex in a loop header before OpLoopMerge would move OpLoopMerge into the
+        # split merge block while the back-edge still targets %hdr; rewrite() must reject it.
+        gs = _make_gs([
+            "%entry = OpLabel",
+            "OpBranch %hdr",
+            "%hdr = OpLabel",
+            "%i = OpPhi %uint %u0 %entry %i1 %cont",
+            "OpStore %out_pos %v_a",
+            "OpEmitVertex",
+            "%more = OpULessThan %bool %i %u5",
+            "OpLoopMerge %exit %cont None",
+            "OpBranchConditional %more %cont %exit",
+            "%cont = OpLabel",
+            "%i1 = OpIAdd %uint %i %u1",
+            "OpBranch %hdr",
+            "%exit = OpLabel",
+            "OpEndPrimitive",
+            "OpReturn",
+        ], max_verts=3)
+        with self.assertRaises(gsc.Unsupported) as ctx:
+            gsc.rewrite(gs)
+        self.assertIn("OpLoopMerge", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

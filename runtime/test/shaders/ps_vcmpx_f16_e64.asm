@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; 16-bit float v_cmpx, e64 form with swapped operands: v_cmpx_{f,lt,eq,le,gt,lg,ge,o,u,nge,nlg,ngt,nle,neq,nlt,tru}_f16_e64
 ; B, A (no SDST: the VOP3 form of v_cmpx writes EXEC). Same seven operand pairs, EXEC copy-out/restore and VCC/AND bits
 ; as ps_vcmpx_f16 (see its header), but src0 is the VGPR B and src1 is A (the inline constant for k0..k2), so each op

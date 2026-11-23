@@ -11,8 +11,8 @@ Usage:
 
 ``--game-dir`` defaults to ``LEONIDA_GAME_DIR``. Naming the streams takes about half a minute, so the name table
 (names, offsets and frame sizes only, no movie data) is kept in ``%LOCALAPPDATA%\\Leonida\\bink_names.csv`` and rebuilt
-when the archive or the mount source changes; ``--no-cache`` skips it. The names are a local work product: don't
-commit or post them.
+when the archive or mount source changes, or the cached table cannot be parsed. ``--no-cache`` skips it.
+The names are a local work product: don't commit or post them.
 """
 import argparse
 import csv
@@ -27,6 +27,8 @@ sys.path.insert(0, str(HERE))
 
 import bink_names  # noqa: E402
 
+CACHE_FIELDS = ("path", "offset", "width", "height", "frames")
+
 
 def cache_path():
     base = os.environ.get("LOCALAPPDATA") or str(Path.home() / ".cache")
@@ -38,15 +40,34 @@ def stamp(archive):
     return f"{archive.resolve()}|{st.st_size}|{st.st_mtime_ns}"
 
 
+def _read_cache(cache, key):
+    """Return cached rows, or None for a stale or malformed cache. A valid empty table is a hit."""
+    try:
+        with cache.open(encoding="utf-8", newline="") as f:
+            if f.readline().rstrip("\r\n") != "# " + key:
+                return None
+            reader = csv.reader(f, strict=True)
+            if tuple(next(reader, ())) != CACHE_FIELDS:
+                return None
+            rows = []
+            for path, offset, width, height, frames in reader:
+                offset = int(offset)
+                if not path or offset < 0 or min(int(width), int(height), int(frames)) < 1:
+                    return None
+                rows.append((path, offset, width, height, frames))
+            return rows
+    except (ValueError, csv.Error):
+        return None
+
+
 def load_names(archive, mount, use_cache=True):
     """[(path, offset, width, height, frames)] for the streams of ``archive``, named from ``mount``."""
     cache = cache_path()
     key = stamp(archive) + "|" + stamp(mount)  # the names come from the mount lists too
     if use_cache and cache.is_file():
-        with cache.open(encoding="utf-8", newline="") as f:
-            first = f.readline().rstrip("\r\n")
-            if first == "# " + key:
-                return [(r["path"], int(r["offset"]), r["width"], r["height"], r["frames"]) for r in csv.DictReader(f)]
+        rows = _read_cache(cache, key)
+        if rows is not None:
+            return rows
     cache.parent.mkdir(parents=True, exist_ok=True)
     # Each lookup gets its own report and staging file: two runs at once must not remove or replace each other's.
     fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".tmp.csv", dir=cache.parent)
@@ -66,7 +87,7 @@ def load_names(archive, mount, use_cache=True):
         with open(fd, "w", encoding="utf-8", newline="") as f:
             f.write("# " + key + "\n")
             w = csv.writer(f, lineterminator="\n")
-            w.writerow(["path", "offset", "width", "height", "frames"])
+            w.writerow(CACHE_FIELDS)
             for r in rows:
                 w.writerow([r["path"], r["offset"], r["width"], r["height"], r["frames"]])
         os.replace(name, cache)

@@ -27,6 +27,7 @@ Usage:
                                         [--known NAME=GUID ...] [--json OUT]
 
 Without --header it takes d3d12.h from the newest Windows SDK under "Windows Kits\\10\\Include".
+The --json output must name a file separate from the images and the header.
 """
 from __future__ import annotations
 
@@ -38,6 +39,9 @@ import re
 import struct
 import sys
 import uuid
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 
 MIDL = re.compile(r'MIDL_INTERFACE\("([0-9a-fA-F-]{36})"\)\s*\n\s*(ID3D12\w+)')
 
@@ -349,10 +353,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", help="also write the result here")
     args = ap.parse_args(argv)
 
-    known: dict[str, uuid.UUID] = {}
     header = args.header
     if header is None:
         header = default_header()
+    if args.json:
+        for source in (*args.images, header):
+            if source and same_report_path(args.json, source):
+                ap.error(f"--json {args.json} would overwrite the input {source}")
+
+    known: dict[str, uuid.UUID] = {}
     if header and os.path.isfile(header):
         known.update(read_iids(header))
     for pair in args.known:
@@ -366,6 +375,9 @@ def main(argv: list[str] | None = None) -> int:
 
     results = []
     for path in args.images:
+        if not os.path.isfile(path):
+            print(f"ERROR: cannot read {path}: no such file", file=sys.stderr)
+            return 2
         try:
             r = scan(path, known)
         except (ValueError, struct.error) as e:

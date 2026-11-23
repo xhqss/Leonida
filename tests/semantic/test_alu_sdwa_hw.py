@@ -7,10 +7,11 @@ word in v4 after the lines is the expected one. An SGPR operand is set with s_mo
 and v_cndmask_b32 turns it into 0/1. A v_cmpx form saves EXEC in s20, sets v4 = 1 only where the compare held, and
 restores EXEC.
 
-The forms are all 172 distinct SDWA forms (opcode, operand kinds, sel/sext/neg/abs/dst_unused/omod) in the
-26,503 shader listings of the 1.0.2.1 package, each with 12 operand words per source. Only the form is taken from
-the game; every word here is synthetic. The 624 rows are a sample: up to four per form, chosen for distinct
-results. Every measured case not listed matches too, except for two kinds of known difference:
+The 172 distinct SDWA forms (opcode, operand kinds, sel/sext/neg/abs/dst_unused/omod) in the 26,503 shader listings
+of the 1.0.2.1 package were measured, each with 12 operand words per source. Only the form is taken from the game;
+every word here is synthetic. The 624 rows are a sample from 156 of those forms, up to four per form, chosen for
+distinct results; the other 16 forms are 16-bit dst_sel:DWORD forms whose every case differs as below. No corpus
+form uses dst_unused:UNUSED_SEXT, so this table says nothing about it. Every measured case not listed matches too, except for two kinds of known difference:
 - a 16-bit result with dst_sel:DWORD, where the hardware zeroes the high half (#2187);
 - a NaN result, where the hardware keeps the input NaN's sign and payload and the translator returns the canonical
   quiet NaN (docs/design.md, the f16 transcendentals row).
@@ -704,7 +705,7 @@ class MeasuredWords(unittest.TestCase):
 
     def test_every_form_has_rows(self):
         forms = {next(x for x in row[0].split("\n") if "_sdwa" in x) for row in MEASURED}
-        self.assertGreaterEqual(len(forms), 150)
+        self.assertEqual(len(forms), 156)
 
 
 if __name__ == "__main__":

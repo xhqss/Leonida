@@ -31,6 +31,7 @@ translator models the permute ops per 32-lane half, matching hardware.
 
 Standard library only. Nothing from the game is printed or written: counts only — names, code and data stay in
 the work folder.
+Usage: `python -I tools/wave64_graphics_scan.py --help` lists the options.
 """
 import argparse
 import json

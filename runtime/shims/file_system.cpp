@@ -23,6 +23,7 @@
 // Only images mapped by the loader see these: they are bound through the registry, the runtime's own code calls the
 // host directly.
 #include <windows.h>
+#include <intrin.h>
 
 #include <atomic>
 #include <cstring>
@@ -39,6 +40,7 @@
 
 #include "file_system.h"
 #include "shims.h"
+#include "startup_trace.h"
 
 namespace rt::fs {
 namespace {
@@ -413,9 +415,13 @@ Target write_target(const std::wstring& path, bool copy_up) {
         std::filesystem::create_directories(staging, ec);
         const std::filesystem::path tmp =
             staging / (std::to_wstring(::GetCurrentProcessId()) + L"-" + std::to_wstring(++s_copies));
-        if (!ec) std::filesystem::copy_file(package_path, tmp, std::filesystem::copy_options::overwrite_existing, ec);
+        // Use CopyFileW for staging because MSVC's std::filesystem::copy_file calls CopyFile2, which Wine 9 lacks.
         if (ec) {
             t.error = static_cast<DWORD>(ec.value());
+        } else if (!::CopyFileW(package_path.c_str(), tmp.c_str(), FALSE)) {
+            t.error = ::GetLastError();
+        }
+        if (t.error) {
             std::filesystem::remove(tmp, ec);
             return t;
         }
@@ -629,6 +635,25 @@ std::filesystem::path overlay_dir() {
     return g_overlay_dir;
 }
 
+// gta6rt --trace FILE: a failed open of a guest path goes to the startup trace as a "file_open_failed" event (the
+// path the title passed, the Win32 error, the caller as module+RVA), so a boot that stops on a missing or refused
+// file names it. Failures only, and at most 256 of them, so a title probing many optional files can't fill the file.
+void note_open_failure(const char* api, LPCWSTR name, DWORD error, const void* caller) {
+    if (!rt::startup_trace::enabled()) return;
+    static std::atomic<int> left{256};
+    if (left.fetch_sub(1, std::memory_order_relaxed) <= 0) return;
+    std::string utf8;
+    if (const int n = WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr); n > 1) {
+        utf8.resize(static_cast<size_t>(n) - 1);
+        WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8.data(), n, nullptr, nullptr);
+    }
+    rt::startup_trace::event(
+        "file_open_failed",
+        std::string("\"api\":\"") + api + "\",\"path\":" + rt::startup_trace::quote(utf8) +
+            ",\"error\":" + std::to_string(error) + ",\"caller\":" +
+            rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
+}
+
 HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes,
                             DWORD disposition, DWORD flags, HANDLE template_file) {
     if (!name) {
@@ -637,10 +662,17 @@ HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_
     }
     const Target t = open_target(name, access, disposition);
     if (t.error) {
+        note_open_failure("CreateFileW", name, t.error, _ReturnAddress());
         SetLastError(t.error);
         return INVALID_HANDLE_VALUE;
     }
-    return ::CreateFileW(t.path.c_str(), access, share, attributes, disposition, flags, template_file);
+    const HANDLE h = ::CreateFileW(t.path.c_str(), access, share, attributes, disposition, flags, template_file);
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        note_open_failure("CreateFileW", name, error, _ReturnAddress());
+        SetLastError(error);
+    }
+    return h;
 }
 
 HANDLE WINAPI create_file_a(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes,
@@ -661,10 +693,17 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
     }
     const Target t = open_target(name, access, disposition);
     if (t.error) {
+        note_open_failure("CreateFile2", name, t.error, _ReturnAddress());
         SetLastError(t.error);
         return INVALID_HANDLE_VALUE;
     }
-    return ::CreateFile2(t.path.c_str(), access, share, disposition, params);
+    const HANDLE h = ::CreateFile2(t.path.c_str(), access, share, disposition, params);
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        note_open_failure("CreateFile2", name, error, _ReturnAddress());
+        SetLastError(error);
+    }
+    return h;
 }
 
 DWORD WINAPI get_file_attributes_w(LPCWSTR name) {
@@ -889,6 +928,13 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
             if (std::filesystem::is_directory(package_path, ec)) {
                 SetLastError(ERROR_ACCESS_DENIED);
                 return FALSE;
+            }
+            // The overlay delete already checked its own attributes. Without an overlay, the package file's
+            // read-only bit still applies even though deletion only writes a marker instead of deleting that file.
+            if (!removed) {
+                const DWORD attributes = ::GetFileAttributesW(package_path.c_str());
+                if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY) != 0)
+                    return fail_bool(ERROR_ACCESS_DENIED);
             }
             // The package file stays where it is; the marker is what hides it.
             DWORD error = 0;
@@ -1220,13 +1266,12 @@ bool fallback_supports(const COPYFILE2_EXTENDED_PARAMETERS* parameters) {
 }
 
 // CopyFile2 through CopyFileExW, for hosts without it (only for calls fallback_supports). The cancel flag has the
-// same type in both; one already set is answered here, since Wine 9's CopyFileExW doesn't read it. A COPYFILE2
-// progress routine has another signature and message set, so it isn't called here.
+// same type in both (one already set is answered by copy_file2 before this runs). A COPYFILE2 progress routine has
+// another signature and message set, so it isn't called here.
 HRESULT copy_file2_fallback(const wchar_t* source, const wchar_t* destination,
                             const COPYFILE2_EXTENDED_PARAMETERS* parameters) {
     const DWORD flags = parameters ? parameters->dwCopyFlags & kFallbackPassedFlags : 0;
     BOOL* const cancel = parameters ? parameters->pfCancel : nullptr;
-    if (cancel && *cancel) return HRESULT_FROM_WIN32(ERROR_REQUEST_ABORTED);
     if (::CopyFileExW(source, destination, nullptr, nullptr, cancel, flags)) return S_OK;
     const DWORD error = GetLastError();
     return HRESULT_FROM_WIN32(error ? error : ERROR_GEN_FAILURE);
@@ -1248,6 +1293,10 @@ HRESULT WINAPI copy_file2(PCWSTR from, PCWSTR to, COPYFILE2_EXTENDED_PARAMETERS*
     std::filesystem::path source, destination;
     DWORD error = 0;
     if (!copy_paths(from, to, fail_if_exists, source, destination, error)) return HRESULT_FROM_WIN32(error);
+    // A cancel flag already set is answered here, for the host's CopyFile2 as well as the fallback: Windows returns
+    // ERROR_REQUEST_ABORTED and writes nothing, while Wine reads the flag in neither call (Wine 11.20's CopyFile2 logs
+    // "pfCancel is not supported" and copies, dlls/kernelbase/file.c copy_file; Wine 9 has only CopyFileExW).
+    if (parameters && parameters->pfCancel && *parameters->pfCancel) return HRESULT_FROM_WIN32(ERROR_REQUEST_ABORTED);
     if (host) return host(source.c_str(), destination.c_str(), parameters);
     return copy_file2_fallback(source.c_str(), destination.c_str(), parameters);
 }

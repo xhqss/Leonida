@@ -619,6 +619,8 @@ def main(argv=None):
     if not argv:
         ap.error("no arguments given; pass --help for the available options")
     a = ap.parse_args(argv)
+    if a.show and a.program is None:
+        ap.error("--show requires --program")
     if a.programs < 1:
         ap.error("--programs must be at least 1")
     if a.spirv_val:

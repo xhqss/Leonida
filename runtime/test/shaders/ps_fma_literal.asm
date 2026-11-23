@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Which operand the literal K multiplies. v_fmamk_f32/v_madmk_f32 (printed vdst, src0, K, vsrc1): D = S0 * K + S1.
 ; v_fmaak_f32/v_madak_f32 (printed vdst, src0, vsrc1, K): D = S0 * S1 + K. All values are exact in f32, and each
 ; word changes if K and vsrc1 trade places: fmamk 2*10+3 = 23, fmaak 2*3+10 = 16, madmk 4*0.5+5 = 7, madak 4*5+0.5 = 20.5.

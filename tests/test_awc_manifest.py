@@ -402,5 +402,28 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(row["streamed_music"], "yes")
 
 
+    def test_a_single_named_file_that_is_not_a_bank_is_refused(self):
+        path = os.path.join(self.tmp.name, "notes.bin")
+        with open(path, "wb") as f:
+            f.write(b"not an AWC bank")
+        out = os.path.join(self.tmp.name, "manifest.json")
+        p = self.run_tool(path, "--out", out)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("holds no AWC bank", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(p.stdout, "")
+        self.assertFalse(os.path.exists(out))
+
+    def test_a_scanned_directory_with_no_bank_still_reports_empty(self):
+        # The refusal is for one named file: an empty folder scan is a valid "0 banks" answer.
+        os.mkdir(os.path.join(self.tmp.name, "banks"))
+        with open(os.path.join(self.tmp.name, "banks", "notes.bin"), "wb") as f:
+            f.write(b"not an AWC bank")
+        p = self.run_tool(os.path.join(self.tmp.name, "banks"))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("0 banks, 0 streams, 0 streamed-music channels", p.stderr)
+        self.assertEqual(p.stdout.splitlines()[0], ",".join(HEADER))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

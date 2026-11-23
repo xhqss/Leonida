@@ -128,6 +128,45 @@ class JsavTest(unittest.TestCase):
             r = subprocess.run([sys.executable, "-I", TOOL, "verify", p], capture_output=True, text=True)
             self.assertNotEqual(r.returncode, 0)
 
+    def test_verify_batch_reports_every_input_and_keeps_the_worst_status(self):
+        data, _, _ = make_jsav()
+        with tempfile.TemporaryDirectory() as tmp:
+            bad, missing, changed, good = (os.path.join(tmp, n) for n in
+                                           ("bad.jsav", "missing.jsav", "changed.jsav", "good.jsav"))
+            write(bad, b"JSAV")
+            write(changed, data + bytes(16))  # excess padding: parses but does not rebuild identically
+            write(good, data)
+            for paths, status in [([bad, missing, changed, good], 2), ([changed, good], 1)]:
+                with self.subTest(paths=paths):
+                    r = subprocess.run([sys.executable, "-I", TOOL, "verify", *paths],
+                                       capture_output=True, text=True)
+                    self.assertEqual(r.returncode, status, r.stderr)
+                    self.assertIn(f"{changed}: MISMATCH", r.stdout)
+                    self.assertIn(f"{good}: OK", r.stdout)
+                    errors = r.stderr.splitlines()
+                    self.assertEqual(len(errors), len(paths) - 2)
+                    for path, line in zip(paths[:-2], errors):
+                        self.assertIn(path, line)
+
+    def test_block_decoder_recursion_error_does_not_abort_verify_batch(self):
+        data, _, blocks = make_jsav(seed=1)
+        loads = json.loads
+
+        def decode(payload, *args, **kwargs):
+            if payload == blocks[1]:  # fail one block, not the whole-body parse or the next file
+                raise RecursionError("decoder nesting limit")
+            return loads(payload, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bad, good = (os.path.join(tmp, n) for n in ("first.jsav", "next.jsav"))
+            write(bad, data)
+            write(good, make_jsav(seed=2)[0])
+            with mock.patch.object(saves.json, "loads", side_effect=decode), \
+                    contextlib.redirect_stderr(io.StringIO()) as err, contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(saves.main(["saves.py", "verify", bad, good]), 2)
+            self.assertIn(f"{good}: OK", out.getvalue())
+            self.assertEqual(err.getvalue().splitlines(), [f"ERROR: JSAV block 1 exceeds the JSON nesting limit ({bad})"])
+
     def test_extract_edit_pack(self):
         d, _, _ = make_jsav()
         with tempfile.TemporaryDirectory() as tmp:
@@ -599,6 +638,19 @@ class ImportTest(unittest.TestCase):
             self.assertIn("--out needs a value", result.stderr)
             self.assertFalse(os.path.exists(os.path.join(tmp, "--dry-run")))
 
+    def test_import_map_needs_old_equals_new(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            story, _, _ = self._folders(tmp)
+            tool = os.path.join(ROOT, "tools", "saves.py")
+            result = subprocess.run(
+                [sys.executable, "-I", tool, "import", story, "--map", "SLOT3", "--dry-run"],
+                cwd=tmp, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("--map needs OLD=CONTAINER/BLOB", result.stderr)
+            self.assertIn("SLOT3", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
     def test_import_layout_and_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             story, prof, jsav = self._folders(tmp)
@@ -947,6 +999,29 @@ class PackIndexValidationTest(unittest.TestCase):
         self.assertIn("invalid JSON", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(rd(out), b"previous complete output")
+
+    def test_pack_refuses_an_out_that_names_a_source_file(self):
+        """pack reads the index and every block; an --out naming one of them replaced the file it had just read."""
+        block_path = os.path.join(self.extracted, self.index["entries"][0]["file"])
+        for target in (self.index_path, block_path):
+            with self.subTest(target=os.path.relpath(target, self.extracted)):
+                before = rd(target)
+                with self.assertRaises(ValueError) as error:
+                    saves.pack(self.extracted, target)
+                self.assertIn(target, str(error.exception))
+                self.assertIn("would replace it", str(error.exception))
+                self.assertNotIn("invalid JSON", str(error.exception))
+                self.assertEqual(rd(target), before, "the source file changed")
+
+    def test_cli_pack_refuses_an_out_that_names_the_index(self):
+        before = rd(self.index_path)
+        result = subprocess.run([sys.executable, "-I", TOOL, "pack", self.extracted, self.index_path],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("ERROR:", result.stderr)
+        self.assertIn("would replace it", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(rd(self.index_path), before)
 
     def test_valid_editable_metadata_still_round_trips(self):
         self.index["header"]["note"] = "extra metadata is ignored"

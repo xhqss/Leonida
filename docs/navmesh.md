@@ -32,7 +32,7 @@ is in this document or the repository.
 | Inflated bytes | 20,551,068,624 (3.14x stored) |
 | Zero padding | 161,191,191 (2.40%) |
 | Unread (non-zero, non-stream) | 6,080,993 (0.09%) |
-| Tiny continuations recovered (`16â€“48` B) | 10 (`3` `0DRP`, `7` `0x00010015`) |
+| Tiny continuations recovered (`16–48` B) | 10 (`3` `0DRP`, `7` `0x00010015`) |
 | Bink 2 streams | 0 |
 
 Every stream in the earlier 53,026 "other" bucket is now classified into continuations or the Band-3 `grid` class
@@ -55,9 +55,9 @@ sub-RPF header/TOC gaps (`5,947,550` bytes total) plus `117,745` non-zero bytes 
 
 | Band | Archive offset range | Contents |
 |---|---|---|
-| **Band 1** (`0DRP`) | `0x0000037010` â€“ `0x002ed51619` | All `9,603` `0DRP` cover-point resources (`7,122` 1-stream, `2,481` 2-stream) |
-| **Band 2** (`0x00010015`) | `0x002ed87000` â€“ `0x0174b93f8f` | All `27,644` navmesh tiles (`4,598` 1-stream, `23,046` 2-stream) + `11` `PSIN` (`10` regional + `1` non-grid) |
-| **Band 3** (`grid`) | `0x0174bbc000` â€“ `0x018fcab8bf` | All `27,482` `grid` resources (`27,476` 1-stream, `6` 2-stream) + `11` `PSIN` (`10` identical regional pairs + `1` EOF v79) |
+| **Band 1** (`0DRP`) | `0x0000037010` – `0x002ed51619` | All `9,603` `0DRP` cover-point resources (`7,122` 1-stream, `2,481` 2-stream) |
+| **Band 2** (`0x00010015`) | `0x002ed87000` – `0x0174b93f8f` | All `27,644` navmesh tiles (`4,598` 1-stream, `23,046` 2-stream) + `11` `PSIN` (`10` regional + `1` non-grid) |
+| **Band 3** (`grid`) | `0x0174bbc000` – `0x018fcab8bf` | All `27,482` `grid` resources (`27,476` 1-stream, `6` 2-stream) + `11` `PSIN` (`10` identical regional pairs + `1` EOF v79) |
 
 Within Bands 2 and 3, static tiles are packed into 10 regional sub-RPF partitions (`2,448` unique tiles each, headed by
 10 byte-for-byte identical `PSIN` version-256 pairs), plus an overlay partition of `3,002` variant tiles (`940` unique
@@ -72,13 +72,13 @@ pointer base (`offset = u64_ptr - 0x50000000` when the upper 32 bits are zero an
 - `+0x00` (`u64`): always `0` (`64,729 / 64,729`).
 - `+0x08` (`u64`): pointer to a block-map descriptor (`24` bytes on `0DRP`, `32` bytes on `0x00010015` and `grid`):
   - `+0x00` (`u64`): `0`
-  - `+0x08` (`u64`): **exact logical zlib stream count (`1` or `2`)** â€” matches actual stream membership on
+  - `+0x08` (`u64`): **exact logical zlib stream count (`1` or `2`)** — matches actual stream membership on
     `9,603 / 9,603` `0DRP`, `27,644 / 27,644` `0x00010015`, and `27,482 / 27,482` `grid` resources (`0` resources span
     more than 2 streams).
   - `+0x10` (`u64`): `0` (and `+0x18` `u64` is `0` on `100%` of `0x00010015` and `grid`; on `105` `0DRP` pages the next
     object begins at `+0x18`, confirming the `0DRP` block map is 24 bytes).
 
-## `0DRP` directory pages (`9,603` pages â€” `0x7a` cover-point resources)
+## `0DRP` directory pages (`9,603` pages — `0x7a` cover-point resources)
 
 `0DRP` pages in `navmeshes.rpf` are **self-describing `0x7a` resources** (the same container format documented in
 [world.md](world.md) and [page_directory.md](page_directory.md)). Reconciling the full `9,603`-page corpus settles the
@@ -93,18 +93,18 @@ fields previously marked "not decoded" (`+0x48` eight `u16` values, `+0x60` "key
 | `+0x10` | 4 | `30 44 52 50` (`0DRP`) | `0x7a` container magic |
 | `+0x14` | 4 | `122` (`0x7A`, `9,603 / 9,603`) | format version |
 | `+0x18` | 8 | zero (`9,603 / 9,603`) | reserved |
-| `+0x20` | 4 | `1â€“6` (`3`: 7,650, `4`: 932, `2`: 779, `6`: 219, `5`: 22, `1`: 1) | **1-based index into `q38` naming the root object block** (`1 <= u20 <= n_blocks` and `blocks[u20-1].hash` is in `q28` on `9,603 / 9,603`) |
+| `+0x20` | 4 | `1–6` (`3`: 7,650, `4`: 932, `2`: 779, `6`: 219, `5`: 22, `1`: 1) | **1-based index into `q38` naming the root object block** (`1 <= u20 <= n_blocks` and `blocks[u20-1].hash` is in `q28` on `9,603 / 9,603`) |
 | `+0x24` | 4 | zero (`9,603 / 9,603`) | high half of `+0x20` |
 | `+0x28` | 8 | `0x50xxxxxx`, 8-byte aligned | pointer to `q28` struct schema table (`32` B/record) |
 | `+0x30` | 8 | `0x50xxxxxx` (`9,600`) or `0` (`3`) | pointer to `q30` enum schema table (`24` B/record) |
 | `+0x38` | 8 | `0x50xxxxxx`, 16-byte aligned | pointer to `q38` instance block table (`16` B/record) |
 | `+0x40` | 8 | `0x50xxxxxx`, 8-byte aligned | pointer to `q40` auxiliary table (`{u32 count, count x {u32 tag, u32 size}, payloads}`) |
-| `+0x48` | 2 | `2â€“12` | `n_structs`: number of `q28` struct definitions |
-| `+0x4a` | 2 | `0â€“4` | `n_enums`: number of `q30` enum definitions |
-| `+0x4c` | 2 | `2â€“6` | `n_blocks`: number of `q38` instance blocks |
+| `+0x48` | 2 | `2–12` | `n_structs`: number of `q28` struct definitions |
+| `+0x4a` | 2 | `0–4` | `n_enums`: number of `q30` enum definitions |
+| `+0x4c` | 2 | `2–6` | `n_blocks`: number of `q38` instance blocks |
 | `+0x4e` | 2 | `0` (`2,578`) or `1..602` (`7,025`) | **`pages_4k`:** `0` or `ceil(data_end / 4096)` (`9,603 / 9,603`; see rule below) |
 | `+0x50` | 16 | zero (`9,603 / 9,603`) | reserved (covers the trailing four `u16`s of `+0x48..+0x57` plus `+0x58..+0x5f`) |
-| `+0x60` | â€” | first `q38` instance block (`9,603 / 9,603`) | **payload, not a header field** |
+| `+0x60` | — | first `q38` instance block (`9,603 / 9,603`) | **payload, not a header field** |
 
 #### Decoding `u16@0x4e` (`pages_4k`)
 
@@ -128,14 +128,14 @@ Across all **9,603 / 9,603** pages (`0` exceptions), `u16@0x4e` is either `0` or
 - **`q38` instance blocks (`16` B/record):** `{u32 struct_or_type_hash, u32 byte_size, ptr64 target}`. Disjoint with **0 overlaps** across all `9,603` pages (`54,898` total records, including `18` on the 3 tiny-continuation pages); every page has a block starting at `+0x60`.
 - **`q40` auxiliary table:** `{u32 count, count x {u32 tag, u32 size}, payload bytes}`. Fits cleanly in-bounds on `9,603 / 9,603` pages. On `8,275` world-grid `CCoverPointRegion` pages it holds a single tag `0x101` (`32/48/64/80` B = `2..5` 16-byte entries); on all `137` non-grid `CCoverPointRegion` pages and all `1,187` `0x4712787b` pages `count == 0`; the 4 singleton pages carry larger `0x101`, `0x207` or `0x211` tables.
 
-Only **10 distinct schemas** (6 root structs) occur across all `9,603` `0DRP` pages â€” **all cover-point data, not
+Only **10 distinct schemas** (6 root structs) occur across all `9,603` `0DRP` pages — **all cover-point data, not
 navmesh polygons**. Struct/enum/member hashes match standard RAGE cover names under **case-sensitive joaat32**
 (verified from hand-typed clean-room candidates in `tools/navmesh_decode.py`):
 
 | Root struct (joaat32) | Pages | Schemas | Summary |
 |---|---:|---:|---|
-| `CCoverPointRegion` (`0x2283b2cb`, `304` B) | 8,412 | 2 (`11â€“12` structs) | `8,275` 128 m Ã— 128 m world-grid cover tiles + `137` smaller local/interior tiles; `15,474,729` `CCoverPointNode` (`0x0bcb00e4`, `160` B) instances (`+0xA0` `u16` array count `== block_count` on `8,412 / 8,412`; `+0x04` `i32` point count matches on `8,411 / 8,412`, with 1 local tile at `0x2e329010` having `23` vs `8` serialized nodes); world bounds (`+0x10`/`+0x20`) `X âˆˆ [-10,368, +10,411.9]`, `Y âˆˆ [-8,448, +9,472]`, `Z âˆˆ [-500, +1,350]` m; `256` sub-regions (`0xde5f1345`, `4,096` B) + `CCoverSpatialTreeNode` (`0xbb5a70d8`, `64` B) |
-| `0x4712787b` (`48` B, name open) | 1,187 | 4 (`3â€“9` structs) | Local-space dynamic/entity cover sets (`155,250` `CCoverPointNode` instances on `1,173` pages, `0` nodes on `14` pages; node `+0x38` `f32[3]` positions in `[-63.1, +67.0] Ã— [-36.0, +35.4] Ã— [-72.1, +6.9]` m; `q40` always empty) |
+| `CCoverPointRegion` (`0x2283b2cb`, `304` B) | 8,412 | 2 (`11–12` structs) | `8,275` 128 m × 128 m world-grid cover tiles + `137` smaller local/interior tiles; `15,474,729` `CCoverPointNode` (`0x0bcb00e4`, `160` B) instances (`+0xA0` `u16` array count `== block_count` on `8,412 / 8,412`; `+0x04` `i32` point count matches on `8,411 / 8,412`, with 1 local tile at `0x2e329010` having `23` vs `8` serialized nodes); world bounds (`+0x10`/`+0x20`) `X ∈ [-10,368, +10,411.9]`, `Y ∈ [-8,448, +9,472]`, `Z ∈ [-500, +1,350]` m; `256` sub-regions (`0xde5f1345`, `4,096` B) + `CCoverSpatialTreeNode` (`0xbb5a70d8`, `64` B) |
+| `0x4712787b` (`48` B, name open) | 1,187 | 4 (`3–9` structs) | Local-space dynamic/entity cover sets (`155,250` `CCoverPointNode` instances on `1,173` pages, `0` nodes on `14` pages; node `+0x38` `f32[3]` positions in `[-63.1, +67.0] × [-36.0, +35.4] × [-72.1, +6.9]` m; `q40` always empty) |
 | `CCoverPointRegionManifest` (`0xe842b0d6`, `48` B) | 1 | 1 (`4` structs) | Singleton at `0xca9d010`: `6,446` `CCoverPointRegionDef` (`0xbea9889e`, `64` B) entries |
 | `0xb6dbe11b` (`16` B, name open) | 1 | 1 (`2` structs) | Singleton at `0x24c9a010`: `1,829` `0x0904902e` (`24` B) entries mapping hashes/strings to `RegionIndex` |
 | `0x339accda` / `0x2bf76252` (`24` B, names open) | 2 | 2 (`2` structs each) | Two singleton map tables (`0x2e43e010`, `0x2ed47010`) |
@@ -157,12 +157,12 @@ first `q38` payload block starting at `+0x60`:
 
 | Block placed at `+0x60` | Pages | `+0x60..+0x8f` byte layout |
 |---|---:|---|
-| `CCoverPointNode[]` (`0x0bcb00e4`, `160` B/node) | **9,378** (`8,205` region + `1,173` dynamic) | Node 0 starts with **three 16-byte `CCoverNodeId` (`0xa33600ff`) structs** at `+0x60`, `+0x70`, `+0x80`, each `{u64 id_key, u32 field_08, u32 local_index}`. `+0x60..+0x67` is `Uid.id_key` (always nonzero); `+0x68..+0x6b` is `0` on all `1,173` local/dynamic `0x4712787b` pages; `+0x6c..+0x6f` is `Uid.local_index` (`0` on all `9,378` pages because it is node 0). **`+0x70..+0x7f`** is the second `CCoverNodeId` (repeating `Uid.id_key` on `1,186` pages and holding sentinel `0xffffffff` at `+0x7c` on `3,966` pages and at `+0x78` on `1,912` pages â€” the `+0x70` pattern). **`+0x80..+0x8f`** is the third `CCoverNodeId` (repeating `id_key` on `2,237` pages, `local_index == 1` on `9,105` pages, `0xffffffff` on `203` pages). |
-| `0xde5f1345[]` (`256 Ã— 16` B sub-regions) | **207** (all `CCoverPointRegion`) | First `atArray<u16>` descriptor. On **`194`** pages the first sub-region is empty (`{0, 0, 0}` -> exact match for all **194** zero `+0x60` values and `194` of the `u32_68 == 0` pages); on `13` pages it is non-empty. |
+| `CCoverPointNode[]` (`0x0bcb00e4`, `160` B/node) | **9,378** (`8,205` region + `1,173` dynamic) | Node 0 starts with **three 16-byte `CCoverNodeId` (`0xa33600ff`) structs** at `+0x60`, `+0x70`, `+0x80`, each `{u64 id_key, u32 field_08, u32 local_index}`. `+0x60..+0x67` is `Uid.id_key` (always nonzero); `+0x68..+0x6b` is `0` on all `1,173` local/dynamic `0x4712787b` pages; `+0x6c..+0x6f` is `Uid.local_index` (`0` on all `9,378` pages because it is node 0). **`+0x70..+0x7f`** is the second `CCoverNodeId` (repeating `Uid.id_key` on `1,186` pages and holding sentinel `0xffffffff` at `+0x7c` on `3,966` pages and at `+0x78` on `1,912` pages — the `+0x70` pattern). **`+0x80..+0x8f`** is the third `CCoverNodeId` (repeating `id_key` on `2,237` pages, `local_index == 1` on `9,105` pages, `0xffffffff` on `203` pages). |
+| `0xde5f1345[]` (`256 × 16` B sub-regions) | **207** (all `CCoverPointRegion`) | First `atArray<u16>` descriptor. On **`194`** pages the first sub-region is empty (`{0, 0, 0}` -> exact match for all **194** zero `+0x60` values and `194` of the `u32_68 == 0` pages); on `13` pages it is non-empty. |
 | `0x00000100` (map-pair array) | **16** (`14` empty `0x4712787b` + `2` singletons) | Map entry array; contributes the remaining `14` `u32_68 == 0` pages (`1,173 + 194 + 14 = 1,381` exact). |
 | `CCoverPointRegionDef[]` / `0x0904902e[]` | **2** (`2` singletons) | First manifest/index record (accounts for 2 of the 3 nonzero `+0x6c` words; `0x339accda` accounts for the 3rd). |
 
-## Typed data pages (`27,644` pages â€” `0x00010015` navmesh tiles)
+## Typed data pages (`27,644` pages — `0x00010015` navmesh tiles)
 
 The 27,644 pages with `u32 0x00010015` at `+0x14` are the actual **navmesh geometry tiles** (RAGE `CNavMesh`-family
 layout, fixed `0xF0`-byte header, `14.36 GiB` / `15,420,757,856` bytes inflated including continuations).
@@ -172,10 +172,10 @@ layout, fixed `0xF0`-byte header, `14.36 GiB` / `15,420,757,856` bytes inflated 
 | Offset | Size | Type | Verified meaning | Full-corpus check (`27,644` pages) |
 |---:|---:|---|---|---|
 | `+0x00` | 8 | `u64` | `pgBase` vtable slot | `0` on `27,644 / 27,644` |
-| `+0x08` | 8 | `ptr64` | Pointer to 32-byte block map | `bm[1] == stream_count` (`4,598` Ã— 1, `23,046` Ã— 2) on `27,644 / 27,644` |
+| `+0x08` | 8 | `ptr64` | Pointer to 32-byte block map | `bm[1] == stream_count` (`4,598` × 1, `23,046` × 2) on `27,644 / 27,644` |
 | `+0x10` | 4 | `u32` | Navmesh flags bitmask | `{9: 18791, 11: 5507, 3: 3149, 7: 161, 1: 35, 69: 1}` |
 | `+0x14` | 4 | `u32` | Format word (`0x00010015`, low16 = `21`) | `0x00010015` on `27,644 / 27,644` |
-| `+0x20` | 64 | `f32[16]` | Transform matrix (padded 3Ã—4) | Identity `(1,0,0,0 / 0,1,0,0 / 0,0,1,0 / 0,0,0,0)` on `27,644 / 27,644` |
+| `+0x20` | 64 | `f32[16]` | Transform matrix (padded 3×4) | Identity `(1,0,0,0 / 0,1,0,0 / 0,0,1,0 / 0,0,0,0)` on `27,644 / 27,644` |
 | `+0x60` | 12 | `f32[3]` | 3D tile extents `(dx, dy, dz)` | Matches `quadtree_root.vMax - vMin` (`< 0.02` m) on `27,644 / 27,644`; `(128, 128)` on all `27,482` static tiles |
 | `+0x70` | 8 | `ptr64` | `aiSplitArray` of compressed vertices (`6` B: `u16[3]`) | Valid & total `== u32@0xC0` (`138,041,746` verts, max `52,608`) on `27,644 / 27,644` |
 | `+0x78` | 8 | `ptr64` | Uncompressed vertex array (unused; bit 0 always set) | `0` on `27,644 / 27,644` |
@@ -189,7 +189,7 @@ layout, fixed `0xF0`-byte header, `14.36 GiB` / `15,420,757,856` bytes inflated 
 | `+0xB8` | 8 | `ptr64` | Nullable 96-byte obstacle footprint array (count `u32@0xDC`) | Present on `9,425` pages (`6,246,890` records = `3,123,445` outer/inner contour pairs); in-bounds & valid `27,644 / 27,644` |
 | `+0xC0` | 4 | `u32` | Vertex count | Min `4`, max `52,608`, sum `138,041,746` |
 | `+0xC4` | 4 | `u32` | Polygon count | Min `1`, max `71,803`, sum `124,768,148` |
-| `+0xC8` | 4 | `u32` | 512 Ã— 512 sector ID (`0` if `flags & 4`) | `0` iff `flags & 4` (`162` pages); exact `136 Ã— 180 = 24,480` static grid |
+| `+0xC8` | 4 | `u32` | 512 × 512 sector ID (`0` if `flags & 4`) | `0` iff `flags & 4` (`162` pages); exact `136 × 180 = 24,480` static grid |
 | `+0xCC` | 4 | `u32` | Core mesh data byte size | `6*c0 + 14*pool + 44*c4 + 32*d4 == u32@0xCC` with **0 residual** on `27,644 / 27,644` |
 | `+0xD4` / `+0xD8` / `+0xDC` | 12 | `u32[3]` | Special-link, link-index, and `+0xB8` record counts | Sums `26,679,246` / `26,903,247` / `6,246,890` |
 | `+0xE8` | 4 | `u8[4]` | Build stamp (`0` if `flags & 4`): second, minute, hour, day of month | `7` distinct values (`0` on `162`, `0x09090516` on `24,474`, `0x160e3132` on `3,003`, 4 rare on `5`); see [Build stamp](#build-stamp-0xe8) |
@@ -239,7 +239,7 @@ road/pavement labels were not adopted: a 1,027,984-polygon sample over 238 tiles
 they are not a partition, and in the lane-graph count [below](#polygon-flags-under-the-lane-graph) neither is under
 most lane nodes; `+0x18` bits 8 and 13 are. No 6stars code was copied; the repository has no licence.
 
-### Flags (`u32@0x10`) and 512 Ã— 512 world grid
+### Flags (`u32@0x10`) and 512 × 512 world grid
 
 - **Bit 0 (`0x01`)**: set on `27,644 / 27,644` (compressed 6-byte vertices at `+0x70`, `+0x78 == 0`).
 - **Bit 1 (`0x02`)**: exact bijection (`27,644 / 27,644`) with special links (`+0xA8/+0xB0` non-null, `u32@0xD4/0xD8 > 0`; `8,817` tiles).
@@ -257,7 +257,7 @@ world_min_x = (sector_x - 256) * 128.0  # -12,288 .. +4,992 m (max +5,120 m)
 world_min_y = (sector_y - 256) * 128.0  #  -9,856 .. +13,056 m (max +13,184 m)
 ```
 
-The `24,480` unique static sector IDs form a complete, gap-free `136 Ã— 180` rectangle (`Z âˆˆ [-78.55, +403.84]` m).
+The `24,480` unique static sector IDs form a complete, gap-free `136 × 180` rectangle (`Z ∈ [-78.55, +403.84]` m).
 
 ### Adjacent-polygon edges (`+0x88`, `493,024,188` records) and special links (`+0xA8`/`+0xB0`, `26,679,246` records)
 
@@ -378,16 +378,16 @@ The final 433 MiB of `navmeshes.rpf` holds `27,482` `pgBase` resources (`+6` con
 
 | Offset | Size | Type | Verified meaning (`27,482 / 27,482`) |
 |---:|---:|---|---|
-| `+0x00` / `+0x08` | 16 | `u64`, `ptr64` | `0`, pointer to 32-byte block map (`bm[1] == stream_count`: `27,476` Ã— 1, `6` Ã— 2) |
+| `+0x00` / `+0x08` | 16 | `u64`, `ptr64` | `0`, pointer to 32-byte block map (`bm[1] == stream_count`: `27,476` × 1, `6` × 2) |
 | `+0x10` / `+0x14` | 8 | `u32`, `u32` | Power-of-2 group count (`8..2048`), active entry count `N` (`85..14,903`; sum `53,835,068`) |
-| `+0x18` / `+0x20` | 16 | `ptr64`, `ptr64` | Hash-table pointer (always `+0x60`, `groups Ã— 272` B), payload pointer (`u32[N]`) |
-| `+0x28` / `+0x34` | 16 | `u32[3]`, `u32` | Cubic volume extent (`128Â³ / 256Â³ / 512Â³ / 1024Â³ / 4096Â³` m), 512 Ã— 512 sector ID |
-| `+0x40` | 12 | `f32[3]` | World origin `(ox, oy, oz)` (`ox, oy` match sector ID on `27,482 / 27,482`; `oz âˆˆ {-2048..+256}`) |
+| `+0x18` / `+0x20` | 16 | `ptr64`, `ptr64` | Hash-table pointer (always `+0x60`, `groups × 272` B), payload pointer (`u32[N]`) |
+| `+0x28` / `+0x34` | 16 | `u32[3]`, `u32` | Cubic volume extent (`128³ / 256³ / 512³ / 1024³ / 4096³` m), 512 × 512 sector ID |
+| `+0x40` | 12 | `f32[3]` | World origin `(ox, oy, oz)` (`ox, oy` match sector ID on `27,482 / 27,482`; `oz ∈ {-2048..+256}`) |
 | `+0x50` | 4 | `u32` | Mirror of entry count (`u32@0x50 == u32@0x14` on `27,482 / 27,482`) |
 
 Reserved slots `+0x38..+0x3f`, `+0x4c..+0x4f`, and `+0x54..+0x5f` are zero on `27,482 / 27,482`. Each 272-byte group at
 `+0x60` is a 16-way SwissTable block (`16` control bytes where `0x80` = empty and `< 0x80` = occupied tag, followed by
-`16 Ã— {u64 key, u64 value}`). Across all `27,482 / 27,482` resources, occupied slots equal `N` and their `value` fields
+`16 × {u64 key, u64 value}`). Across all `27,482 / 27,482` resources, occupied slots equal `N` and their `value` fields
 form an exact bijection onto `[0 .. N - 1]`: `value` indexes the `u32[N]` payload.
 
 **Keys (ASSET-287).** The `u64` keys are sentinel-bit linear octree keys over the cubic volume: `1` is the root and a
@@ -527,12 +527,85 @@ are authoring/build-time inputs to that partition:
   counts the `CVehiclePoints` cell sizes and searches the meshes for the models' name hashes; `--static-every N`
   adds a static-tile control. It prints aggregates only (ASSET-332).
 - `tools/navmesh_index.py` (stdlib-only) performs the quick `0DRP` header inventory (`offset`, sizes, version, `+0x20`,
-  raw `+0x60`/`+0x68`).
+  raw `+0x60`/`+0x68`). For a carve directory, `--pattern` selects paths recursively. Each matching pathname
+  counts once, including when the pattern itself contains `**`.
 - `tools/navmesh_decode.py` (stdlib-only) decodes all four resource classes (`0DRP`, `0x00010015`, `grid`, `PSIN`),
   joins continuations (including tiny `< 64`-byte continuations), validates structural invariants, and writes aggregate
   JSON and optional numeric CSV metadata. It never writes payload bytes and never touches the TOC.
 - `tools/navmesh_links.py` (stdlib-only) decodes and verifies the 12-byte `+0x88` adjacent-polygon edges, the polygon
   `+0x20` special-link prefix-sum chain, and the 32-byte `+0xA8` special links and `+0xB0` index table.
+  Pass `--reciprocity` to include a `reciprocity` object. `tiles_counted` covers tiles with verified pool bounds
+  and contiguous polygon spans. Within each tile, `excess_directed` sums the positive differences between the
+  counts of A to B and B to A for each ordered polygon pair. Self edges contribute zero excess. The report counts
+  valid same-tile records, all-ones open targets and invalid targets separately. This measures polygon references
+  without testing geometric edge alignment.
+  Pass `--endpoint-agreement` to compare two ways to associate slot *j* of the adjacency span with its
+  polygon boundary. Under `outgoing` it runs from vertex *j* to the next vertex. Under `incoming` it runs
+  from the previous vertex to *j*. Both wrap within the polygon and compare all three stored u16 coordinates
+  at `+0x70` through the `+0x80` indices. The unit is a directed slot. With one occurrence on each polygon,
+  matching endpoints count as `reversed`, `same_direction`, or `degenerate` (identical endpoints).
+  If a return exists and either polygon repeats the same unordered endpoints for this neighbor, all affected
+  slots count as `repeated`. A slot with no return to its source at those exact coordinates counts as
+  `no_exact_return`. Open, invalid and self targets have separate totals.
+
+  Across all 27,644 Xbox 1.0.2.1 tiles, each convention accounts for 458,728,869 directed same-tile slots.
+  The endpoint agreement supports slot *j* describing the outgoing boundary edge. A unique return can run
+  in either direction. Another 34,295,319 slots were open. None had invalid or self targets.
+
+  | Boundary tested | Reversed | Same direction | Degenerate | Repeated | No exact return |
+  |---|---:|---:|---:|---:|---:|
+  | Outgoing | 449,013,586 | 9,676,624 | 42 | 94 | 38,523 |
+  | Incoming | 702 | 102,408 | 2 | 3 | 458,625,754 |
+
+  Pass `--relative-winding` to subdivide uniquely matched outgoing slots by the winding of the two
+  polygon rings. The first two words of each vertex at `+0x70` are its tile-space X and Y coordinates
+  (see [the lane-graph height check](#polygon-flags-under-the-lane-graph)). Translation and positive
+  per-axis scaling by the tile extents at `+0x60` preserve the sign of the shoelace area, so the test uses
+  exact integer arithmetic. Dynamic meshes use their local XY plane. Endpoint matching still uses XYZ.
+  Either ring makes the pair ambiguous if it has fewer than three projected vertices, zero signed area,
+  a repeated point, or a boundary that crosses, touches itself or doubles back. Nonpositive or nonfinite
+  horizontal extents also make the pair ambiguous.
+
+  | Unique outgoing match (directed slots) | Same winding | Opposite winding | Ambiguous |
+  |---|---:|---:|---:|
+  | Same direction | 61,128 | 592 | 9,614,904 |
+  | Reversed | 448,891,156 | 11,896 | 110,534 |
+
+  Across the whole archive, only 592 same-direction slots have demonstrably opposite XY winding. Of the
+  61,720 same-direction slots with classifiable rings, 61,128 have the same winding. The remaining
+  9,614,904 slots admit no conclusion from this projection. Reversed slots overwhelmingly join rings
+  of the same winding.
+
+  Pass `--coplanar-winding` to examine the 9,614,904 XY-ambiguous same-direction directed slots.
+  The three unsigned words per vertex at `+0x70` give tile-space XYZ. Positive per-axis scaling and
+  translation preserve coplanarity and the relative orientation of rings in a common plane. A zero
+  extent collapses that axis. The test requires finite, nonnegative extents. It finds a plane from
+  three noncollinear ring points and verifies all remaining points against it with integer arithmetic.
+  Dropping an axis with a nonzero normal component maps that plane one-to-one onto a coordinate plane,
+  where the existing simple-ring and signed-area tests apply. Two parallel planes containing the same
+  edge coincide, so both rings use the same projection. For different planes the relative sign can
+  depend on the viewing direction.
+
+  A private census over all 27,644 tiles classified each ring separately. For planar rings with
+  distinct vertices, the segment checks stop at the first boundary defect in vertex order. When the
+  two rings have different conditions, the first listed below takes precedence. Each reciprocal
+  pair contributes two directed slots.
+
+  | First applicable 3D condition | Directed slots |
+  |---|---:|
+  | Fewer than three vertices | 6,375,984 |
+  | Repeated XYZ vertex in a ring | 84 |
+  | All vertices collinear | 1,100,732 |
+  | Adjacent segments double back in a planar ring | 89,984 |
+  | Nonadjacent segments intersect or touch in a planar ring | 738,318 |
+  | Nonplanar ring | 596,656 |
+  | Both rings simple and planar | 713,146 |
+
+  Among the 713,146 slots with two simple planar rings, 713,102 join different planes. The coplanar
+  group contains 20 slots of equal winding, 20 of opposite winding and 4 with coincident boundaries.
+  The coincidence test ignores extra vertices along straight sides. The remaining 8,901,758 slots
+  have at least one undefined ring. These counts describe polygon geometry only.
+
 - `tools/navmesh_nodes.py` (stdlib-only) counts the polygon flag bits under the lane-graph nodes
   ([above](#polygon-flags-under-the-lane-graph)). It reads `navmeshes.rpf` and `levels.rpf` and writes counts only.
 
@@ -562,3 +635,15 @@ failures**, in 236 s. Both test suites build synthetic archives in memory/tempdi
 The package is read-only. Do not commit, upload or share the archive, any carved page, a key, an extracted name,
 or a report that quotes payload bytes. Only aggregate counts, offsets, verified layouts and four-byte magics belong in
 this repository.
+
+## Inspect one tile locally
+
+Run `python -I tools/navmesh_tile_obj.py navmeshes.rpf --tile 0 --out <private-folder>/tile.obj`
+with a zero-based tile ordinal. The reader walks complete navmesh resources in archive order and stops at the
+selection. Dynamic tiles count toward the ordinal and lack the static world-space placement required for export.
+
+Each `polygon_N` group corresponds to record N in the selected tile. A single slot becomes a point, two slots
+become a line, and three or more become a polyline closed back to the first slot. Empty records keep their group.
+Repeated or collinear slots remain in order, including zero-length edges. OBJ vertex numbers are local to this
+export. The boundary drawing makes no claim about surface triangulation, connections or navigability.
+Keep generated OBJ files in your private work folder.

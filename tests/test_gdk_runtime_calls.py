@@ -390,6 +390,22 @@ class ImageTest(unittest.TestCase):
         self.assertIn("report written as thunks.dll-2.gdk_calls.txt/.json", stderr.getvalue())
         self.assertIn("path is a file, not a directory", stderr.getvalue())
 
+    def test_main_refuses_out_that_overwrites_input(self):
+        aliased_dir = os.path.join(self.tmp, "alias-out")
+        os.makedirs(aliased_dir, exist_ok=True)
+        aliased = os.path.join(aliased_dir, "thunks.dll.gdk_calls.json")
+        shutil.copyfile(grc.DEFAULT_TABLE, aliased)
+        with open(aliased, "rb") as f:
+            original = f.read()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = grc.main([self.path, "--table", aliased, "--out", aliased_dir])
+        self.assertEqual(rc, 1)
+        self.assertIn("would overwrite input file", stderr.getvalue())
+        with open(aliased, "rb") as f:
+            self.assertEqual(f.read(), original)
+        self.assertFalse(os.path.exists(os.path.join(aliased_dir, "thunks.dll.gdk_calls.txt")))
+
     def test_the_default_source_is_every_runtime_shim(self):
         # The classes xgameruntime.cpp hands on to its sibling files count as served: XUserImpl, XGameSaveImpl and
         # XStoreImpl live in xgameruntime_user.cpp, _gamesave.cpp and _store.cpp.
@@ -398,6 +414,10 @@ class ImageTest(unittest.TestCase):
         for name in ("kThreadingClass", "kUserClass", "kSaveClass", "kStoreClass"):
             self.assertIn(name, names)
         self.assertEqual(served.get("704c3f58-e629-4cc2-b197-30511b996fe2"), "kSaveClass")
+        # xgameruntime.cpp serves XGameRuntimeFeatureImpl; the ids its feature table only names (k...ClassId) don't count.
+        self.assertEqual(served.get("8836fe87-edb9-4fe3-8dad-05f0d2cd5b40"), "kGameRuntimeFeatureClass")
+        self.assertEqual(served.get("1b339674-328d-4283-a200-3171f18d3639"), "kLauncherClass")   # XLauncherImpl, xgameruntime_offline.cpp
+        self.assertNotIn("a4f1aee2-4bf1-4485-b008-a7c26d52ac27", served)   # XAppCaptureImpl
         empty = os.path.join(self.tmp, "no-shims")
         os.makedirs(empty, exist_ok=True)
         with self.assertRaises(OSError):
@@ -440,6 +460,10 @@ class DecoderTest(unittest.TestCase):
             "48B80000000000000000": 10,   # mov rax,imm64
             "F6C101": 3,                  # test cl,1
             "F7C100000000": 6,            # test ecx,imm32
+            "66F7C10000": 5,              # test cx,imm16
+            "6648F7C100000000": 8,        # test rcx,imm32 (REX.W overrides 66h)
+            "66C7C10000": 5,              # mov cx,imm16
+            "6648C7C100000000": 8,        # mov rcx,imm32 (REX.W overrides 66h)
             "4C8B11": 3,                  # mov r10,[rcx]
             "0F8400000000": 6,            # je rel32
         }

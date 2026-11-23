@@ -33,13 +33,17 @@ try
     string failed = Path.Combine(dir, "b.dds");
     try { Util.WriteAtomic(failed, t => { File.WriteAllBytes(t, [9]); throw new IOException("disk full"); }); Check(false, "error propagates"); }
     catch (IOException) { }
-    Check(!File.Exists(failed) && !File.Exists(failed + ".partial"), "a failed write leaves neither file");
+    Check(!File.Exists(failed) && Directory.GetFiles(dir, "b.dds*partial").Length == 0,
+        "a failed write leaves neither file nor a .partial");
 
     // A stopped run's leftover .partial must not block a writer that opens with FileMode.CreateNew.
     string stale = Path.Combine(dir, "c.xma.wav");
     File.WriteAllBytes(stale + ".partial", [7]);
     Util.WriteAtomic(stale, t => { using var f = new FileStream(t, FileMode.CreateNew); f.WriteByte(5); });
-    Check(File.ReadAllBytes(stale).SequenceEqual(new byte[] { 5 }) && !File.Exists(stale + ".partial"), "stale .partial is replaced");
+    Check(File.ReadAllBytes(stale).SequenceEqual(new byte[] { 5 })
+         && !File.Exists(stale + ".partial")
+         && Directory.GetFiles(dir, "c.xma.wav*partial").Length == 0,
+         "stale .partial is replaced");
 }
 finally { Directory.Delete(dir, true); }
 Console.WriteLine("Atomic write tests passed.");

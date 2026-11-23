@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; 10:10:10:2 typed buffers. Format names list the channel widths from the top bit: 2_10_10_10 (50) is R10G10B10A2
 ; with x in bits 9:0, and 10_10_10_2 (44) has a 2-bit x in bits 1:0. out[12..13] = 0xc00ffc00 0x003ff003 (raw),
 ; out[0..3] = out[12] read as 50, out[4..7] = out[13] read as 44, out[8..11] = out[12] read by tbuffer as 50 through

@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; v_pk_lshlrev_b16 / v_pk_lshrrev_b16 (per-half shift amounts), v_add_nc_u16 (keeps dst high half), v_sin_f16 (turns).
 ; Expected mrt0 bits: 0x34000010, 0x00120800, 0xbeef0000, 0x12343c00
 v_mov_b32_e32 v0, 0x12348001

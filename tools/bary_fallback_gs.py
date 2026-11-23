@@ -14,6 +14,7 @@ BaryCoordKHR has, so the pixel shader's .y/.z are AMD's i/j.
 
 The paired helper forwards a VS ClipDistance or CullDistance array. The suffix identifies the kind and length.
 Mixed clip/cull layouts are rejected. Standard library only; build_for_index assembles and validates with spirv-as / spirv-val from PATH.
+Usage: `python -I tools/bary_fallback_gs.py --help` lists the options.
 """
 import argparse
 from collections.abc import Iterator

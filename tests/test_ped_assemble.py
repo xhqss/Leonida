@@ -192,6 +192,21 @@ class StandingSpaceTests(unittest.TestCase):
 
 
 class CoplanarCullingAndSeamTests(unittest.TestCase):
+    def test_weld_collapsed_faces_do_not_contribute_edge_incidence(self):
+        part = pa.MeshPart(name="panel", positions=[(0, 0, 0), (1, 0, 0), (0, 1, 0),
+                                                    (0.00001, 0.00001, 0), (0, 0.00001, 0)],
+                           triangles=[(0, 1, 2), (0, 3, 1), (0, 3, 4)])
+        report = pa.inspect_seams([part], weld_tol=1e-4)
+        self.assertEqual(report["parts"][0]["triangles"], 3)
+        self.assertEqual(report["combined_topology"], {
+            "unique_edges": 3, "boundary_edges": 3, "manifold_edges": 0,
+            "non_manifold_edges": 0, "collapsed_triangles": 2,
+        })
+        # At a finer weld resolution all three faces retain their own corners.
+        fine = pa.analyze_edge_topology([part], weld_tol=1e-6)
+        self.assertEqual(fine["collapsed_triangles"], 0)
+        self.assertEqual(fine["manifold_edges"], 2)
+
     def _build_synthetic_body_parts(
         self,
         *,

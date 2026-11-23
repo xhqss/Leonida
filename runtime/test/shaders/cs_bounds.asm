@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; num_records bounds checking: s[0:3] has base 0, stride 0, num_records = 16 (bytes 0..15), word3 0x31016fac (OOB_SELECT RAW).
 ; Thread 0 writes 0x12345678 to offset 0 (in-bounds), attempts write 0xdeadbeef to offset 16 (OOB, ignored),
 ; loads offset 0 (0x12345678) into offset 4, and loads offset 16 (OOB -> 0) into offset 8.

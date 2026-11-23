@@ -12,6 +12,7 @@ totals only (no game data).
 import argparse
 from collections import Counter
 import json
+import math
 import mmap
 import os
 import struct
@@ -38,6 +39,198 @@ def _counter_top(counter, limit=32):
     return {str(k): v for k, v in counter.most_common(limit)}
 
 
+def _count_reciprocity(b, polygons, edges, sector, polygon_count, totals):
+    """Match directed polygon counts within one tile whose pool sizes agree."""
+    records = (record for offset, count in edges
+               for record in struct.iter_unpack("<IH6x", memoryview(b)[offset:offset + count * 12]))
+    directed = Counter()
+    source = position = same = invalid = unlinked = 0
+    for offset, count in polygons:
+        for i in range(count):
+            packed = nd._u32(b, offset + 44 * i + 4)
+            if packed >> 4 != position:
+                return  # Overlapping or missing spans make edge ownership ambiguous.
+            for _ in range(packed & 15):
+                target_sector, target = next(records)
+                if target_sector == 0xFFFFFFFF and target == 0xFFFF:
+                    unlinked += 1
+                elif target_sector == sector and target < polygon_count:
+                    directed[source, target] += 1
+                    same += 1
+                else:
+                    invalid += 1
+            position += packed & 15
+            source += 1
+
+    excess = sum(max(0, n - directed[target, source])
+                 for (source, target), n in directed.items())
+    totals["tiles_counted"] += 1
+    totals["same_tile"] += same
+    totals["excess_directed"] += excess
+    totals["invalid_targets"] += invalid
+    totals["unlinked"] += unlinked
+
+
+ENDPOINT_CLASSES = (
+    "reversed", "same_direction", "degenerate", "repeated", "no_exact_return",
+)
+
+
+def _turn(a, b, c):
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _xy_winding(points):
+    """Sign of twice the area of a simple projected ring, or zero if ambiguous."""
+    n = len(points)
+    if n < 3:
+        return 0
+    if n == 3:
+        area = _turn(*points)
+        return (area > 0) - (area < 0)
+    if len(set(points)) != n:
+        return 0
+    area = 0
+    for i, a in enumerate(points):
+        b = points[(i + 1) % n]
+        area += a[0] * b[1] - b[0] * a[1]
+        prev = points[i - 1]
+        if (_turn(prev, a, b) == 0 and
+                (prev[0] - a[0]) * (b[0] - a[0]) + (prev[1] - a[1]) * (b[1] - a[1]) > 0):
+            return 0  # Adjacent segments double back over one another.
+        for j in range(i + 2, n if i else n - 1):
+            c, d = points[j], points[(j + 1) % n]
+            if (max(a[0], b[0]) < min(c[0], d[0]) or max(c[0], d[0]) < min(a[0], b[0]) or
+                    max(a[1], b[1]) < min(c[1], d[1]) or max(c[1], d[1]) < min(a[1], b[1])):
+                continue
+            if _turn(a, b, c) * _turn(a, b, d) <= 0 and _turn(c, d, a) * _turn(c, d, b) <= 0:
+                return 0
+    return (area > 0) - (area < 0)
+
+
+def _plane_ring(points):
+    """Return a canonical plane normal, winding sign and undirected corner cycle."""
+    if len(points) < 3 or len(set(points)) != len(points):
+        return None
+    a, b = points[:2]
+    dx, dy, dz = (v - u for u, v in zip(a, b))
+    for c in points[2:]:
+        ex, ey, ez = (v - u for u, v in zip(a, c))
+        normal = (dy * ez - dz * ey, dz * ex - dx * ez, dx * ey - dy * ex)
+        if any(normal):
+            break
+    else:
+        return None
+    if any(sum(n * (v - u) for n, v, u in zip(normal, point, a)) for point in points):
+        return None
+    axis = next(i for i, n in enumerate(normal) if n)
+    divisor = math.gcd(*normal) * (1 if normal[axis] > 0 else -1)
+    plane = tuple(n // divisor for n in normal)
+    projected = [(p[(axis + 1) % 3], p[(axis + 2) % 3]) for p in points]
+    sign = _xy_winding(projected)
+    if not sign:
+        return None
+    corners = [p for i, p in enumerate(projected)
+               if _turn(projected[i - 1], p, projected[(i + 1) % len(points)])]
+    boundary = frozenset(tuple(sorted((p, corners[i - 1]))) for i, p in enumerate(corners))
+    return plane, sign, boundary
+
+
+def _plane_relation(left, right):
+    if left is None or right is None:
+        return "undefined_ring"
+    # The exact shared edge supplies a common point, so parallel planes coincide.
+    if left[0] != right[0]:
+        return "different_planes"
+    if left[2] == right[2]:
+        return "coincident"
+    return "same" if left[1] == right[1] else "opposite"
+
+
+def _endpoint_counts(b, tables, sector, polygon_count, totals):
+    """Compare each slot under both cyclic boundary conventions within this tile."""
+    vertices, indices, edges, polygons = tables
+    coords = [xyz for offset, count in vertices
+              for (xyz,) in struct.iter_unpack("<6s", b[offset:offset + count * 6])]
+    ring_indices = [index for offset, count in indices
+                    for (index,) in struct.iter_unpack("<H", b[offset:offset + count * 2])]
+    targets = (target for offset, count in edges for target in
+               struct.iter_unpack("<IH6x", b[offset:offset + count * 12]))
+    hypotheses = {"outgoing": Counter(), "incoming": Counter()}
+    winding = totals.get("relative_winding")
+    if winding is not None:
+        xy = [struct.unpack_from("<HH", vertex) for vertex in coords]
+        valid_xy = all(math.isfinite(v) and v > 0 for v in nd._f32s(b, 0x60, 2))
+        signs = []
+    coplanar = totals.get("coplanar_winding")
+    if coplanar is not None:
+        rings = []
+        planes = {}
+        extents = nd._f32s(b, 0x60, 3)
+        valid_xyz = all(math.isfinite(v) and v >= 0 for v in extents)
+
+        def plane(index):
+            if index not in planes:
+                points = [tuple(v if extent else 0 for v, extent in zip(struct.unpack("<3H", raw), extents))
+                          for raw in rings[index]]
+                planes[index] = _plane_ring(points) if valid_xyz else None
+            return planes[index]
+
+    position = source = self_refs = unlinked = invalid = 0
+    for offset, count in polygons:
+        for i in range(count):
+            span = nd._u32(b, offset + 44 * i + 4)
+            if span >> 4 != position:
+                return
+            end = position + (span & 15)
+            ring = [coords[index] for index in ring_indices[position:end]]
+            if coplanar is not None:
+                rings.append(ring)
+            if winding is not None:
+                signs.append(_xy_winding([xy[index] for index in ring_indices[position:end]])
+                             if valid_xy else 0)
+            for j, vertex in enumerate(ring):
+                target_sector, target = next(targets)
+                if (target_sector, target) == (0xffffffff, 0xffff):
+                    unlinked += 1
+                elif target_sector != sector or target >= polygon_count:
+                    invalid += 1
+                elif target == source:
+                    self_refs += 1
+                else:
+                    hypotheses["outgoing"][source, target, vertex, ring[(j + 1) % len(ring)]] += 1
+                    hypotheses["incoming"][source, target, ring[j - 1], vertex] += 1
+            position = end
+            source += 1
+
+    totals["tiles_counted"] += 1
+    totals["self_references"] += self_refs
+    totals["unlinked"] += unlinked
+    totals["invalid_targets"] += invalid
+    for convention, counts in hypotheses.items():
+        for (source, target, start, end), n in counts.items():
+            reverse = counts[target, source, end, start]
+            same = counts[target, source, start, end] if start != end else 0
+            if not (same or reverse):
+                category = "no_exact_return"
+            elif (n > 1 or reverse + same > 1 or
+                  (start != end and counts[source, target, end, start])):
+                category = "repeated"
+            elif start == end:
+                category = "degenerate"
+            elif reverse:
+                category = "reversed"
+            else:
+                category = "same_direction"
+            totals[convention][category] += n
+            if winding is not None and convention == "outgoing" and category in winding:
+                product = signs[source] * signs[target]
+                relation = "ambiguous" if product == 0 else "same" if product > 0 else "opposite"
+                winding[category][relation] += n
+                if coplanar is not None and category == "same_direction" and relation == "ambiguous":
+                    coplanar[_plane_relation(plane(source), plane(target))] += n
+
+
 def verify_tile(b, stats):
     """Verify +0x88 adjacent edges, polygon +0x20 link chain, and +0xA8/+0xB0 special links."""
     chk = {}
@@ -51,8 +244,9 @@ def verify_tile(b, stats):
     pool = nd._u32(b, 0x90)
     a8, b0 = nd._u64(b, 0xA8), nd._u64(b, 0xB0)
 
-    # Cross-check u32@0x90 (pool) against +0x80 (2-byte vertex indices), +0x88 (12-byte edges),
-    # and the sum of polygon vertex counts in +0x98 (44-byte polygons).
+    # Cross-check u32@0xC0 (c0) and u32@0x90 (pool) against +0x70 (6-byte vertices),
+    # +0x80 (2-byte vertex indices < c0), +0x88 (12-byte edges), and the sum of polygon vertex counts in +0x98.
+    b70 = nd.split_array(b, 0x70, 6, c0)
     b80 = nd.split_array(b, 0x80, 2, pool)
     b88 = nd.split_array(b, 0x88, 12, pool)
     b98 = nd.split_array(b, 0x98, 44, c4)
@@ -61,10 +255,15 @@ def verify_tile(b, stats):
         for po, pcnt in b98:
             for pi in range(pcnt):
                 poly_vert_sum += struct.unpack_from("<I", b, po + 44 * pi + 4)[0] & 0xF
-    pool_confirmed = b80 is not None and b98 is not None and poly_vert_sum == pool
+    vidx_in_bounds = b80 is not None and all(nd._u16_max(b, o, n) < c0 for o, n in b80)
+    pool_confirmed = b70 is not None and vidx_in_bounds and b98 is not None and poly_vert_sum == pool
 
     # 1. 12-byte adjacent-polygon edges at +0x88 (count = pool = u32@0x90).
     edges_ok = b88 is not None and pool_confirmed
+    if edges_ok and "reciprocity" in stats:
+        _count_reciprocity(b, b98, b88, c8, c4, stats["reciprocity"])
+    if edges_ok and "endpoint_agreement" in stats:
+        _endpoint_counts(b, (b70, b80, b88, b98), c8, c4, stats["endpoint_agreement"])
     same_tile = 0
     unlinked = 0
     edge_flags_lo = Counter()
@@ -303,14 +502,34 @@ def _iter_resources(path, start=0, limit=None):
                 yield bytes(buf)
 
 
-def scan(path, start=0, limit=None):
+def scan(path, start=0, limit=None, *, reciprocity=False, endpoint_agreement=False, relative_winding=False,
+         coplanar_winding=False):
+    relative_winding = relative_winding or coplanar_winding
     stats = new_stats()
+    if endpoint_agreement or relative_winding:
+        stats["endpoint_agreement"] = {
+            "tiles_counted": 0, "self_references": 0, "unlinked": 0, "invalid_targets": 0,
+            **{name: dict.fromkeys(ENDPOINT_CLASSES, 0) for name in ("incoming", "outgoing")},
+        }
+    if relative_winding:
+        stats["endpoint_agreement"]["relative_winding"] = {
+            category: dict.fromkeys(("same", "opposite", "ambiguous"), 0)
+            for category in ("reversed", "same_direction")
+        }
+    if coplanar_winding:
+        stats["endpoint_agreement"]["coplanar_winding"] = dict.fromkeys(
+            ("same", "opposite", "different_planes", "coincident", "undefined_ring"), 0)
+    if reciprocity:
+        stats["reciprocity"] = dict.fromkeys(
+            ("tiles_counted", "same_tile", "excess_directed", "invalid_targets", "unlinked"), 0)
     for buf in _iter_resources(path, start=start, limit=limit):
         stats["tiles"] += 1
         chk = verify_tile(buf, stats)
         for name, ok in chk.items():
             stats["checks"][name]["pass" if ok else "fail"] += 1
     return {
+        **({"endpoint_agreement": stats["endpoint_agreement"]} if endpoint_agreement or relative_winding else {}),
+        **({"reciprocity": stats["reciprocity"]} if reciprocity else {}),
         "tiles": stats["tiles"],
         "checks": stats["checks"],
         "edges": {
@@ -345,6 +564,14 @@ def main(argv=None):
     ap.add_argument("--limit", type=int, default=None, help="Maximum byte span to scan")
     ap.add_argument("--out", default=None, help="Optional JSON output path")
     ap.add_argument("--quiet", action="store_true", help="Suppress stdout summary")
+    ap.add_argument("--reciprocity", action="store_true",
+                    help="Count same-tile directed edges in excess of their reverse multiplicity")
+    ap.add_argument("--endpoint-agreement", action="store_true",
+                    help="Compare incoming and outgoing boundary endpoints for same-tile edges")
+    ap.add_argument("--coplanar-winding", action="store_true",
+                    help="Also classify XY-ambiguous same-direction slots using coplanar 3D rings")
+    ap.add_argument("--relative-winding", action="store_true",
+                    help="Include endpoint agreement and compare polygon XY winding for unique outgoing matches")
     args = ap.parse_args(argv)
 
     if args.start < 0:
@@ -366,8 +593,15 @@ def main(argv=None):
         if same_report_path(args.out, args.input):
             sys.stderr.write("error: --out must not overwrite the input path\n")
             return 2
+        if os.path.isdir(args.input):
+            for fname in os.listdir(args.input):
+                if fname.endswith(".bin") and same_report_path(args.out, os.path.join(args.input, fname)):
+                    sys.stderr.write("error: --out must not overwrite a carved input stream\n")
+                    return 2
 
-    doc = scan(args.input, start=args.start, limit=args.limit)
+    doc = scan(args.input, start=args.start, limit=args.limit, reciprocity=args.reciprocity,
+               endpoint_agreement=args.endpoint_agreement, relative_winding=args.relative_winding,
+               coplanar_winding=args.coplanar_winding)
     if args.out is not None:
         parent = os.path.dirname(os.path.abspath(args.out))
         if parent:

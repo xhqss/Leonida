@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; 16-bit float VOPC compares, e32 form (VCC destination): v_cmp_{f,lt,eq,le,gt,lg,ge,o,u,nge,nlg,ngt,nle,neq,nlt,tru}_f16
 ; (all 16 IEEE predicates) on seven operand pairs covering the four relations less, greater, equal and unordered, with
 ; +-0, +-inf, quiet and signalling NaN and f16 denormals, and junk in the high halves of the register operands.

@@ -118,9 +118,10 @@ def scan_document(doc: dict) -> dict:
         "refs": [],
         "includes": [],
     }
+    data = doc["data"]
     try:
-        root = ET.fromstring(doc["data"])
-    except (ET.ParseError, ValueError):
+        root = ET.fromstring(data)
+    except (ET.ParseError, ValueError, LookupError):
         # A truncated tail can still carry a closing-root hint from the index. It is a named but
         # unparsed document, not a rootless fragment; only an empty hint is rootless.
         report["root"] = doc.get("root_hint") or ""

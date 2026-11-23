@@ -6,6 +6,21 @@ cannot be mixed with this repository. This page records what we may learn from e
 The rule is the same for every entry: **facts are fine; code is not.** A format layout, an ABI observation or a
 measured behaviour can be reimplemented independently. The source that expressed it cannot be copied.
 
+## ivall/xcl
+
+<https://github.com/ivall/xcl>
+
+An Xbox Series compatibility layer for Windows. It runs a title's x64 code natively and reimplements the console
+system libraries, in the spirit of Wine. It recompiles RDNA2 shaders to HLSL/DXIL instead of SPIR-V. Its README
+reports several retail titles as playable, and its design notes record measured facts relevant here: root-argument
+placement in user SGPRs, thread-group lane layout on PC drivers and GFX10 texture tiling.
+
+**Licence:** **GPL-2.0-only**, which is **incompatible with GPL-3.0-or-later**, as for americas-recomp below. **No
+code, tables or comments may be copied.**
+
+**What we use it for:** its measured facts only. Verify each one with Leonida's own census, a synthetic test or a
+public specification before relying on it. This repository never contains game data, so a fact XCL measured on a retail package is checked here with synthetic inputs or a contributor's own copy.
+
 ## rpatty-dev/PercyStar
 
 <https://github.com/rpatty-dev/PercyStar>

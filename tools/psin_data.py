@@ -52,6 +52,9 @@ Usage:
 The default output is counts only: containers, block tables, bytes reached from the root, pointers, arrays and maps,
 with every check. `--dump` prints the decoded tree of one container on stdout, hashes as hex, for local inspection;
 it writes no file. Unknown member types (0x5a, 0x76, 0x77, ...) are counted and skipped, never guessed.
+
+In a carve directory, a stream that does not start with the `PSIN` magic is skipped (the folder holds other files
+too). As the only argument it is a wrong path, so it is one `ERROR:` line and exit 2 rather than an empty count.
 """
 import argparse
 import bisect
@@ -79,6 +82,7 @@ HASHES = {0x4A: "<I", 0x4D: "<I", 0x4B: "<I", 0x4F: "<Q"}
 ENUMS = {0x60: "<B", 0x63: "<B", 0x64: "<H", 0x62: "<i", 0x65: "<I", 0x68: "<q"}
 POINTERS = (0x07, 0x42)
 CONTAINERS = {0x5C: 16, 0x52: 16, 0x73: 16, 0x75: 16, 0x71: 24, 0x44: 16}
+_HEADER_BYTES = {0x07: 8, 0x42: 8, 0x44: 16, 0x52: 12, 0x5C: 16, 0x71: 20, 0x73: 16, 0x75: 16}
 VECTOR16 = (0x31, 0x33, 0x34, 0x35, 0x36, 0x0C, 0x0D)
 
 
@@ -215,12 +219,28 @@ class Walker:
         self.seen = set()
         self._block_bases = [base for _, base, _ in container.blocks]
         self._block_ends = [base + size for _, base, size in container.blocks]
+        self._limit = None
 
     def _block_end(self, at):
         i = bisect.bisect_right(self._block_bases, at) - 1
         if i >= 0 and at <= self._block_ends[i]:
             return self._block_ends[i]
         return None
+
+    def _active_end(self, at):
+        return self._limit if self._limit is not None else self._block_end(at)
+
+    def _read_size(self, m):
+        t = m["type"]
+        if t in SCALARS:
+            return struct.calcsize(SCALARS[t])
+        if t in HASHES:
+            return struct.calcsize(HASHES[t])
+        if t in ENUMS:
+            return struct.calcsize(ENUMS[t])
+        if t == 0x40:
+            return m["ref"]
+        return _HEADER_BYTES.get(t)
 
     def mark(self, number, absolute, n):
         btype, base, size = self.c.blocks[number - 1]
@@ -235,6 +255,9 @@ class Walker:
         btype, base, size = c.blocks[c.root - 1]
         if btype not in c.structs:
             st["root not a struct block"] += 1
+            return None
+        if size < c.structs[btype]["size"]:
+            st["root past block end"] += 1
             return None
         value = self.struct(btype, base, 0, c.root)
         reached = sum(sum(b) for b in self.cover)
@@ -251,18 +274,31 @@ class Walker:
             st["struct not in LSCH"] += 1
             return None
         if number:
+            _, base, size = c.blocks[number - 1]
+            limit = base + size
+        else:
+            limit = self._active_end(at)
+        if limit is None or at < 0 or at + s["size"] > limit:
+            st["struct past block end"] += 1
+            return None
+        if number:
             self.mark(number, at, s["size"])
         if (name, at) in self.seen or depth > MAX_DEPTH:
             return None
         self.seen.add((name, at))
         st["structs"] += 1
         out = {} if self.keep else None
-        for m in s["members"]:
-            if m["hash"] == ELEMENT:
-                continue
-            v = self.value(m, s["members"], at + m["offset"], depth)
-            if self.keep:
-                out[f"{m['hash']:08x}"] = v
+        prev_limit = self._limit
+        self._limit = limit
+        try:
+            for m in s["members"]:
+                if m["hash"] == ELEMENT:
+                    continue
+                v = self.value(m, s["members"], at + m["offset"], depth)
+                if self.keep:
+                    out[f"{m['hash']:08x}"] = v
+        finally:
+            self._limit = prev_limit
         return out
 
     def elements(self, el, members, base, count, depth):
@@ -273,6 +309,12 @@ class Walker:
         c, st, blob = self.c, self.stats, self.c.blob
         t = m["type"]
         st[f"type {t:02x}"] += 1
+        need = self._read_size(m)
+        if need is not None:
+            end = self._active_end(at)
+            if end is None or at < 0 or at + need > end:
+                st["member past block end"] += 1
+                return None
         if t in SCALARS:
             v = struct.unpack_from(SCALARS[t], blob, at)
             return (v[0] if len(v) == 1 else list(v)) if self.keep else None
@@ -301,8 +343,11 @@ class Walker:
             return self.struct(btype, absolute, depth + 1, number)
         if t == 0x44 and blob[at + 15] & 0x80:
             n = blob[at + 15] & 0x7F
-            st["short strings in place" if n <= 15 and blob[at + n] == 0 else "short string length mismatch"] += 1
-            return blob[at:at + n].decode("utf-8", "replace") if self.keep else None
+            if n <= 15 and blob[at + n] == 0:
+                st["short strings in place"] += 1
+                return blob[at:at + n].decode("utf-8", "replace") if self.keep else None
+            st["short string length mismatch"] += 1
+            return None
         if t in (0x42, 0x44):
             r = c.resolve(at, 1, st, "string pointer")
             if r is None:
@@ -317,8 +362,6 @@ class Walker:
             self.mark(number, absolute, end - absolute + 1)
             return blob[absolute:end].decode("utf-8", "replace") if self.keep else None
         if t == 0x40:
-            if at + m["ref"] > len(blob):
-                raise IndexError("char array past end of blob")
             st["char arrays"] += 1
             return blob[at:at + m["ref"]].split(b"\0")[0].decode("utf-8", "replace") if self.keep else None
         if t in (0x50, 0x53, 0x54, 0x5C, 0x52):
@@ -362,18 +405,21 @@ class Walker:
         if t in (0x50, 0x53):
             st["fixed arrays"] += 1
             n = m["ref"] & 0xFFFF
-            end = self._block_end(at)
-            if end is None or at + size * n > end:
+            end = self._active_end(at)
+            if end is None or at < 0 or at + size * n > end:
                 st["fixed array out of bounds"] += 1
                 return None
             return self.elements(el, members, at, n, depth)
         if t == 0x54:
+            end = self._active_end(at)
+            if end is None or at < 0 or at + 8 > end:
+                st["inline array out of bounds"] += 1
+                return None
             capacity, count = struct.unpack_from("<II", blob, at)
             st["inline arrays"] += 1
             st["count <= capacity" if count <= capacity else "count > capacity"] += 1
             n = min(count, capacity)
-            end = self._block_end(at)
-            if end is None or at + 8 + size * n > end:
+            if at + 8 + size * n > end:
                 st["inline array out of bounds"] += 1
                 return None
             return self.elements(el, members, at + 8, n, depth)
@@ -395,7 +441,13 @@ class Walker:
         want = el["ref"] if el["type"] == 0x05 else el["type"]
         st[f"{kind} block type matches element" if btype == want else f"{kind} block type differs"] += 1
         self.mark(number, absolute, size * count)
-        return self.elements(el, members, absolute, count, depth)
+        _, blk_base, blk_size = c.blocks[number - 1]
+        prev_limit = self._limit
+        self._limit = blk_base + blk_size
+        try:
+            return self.elements(el, members, absolute, count, depth)
+        finally:
+            self._limit = prev_limit
 
     def map(self, m, members, at, depth):
         c, st, blob = self.c, self.stats, self.c.blob
@@ -463,11 +515,17 @@ class Walker:
                      if blob[absolute + i * slot:absolute + i * slot + ks] != bytes(ks)]
             st[f"{kind} used slots == count" if len(slots) == count else f"{kind} used slots != count"] += 1
         st[f"{kind} pairs"] += len(slots)
-        for s in slots:
-            k = self.value(key, members, s, depth + 1)
-            v = self.value(val, members, s + voff, depth + 1)
-            if self.keep:
-                pairs.append([k, v])
+        _, blk_base, blk_size = c.blocks[number - 1]
+        prev_limit = self._limit
+        self._limit = blk_base + blk_size
+        try:
+            for s in slots:
+                k = self.value(key, members, s, depth + 1)
+                v = self.value(val, members, s + voff, depth + 1)
+                if self.keep:
+                    pairs.append([k, v])
+        finally:
+            self._limit = prev_limit
         return pairs if self.keep else None
 
 
@@ -515,6 +573,17 @@ def main():
     if not os.path.exists(a.src):
         print(f"ERROR: {a.src}: no such file or folder", file=sys.stderr)
         return 2
+    if os.path.isfile(a.src):
+        # a directory skips a stream without the magic, but a lone file named on the command line is a wrong path
+        try:
+            with open(a.src, "rb") as f:
+                magic = f.read(4)
+        except OSError as e:
+            print(f"ERROR: {a.src}: {e}", file=sys.stderr)
+            return 2
+        if magic != psin_index.MAGIC:
+            print(f"ERROR: {a.src}: not a PSIN container", file=sys.stderr)
+            return 2
     if a.dump:
         if not os.path.isfile(a.src):
             print("ERROR: --dump takes one PSIN file", file=sys.stderr)

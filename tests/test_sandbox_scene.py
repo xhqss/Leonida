@@ -5,6 +5,7 @@ import os
 import sys
 import struct
 import tempfile
+import tracemalloc
 import unittest
 from contextlib import redirect_stderr
 
@@ -74,6 +75,22 @@ class TestSandboxScene(unittest.TestCase):
         self.assertAlmostEqual(result[1]["_pos"][0], 3.0, places=6)
         self.assertAlmostEqual(result[1]["_pos"][1], 3.0, places=6)
 
+    def test_full_selection_memory(self):
+        # Searching past missing models needs every nearby candidate, without
+        # retaining distance/row tuples and duplicate full-size reference lists.
+        rows = [{"_pos": (0.0, 0.0)}] * 100_000
+        tracemalloc.start()
+        try:
+            picked = sandbox_scene.select_rows(rows, (0, 0), 1, len(rows))
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(len(picked), len(rows))
+        self.assertTrue(all(row is rows[0] for row in picked))
+        # Allow eight pointers per row, including temporary sorting storage.
+        # The original tuple-based selection needs more than twelve on x64.
+        self.assertLess(peak, 8 * struct.calcsize("P") * len(rows))
+
     def test_mesh_bytes(self):
         prim = {
             "positions": [(0, 0, 0), (1, 0, 0), (0, 1, 0)],
@@ -124,6 +141,9 @@ class TestCliErrors(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertEqual(len(err.strip().splitlines()), 1)
         self.assertTrue(err.startswith("ERROR:"))
+        # the refusal is up front and says why, not a repr'd OSError with doubled backslashes
+        self.assertIn("is a folder, not a scene file", err)
+        self.assertNotIn("[Errno", err)
 
     def test_out_under_a_regular_file_is_one_error_line(self):
         reg = os.path.join(self.tmp.name, "reg")

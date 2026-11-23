@@ -22,6 +22,7 @@ ASSUMPTION: the order of the regions inside a buffer, the leaf packing and the b
 only reaches the regions through the header, so those choices do not change what it reads.
 
 Standard library only. Nothing here reads game files; ``validate`` reads a buffer the user dumped locally.
+Usage: `python -I tools/xdxr_bvh.py --help` lists the options.
 """
 import argparse
 import math

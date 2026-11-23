@@ -15,6 +15,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -94,8 +95,24 @@ inline bool parse_model_id(const std::string& text, uint32_t& out) {
     return true;
 }
 
+// A JSON number that is a whole value in [0, max]. Checked before any integer cast: converting a double outside the
+// target type's range is undefined, so `v != static_cast<int>(v)` cannot be the test for a value past INT_MAX.
+inline bool whole_number(double v, double max) { return v >= 0 && v <= max && v == std::floor(v); }
+
 // Parses one mod.json's text. On failure returns false with `error` set; `mod` is then not to be used.
 inline bool parse_mod(std::string_view text, const std::string& folder, Mod& mod, std::string& error) {
+    // Windows editors and shells mark the encoding. Notepad's "UTF-8 with BOM" and Windows PowerShell 5.1's
+    // `-Encoding utf8` put EF BB BF in front of the same JSON, so it is skipped. PowerShell 5.1's `>` writes UTF-16,
+    // which is not readable as bytes: say so, instead of blaming the JSON. A NUL in the first two bytes is UTF-16
+    // without a mark; no UTF-8 JSON text starts that way.
+    if (text.substr(0, 3) == std::string_view("\xEF\xBB\xBF", 3)) {
+        text.remove_prefix(3);
+    } else if (text.size() >= 2 && (text.substr(0, 2) == std::string_view("\xFF\xFE", 2) ||
+                                    text.substr(0, 2) == std::string_view("\xFE\xFF", 2) || text[0] == '\0' ||
+                                    text[1] == '\0')) {
+        error = "mod.json is UTF-16; save it as UTF-8";
+        return false;
+    }
     Json root;
     if (!JsonReader(text).parse(root) || root.kind != Json::Kind::object) {
         error = "mod.json is not a JSON object";
@@ -161,7 +178,7 @@ inline bool parse_mod(std::string_view text, const std::string& folder, Mod& mod
         }
         mod.camera.first_person = view->string == "first_person";
         if (const Json* v = cam->find("first_person_value")) {
-            if (v->kind != Json::Kind::number || v->number < 0 || v->number > 255 || v->number != static_cast<int>(v->number)) {
+            if (v->kind != Json::Kind::number || !whole_number(v->number, 255)) {
                 error = "\"camera\": \"first_person_value\" must be a whole number 0-255";
                 return false;
             }
@@ -173,8 +190,8 @@ inline bool parse_mod(std::string_view text, const std::string& folder, Mod& mod
                 return false;
             }
             for (const Json& x : c->array) {
-                if (x.kind != Json::Kind::number || x.number < 0 || x.number != static_cast<int>(x.number)) {
-                    error = "\"camera\": \"contexts\" must be a list of whole numbers";
+                if (x.kind != Json::Kind::number || !whole_number(x.number, 4294967295.0)) {
+                    error = "\"camera\": \"contexts\" must be a list of whole numbers from 0 to 4294967295";
                     return false;
                 }
                 mod.camera.contexts.push_back(static_cast<uint32_t>(x.number));

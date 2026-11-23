@@ -66,8 +66,12 @@ HRESULT call_slot(void* object, unsigned slot) {
 }
 
 ULONG_PTR g_fault_address = 0;
+// The code is taken in the filter, from the exception record: GetExceptionCode() in the __except body returns 0
+// under Wine 9.0 (clang-cl reads it from what the unwind hands the handler, which that Wine does not supply).
+DWORD g_fault_code = 0;
 
 int record_fault(EXCEPTION_POINTERS* info) {
+    g_fault_code = info->ExceptionRecord->ExceptionCode;
     g_fault_address = info->ExceptionRecord->NumberParameters >= 2 ? info->ExceptionRecord->ExceptionInformation[1] : 0;
     return EXCEPTION_EXECUTE_HANDLER;
 }
@@ -80,12 +84,13 @@ __declspec(noinline) void* read_entry(void* const* vtable, unsigned slot) {
 // Reads vtable[slot] the way a call through it does. The exception code, or 0 when the read worked.
 DWORD read_slot_guarded(void* const* vtable, unsigned slot) {
     g_fault_address = 0;
+    g_fault_code = 0;
     __try {
         void* volatile entry = read_entry(vtable, slot);
         (void)entry;
         return 0;
     } __except (record_fault(GetExceptionInformation())) {
-        return GetExceptionCode();
+        return g_fault_code;
     }
 }
 

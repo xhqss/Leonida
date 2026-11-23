@@ -2,23 +2,26 @@
 # Reads the exe only; no game code runs.
 param(
     [Parameter(Mandatory)][string]$Exe,
-    [string]$GameDir = (Split-Path $Exe -Parent)
+    [string]$GameDir
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
+$Exe = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Exe)
+if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { throw "$Exe not found" }
+$image = Get-Item -LiteralPath $Exe
+if (-not $GameDir) { $GameDir = $image.DirectoryName }
 $name = [IO.Path]::GetFileNameWithoutExtension($Exe)
 $out = Join-Path $root "reports\exe\$name"
 New-Item -ItemType Directory -Force $out | Out-Null
 
-if (-not (Test-Path $Exe)) { throw "$Exe not found" }
 $fs = [IO.File]::OpenRead($Exe); $mz = New-Object byte[] 2; [void]$fs.Read($mz, 0, 2); $fs.Close()
 if ([Text.Encoding]::ASCII.GetString($mz) -ne "MZ") {
     throw "$Exe doesn't start with an MZ header. It's still packaged or encrypted, so there's nothing to inspect."
 }
 
-$size = (Get-Item $Exe).Length
-$hash = (Get-FileHash $Exe -Algorithm SHA256).Hash.ToLower()
-"sha256 $hash  size $size" | Tee-Object (Join-Path $out "hash.txt")
+$size = $image.Length
+$hash = (Get-FileHash -LiteralPath $Exe -Algorithm SHA256).Hash.ToLower()
+"sha256 $hash  size $size" | Tee-Object -LiteralPath (Join-Path $out "hash.txt")
 
 Write-Host "`n== PE inspection"
 python -I (Join-Path $root "tools\pe_inspect.py") $Exe --game-dir $GameDir --out $out
@@ -35,28 +38,59 @@ if ($LASTEXITCODE -ne 0) { Write-Warning "find_hash_lookup could not scan $Exe" 
 Write-Host "`n== What to confirm against this executable (every ASSUMPTION / UNVERIFIED / VERIFY note; called ones first)"
 $calls = Join-Path $out ((Split-Path $Exe -Leaf) + ".gdk_calls.json")
 $checklistArgs = @("--out", (Join-Path $out "checklist.md"))
-if (Test-Path $calls) { $checklistArgs += @("--gdk-calls", $calls) }
+if (Test-Path -LiteralPath $calls) { $checklistArgs += @("--gdk-calls", $calls) }
 python -I (Join-Path $root "tools\exe_checklist.py") @checklistArgs
 if ($LASTEXITCODE -ne 0) { Write-Warning "exe_checklist could not write the checklist" }
 
-$rt = Join-Path $root "runtime\build\gta6rt.exe"
-$tlsHost = Join-Path $root "runtime\build\gta6rt_tls_host.dll"
-$runtimeFiles = @($rt, $tlsHost)
-$missing = @($runtimeFiles | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
+function Find-RuntimeLoader($build, $folders) {
+    foreach ($folder in $folders) {
+        $candidate = [IO.Path]::Combine($build, $folder, "gta6rt.exe")
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+}
+
+$build = Join-Path $root "runtime\build"
+$configs = @("RelWithDebInfo", "Release", "MinSizeRel", "Debug")
+$folders = @("") + $configs
+$rt = Find-RuntimeLoader $build $folders
 # A gta6rt.exe older than the runtime sources (a pull since the last build) would report the old shim table, so it
 # is rebuilt then too, not only when missing.
 $sources = @("runtime\src", "runtime\shims", "runtime\CMakeLists.txt") | ForEach-Object { Join-Path $root $_ } |
-    Where-Object { Test-Path $_ }
-$newest = $sources | Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue |
+    Where-Object { Test-Path -LiteralPath $_ }
+$newest = $sources | ForEach-Object { Get-ChildItem -LiteralPath $_ -Recurse -File -ErrorAction SilentlyContinue } |
     Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
-$stale = ($missing.Count -eq 0) -and $newest -and ($newest.LastWriteTimeUtc -gt (Get-Item -LiteralPath $rt).LastWriteTimeUtc)
-if ($stale) { Write-Host "runtime\build\gta6rt.exe is older than $($newest.Name): rebuilding it first" }
-if ($missing.Count -gt 0 -or $stale) {
-    if ($missing.Count -gt 0) { Write-Host "Missing runtime files: $($missing -join ', '); rebuilding the runtime" }
-    & (Join-Path $PSScriptRoot "build_runtime.ps1")
-    foreach ($file in $runtimeFiles) {
-        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "runtime build did not produce $file" }
+$stale = $rt -and $newest -and ($newest.LastWriteTimeUtc -gt (Get-Item -LiteralPath $rt).LastWriteTimeUtc)
+if ($stale) { Write-Host "$rt is older than $($newest.Name): rebuilding it first" }
+$tlsName = "gta6rt_tls_host.dll"
+$hasTls = $rt -and (Test-Path -LiteralPath (Join-Path (Split-Path -LiteralPath $rt) $tlsName) -PathType Leaf)
+if (-not $hasTls -or $stale) {
+    if (-not $hasTls) { Write-Host "Missing runtime files: gta6rt.exe and $tlsName must be in the same folder; rebuilding the runtime" }
+    $cache = Join-Path $build "CMakeCache.txt"
+    if ((Test-Path -LiteralPath $cache -PathType Leaf) -and
+        (Select-String -LiteralPath $cache -Pattern '^CMAKE_GENERATOR:INTERNAL=Visual Studio ' -Quiet)) {
+        # The wrapper configures Ninja and cannot reuse a Visual Studio build tree.
+        $commandEntry = Select-String -LiteralPath $cache -Pattern '^CMAKE_COMMAND:INTERNAL=(.+)$'
+        if (-not $commandEntry) { throw "Missing CMAKE_COMMAND in $cache. Reconfigure the Visual Studio build and retry." }
+        $cmake = $commandEntry.Matches.Groups[1].Value
+        $folders = $configs
+        $types = Select-String -LiteralPath $cache -Pattern '^CMAKE_CONFIGURATION_TYPES:[^=]+=(.+)$'
+        if ($types) {
+            $available = $types.Matches.Groups[1].Value -split ';'
+            $folders = @($configs | Where-Object { $_ -in $available })
+        }
+        $existing = Find-RuntimeLoader $build $folders
+        $configArgs = @()
+        if ($existing) { $configArgs = @("--config", (Split-Path (Split-Path $existing) -Leaf)) }
+        elseif ($types -and $folders.Count) { $configArgs = @("--config", $folders[0]) }
+        & $cmake --build $build --target gta6rt @configArgs
+        if ($LASTEXITCODE -ne 0) { throw "Building gta6rt in $build failed ($LASTEXITCODE)" }
+    } else {
+        & (Join-Path $PSScriptRoot "build_runtime.ps1")
     }
+    $rt = Find-RuntimeLoader $build $folders
+    if (-not $rt) { throw "runtime build did not produce gta6rt.exe in $build" }
+    $tlsHost = Join-Path (Split-Path -LiteralPath $rt) $tlsName
+    if (-not (Test-Path -LiteralPath $tlsHost -PathType Leaf)) { throw "runtime build did not produce $tlsHost" }
 }
 Write-Host "`n== Loader dry run (map, relocate, bind imports; nothing executes)"
 & {
@@ -64,11 +98,11 @@ Write-Host "`n== Loader dry run (map, relocate, bind imports; nothing executes)"
     $ErrorActionPreference = "Continue"
     $PSNativeCommandUseErrorActionPreference = $false
     & $rt --dry-run $Exe --game-dir $GameDir 2>&1
-} | Tee-Object (Join-Path $out "dryrun.txt") | Select-Object -Last 40
+} | Tee-Object -LiteralPath (Join-Path $out "dryrun.txt") | Select-Object -Last 40
 $dryRunExitCode = $LASTEXITCODE
 
 # Shim to-do list, grouped by DLL, most functions first.
-$report = Get-Content (Join-Path $out "$([IO.Path]::GetFileName($Exe)).json") -Raw | ConvertFrom-Json
+$report = Get-Content -LiteralPath (Join-Path $out "$([IO.Path]::GetFileName($Exe)).json") -Raw | ConvertFrom-Json
 $todo = $report.imports | Where-Object { $_.where -eq "shim" } | Sort-Object { -$_.functions.Count }
 $lines = foreach ($t in $todo) { "{0,-40} {1,5}" -f $t.dll, $t.functions.Count }
 Set-Content -LiteralPath (Join-Path $out "shim-todo.txt") -Value $lines

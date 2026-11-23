@@ -44,7 +44,7 @@ VALUE_TYPES = {0x10: "int", 0x20: "bool", 0x30: "bool", 0x40: "float", 0x50: "ve
 XML_BAD = re.compile(r"[^\u0009\u000a\u000d\u0020-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
 CSV_COLUMNS = ["resource", "root", "status", "parent", "slot", "sibling", "child_index", "depth", "kind",
                "name", "descriptor", "offset", "end", "attrs", "children", "content_count", "type",
-               "length", "nul", "utf8", "value"]
+               "length", "nul", "utf8", "value", "source"]
 
 
 def _utf8(raw):
@@ -619,7 +619,7 @@ def write_csv(path, docs):
                         resource, doc["root_name"], doc["status"], parent, slot, sibling, child_index,
                         node["depth"], node["kind"], node["name"], node["descriptor"],
                         f"0x{node['offset']:x}", end, node["attrs_declared"], node["children"],
-                        node["content_count"], "", "", "", "", ""])
+                        node["content_count"], "", "", "", "", "", doc["source"]])
                     content = node["content"]
                     child_indices = []
                     next_child = 0
@@ -646,13 +646,13 @@ def write_csv(path, docs):
                         f"0x{node['offset']:x}", "", "", "", "", node["type"],
                         node.get("byte_length", ""),
                         "" if "nul_terminated" not in node else int(node["nul_terminated"]),
-                        "" if "utf8_valid" not in node else int(node["utf8_valid"]), value])
+                        "" if "utf8_valid" not in node else int(node["utf8_valid"]), value, doc["source"]])
                 else:
                     writer.writerow([
                         resource, doc["root_name"], doc["status"], parent, slot, sibling, child_index,
                         node["depth"], node["kind"], "", "", f"0x{node['offset']:x}", "",
                         "", "", "", "text", node["length"],
-                        int(node["nul_terminated"]), int(node["utf8_valid"]), node["text"]])
+                        int(node["nul_terminated"]), int(node["utf8_valid"]), node["text"], doc["source"]])
 
 
 def write_json(path, docs, summary):
@@ -739,10 +739,10 @@ def main(argv=None):
     except SelectionError as error:
         ap.error(str(error))
     except RecursionError:
-        print(f"{path!r}: tree exceeds the export depth limit", file=sys.stderr)
+        print(f"{path}: tree exceeds the export depth limit", file=sys.stderr)
         return 1
     except OSError as error:
-        print(f"{path!r}: {error.strerror or error}", file=sys.stderr)
+        print(f"{path}: {error.strerror or error}", file=sys.stderr)
         return 1
     if not args.quiet:
         print(f"{summary['resources']} resources: {summary['ok']} ok, {summary['bad']} bad, "

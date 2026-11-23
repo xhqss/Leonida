@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Memory ops merged with CPU-only checks (#1633's global_atomic_*, #1643 buffer_atomic_*_x2, #1666 8/16-bit global
 ; stores and d16 loads, global_atomic_*_x2), run once on a GPU. As cs_global_neg_offset: 40 groups make a 0x2800-byte
 ; heap, only group 0 thread 0 runs, global addresses are heap offsets (s[20:21] = P = 0x2000, v30 = 0).

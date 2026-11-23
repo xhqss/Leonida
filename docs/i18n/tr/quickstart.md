@@ -3,7 +3,7 @@
 > [!NOTE]
 > İngilizce dokümantasyon ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) ve
 > [`docs/README.md`](../../README.md)) **yetkili kaynaktır**. Bu rehber yalnızca kararlı kurulum ve derleme
-> yönergelerini kapsar (`f85582e` commit'ine göre eşitlenmiştir). Günlük değişen proje durumu için
+> yönergelerini kapsar (`561b65a` commit'ine göre eşitlenmiştir). Günlük değişen proje durumu için
 > [`README.md`](../../../README.md) dosyasına bakın.
 
 ## Leonida Nedir?
@@ -27,7 +27,8 @@ Proje henüz erken aşamadadır: **oyun şu an açılmıyor**.
 - **Kendi Xbox Series paket kopyanız**, sürüm `1.0.2.1` (`MicrosoftGame.Config` dosyasını ve `.rpf` arşivlerini diskte
   düz dosyalar olarak barındıran klasör).
 - **Windows 10/11 x64** ve çalışma dosyaları için yaklaşık **400 GB boş disk alanı** (`--work` ile başka bir diske
-  yönlendirilebilir).
+  yönlendirilebilir). Bu rakam tam derleme içindir: yalnızca çalıştırmak için `--stages check,shaders,runtime`
+  yaklaşık 30 GB ister, `assets` aşaması ise yaklaşık 370 GB.
 - [Python 3.12+](https://www.python.org/downloads/) (kurulumda *"Add python.exe to PATH"* seçeneğini işaretleyin).
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [Vulkan SDK](https://vulkan.lunarg.com/) (`spirv-as`, `spirv-val` ve `vulkaninfo` için).
@@ -36,6 +37,10 @@ Proje henüz erken aşamadadır: **oyun şu an açılmıyor**.
   - AMDGPU destekli yerel `llvm-mc.exe` derlemek için depo kök dizininde PowerShell'den `.\scripts\build_llvm_mc.ps1`
     betiğini çalıştırın (`git` ve aşağıdaki Visual Studio C++ araçları gerekir). Betik kullanıcınız için `LLVM_MC`
     ortam değişkenini ayarlar; geçerli olması için yeni bir terminal açın.
+  - Daha hızlı bir yol: [conda](https://docs.conda.io/) kullanıyorsanız `conda install -c conda-forge llvm-tools`
+    (Windows derlemesi AMDGPU hedefini içerir; [`docs/testing.md`](../../testing.md) 23.1.6 sürümünü kullandı), ardından
+    `LLVM_MC` değişkenini kurduğu `llvm-mc.exe` dosyasının tam yoluna ayarlayın (ortam etkinleştirildikten sonra
+    `where.exe llvm-mc` yolunu gösterir; PowerShell'de çıplak `where` komutu `Where-Object` demektir).
   - Alternatif olarak WSL (Ubuntu) içinde `llvm-21` kurup `make_game.py` çalıştıracağınız PowerShell oturumunda
     `LLVM_MC` değişkenini tam komut olarak ayarlayın:
 
@@ -71,7 +76,9 @@ yazılır; yarım kalan bir derleme kaldığı yerden devam eder.
 
 ```powershell
 python -I make_game.py --find                          # bilgisayarda bulunan kopyaları listele
+python -I make_game.py --pick                          # oyun klasörünü bir klasör penceresinde seç
 python -I make_game.py --check                         # kopyayı doğrula, derleme yapma
+python -I make_game.py --check --full-check            # ayrıca her dosyanın SHA-256 özetini karşılaştır (yavaş)
 python -I make_game.py --game "D:\paket\yolu" --out "D:\Games\Leonida" --work "E:\leonida-work"
 python -I make_game.py --stages shaders,assets         # yalnızca seçili aşamaları çalıştır
 python -I make_game.py --game "D:\paket\yolu" --wav    # Opus akışlarını ayrıca PCM WAV'a çöz (büyük boyut)
@@ -83,7 +90,8 @@ Aşamalar şu sırayla çalışır: `check` → `shaders` → `assets` → `runt
 - **`--wave64-emulate`**: Wave64 compute ve mesh shader'larını her subgroup genişliğinde birebir çalışacak şekilde
   çevirir. NVIDIA ve Intel GPU'lar 32 şeritli subgroup kullandığı için buna ihtiyaç duyar. Varsayılan `auto` modu
   `vulkaninfo` çıktısına bakar ve tüm GPU'lar yerel 64 şeritli subgroup bildirmediği sürece emülasyonu otomatik açar.
-- **`--work`**: En az 400 GB boş alana sahip bir sürücü seçin. En uzun adım shader çevirisidir ve varsayılan olarak
+- **`--work`**: Tam derleme için en az 400 GB boş alana sahip bir sürücü seçin (yalnızca çalıştırmak için yaklaşık
+  30 GB, `assets` aşaması için yaklaşık 370 GB yeterlidir). En uzun adım shader çevirisidir ve varsayılan olarak
   CPU iş parçacıklarının yarısını kullanır (`--jobs` ile değiştirilebilir).
 - **`--wav`**: Varsayılan olarak kapalıdır; 16-bit PCM WAV dosyaları Ogg Opus'tan birkaç kat daha büyüktür.
 - **Linux ve Wine/Proton**: `make_game.py` Linux'ta da çalışır. Yükleyici (`gta6rt.exe`) bir Windows programıdır ve

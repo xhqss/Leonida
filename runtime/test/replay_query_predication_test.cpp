@@ -5,7 +5,9 @@
 // how resolves inside a pipeline-statistics query are replayed; cases 7 and 8 cover the other helper dispatches
 // and their no-pool fallback (D3D-162). Cases 9 to 13 check overlapping queries: statistics over statistics, binary
 // inside ordinary, the composite sum-and-normalize binary resolve, helper dispatches inside overlapping statistics
-// queries, and the single-list refusal (D3D-252) and, with a pool, its replay (D3D-399). No GPU or game data.
+// queries, the single-list refusal (D3D-252) and, with a pool, its replay (D3D-399). Cases 15 and 16 check queries
+// that hold mesh draws, split between the full and the mesh-compatible pool, alone and overlapping (D3D-291). No GPU or
+// game data.
 #include "../src/vulkan_replay.h"
 #include <cstdint>
 #include <cstdio>
@@ -125,8 +127,8 @@ int main() {
     vk.query_pool = [&](QueryHeapId id) -> QueryPool* {
         return id == 1 ? &heap : id == 6 ? &statistics_heap : nullptr;
     };
-    vk.sum_statistics = [](VkCommandBuffer, VkQueryPool pool, std::uint32_t first, std::uint32_t count, VkBuffer,
-                           VkDeviceSize) {
+    vk.sum_statistics = [](VkCommandBuffer, VkQueryPool pool, VkQueryPool, const std::uint8_t*, std::uint32_t first,
+                           std::uint32_t count, VkBuffer, VkDeviceSize) {
         g_trace->events.push_back(query_event("sum_statistics", pool, first) + "+" + std::to_string(count));
     };
     vk.resolve_binary_occlusion = [](VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer,
@@ -617,6 +619,140 @@ int main() {
                                             "end_query 8:1",   "begin_query 8:2", "end_query 8:2",
                                             "sum_occlusion 8:0+3"};
         expect(trace.events == want, "pooled: the same segments and sums as the batched path");
+    }
+
+    // 15. D3D-291: a pipeline-statistics query around vertex, mesh, mesh and vertex draws is split where the kind
+    //    changes, the mesh segment is marked for the mesh pool, and its resolve sums the three segments. A query that
+    //    holds only a mesh draw is one mesh segment, still summed so its counters land in their D3D12 fields; one
+    //    with only vertex draws is not split.
+    {
+        Trace trace;
+        g_trace = &trace;
+        const auto draw = [](bool mesh) {
+            Draw d{};
+            d.pipeline = 1;
+            d.count = d.instances = d.first = 1;
+            d.mesh = mesh;
+            return d;
+        };
+        CommandList list;
+        expect(list.begin_query({6, d3d12_query::pipeline_statistics, 0}), "record mixed begin");     // 0
+        expect(list.draw(draw(false)), "record vertex draw");                                           // 1
+        expect(list.draw(draw(true)), "record mesh draw");                                              // 2
+        expect(list.draw(draw(true)), "record second mesh draw");                                       // 3
+        expect(list.draw(draw(false)), "record second vertex draw");                                    // 4
+        expect(list.end_query({6, d3d12_query::pipeline_statistics, 0}), "record mixed end");          // 5
+        expect(list.begin_query({6, d3d12_query::pipeline_statistics, 1}), "record mesh-only begin");  // 6
+        expect(list.draw(draw(true)), "record lone mesh draw");                                         // 7
+        expect(list.end_query({6, d3d12_query::pipeline_statistics, 1}), "record mesh-only end");      // 8
+        expect(list.begin_query({6, d3d12_query::pipeline_statistics, 0}), "record vertex-only begin"); // 9
+        expect(list.draw(draw(false)), "record lone vertex draw");                                      // 10
+        expect(list.end_query({6, d3d12_query::pipeline_statistics, 0}), "record vertex-only end");    // 11
+        expect(list.resolve_queries({6, d3d12_query::pipeline_statistics, 1, 1, 1, 0}), "record mesh resolve");
+        expect(list.close(), "close mixed list");
+        expect(list.commands().size() == 13, "mixed list: thirteen commands");
+
+        // The draws need a pipeline and attachments to prepare, so the query plan is built by hand here; the GPU
+        // test d3d12_mesh_test replays the same shape.
+        PreparedList prepared;
+        prepared.list = &list;
+        prepared.commands.assign(list.commands().size(), {});
+        for (std::size_t i : {0, 5, 6, 8, 9, 11, 12}) {
+            const bool begin = std::holds_alternative<BeginQuery>(list.commands()[i]);
+            prepared.queries.push_back({i, &statistics_heap, begin});  // as prepare() records statistics_active
+        }
+        plan_statistics_segments(prepared);
+        expect(prepared.statistics_segment_count == 4, "mixed list: three segments and one for the mesh-only query");
+        expect(prepared.statistics_mesh == std::vector<std::uint8_t>({0, 1, 0, 1}),
+               "mixed list: vertex, mesh, vertex, then the mesh-only query's mesh segment");
+        const auto& c = prepared.commands;
+        constexpr auto none = UINT32_MAX;
+        expect(c[1].statistics_begin == none && c[3].statistics_begin == none && c[7].statistics_begin == none &&
+                   c[10].statistics_begin == none,
+               "mixed list: no split before a draw of the segment's own kind");
+        expect(c[2].statistics_end == 0 && c[2].statistics_begin == 1, "mixed list: the first mesh draw splits");
+        expect(c[4].statistics_end == 1 && c[4].statistics_begin == 2, "mixed list: the vertex draw after it splits");
+        const auto& q = prepared.queries;
+        expect(q[0].statistics_begin == 0 && q[1].statistics_end == 2 && q[1].statistics_first == 0 &&
+                   q[1].statistics_count == 3,
+               "mixed list: the query ends in its third segment and sums all three");
+        expect(q[2].statistics_begin == 3 && q[3].statistics_end == 3 && q[3].statistics_count == 1,
+               "mixed list: the mesh-only query is one segment");
+        expect(q[4].statistics_begin == detail::PreparedQuery::no_segment &&
+                   q[5].statistics_end == detail::PreparedQuery::no_segment,
+               "mixed list: the vertex-only query is not split");
+
+        auto segments = std::make_shared<OcclusionSegmentPool>();
+        segments->pool = handle<VkQueryPool>(9);
+        segments->mesh_pool = handle<VkQueryPool>(10);
+        segments->mesh = prepared.statistics_mesh;
+        segments->destroy = mock_destroy_pool;
+        QueryReplay queries;
+        expect(queries.plan(prepared, {}, 0, true, segments, 0) == ReplayResult::success, "plan mixed list");
+        expect(prepared.statistics_mesh_pool == handle<VkQueryPool>(10), "mixed list: the mesh pool is the list's");
+        expect(q[6].resolves.size() == 1 && q[6].resolves[0].sum && q[6].resolves[0].first == 3 &&
+                   q[6].resolves[0].count == 1 && q[6].resolves[0].mesh_pool == handle<VkQueryPool>(10) &&
+                   q[6].resolves[0].mesh && q[6].resolves[0].mesh[3] == 1,
+               "mixed list: the mesh-only query's resolve sums its one mesh segment");
+        expect(queries.needs_statistics_sum, "mixed list: the statistics sum helper is needed");
+
+        // Without the mesh-compatible pool, the query cannot run unsplit around a mesh draw.
+        PreparedList again = prepared;
+        again.statistics_pool = again.statistics_mesh_pool = VK_NULL_HANDLE;
+        auto full_only = std::make_shared<OcclusionSegmentPool>();
+        full_only->pool = handle<VkQueryPool>(9);
+        full_only->destroy = mock_destroy_pool;
+        QueryReplay refused;
+        expect(refused.plan(again, {}, 0, true, full_only, 0) == ReplayResult::unsupported,
+               "mixed list: refused without the mesh pool");
+        QueryReplay unsplit;
+        expect(unsplit.plan(again, {}, 0, true, {}, 0) == ReplayResult::unsupported,
+               "mixed list: refused without a segment pool");
+    }
+
+    // 16. D3D-291 with overlapping statistics queries (D3D-252's planner): query 0 holds a vertex and a mesh draw,
+    //     query 1 (begun inside it) a mesh draw, then a mesh and a vertex draw after query 0 ends. Every Begin and
+    //     End opens a segment as before; the vertex draw after the mesh draws opens one more, so the four segments
+    //     are vertex, mesh, mesh, vertex, query 0 sums segments 0-1 and query 1 segments 1-3.
+    {
+        const auto draw = [](bool mesh) {
+            Draw d{};
+            d.pipeline = 1;
+            d.count = d.instances = d.first = 1;
+            d.mesh = mesh;
+            return d;
+        };
+        CommandList list;
+        expect(list.begin_query({6, d3d12_query::pipeline_statistics, 0}), "record overlap-mesh begin 0");  // 0
+        expect(list.draw(draw(false)), "record overlap-mesh vertex draw");                                   // 1
+        expect(list.begin_query({6, d3d12_query::pipeline_statistics, 1}), "record overlap-mesh begin 1");  // 2
+        expect(list.draw(draw(true)), "record overlap-mesh mesh draw");                                      // 3
+        expect(list.end_query({6, d3d12_query::pipeline_statistics, 0}), "record overlap-mesh end 0");      // 4
+        expect(list.draw(draw(true)), "record overlap-mesh second mesh draw");                               // 5
+        expect(list.draw(draw(false)), "record overlap-mesh second vertex draw");                            // 6
+        expect(list.end_query({6, d3d12_query::pipeline_statistics, 1}), "record overlap-mesh end 1");      // 7
+        expect(list.close(), "close overlap-mesh list");
+        PreparedList prepared;
+        prepared.list = &list;
+        prepared.commands.assign(list.commands().size(), {});
+        for (std::size_t i : {0, 2, 4, 7}) {
+            const bool begin = std::holds_alternative<BeginQuery>(list.commands()[i]);
+            prepared.queries.push_back({i, &statistics_heap, begin});
+        }
+        expect(plan_overlapping_statistics_segments(prepared) == ReplayResult::success, "plan overlap-mesh list");
+        expect(prepared.statistics_segment_count == 4, "overlap-mesh: four segments");
+        expect(prepared.statistics_mesh == std::vector<std::uint8_t>({0, 1, 1, 0}),
+               "overlap-mesh: vertex, mesh, mesh, vertex");
+        const auto& c = prepared.commands;
+        constexpr auto none = detail::PreparedQuery::no_segment;
+        expect(c[1].statistics_begin == none && c[3].statistics_begin == none && c[5].statistics_begin == none,
+               "overlap-mesh: a segment's first draw and a draw of its kind do not split");
+        expect(c[6].statistics_end == 2 && c[6].statistics_begin == 3,
+               "overlap-mesh: the vertex draw after the mesh draws splits");
+        const auto& q = prepared.queries;
+        // queries[] follows the commands: Begin 0, Begin 1, End 0, End 1.
+        expect(q[2].statistics_first == 0 && q[2].statistics_count == 2, "overlap-mesh: query 0 sums segments 0-1");
+        expect(q[3].statistics_first == 1 && q[3].statistics_count == 3, "overlap-mesh: query 1 sums segments 1-3");
     }
 
     if (failures) return 1;

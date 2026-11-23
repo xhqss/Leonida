@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Narrow integer typed buffers: 8/16-bit UINT and SINT formats 5, 6, 11, 12, 18, 19, 28, 61 and 70.
 ; Lane 0 writes the source dwords 0x7f01ff80 0x8000ffff 0x12345678 0x9abcdef0 at byte 0x200, then:
 ; out[0..35]: buffer_load_format_xyzw with DST_SEL XYZW, four words per format in the order above;

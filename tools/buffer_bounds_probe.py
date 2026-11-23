@@ -17,7 +17,7 @@ Usage:
 Exit codes:
     0   every case matches the measured RDNA2/GFX11 column
     1   at least one case disagrees (or a wave32/wave64 result differs)
-    2   bad arguments or harness error
+    2   bad arguments (including a --json path this tool cannot write) or harness error
     77  hardware oracle unavailable or not a GFX10 device
 """
 import argparse
@@ -203,6 +203,15 @@ def main():
     if not waves or any(w not in (32, 64) for w in waves):
         print("--waves must be a non-empty list of 32 and/or 64", file=sys.stderr)
         return 2
+    if args.json_out:
+        # The report is written after the sweep, but a path that cannot be written must fail before the GPU work.
+        if os.path.isdir(args.json_out):
+            print(f"ERROR: --json {args.json_out} is a directory", file=sys.stderr)
+            return 2
+        folder = os.path.dirname(os.path.abspath(args.json_out))
+        if not os.path.isdir(folder):
+            print(f"ERROR: --json {args.json_out}: its folder {folder} does not exist", file=sys.stderr)
+            return 2
     from hw_oracle import asm, runner
     try:
         oracle = runner.open_oracle()
@@ -233,8 +242,13 @@ def main():
           f"{gfx10_diff} disagree with Mesa's GFX10 column, "
           f"{wave_diff} wave32/wave64 differences")
     if args.json_out:
-        with open(args.json_out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=2)
+        try:
+            with open(args.json_out, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=2)
+        except OSError as exc:
+            print(f"ERROR: cannot write {args.json_out}: {getattr(exc, 'strerror', None) or exc}",
+                  file=sys.stderr)
+            return 2
     return 1 if gfx11_diff or wave_diff else 0
 
 

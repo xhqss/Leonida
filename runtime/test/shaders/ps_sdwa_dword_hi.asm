@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; 16-bit SDWA results written with dst_sel:DWORD. The non-SDWA f16 VOP1/VOP2 forms keep the destination's high
 ; half (docs/design.md, 16-bit results), but an SDWA destination with dst_sel:DWORD takes the whole dword: the
 ; 16-bit result zero-extended, whatever dst_unused says. Measured natively on an AMD Radeon iGPU (gfx1036, RDNA2,

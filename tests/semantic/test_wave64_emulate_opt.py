@@ -1542,6 +1542,175 @@ class StructuredEmulationTests(unittest.TestCase):
         self.assertEqual(count_guards(raw_tree), 22)
         self.assertEqual(count_guards(unwrapped_tree), 12)
 
+    def test_slist_and_src_scc_liveness_and_scalar_rw(self):
+        sgpr = lambda r, n=1: {"k": "sgpr", "r": r, "n": n}
+        vgpr = lambda r, n=1: {"k": "vgpr", "r": r, "n": n}
+        spec = lambda t: {"k": "special", "t": t}
+        slist = lambda *regs: {"k": "slist", "r": list(regs), "n": len(regs)}
+
+        # reads_scc & scc_live_outs: explicit `src_scc` operand keeps the producer's SCC live.
+        prod = {"op": "s_and_saveexec_b64", "args": [sgpr(8, 2), spec("vcc")], "mods": ()}
+        cons = {"op": "s_mov_b32", "args": [sgpr(10), spec("src_scc")], "mods": ()}
+        end = {"op": "s_endpgm", "args": [], "mods": ()}
+        self.assertTrue(wave64_emulate_opt.reads_scc(cons))
+        self.assertIn(id(prod), wave64_emulate_opt.scc_live_outs([[prod, cons, end]], [[]]))
+        rd_scc, _, _ = wave64_emulate_opt._scalar_rw(cons)
+        self.assertEqual(rd_scc, 1 << wave64_emulate_opt._BIT_SCC)
+
+        # _scalar_rw on sgpr-pair slist copy/load.
+        load_pair = {"op": "s_buffer_load_dwordx2", "args": [slist(12, 13), slist(4, 5, 6, 7), {"k": "imm", "v": 0}], "mods": ()}
+        rd, mw, mk = wave64_emulate_opt._scalar_rw(load_pair)
+        self.assertEqual(rd, (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7))
+        self.assertEqual(mw, (1 << 12) | (1 << 13))
+        self.assertEqual(mk, (1 << 12) | (1 << 13))
+
+        # Partial vcc_lo in an slist: may_w includes VCC, must_kill kills s105 only (vcc_hi is preserved).
+        load_half = {"op": "s_buffer_load_dwordx2", "args": [slist(105, "vcc_lo"), sgpr(0, 4), {"k": "imm", "v": 0}], "mods": ()}
+        rd, mw, mk = wave64_emulate_opt._scalar_rw(load_half)
+        self.assertEqual(rd, 0xF)
+        self.assertEqual(mw, (1 << 105) | (1 << wave64_emulate_opt._BIT_VCC))
+        self.assertEqual(mk, 1 << 105)
+
+        # Full [vcc_lo, vcc_hi] slist overwrites both halves -> must_kill includes VCC.
+        load_vcc = {"op": "s_buffer_load_dwordx4", "args": [slist(104, 105, "vcc_lo", "vcc_hi"), sgpr(0, 4), {"k": "imm", "v": 0}], "mods": ()}
+        rd, mw, mk = wave64_emulate_opt._scalar_rw(load_vcc)
+        self.assertEqual(mw, (1 << 104) | (1 << 105) | (1 << wave64_emulate_opt._BIT_VCC))
+        self.assertEqual(mk, (1 << 104) | (1 << 105) | (1 << wave64_emulate_opt._BIT_VCC))
+
+        # VOP3b carry-out second destination as an slist.
+        add_co = {"op": "v_add_co_u32_e64", "args": [vgpr(0), slist(4, 5), vgpr(1), vgpr(2)], "mods": ()}
+        rd, mw, mk = wave64_emulate_opt._scalar_rw(add_co)
+        self.assertEqual(rd, 0)
+        self.assertEqual(mw, (1 << 4) | (1 << 5))
+        self.assertEqual(mk, (1 << 4) | (1 << 5))
+
+    def test_slist_lane_mask_and_barrier_classification(self):
+        sgpr = lambda r, n=1: {"k": "sgpr", "r": r, "n": n}
+        slist = lambda *regs: {"k": "slist", "r": list(regs), "n": len(regs)}
+
+        pair_45 = slist(4, 5)
+        pair_89 = slist(8, 9)
+        vcc_pair = slist("vcc_lo", "vcc_hi")
+
+        bcnt = {"op": "s_bcnt1_i32_b64", "args": [sgpr(0), pair_45], "mods": ()}
+        lm_45 = {id(bcnt): {4: "mask", 5: "mask"}}
+        self.assertTrue(wave64_emulate_opt._holds_lane_mask(bcnt, pair_45, lm_45[id(bcnt)]))
+        self.assertFalse(wave64_emulate_opt._holds_lane_mask(bcnt, pair_89, lm_45[id(bcnt)]))
+        self.assertTrue(wave64_emulate_opt._is_mask_op(bcnt, vcc_pair, {}))
+        self.assertTrue(wave64_emulate_opt._insn_may_barrier(bcnt, lm_45, set()))
+        clean, _, _, _, _ = wave64_emulate_opt._classify_block_body([bcnt], lm_45, set(), frozenset())
+        self.assertFalse(clean)
+
+        # Live-SCC mask vote with [vcc_lo, vcc_hi] destination must be treated as a barrier / non-foldable.
+        and_vcc = {"op": "s_and_b64", "args": [vcc_pair, sgpr(6, 2), sgpr(8, 2)], "mods": ()}
+        self.assertTrue(wave64_emulate_opt._insn_may_barrier(and_vcc, {}, {id(and_vcc)}))
+        clean, _, _, _, _ = wave64_emulate_opt._classify_block_body([and_vcc], {}, {id(and_vcc)}, frozenset())
+        self.assertFalse(clean)
+
+        # _is_uniform_scc_safe rejects 32-bit logic with live SCC reading a masked slist.
+        and_mask32 = {"op": "s_and_b32", "args": [sgpr(8), pair_45, sgpr(6)], "mods": ()}
+        self.assertFalse(wave64_emulate_opt._is_uniform_scc_safe([[and_mask32]], {id(and_mask32): {4: "mask"}}, {id(and_mask32)}))
+
+    def test_slist_live_out_scalar_and_src_scc_end_to_end(self):
+        # 1) Live-out scalar written via FSPX slist `[s105,vcc_lo]` inside s_cbranch_execz must NOT fold.
+        insns_live = [
+            ("v_mov_b32_e32 v10, 42", 4),
+            ("v_mov_b32_e32 v11, 0", 4),
+            ("buffer_store_dword v10, v11, s[0:3], 0 offen", 8),
+            ("s_mov_b32 s105, 0", 4),
+            ("s_mov_b32 exec_lo, 0", 4),
+            ("s_mov_b32 exec_hi, 0xff", 4),                # lanes 32..39 active; lanes 0..31 inactive
+            ("s_cbranch_execz 2", 4),                      # skip 2 dwords (8-byte SMEM load)
+            ("s_buffer_load_dwordx2 [s105,vcc_lo], s[0:3], 0", 8),
+            ("s_mov_b64 exec, -1", 4),
+            ("v_mov_b32_e32 v5, s105", 4),
+            ("v_lshlrev_b32_e32 v6, 2, v0", 4),
+            ("v_add_nc_u32_e32 v6, 256, v6", 4),
+            ("buffer_store_dword v5, v6, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        spv, _ = _translate_encoded("cs_slist_live_scalar", insns_live, (64, 1, 1), emulate=True)
+        self.assertGreaterEqual(spv.count("OpAtomicOr"), 1)
+        mem, _ = run_emulated_workgroup(spv, (64, 1, 1), push_constants=VSHARP + [0] * 28)
+        for lane in range(64):
+            self.assertEqual(mem[256 + lane * 4], 42, f"lane {lane}: stale s105 after slist load in s_cbranch_execz")
+
+        # 2) Explicit `src_scc` read after s_and_saveexec_b64 must keep SCC live (vote across all 64 lanes).
+        insns_scc = [
+            ("v_cmp_le_u32_e64 s[6:7], 32, v0", 8),        # only lanes 32..63 active -> wave SCC = 1
+            ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+            ("s_mov_b32 s10, src_scc", 4),
+            ("s_or_b64 exec, exec, s[8:9]", 4),
+            ("v_mov_b32_e32 v5, s10", 4),
+            ("v_lshlrev_b32_e32 v6, 2, v0", 4),
+            ("buffer_store_dword v5, v6, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        spv, _ = _translate_encoded("cs_src_scc_live", insns_scc, (64, 1, 1), emulate=True)
+        self.assertGreaterEqual(spv.count("OpAtomicOr"), 1)
+        mem, _ = run_emulated_workgroup(spv, (64, 1, 1), push_constants=VSHARP + [0] * 28)
+        for lane in range(64):
+            self.assertEqual(mem[lane * 4], 1, f"lane {lane}: src_scc lost wave vote after s_and_saveexec_b64")
+
+    def test_bounded_opcode_caches_and_superblock_dirty_transfer(self):
+        # 1) Bounded caches must stay within _OP_CACHE_MAX even with > _OP_CACHE_MAX synthetic opcodes.
+        limit = wave64_emulate_opt._OP_CACHE_MAX
+        wave64_emulate_opt._BASE_OP_CACHE.clear()
+        wave64_emulate_opt._OP_META_CACHE.clear()
+        for i in range(limit + 32):
+            op = f"v_synth_op_{i}_e32"
+            self.assertEqual(wave64_emulate_opt.base_op(op), f"v_synth_op_{i}")
+            meta = wave64_emulate_opt._get_op_meta(op)
+            self.assertEqual(meta[0], f"v_synth_op_{i}")
+        self.assertLessEqual(len(wave64_emulate_opt._BASE_OP_CACHE), limit)
+        self.assertLessEqual(len(wave64_emulate_opt._OP_META_CACHE), limit)
+
+        # 2) Precomputed superblock dirty transfer: s_barrier clears earlier dirty state while a
+        #    subsequent folded region's mem_reads still propagates to the successor block.
+        sgpr = lambda r, n=1: {"k": "sgpr", "r": r, "n": n}
+        vgpr = lambda r, n=1: {"k": "vgpr", "r": r, "n": n}
+        spec = lambda t: {"k": "special", "t": t}
+        imm = lambda v: {"k": "imm", "v": v}
+        ins_se = {"op": "s_and_saveexec_b64", "args": [sgpr(8, 2), spec("vcc")], "mods": ()}
+        blocks = [
+            [
+                {"op": "ds_write_b32", "args": [vgpr(0), vgpr(1)], "mods": ()},
+                {"op": "s_barrier", "args": [], "mods": ()},
+                ins_se,
+                {"op": "s_cbranch_execz", "args": [imm(2)], "mods": ()},
+            ],
+            [
+                {"op": "buffer_load_dword", "args": [vgpr(2), vgpr(0), sgpr(0, 4), imm(0)], "mods": ()},
+            ],
+            [
+                {"op": "s_or_b64", "args": [spec("exec"), spec("exec"), sgpr(8, 2)], "mods": ()},
+                {"op": "s_cmp_eq_u32", "args": [sgpr(4), imm(0)], "mods": ()},
+                {"op": "s_cbranch_scc0", "args": [imm(1)], "mods": ()},
+            ],
+            [
+                {"op": "buffer_store_dword", "args": [vgpr(2), vgpr(0), sgpr(0, 4), imm(0)], "mods": ()},
+                {"op": "s_endpgm", "args": [], "mods": ()},
+            ],
+            [
+                {"op": "s_endpgm", "args": [], "mods": ()},
+            ],
+        ]
+        raw_edges = [[2, 1], [2], [4, 3], [], []]
+        succ = [[2, 1], [2], [4, 3], [], []]
+        lm = {id(ins_se): {"vcc": True}}
+        scc_live = wave64_emulate_opt.scc_live_outs(blocks, succ)
+        folds, fold_chain, absorbed = wave64_emulate_opt.find_local_exec_folds(blocks, raw_edges, succ, lm, scc_live)
+        self.assertIn(0, folds)
+        self.assertEqual(fold_chain.get(0), 2)
+        plan = wave64_emulate_opt.plan_structured_emulation(
+            blocks, raw_edges, succ, folds, fold_chain, absorbed, lm, scc_live, 64
+        )
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan["mode"], "inline_all")
+        # s_barrier cleared ("lds", "w"), and folded block 1 added ("mem", "r") after it.
+        self.assertEqual(plan["dirty_in"][3], frozenset({("mem", "r")}))
+        self.assertEqual(plan["dirty_in"][4], frozenset({("mem", "r")}))
+
 
 if __name__ == "__main__":
     unittest.main()

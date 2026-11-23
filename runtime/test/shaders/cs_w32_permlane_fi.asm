@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; SHADER-74: v_permlane16_b32 / v_permlanex16_b32 with the SOURCE lane off in EXEC (wave32). Hardware measurement on
 ; RDNA2 by aslan2142 (issue #374): op_sel:[FI, BOUND_CTRL] (LLVM: llvm.amdgcn.permlane16 <fi> <bound_control> -> op_sel
 ; bits 0, 1). FI=1: the value of the off source lane. FI=0, BC=0: the destination lane is not written. FI=0, BC=1:

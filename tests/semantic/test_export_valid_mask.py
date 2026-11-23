@@ -1,8 +1,10 @@
-"""The PS valid mask: a pixel is discarded by EXEC at its last executed `exp ... vm`, not by EXEC at the end.
+"""The PS valid mask: a pixel is discarded by EXEC at its last executed `exp ... vm`, not by EXEC at the end, and a
+lane that was off at the last export to the color target is not written either.
 
 RDNA2 ISA reference guide (30-November-2020), 11.1 and 11.2.1: with VM set EXEC is the valid mask, the final one
-sent is used, and an export to NULL may carry only the mask. Not measured on hardware; docs/design.md, EXEC.
-Hand-written programs, no tools needed.
+sent is used, and an export to NULL may carry only the mask. Measured on RDNA2 (gfx1036, ps_oracle.py of #3061, 18
+programs; docs/design.md, EXEC): that rule holds, and the color export has its own mask, EXEC at that export, which
+is also what decides on a path with no `vm` export (class ColorExportMask). Hand-written programs, no tools needed.
 """
 from pathlib import Path
 import unittest
@@ -102,9 +104,49 @@ class StraightLine(unittest.TestCase):
     def test_a_later_export_without_vm_does_not_move_the_mask(self):
         self.check(EXP + OFF + EXP_MRT1, {**MRT0, "%out_mrt1": (0,) * 4})      # 0: the interpreter's unwritten output
 
-    def test_without_a_vm_export_exec_at_the_end_decides(self):
-        self.check(EXP_NO_VM + OFF, KILLED)
+    def test_without_a_vm_export_exec_at_the_color_export_decides(self):
+        # Hardware: `exp mrt0 done` with every lane on, EXEC cut afterwards: written; off at the export and back on
+        # afterwards: not written. Until 2026-11-23 EXEC at the end decided, the other way round for both.
+        self.check(EXP_NO_VM + OFF, MRT0)
         self.check(EXP_NO_VM + OFF + ON, MRT0)
+        self.check(OFF + EXP_NO_VM + ON, KILLED)
+        self.check(OFF + EXP_NO_VM, KILLED)
+
+
+class ColorExportMask(unittest.TestCase):
+    """Measured on RDNA2 (gfx1036): the rows of the docs/design.md EXEC table where EXEC changes between a color
+    export and the last `vm` export. A = 1.0 (v2), B = 2.0 (v3)."""
+    B = ["v_mov_b32_e32 v3, 2.0"]
+    EXP_B = ["exp mrt0 v3, v3, v3, v3"]
+    TWO = {"%out_mrt0": (0x40000000,) * 4}
+
+    def check(self, lines, want):
+        self.assertEqual(run_fragment(translate(SEED + self.B + lines + END)), want)
+
+    def test_off_at_the_color_export_is_not_written_even_with_a_later_full_vm(self):
+        self.check(OFF + EXP_NO_VM + ON + NULL, KILLED)
+        self.check(EXP_NO_VM + NULL, MRT0)
+
+    def test_the_last_color_export_is_the_one_that_counts(self):
+        self.check(EXP_NO_VM + OFF + self.EXP_B + ON + NULL, KILLED)      # A from every lane, then B without this one
+        self.check(OFF + EXP_NO_VM + ON + self.EXP_B + NULL, self.TWO)    # off at A, on at B
+
+    def test_both_masks_apply(self):
+        first = ["exp mrt0 v2, v2, v2, v2 vm"]
+        self.check(first + OFF + ["exp mrt0 v3, v3, v3, v3 done"] + ON, KILLED)   # vm: on; last color export: off
+        self.check(OFF + first + ON + ["exp mrt0 v3, v3, v3, v3 done"], KILLED)   # vm: off; last color export: on
+        self.check(first + ["exp mrt0 v3, v3, v3, v3 done"] + OFF, self.TWO)
+
+    def test_another_target_keeps_the_pixel(self):
+        # Not measured (one target on the hardware side): a lane that exported to one target stays, as before.
+        self.check(EXP + OFF + EXP_MRT1, {**MRT0, "%out_mrt1": (0,) * 4})
+
+
+class GpuFixture(unittest.TestCase):
+    def test_ps_exp_color_mask(self):
+        """runtime/test/shaders/ps_exp_color_mask.asm: the words of its header, from every lane."""
+        out = run_fragment(support.translate_fixture("ps_exp_color_mask"))
+        self.assertEqual(out, {"%out_mrt0": (0x40000000, 0x40800000, 0x40000000, 0x40800000)})
 
 
 class Branches(unittest.TestCase):
@@ -126,9 +168,11 @@ class Branches(unittest.TestCase):
         body = OFF + EXP + far + self.skip_over(False, ON)
         self.assertEqual(run_fragment(translate(SEED + body + END)), KILLED)
 
-    def test_a_path_around_the_vm_export_uses_exec_at_the_end(self):
-        # The branch skips the export: that path has no valid mask, so EXEC at the end decides, as before.
+    def test_a_path_around_the_vm_export_uses_exec_at_the_color_export(self):
+        # The branch skips the `vm` export: that path has no valid mask, so EXEC at its color export decides.
         body = EXP_NO_VM + self.skip_over(True, NULL) + OFF
+        self.assertEqual(run_fragment(translate(SEED + body + END)), MRT0)
+        body = OFF + EXP_NO_VM + ON + self.skip_over(True, NULL)
         self.assertEqual(run_fragment(translate(SEED + body + END)), KILLED)
         body = EXP_NO_VM + self.skip_over(False, NULL) + OFF
         self.assertEqual(run_fragment(translate(SEED + body + END)), MRT0)
@@ -149,9 +193,12 @@ class Branches(unittest.TestCase):
 
 class OnlyWhereNeeded(unittest.TestCase):
     def test_no_latch_when_exec_cannot_change_after_the_export(self):
-        for body in (EXP, OFF + EXP, OFF + ON + EXP, EXP_NO_VM + OFF, OFF + EXP + ["s_cmp_eq_u64 exec, 0"],
+        for body in (EXP, OFF + EXP, OFF + ON + EXP, OFF + EXP_NO_VM, OFF + EXP + ["s_cmp_eq_u64 exec, 0"],
                      OFF + EXP + ["v_mov_b32_e32 v3, 0"]):
-            self.assertNotIn("%vm_mask", translate(SEED + body + END), body)
+            text = translate(SEED + body + END)
+            self.assertNotIn("%vm_mask", text, body)
+            self.assertNotIn("%col_mask", text, body)
+        self.assertIn("%col_mask_mrt0", translate(SEED + EXP_NO_VM + OFF + END))   # EXEC changes after a color export
 
     def test_code_after_endpgm_does_not_count(self):
         self.assertNotIn("%vm_mask", translate(SEED + OFF + EXP + END + ON))

@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; v_mul_hi_u32 / v_mul_hi_i32, v_bcnt_u32_b32 with an accumulator, v_ffbl_b32 / v_ffbh_u32 (and v_ffbh_u32 of 0
 ; = 0xffffffff), v_xad_u32 and v_add3_u32 wrapping.
 ; Expected mrt0 bits: 0x80000000, 0xbfffffff, 0x000f100e, 0x0f0f0f1f

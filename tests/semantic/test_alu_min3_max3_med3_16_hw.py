@@ -574,9 +574,8 @@ MEASURED = [
 ]
 
 
-# The one measured case the translator does not model (docs/design.md): every operand a NaN. gfx1036 returns src0's
-# bits, so a signalling NaN in src0 comes back unchanged; the translator returns the quiet NaN 0x7E00. These are all
-# eight such min3/max3 rows of the sweep with a signalling src0 (with a quiet src0 both give 0x7E00).
+# Measured all-NaN rows from the gfx1036 sweep with a signalling src0: with all three operands NaN, hardware returns
+# src0's bits unchanged (0x7C01 stays signalling under IEEE 0), preserving the unwritten high half.
 ALL_NAN_SRC0_SIGNALLING = [
     ('v_min3_f16 v4, v1, v2, v3', 0xABCD7C01, 0xABCD7E00, 0xABCD7E00, 0xDEAD7C01),
     ('v_min3_f16 v4, v1, v2, v3', 0xABCD7C01, 0xABCD7E00, 0xABCD7C01, 0xDEAD7C01),
@@ -622,15 +621,10 @@ class MeasuredWords(unittest.TestCase):
                 with self.subTest(insn=row[0], v1=hex(row[1]), v2=hex(row[2]), v3=hex(row[3])):
                     self.assertEqual(word, row[4])
 
-    @unittest.expectedFailure
     def test_all_nan_keeps_src0(self):
-        """Not modelled yet: when this starts passing, drop the decorator and the docs/design.md caveat."""
+        """When all three operands are NaN, v_min3_f16/v_max3_f16 return src0's exact 16-bit pattern."""
         rows = ALL_NAN_SRC0_SIGNALLING
         self.assertEqual(run_rows(rows), [row[4] for row in rows])
-
-    def test_all_nan_translator_word_today(self):
-        """What the translator returns for those rows now, so a change to it is seen."""
-        self.assertEqual(run_rows(ALL_NAN_SRC0_SIGNALLING), [0xDEAD7E00] * len(ALL_NAN_SRC0_SIGNALLING))
 
 
 if __name__ == "__main__":

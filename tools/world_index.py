@@ -28,6 +28,7 @@ JSON summary. Place reports outside a directory input if you want to overwrite t
 import argparse
 import csv
 import json
+import math
 import mmap
 import os
 import re
@@ -80,6 +81,46 @@ MAP_ENTITIES = 0xCCAB9307
 PARENT_MAPS = 0x75D16ADF
 PARENT_MAP_SLOT = 0x84799847
 LOD_NAMES = {0: "HD", 1: "LOD", 2: "SLOD1", 3: "SLOD2", 4: "SLOD3", 5: "ORPHAN_HD", 6: "SLOD4"}
+# Byte widths of supported member types in CEntityDef and CMapData schemas.
+MEMBER_WIDTH = {
+    0x10: 1, 0x11: 1, 0x60: 1,
+    0x12: 2, 0x13: 2,
+    0x14: 4, 0x15: 4, 0x21: 4, 0x4A: 4,
+    0x08: 8, 0x4F: 8,
+    0x32: 12, 0x33: 12,
+    0x34: 16,
+}
+# Expected member types for known fields in CEntityDef and CMapData schemas.
+# A resource whose schema declares a known field with a mismatched type byte is rejected.
+ENTITY_MEMBER_TYPES = {
+    FIELD["archetypeName"]: (0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x4A),
+    ARCHETYPE_KEY: (0x08, 0x4F),
+    FIELD["position"]: (0x32, 0x33),
+    FIELD["rotation"]: (0x34,),
+    FIELD["scaleXY"]: (0x21,),
+    FIELD["scaleZ"]: (0x21,),
+    FIELD["flags"]: (0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x4A),
+    FIELD["guid"]: (0x08, 0x4F),
+    FIELD["lodLevel"]: (0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x60),
+    FIELD["parentIndex"]: (0x10, 0x11, 0x12, 0x13, 0x14, 0x15),
+    FIELD["parentInstance"]: (0x10, 0x11, 0x12, 0x13, 0x14, 0x15),
+    FIELD["numChildren"]: (0x10, 0x11, 0x12, 0x13, 0x14, 0x15),
+    FIELD["lodDist"]: (0x21,),
+    FIELD["childLodDist"]: (0x21,),
+    FIELD["priorityLevel"]: (0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x60),
+    PARENT_MAP_SLOT: (0x10, 0x11, 0x12, 0x13, 0x14, 0x15),
+}
+MAPDATA_MEMBER_TYPES = {
+    FIELD["name"]: (0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x4A),
+    FIELD["name64"]: (0x08, 0x4F),
+    FIELD["parent"]: (0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x4A),
+    FIELD["streamingExtentsMin"]: (0x32, 0x33),
+    FIELD["streamingExtentsMax"]: (0x32, 0x33),
+    FIELD["entitiesExtentsMin"]: (0x32, 0x33),
+    FIELD["entitiesExtentsMax"]: (0x32, 0x33),
+    FIELD["flags_map"]: (0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x4A),
+    FIELD["contentFlags"]: (0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x4A),
+}
 
 
 def _u16(b, o):
@@ -149,7 +190,10 @@ def _value(b, base, member):
 
 
 def _r4(values):
-    return [round(v, 4) for v in values] if values else None
+    if not values:
+        return None
+    res = [round(v, 4) if (isinstance(v, (int, float)) and math.isfinite(v)) else None for v in values]
+    return res if any(v is not None for v in res) else None
 
 
 def _typed_member(schema, key, ty, width):
@@ -224,6 +268,23 @@ def parse_resource(b, collect=None):
             return None
         structs.setdefault(name, (size, members))
 
+    if ENTITY in structs:
+        esize, em = structs[ENTITY]
+        for k, allowed in ENTITY_MEMBER_TYPES.items():
+            if k in em:
+                m = em[k]
+                w = MEMBER_WIDTH.get(m[1], 0)
+                if m[1] not in allowed or (w and m[0] + w > esize):
+                    return None
+    if MAPDATA in structs:
+        msize, mm = structs[MAPDATA]
+        for k, allowed in MAPDATA_MEMBER_TYPES.items():
+            if k in mm:
+                m = mm[k]
+                w = MEMBER_WIDTH.get(m[1], 0)
+                if m[1] not in allowed or (w and m[0] + w > msize):
+                    return None
+
     blocks = []
     for i in range(nbl):
         o = it + 16 * i
@@ -270,34 +331,38 @@ def parse_resource(b, collect=None):
         for k in range(size // entity_size):
             o = off + k * entity_size
             a = _value(b, o, em.get(FIELD["archetypeName"]))
-            if a is not None:
+            if a is not None and isinstance(a, int):
                 archetypes.add(a)
             pos = _value(b, o, em.get(FIELD["position"]))
-            if pos:
+            if isinstance(pos, list) and len(pos) == 3:
                 positions.append(pos)
             level = _value(b, o, em.get(FIELD["lodLevel"]))
-            if level in LOD_NAMES:
+            if isinstance(level, int) and level in LOD_NAMES:
                 lod[LOD_NAMES[level]] = lod.get(LOD_NAMES[level], 0) + 1
             dist = _value(b, o, em.get(FIELD["lodDist"]))
-            if isinstance(dist, float) and dist >= 0:
+            if isinstance(dist, (int, float)) and math.isfinite(dist) and dist >= 0:
                 lod_dists.append(dist)
             if collect is not None:
+                rot = _value(b, o, em.get(FIELD["rotation"]))
+                sxy = _value(b, o, em.get(FIELD["scaleXY"]))
+                sz = _value(b, o, em.get(FIELD["scaleZ"]))
+                cld = _value(b, o, em.get(FIELD["childLodDist"]))
                 entity = {
                     "complete": o + entity_size <= len(b),
                     "archetype": a,
                     "archetype_key": _value(b, o, em.get(ARCHETYPE_KEY)),
-                    "position": pos,
-                    "rotation": _value(b, o, em.get(FIELD["rotation"])),
-                    "scale_xy": _value(b, o, em.get(FIELD["scaleXY"])),
-                    "scale_z": _value(b, o, em.get(FIELD["scaleZ"])),
+                    "position": [v if (isinstance(v, (int, float)) and math.isfinite(v)) else None for v in pos] if pos else None,
+                    "rotation": [v if (isinstance(v, (int, float)) and math.isfinite(v)) else None for v in rot] if rot else None,
+                    "scale_xy": sxy if (isinstance(sxy, (int, float)) and math.isfinite(sxy)) else None,
+                    "scale_z": sz if (isinstance(sz, (int, float)) and math.isfinite(sz)) else None,
                     "flags": _value(b, o, em.get(FIELD["flags"])),
                     "guid": _value(b, o, em.get(FIELD["guid"])),
                     "lod_level": level,
                     "parent_index": _value(b, o, em.get(FIELD["parentIndex"])),
                     "parent_instance": _value(b, o, em.get(FIELD["parentInstance"])),
                     "num_children": _value(b, o, em.get(FIELD["numChildren"])),
-                    "lod_dist": dist,
-                    "child_lod_dist": _value(b, o, em.get(FIELD["childLodDist"])),
+                    "lod_dist": dist if (isinstance(dist, (int, float)) and math.isfinite(dist)) else None,
+                    "child_lod_dist": cld if (isinstance(cld, (int, float)) and math.isfinite(cld)) else None,
                 }
                 # Match a typed record start exactly, without renumbering or reordering the legacy rows.
                 ordinal = ordinals.get(((k * entity_size) << 20) | block_number) if ordinals else None
@@ -319,8 +384,15 @@ def parse_resource(b, collect=None):
         "lod_dist_max": max(lod_dists) if lod_dists else None,
     })
     if positions:
-        row["position_min"] = _r4([min(p[i] for p in positions) for i in range(3)])
-        row["position_max"] = _r4([max(p[i] for p in positions) for i in range(3)])
+        pos_min = []
+        pos_max = []
+        for i in range(3):
+            axis_vals = [p[i] for p in positions if isinstance(p[i], (int, float)) and math.isfinite(p[i])]
+            pos_min.append(round(min(axis_vals), 4) if axis_vals else None)
+            pos_max.append(round(max(axis_vals), 4) if axis_vals else None)
+        if any(v is not None for v in pos_min):
+            row["position_min"] = pos_min
+            row["position_max"] = pos_max
 
     for name, size, off in blocks:
         if name != MAPDATA or off is None or map_size == 0:
@@ -333,7 +405,9 @@ def parse_resource(b, collect=None):
                            ("entities_min", "entitiesExtentsMin"), ("entities_max", "entitiesExtentsMax")):
             v = _value(b, off, mm.get(FIELD[field]))
             if v:
-                row[key] = _r4(v)
+                r = _r4(v)
+                if r is not None:
+                    row[key] = r
         row["map_flags"] = _value(b, off, mm.get(FIELD["flags_map"]))
         row["content_flags"] = _value(b, off, mm.get(FIELD["contentFlags"]))
         break
@@ -621,7 +695,7 @@ class EntityRows:
         for k in ("map_name", "entity_index", "parent_map_name"):
             if k in entity:
                 row[k] = entity[k]
-        self.handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+        self.handle.write(json.dumps(row, separators=(",", ":"), allow_nan=False) + "\n")
         self.written += 1
 
 
@@ -809,7 +883,7 @@ def main(argv=None):
     except (OSError, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
-    print(json.dumps(summary, indent=1))
+    print(json.dumps(summary, indent=1, allow_nan=False))
     return 0
 
 
@@ -823,7 +897,7 @@ def _write_reports(a, rows, stats, agg):
     doc = {"summary": summary, "resources": rows}
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(doc, f, indent=1, sort_keys=True)
+        json.dump(doc, f, indent=1, sort_keys=True, allow_nan=False)
     if a.csv:
         cols = ["source", "offset", "size", "signature", "version", "kind", "structs", "enums", "blocks",
                 "root_objects", "entities", "entity_size", "archetypes", "map_name", "map_name64", "parent",
@@ -839,12 +913,12 @@ def _write_reports(a, rows, stats, agg):
                 r["source"] = r.get("file") or r.get("path") or os.path.basename(a.path)
                 for k, v in list(r.items()):
                     if isinstance(v, (list, dict)):
-                        r[k] = json.dumps(v, sort_keys=True)
+                        r[k] = json.dumps(v, sort_keys=True, allow_nan=False)
                 w.writerow(r)
     if agg is not None:
         os.makedirs(os.path.dirname(os.path.abspath(a.archetypes_out)), exist_ok=True)
         with open(a.archetypes_out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(agg.to_json(), f, indent=1, sort_keys=True)
+            json.dump(agg.to_json(), f, indent=1, sort_keys=True, allow_nan=False)
         summary["archetype_file"] = agg.to_json()["summary"]
     return summary
 

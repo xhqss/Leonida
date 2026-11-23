@@ -30,6 +30,14 @@ except ModuleNotFoundError as e:
     A = None
     HAVE_NUMPY = False
 
+# tools/amd_swizzle.py needs numpy (tests/requirements.txt). Without it the module-level tests below are skipped,
+# as the __main__ block skips them; the CLI guard tests fake numpy and still run.
+if pytest is not None:
+    needs_numpy = pytest.mark.skipif(not HAVE_NUMPY, reason="numpy is not installed")
+else:
+    def needs_numpy(fn):
+        return fn
+
 
 def table(name, rows):
     body = "\n".join("    {" + ", ".join(r) + ", }, // " + str(i) for i, r in enumerate(rows))
@@ -51,6 +59,7 @@ def load(text):
         return A.load(path)
 
 
+@needs_numpy
 def test_symbols_and_xor():
     nibbles, tables = load(header(["X0", "0", "Y1", "X3 ^ Y3", "Z0", "S2 ^ Y4 ^ X5", "7", "Y0"]))
     assert nibbles["NIBBLE01"] == [[1, 0, 1 << 17, (1 << 3) ^ (1 << 19), 1 << 32,
@@ -59,6 +68,7 @@ def test_symbols_and_xor():
     assert tables["GFX10_SW_64K_D_X_PATINFO"] == [(0, 0, 0, 0, 0, "1 pipes 1 bpe")]
 
 
+@needs_numpy
 def test_rejects_code():
     for cell in ("__import__('os').getcwd()", "X0 | Y0", "X16", "-1"):
         try:
@@ -194,6 +204,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
+@needs_numpy
 def test_64k_block_extent_comes_from_the_element_count():
     # XOR modes have no x/y bit that appears alone, so the old solo-bit guess returned 1x1 or too small.
     for bpe, bw, bh in ((1, 256, 256), (2, 256, 128), (4, 128, 128), (8, 128, 64), (16, 64, 64)):
@@ -209,6 +220,7 @@ def cli(tmp_path, *args):
                           capture_output=True, text=True, timeout=120, check=False)
 
 
+@needs_numpy
 def test_out_cannot_overwrite_the_input(tmp_path):
     # Before: --out naming the blob rendered the preview over the sample it had just detiled.
     blob = tmp_path / "blob.bin"
@@ -221,6 +233,7 @@ def test_out_cannot_overwrite_the_input(tmp_path):
     assert blob.read_bytes() == before
 
 
+@needs_numpy
 def test_out_directory_is_a_message_not_a_traceback(tmp_path):
     (tmp_path / "blob.bin").write_bytes(bytes(range(256)) * 64)
     p = cli(tmp_path, "--width", "256", "--height", "256", "--out", str(tmp_path))
@@ -229,6 +242,7 @@ def test_out_directory_is_a_message_not_a_traceback(tmp_path):
     assert "Traceback" not in p.stderr
 
 
+@needs_numpy
 def test_uncompressed_feature_uses_raw_rgb_bytes():
     import numpy as np
     raw = np.arange(8, dtype=np.uint8).reshape(-1, 4)
@@ -241,6 +255,7 @@ def test_uncompressed_feature_uses_raw_rgb_bytes():
     (1, bytes((17, 63, 129, 245)), [(17, 17, 17), (63, 63, 63), (129, 129, 129), (245, 245, 245)]),
     (2, bytes((17, 33, 63, 94, 129, 159, 245, 200)), [(17, 33, 0), (63, 94, 0), (129, 159, 0), (245, 200, 0)]),
 ], ids=["r8", "rg8"])
+@needs_numpy
 def test_cli_previews_uncompressed_r8_and_rg8(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, bpe: int, texels: bytes, pixels: list[tuple[int, int, int]],
 ) -> None:
@@ -271,6 +286,7 @@ def test_cli_previews_uncompressed_r8_and_rg8(
         assert png.tobytes() == bytes(channel for pixel in pixels for channel in pixel)
 
 
+@needs_numpy
 def test_cli_detiles_4k_tables_with_4k_blocks():
     # A 128x128 RGBA gradient tiled in 4 KB blocks (32x32 elements, row-major). The same pattern entry under
     # a 64K table name must not be picked by --modes 4K, and the 4K table must detile with 12-bit, 4 KB blocks.
@@ -308,6 +324,7 @@ def test_cli_detiles_4k_tables_with_4k_blocks():
     assert float(lines[0].split()[0]) == round(score(linear[..., :3].astype(np.float32)), 2), p.stdout
 
 
+@needs_numpy
 def test_preview_keeps_partial_bc_blocks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import struct
 

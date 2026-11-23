@@ -58,8 +58,13 @@ python -I tools/shader_link_check.py check --ms <mesh.spv> --ps <pixel.spv>
 python -I tools/shader_link_check.py inspect <shader.spv>
 ```
 
+Direct checks use `main` for every stage unless `--entry` sets another shared default.
+Use a stage-specific override for modules with different entry names, for example
+`check --vs vertex.spv --vs-entry Vertex --ps pixel.spv --ps-entry Fragment`.
+
 To audit a batch, give it the shader names from your local translation directory in a JSON file. A stage can
-use a string or a `shader` and `entry` object. Names refer to `<name>.spv` in `--shader-dir`.
+use a string or a `shader` and `entry` object. Names refer to `<name>.spv` in `--shader-dir`. The manifest is read as
+UTF-8 with or without the byte order mark, so a copy saved by Notepad or `Out-File -Encoding utf8` is taken as is.
 
 ```json
 {
@@ -220,8 +225,11 @@ modules and pipelines with **0 failures** and a 3.81 GB cache; see the "Full-cor
 compile-time stall, not a project-wide limit.
 
 The recurring slow family at every shard tail was a set of 6.7-7.2 MB ray-tracing resolve compute
-shaders. One observed single-module stall exceeded 27 minutes. The tool has no per-shader timer, so
-these are lower bounds, not exact compile times.
+shaders. One observed single-module stall exceeded 27 minutes, read from the run's progress output.
+The tool times each pipeline: `--slow SEC` prints `SLOW <stage> <name> (w<N>, <sec>s)` for a pipeline
+that takes longer than SEC, and each stage's summary ends with
+`compile time: <total>s total, <mean>s mean, slowest <name> (<sec>s)`. A run with `--slow 0` therefore
+reports such a stall with its duration, not as a lower bound.
 
 ## Bounded guaranteed-finish sample
 
@@ -286,6 +294,48 @@ modules passed.
 The report above therefore states the limit and the skip count; a later run on an RTX 4060 Ti / 595
 completed the full 26,503-entry set without them (`docs/design.md`). `--max-bytes` remains a visibility
 tool, not a pass: a skipped module has not been validated.
+
+## Stack reserve (BUILD-1457)
+
+A driver compiles on the thread that creates the shader module or the pipeline, and its compiler can recurse with
+the shader's control-flow nesting. On Windows a thread that asks for no stack size gets the reserve written in the
+executable's PE header, 1 MB by default. That is the checker's main thread and every `std::thread` worker.
+
+`vk_pipeline_check` is linked with an **8 MB** reserve: `/STACK:8388608` in `runtime/CMakeLists.txt` and on the
+checker's `cl` line in `scripts/build_runtime.ps1`. The CTest `vk_pipeline_check_stack` reads `SizeOfStackReserve`
+back from the built file (`runtime/test/check_stack_reserve.cmake`; the program is not run), and
+`tests/test_build_runtime_fallback.py` keeps the two numbers the same.
+
+Measured on an AMD Radeon RX 9070 XT, AMD 26.11.2 (LLPC, Windows driver 32.0.32029.2010), each module alone with
+no cache file (`--jobs 1 --start N --count 1`), on a 1.0.2.1 corpus translated at `aa2988cc` with native wave64.
+The reserve was changed with `editbin /STACK` on copies of one binary. Counts only.
+
+| Reserve | The 26 mesh modules that overflow at 1 MB | 28 structured compute modules that overflow at 1 MB |
+|---|---|---|
+| 1 MB | 26 exit 0xC00000FD (stack overflow) | 28 exit 0xC00000FD |
+| 2 MB | 26 create their pipeline | 18 create theirs, 10 exit 0xC00000FD |
+| 4 MB | 26 create their pipeline | 28 create their pipeline |
+| 8 MB | 26 create their pipeline | 28 create their pipeline |
+
+The 26 are what a corpus translated on `main` hits: 2.42 to 2.79 MB of SPIR-V each, among 846 mesh and vertex
+modules of 1 MiB or more that were tried one by one at 1 MB (the other 820 pass). The 28 come from a sample of 60
+compute modules, picked evenly by size, of the 781 that take the structured form once the structured depth bound
+is 64 instead of 16 (SHADER-427): every sampled module from 4.76 MB up overflows 1 MB. So 2 MB is enough today and
+not for the deeper trees. With the linked 8 MB, the same 26 and 28 create their pipelines, and with that binary's
+reserve put back to 1 MB all 54 overflow again.
+
+Not measured: other AMD GPU families, other vendors' Windows drivers, and a corpus translated with
+`--wave64-emulate`.
+
+**The runtime.** The D3D12 shim creates a pipeline on the thread that asks for it
+(`runtime/shims/d3d12_vulkan_device.cpp`), so there the compiler runs on a game thread. The entry thread has 8 MB
+from `run_entry` (`runtime/shims/process_shim.h`). A thread the game starts with `dwStackSize` 0, a thread-pool
+thread and a `std::thread` of the shims get the reserve in `gta6rt.exe`'s header, because the game's `CreateThread`
+is Windows' own. `gta6rt` is therefore linked with the same 8 MB (`GTA6RT_STACK` in `runtime/CMakeLists.txt`, and
+the loader's `cl` line in `scripts/build_runtime.ps1`). The CTest `gta6rt_stack` reads the header, and
+`run_tiny_game_stack` asks Windows from inside a program the loader runs: the entry thread and a thread created
+with `dwStackSize` 0 both report 8 MB. Not covered: a thread the title creates with an explicit smaller size keeps
+that size. Which threads the game creates pipelines on is not known without its executable.
 
 ## Build-stage batches (BUILD-1030)
 

@@ -464,6 +464,9 @@ def main(argv=None) -> int:
     ap.add_argument("--json", help="write aggregate decoded counts to this JSON file")
     a = ap.parse_args(argv)
 
+    if not os.path.exists(a.target):
+        print(f"ERROR: cannot read {a.target}: no such file or folder", file=sys.stderr)
+        return 2
     try:
         if a.json:
             rows = (

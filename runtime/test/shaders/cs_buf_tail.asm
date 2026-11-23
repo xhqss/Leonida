@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Raw MUBUF loads (stride 0) check every dword against NUM_RECORDS on its own: dword i of a load at byte offset
 ; O = inst_offset + soffset + vaddr is data when O + 4*i + 4 <= NUM_RECORDS, else 0. Measured on an AMD Radeon
 ; RX 6800 (gfx1030) as a raw compute kernel with V# word3 OOB_SELECT 3 (docs/design.md, Buffer bounds checking).

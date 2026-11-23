@@ -2,6 +2,8 @@
 
     python -I tests/test_make_game_assets_pools.py
 """
+import contextlib
+import io
 import json
 import os
 import sys
@@ -140,6 +142,19 @@ class AssetsPoolsTest(unittest.TestCase):
         for d in dirs:
             self.assertTrue(os.path.isfile(os.path.join(d, make_game.DECODER_RECORD)), d)
         self.assertEqual([src for src, _ in self.run_assets("d2")], [a, b])
+
+    def test_a_broken_calibration_profile_stops_the_build_with_one_error_line(self):
+        # The profile is hand-written, so a typo must name the file in one ERROR line, not raise a JSONDecodeError.
+        self.pool("data/ttdb/pool.ttpf")
+        with open(os.path.join(self.work, "bcpack-calibration.json"), "w", encoding="utf-8") as f:
+            f.write("{")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
+            self.run_assets()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("ERROR:", stderr.getvalue())
+        self.assertIn("bcpack-calibration.json", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
 
 
 if __name__ == "__main__":

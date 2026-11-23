@@ -31,6 +31,10 @@ methods are still open.
   encoding="utf-8", newline="\n")` (the same for `Path.open`, `Path.write_text` and a text-mode
   `tempfile.NamedTemporaryFile`), so the output is LF on Windows too and the same input gives the same bytes on every
   platform. `tests/test_text_write_line_endings.py` fails for a writer that forgets it.
+- A report writer refuses an output that names one of its inputs or another output, and asks
+  `tools/report_paths.same_report_path(a, b)` rather than deriving the answer again: it resolves both paths,
+  applies the volume's case rules and falls back to `os.path.samefile`, so a new tool reuses one answer
+  instead of a private copy. `tests/test_report_paths.py` covers it.
 - `tools/rpf9dump` needs the submodule: `git submodule update --init`.
 - A new shader-translator rule goes into the contract table in `docs/design.md`, with how it was confirmed: a GPU
   test, a Mesa/LLVM reference, or a count over the corpus.
@@ -54,5 +58,5 @@ methods are still open.
   A new test gets its expected values in the comment at its top and a check in `check.py`.
   [docs/testing.md](docs/testing.md) covers setup per OS, including native Windows options, and known problems.
 - Say what you tested and on which GPU in the pull request.
-- Run the translator tests with `python -m unittest discover -s tests/semantic -v` (see `tests/semantic/README.md`). A new
+- Run the translator tests with `python -I scripts/run_semantic_tests.py tests/semantic` (see `tests/semantic/README.md`). A new
   translator rule should come with a small hand-written `.asm` fixture and its expected output words.

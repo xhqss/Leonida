@@ -12,13 +12,19 @@
 // service or a store UI (purchases, consumables, tokens, collections ids, downloads) fails before starting, so no
 // XAsyncBlock waits, and logs once. License-changed and license-lost callbacks are never called: nothing changes.
 //
-// ASSUMPTION (UNVERIFIED): STORE_SKU_ID_SIZE = 18, SKU_ID_SIZE = 5 and TRIAL_UNIQUE_ID_MAX_SIZE = 64, which fix the
-// layouts of XStoreGameLicense (104 bytes) and XStoreCanAcquireLicenseResult (12 bytes). The public pages name the
-// constants without values; they are from memory of the GDK header and must be confirmed against the executable
-// (the stack buffer it passes to XStoreQueryGameLicenseResult) before a first boot relies on them.
+// XStoreGameLicense's layout is measured on the retail executable (docs/runtime_imports.md): the title's
+// XStoreQueryGameLicenseResult call passes a 104-byte stack buffer and reads the SKU id as a C string at +0x00, the
+// three booleans at +0x13..+0x15, the trial id as a C string at +0x1C and the expiration time at +0x60. That fixes
+// STORE_SKU_ID_SIZE = 18 and the struct's 104-byte total.
+//
+// UNVERIFIED: SKU_ID_SIZE = 5 and the exact TRIAL_UNIQUE_ID_MAX_SIZE = 64. The executable does not call either
+// can-acquire slot (IXStoreImpl slots 24-27), so XStoreCanAcquireLicenseResult is unmeasured. It bounds the trial id
+// to at most 68 bytes (the expiration time is at +0x60) but reads it as a C string, so it does not name the bound;
+// 64 is the public source's value.
 #include <windows.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -49,9 +55,9 @@ using XStoreContextHandle = XStoreContext*;
 using XStoreLicenseHandle = XStoreLicense*;
 using XStoreProductQueryHandle = XStoreProductQuery*;
 
-constexpr size_t STORE_SKU_ID_SIZE = 18;          // UNVERIFIED, see the header
-constexpr size_t SKU_ID_SIZE = 5;                 // UNVERIFIED
-constexpr size_t TRIAL_UNIQUE_ID_MAX_SIZE = 64;   // UNVERIFIED
+constexpr size_t STORE_SKU_ID_SIZE = 18;          // measured, see the header
+constexpr size_t SKU_ID_SIZE = 5;                 // UNVERIFIED; the executable has no call site for it
+constexpr size_t TRIAL_UNIQUE_ID_MAX_SIZE = 64;   // public source; the executable bounds it to <= 68
 
 struct XStoreGameLicense {
     char skuStoreId[STORE_SKU_ID_SIZE];
@@ -63,7 +69,11 @@ struct XStoreGameLicense {
     char trialUniqueId[TRIAL_UNIQUE_ID_MAX_SIZE];
     time_t expirationDate;
 };
-static_assert(sizeof(XStoreGameLicense) == 104, "the layout the UNVERIFIED constants give");
+static_assert(sizeof(XStoreGameLicense) == 104, "the layout the executable's result buffer gives");
+// The offsets the executable's XStoreQueryGameLicenseResult caller reads (docs/runtime_imports.md).
+static_assert(offsetof(XStoreGameLicense, isTrialOwnedByThisUser) == 0x13, "measured flag offset");
+static_assert(offsetof(XStoreGameLicense, trialUniqueId) == 0x1C, "measured trial-id offset");
+static_assert(offsetof(XStoreGameLicense, expirationDate) == 0x60, "measured expiration offset");
 
 enum class XStoreCanLicenseStatus : uint32_t { NotLicensableToUser = 0, Licensable = 1, LicenseActionNotApplicableToProduct = 2 };
 struct XStoreCanAcquireLicenseResult {

@@ -14,12 +14,16 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TOOLS = ROOT / "tools"
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
+
+import report_paths  # noqa: E402
 
 # tool -> name of its two-path comparison helper
 HELPERS = {
@@ -28,6 +32,7 @@ HELPERS = {
     "gamedata_xml": None,
     "gamedata_index": None,
     "navmesh_decode": "same_report_path",
+    "world_census": "same_report_path",
 }
 
 
@@ -75,6 +80,19 @@ class ReportPathCaseTest(unittest.TestCase):
         for name in HELPERS:
             with self.subTest(tool=name):
                 self.assertTrue(helper(load(name), name)(str(composed), str(decomposed)))
+
+    def test_world_census_follows_the_folding_volume(self):
+        """The archive guard asks report_paths, so a case-insensitive APFS volume refuses a report that would
+        overwrite the archive; its own realpath+normcase copy answered "two files" there."""
+        module = load("world_census")
+        composed = self.dir / "café.json"
+        decomposed = self.dir / unicodedata.normalize("NFD", "café.json")
+        folding = [True]
+        with mock.patch.object(report_paths, "sys", mock.Mock(platform="darwin")), \
+                mock.patch.object(report_paths, "case_insensitive_volume", lambda path: folding[0]):
+            self.assertTrue(module.same_report_path(str(composed), str(decomposed)))
+            folding[0] = False
+            self.assertFalse(module.same_report_path(str(composed), str(decomposed)))
 
     def test_bvh_index_refuses_case_only_report_pair(self):
         source = self.dir / "in.rpf"

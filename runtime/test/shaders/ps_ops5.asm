@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Scalar b16 shifts (VOP3, high half kept) and v_cos_f16 (turns).
 ; Expected mrt0 bits: 0x12340010, 0xbeef0800, 0xaaaaffff, 0xdeadbc00
 v_mov_b32_e32 v0, 0x12348001

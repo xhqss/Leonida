@@ -31,6 +31,7 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rsc8_audio import parse_adat_header_bytes  # noqa: E402
+from restofworld_model_join import ModelSystemPages  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter, then u32 size-8).
 # RPF9 magic as it sits on disk: the tag "RPF9" stored little-endian (docs/rpf.md, docs/bvh.md).
@@ -169,6 +170,7 @@ def main(argv=None) -> int:
                 print(f"--until-adat: first AWC bank at {boundary:#x}; scanning {pos:#x}..{boundary:#x}", flush=True)
         rows, last, unread, zero = [], pos, 0, 0
         unread_ranges = []
+        system_pages = ModelSystemPages()
 
         def account(a, b):
             """Count the gap m[a:b] as zero padding, or as an unread range that is also listed."""
@@ -207,6 +209,7 @@ def main(argv=None) -> int:
                     except OSError as e:
                         sys.exit(f"{out_file}: cannot write: {e.strerror or e}")
                 last = pos = s + blen
+                system_pages.reset()
                 continue
             d = zlib.decompressobj()
             try:
@@ -225,10 +228,13 @@ def main(argv=None) -> int:
             except zlib.error:
                 pos = s + 1
                 continue
-            if not d.eof or len(out) < 64:
+            adjacent = s == ((last + 15) & ~15) and not any(m[last:s])
+            if not d.eof or len(out) < system_pages.minimum_size(adjacent):
                 pos = s + 1
                 continue
             used = p - s - len(d.unused_data)
+            system_pages.accept(out, adjacent=adjacent,
+                                root_framed=(s & 0xFFF) == 0x10 and s >= 16 and m[s - 16:s] == b"\0" * 16)
             account(last, s)
             rows.append({"off": s, "stored": used, "size": len(out), "pre": m[max(0, s - 16):s].hex(),
                          "head": out[:16].hex()})

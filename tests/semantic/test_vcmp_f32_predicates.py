@@ -98,6 +98,20 @@ class VcmpF32(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(run(lines)[0], int(PREDS[pred](ea, eb)))
 
+    def test_lg_is_ordered_without_ord_not_equal(self):
+        # LG is less-or-greater, false on a NaN. OpFOrdNotEqual means the same in SPIR-V, but SPIRV-Cross (MoltenVK
+        # 1.4.2) writes it as a plain `!=`, which Metal makes true on a NaN: ps_vcmp_f32_nan, ps_vcmp_f16 and the cmpx
+        # forms failed on a Mac in exactly the LG bits of their NaN pairs. The values are checked above; this pins
+        # the form, which the CPU interpreter can't tell apart.
+        for text in ("v_cmp_lg_f32_e32 vcc_lo, v2, v3", "v_cmp_lg_f32_e64 s20, v2, v3", "v_cmpx_lg_f32_e32 v2, v3",
+                     "v_cmp_lg_f16_e32 vcc_lo, v2, v3", "v_cmpx_lg_f16_e64 v2, v3"):
+            with self.subTest(text=text):
+                spv = support.translate_lines("ps_vcmp_lg", load(0x7FC00000, 0x3F800000) + [
+                    text, "exp mrt0 v10, v11, v12, v13 done vm", "s_endpgm"])
+                self.assertNotIn("OpFOrdNotEqual", spv)
+                self.assertIn("OpFOrdLessThan", spv)
+                self.assertIn("OpFOrdGreaterThan", spv)
+
 
 if __name__ == "__main__":
     unittest.main()

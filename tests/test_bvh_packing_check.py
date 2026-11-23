@@ -237,6 +237,39 @@ class TestArchive(unittest.TestCase):
             self.assertEqual(rep["kinds"].get("continuation"), 1)
             self.assertNotIn("raw", rep["kinds"])
 
+    def test_stream_starting_at_window_boundary_is_not_dropped(self):
+        good_z = zlib.compress(payload(build()))
+        bad_z = zlib.compress(payload(build(orders=[GOOD_ORDER, 0x05, GOOD_ORDER, GOOD_ORDER])))
+        # Header has data_start = 16; with window = 64, window 0 is [16, 80).
+        # Place good_z at offset 79 (end - 1) so its 2-byte zlib header straddles 79..80,
+        # and place bad_z on an exact later window boundary to verify no double-counting.
+        window = 64
+        pad_before_good = (16 + window - 1) - 16
+        after_good = 16 + pad_before_good + len(good_z)
+        next_boundary = 16 + ((after_good - 16 + window - 1) // window) * window
+        if next_boundary == after_good:
+            next_boundary += window
+        pad_before_bad = next_boundary - after_good
+        raw = b"RPF9" + struct.pack("<I", 16) + bytes(8) + bytes(pad_before_good) + good_z + bytes(pad_before_bad) + bad_z + bytes(16)
+        fd, path = tempfile.mkstemp(suffix=".rpf")
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+        self.addCleanup(os.unlink, path)
+
+        for workers in (1, 2):
+            tally, _ = C.scan_archive(path, workers, window, progress=False)
+            rep = tally.report()
+            self.assertEqual((rep["checked"], rep["passed"]), (2, 1), workers)
+            self.assertEqual(rep["fail_streams"], {"leaf_vertex_order": 1}, workers)
+
+        # Direct window check: stream at end - 1 belongs to window 0, stream at next_boundary belongs only to its window.
+        w0 = C.scan_window((path, 16, 16 + window))
+        self.assertEqual((w0.checked, w0.passed), (1, 1))
+        w_before_bad = C.scan_window((path, next_boundary - window, next_boundary))
+        self.assertEqual(w_before_bad.checked, 0)
+        w_bad = C.scan_window((path, next_boundary, next_boundary + window))
+        self.assertEqual((w_bad.checked, w_bad.passed), (1, 0))
+
     def test_cli_json_and_exit_status(self):
         with tempfile.TemporaryDirectory() as d:
             good, bad = os.path.join(d, "good.bin"), os.path.join(d, "bad.bin")
@@ -256,6 +289,11 @@ class TestArchive(unittest.TestCase):
                 self.assertEqual(C.main([good, "--json", good]), 2)          # never overwrite an input
                 self.assertEqual(C.main([good, "--limit", "5"]), 2)          # --limit is for an archive
                 self.assertEqual(C.main([os.path.join(d, "missing.bin")]), 2)
+                self.assertEqual(C.main([good, "--json", d]), 2)             # --json is a directory
+                self.assertEqual(C.main([good, "--json", os.path.join(d, "no_such_dir", "r.json")]), 2)
+                self.assertEqual(C.main([good, "--json", os.path.join(d, ".", os.path.basename(good))]), 2)
+                if sys.platform == "win32":
+                    self.assertEqual(C.main([good, "--json", good.upper()]), 2)  # case-distinct spelling on Windows
 
 
 if __name__ == "__main__":

@@ -1,8 +1,12 @@
 # First boot: the runbook and the two traces
 
-**Status: prepared, not yet run against the retail executable.** The package in the repository's test corpus does
-not contain `game_scarlett_master.exe` (RT-5), so this page is the procedure and the trace tool for the day it
-arrives. Nothing here quotes game data; a real trace stays on the player's machine.
+**Status: `--dry-run` and `--init` have been run on the retail executable; `--run` has not.** The package in the
+repository's test corpus does not contain `game_scarlett_master.exe` (RT-5); the dry-run on an executable supplied
+separately maps it and leaves 30 imports unimplemented, and `--init` runs its TLS callbacks and the package DLLs'
+`DllMain`s without an exception
+([`runtime_imports.md`](runtime_imports.md#the-retail-executable-rt-5)), so this page is still the procedure and the
+trace tool for the first boot. The executable's `ws2_32.dll` imports bind to the host's, so run `--run` with the
+network off. Nothing here quotes game data; a real trace stays on the player's machine.
 
 ## 1. What the first boot produces
 
@@ -68,6 +72,10 @@ Useful switches:
   printing the caller's `module+RVA` and the argument registers (with a debugger attached it breaks instead). Start
   with `log`, then use `stop` to pin the first blocker and `fail` to see how the game's own failure path reacts.
   This switch covers imports only; it does not affect the D3D12 outcomes.
+* `LEONIDA_SKIP_INT3=1` (with `--trace`) steps over each int3 in guest code and logs it once per address as an
+  `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on).
+  Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file
+  open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
 * `LEONIDA_VK_VALIDATION=1` enables the Khronos validation layer with the Vulkan backend (startup overhead; it is a
   diagnostic).
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their

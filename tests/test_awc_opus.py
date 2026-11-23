@@ -10,7 +10,9 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
+import wave
 from pathlib import Path
 from unittest import mock
 
@@ -258,6 +260,81 @@ class WriteWavTest(unittest.TestCase):
         self.assertEqual(w["pcm"], pcm)
         self.assertEqual(len(w["data"]), 58 + len(pcm))
 
+    def test_sliced_memoryview_matches_bytes_for_pcm_and_float(self):
+        pcm = bytes(range(64))
+        view = memoryview(b"prefix" + pcm + b"suffix")[6:-6]
+        for float32 in (False, True):
+            for channels in (1, 2):
+                with self.subTest(float32=float32, channels=channels):
+                    first, second = self.path("bytes.wav"), self.path("view.wav")
+                    awc.write_wav(first, pcm, 48000, channels, float32)
+                    awc.write_wav(second, view, 48000, channels, float32)
+                    self.assertEqual(Path(first).read_bytes(), Path(second).read_bytes())
+
+    def test_typed_pcm_views_use_byte_lengths_in_every_wav_chunk(self):
+        pcm = bytes(range(64))
+        views = [memoryview(pcm).cast(fmt) for fmt in ("h", "I", "f")]
+        views.append(memoryview(pcm).cast("B", shape=(8, 8)))
+        for view in views:
+            for float32 in (False, True):
+                for channels in (1, 2):
+                    with self.subTest(format=view.format, ndim=view.ndim, float32=float32, channels=channels):
+                        first, second = self.path("bytes.wav"), self.path("typed.wav")
+                        awc.write_wav(first, pcm, 48000, channels, float32)
+                        awc.write_wav(second, view, 48000, channels, float32)
+                        self.assertEqual(Path(first).read_bytes(), Path(second).read_bytes())
+                        wav = read_wav(second)
+                        self.assertEqual(wav["riff_size"], len(wav["data"]) - 8)
+                        self.assertEqual(wav["data_size"], view.nbytes)
+                        if float32:
+                            self.assertEqual(struct.unpack("<I", wav["chunks"][b"fact"])[0],
+                                             view.nbytes // (channels * 4))
+                        else:
+                            with wave.open(second, "rb") as reader:
+                                self.assertEqual(reader.getnframes(), view.nbytes // (channels * 2))
+                                self.assertEqual(reader.readframes(reader.getnframes()), pcm)
+
+    def test_noncontiguous_pcm_view_is_refused_before_staging(self):
+        destination = self.path("existing.wav")
+        Path(destination).write_bytes(b"previous complete file")
+        with self.assertRaises(TypeError):
+            awc.write_wav(destination, memoryview(bytes(64))[::2], 48000, 1)
+        self.assertEqual(Path(destination).read_bytes(), b"previous complete file")
+        self.assertEqual(os.listdir(self.tmp.name), ["existing.wav"])
+
+    def test_payload_write_failure_preserves_destination_and_cleans_staging(self):
+        destination = self.path("existing.wav")
+        Path(destination).write_bytes(b"previous complete file")
+        make_temp = awc.tempfile.NamedTemporaryFile
+
+        class FailingPayload:
+            def __init__(self, *args, **kwargs):
+                self.file = make_temp(*args, **kwargs)
+                self.writes = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return self.file.__exit__(*exc)
+
+            @property
+            def name(self):
+                return self.file.name
+
+            def write(self, data):
+                self.writes += 1
+                if self.writes == 2:
+                    self.file.write(data[:3])
+                    raise OSError("payload write failed")
+                return self.file.write(data)
+
+        with mock.patch.object(awc.tempfile, "NamedTemporaryFile", FailingPayload):
+            with self.assertRaisesRegex(OSError, "payload write failed"):
+                awc.write_wav(destination, bytes(64), 48000, 1)
+        self.assertEqual(Path(destination).read_bytes(), b"previous complete file")
+        self.assertEqual(os.listdir(self.tmp.name), ["existing.wav"])
+
 
 class OggCrcTest(unittest.TestCase):
     # A fixed 32-byte page: 27-byte header (checksum field zero), one segment of four bytes, body b"test".
@@ -270,6 +347,13 @@ class OggCrcTest(unittest.TestCase):
 
     def test_payload_changes_crc(self):
         self.assertNotEqual(awc.ogg_crc(self.PAGE[:-1] + b"u"), 0xF7708715)
+
+    def test_page_segment_limit(self):
+        # 254 full segments plus a terminating partial one; a multiple of 255 needs an extra zero segment.
+        page = awc.ogg_page(1, 0, 0, [b"x" * (254 * 255 + 254)], 2)
+        self.assertEqual(len(page), 27 + 255 + 254 * 255 + 254)
+        with self.assertRaisesRegex(ValueError, "255 Ogg segments"):
+            awc.ogg_page(1, 0, 0, [b"x" * (255 * 255)], 2)
 
 
 class OpusSamplesTest(unittest.TestCase):
@@ -486,6 +570,29 @@ class ExportBankTest(unittest.TestCase):
         counts = awc.export_bank(path, self.out)
         self.assertEqual(counts, {"opus": 0, "pcm": 1, "other": 2, "music": 0})
         self.assertEqual(os.listdir(os.path.join(self.out, "odd")), ["00000003.wav"])
+
+    def test_pcm_export_avoids_payload_sized_temporary_copies(self):
+        if tracemalloc.is_tracing():
+            self.skipTest("this allocation check needs its own tracing interval")
+        payload_size = 2 * 1024 * 1024
+        for codec in (0, 2):
+            for channels in (1, 2):
+                with self.subTest(codec=codec, channels=channels):
+                    samples = payload_size // (channels * (4 if codec == 2 else 2))
+                    bank = build_bank([(1, format_block(samples, 48000, codec, channels), bytes(payload_size))])
+                    path = os.path.join(self.tmp.name, f"pcm_{codec}_{channels}.awc")
+                    Path(path).write_bytes(bank)
+                    del bank
+                    tracemalloc.start()
+                    try:
+                        counts = awc.export_bank(path, self.out)
+                        _, peak = tracemalloc.get_traced_memory()
+                    finally:
+                        tracemalloc.stop()
+                    self.assertEqual(counts["pcm"], 1)
+                    # Reading the bank needs one payload-sized allocation. A second full copy, as a slice
+                    # or a combined RIFF buffer, would exceed this generous allowance for headers and I/O.
+                    self.assertLess(peak, payload_size * 2, f"peak {peak:,} for {payload_size:,} PCM bytes")
 
     def test_stereo_plain_stream_length_is_per_channel(self):
         # A stereo format tag stores interleaved samples: 3840 counts = 1920 frames per channel.

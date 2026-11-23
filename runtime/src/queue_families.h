@@ -5,7 +5,9 @@
 
 #include <vulkan/vulkan.h>
 
+#include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <span>
 
 namespace leonida {
@@ -62,6 +64,32 @@ inline QueueFamilies sparse_capable_queue_families(std::span<const VkQueueFamily
     if (chosen.copy >= families.size() ||
         !(families[chosen.copy].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT))
         chosen.copy = chosen.direct;
+    return chosen;
+}
+
+// Which VkQueue a new D3D12 queue runs on. `pools` are its candidate VkQueues in order of preference (a COMPUTE or
+// COPY queue's own family first, then the graphics family); each entry counts the live D3D12 queues on that VkQueue.
+// An unused VkQueue comes first, in pool order, so a GPU with enough queues keeps one VkQueue per live D3D12 queue
+// (D3D-97). With none unused, the VkQueue with the fewest D3D12 queues is shared, the earliest on a tie: the D3D12
+// queues on it then run one after the other, in the order their batches reach it (docs/d3d12_vulkan.md 4.4).
+// `pool` is SIZE_MAX when every pool is empty.
+struct QueueSlot {
+    std::size_t pool = SIZE_MAX;
+    std::size_t index = 0;
+};
+
+inline QueueSlot pick_queue_slot(std::initializer_list<std::span<const std::uint32_t>> pools) {
+    QueueSlot chosen;  // the first VkQueue with the fewest users: an unused one whenever there is one
+    std::uint32_t fewest = UINT32_MAX;
+    std::size_t p = 0;
+    for (const auto users : pools) {
+        for (std::size_t i = 0; i < users.size(); ++i)
+            if (users[i] < fewest) {
+                fewest = users[i];
+                chosen = {p, i};
+            }
+        ++p;
+    }
     return chosen;
 }
 

@@ -16,6 +16,8 @@ The page is one self-contained HTML file: no network, no packages, it opens from
 ## Sources
 
 Each source is optional. A missing one is listed under "Sources" on the page; it is never counted as zero or as a failure.
+For `--junit`, keep the original XML encoding. UTF-16 reports and reports with a supported encoding declaration
+are read directly; there is no need to re-save them as UTF-8.
 
 | Panel | Source | Unit |
 |---|---|---|
@@ -44,7 +46,7 @@ it continues) and its pull requests. Nothing is posted: every `gh` call is a rea
 |---|---|---|---|---|---|
 | VERIFIED | passed, and nothing it depends on changed since | names a GPU check and leaves nothing open | image with 0 unimplemented imports | — | — |
 | IMPLEMENTED | — | confirmed by an LLVM/Mesa reference, a corpus count or a CPU test, not a GPU | bound to a shim, the host or a module | merged into `main` | a PR merged into `main` and none open |
-| PARTIAL | passed before a change to the test, `tools/`, `scripts/` or `make_game.py` (CTest: before the last commit touching `runtime/`) | waits for a GPU measurement, or names a GPU check with an item still open | — | open | pull request open |
+| PARTIAL | passed before a change to the test, `make_game.py`, or a Python file under `tools/`, `scripts/` or `runtime/test/shaders/` (CTest: before the last commit touching `runtime/`) | waits for a GPU measurement, or names a GPU check with an item still open | — | open | pull request open |
 | FAILED | failed on its last run | — | — | — | — |
 | MISSING | — | — | unimplemented | — | unclaimed |
 | UNKNOWN | skipped, or git can't tell what changed | states no confirmation method | — | — | claimed, no code yet |

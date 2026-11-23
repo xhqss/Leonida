@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Swizzled MUBUF addressing and ADD_TID_ENABLE (docs/design.md, Swizzled buffer addressing). Measured natively on
 ; RDNA2 (gfx1036, wave32 & wave64): SWIZZLE_ENABLE = word1 bit 31, STRIDE = word1 [29:16], INDEX_STRIDE = word3 [22:21]
 ; (IS = 8 << n), ADD_TID_ENABLE = word3 bit 23:

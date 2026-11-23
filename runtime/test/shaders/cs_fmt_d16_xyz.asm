@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; The d16 typed-buffer forms no other test runs: buffer_load_format_d16_xyz, tbuffer_load_format_d16_xy,
 ; tbuffer_load_format_d16_xyz and buffer_store_format_d16_xyz. One thread (lane 0) does everything.
 ; RDNA2 ISA (MUBUF/MTBUF): a d16 load converts each component to 16 bits (f16 for float and normalized formats, the

@@ -49,6 +49,7 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bvh_index as I  # noqa: E402
 import bvh_rehydrate as R  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 BOX_TYPES = (R.BOX16, R.BOX32)
 HALF_MAX = 65504.0
@@ -388,7 +389,8 @@ def scan_window(args):
             size = len(m)
             pos = start
             while pos < end:
-                mt = I.ZHDR.search(m, pos, end)
+                # ZHDR is 2 bytes; end + 1 lets a header starting at end - 1 match without entering [end, ...).
+                mt = I.ZHDR.search(m, pos, min(end + 1, size))
                 if not mt:
                     break
                 s = mt.start()
@@ -483,13 +485,24 @@ def main(argv=None):
     ap.add_argument("--header-offset", type=int, default=0)
     ap.add_argument("--json")
     a = ap.parse_args(argv)
+    if a.header_offset < 0:
+        ap.error("--header-offset must be non-negative")
+    if a.header_offset and any(p.lower().endswith(".rpf") for p in a.inputs):
+        ap.error("--header-offset only applies to a stream file")
     bad_limit = a.limit is not None and a.limit <= 0
     if a.window <= 0 or a.workers <= 0 or bad_limit or (a.start is not None and a.start < 0):
         print("error: --window, --workers and --limit must be positive, --start not negative", file=sys.stderr)
         return 2
     if a.json:
+        if os.path.isdir(a.json):
+            print("error: --json is a directory: %s" % a.json, file=sys.stderr)
+            return 2
+        parent = os.path.dirname(os.path.abspath(a.json))
+        if not os.path.isdir(parent):
+            print("error: --json parent folder does not exist: %s" % parent, file=sys.stderr)
+            return 2
         for p in a.inputs:
-            if os.path.exists(a.json) and os.path.isfile(p) and os.path.samefile(a.json, p):
+            if same_report_path(a.json, p):
                 print("error: --json must not overwrite the input %s" % p, file=sys.stderr)
                 return 2
     rpfs = [p for p in a.inputs if p.lower().endswith(".rpf")]
@@ -520,7 +533,11 @@ def main(argv=None):
     for reason, k in rep["fail_streams"].items():
         print("  %s: %d streams, %d items" % (reason, k, rep["fail_items"][reason]))
     if a.json:
-        I._publish(a.json, lambda f: json.dump(rep, f, indent=1), "\n")
+        try:
+            I._publish(a.json, lambda f: json.dump(rep, f, indent=1), "\n")
+        except OSError as e:
+            print("error: cannot write %s: %s" % (a.json, e.strerror or e), file=sys.stderr)
+            return 2
     return 0 if rep["failed"] == 0 else 1
 
 

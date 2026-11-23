@@ -33,6 +33,9 @@ import os
 import sys
 from collections import Counter, defaultdict
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 POINTER_KINDS = ("ptr32_lo", "ptr64_lo", "ptr64_hi")
 DEFAULT_BASE = {"ps": 8, "vs": 8, "gs": 8, "cs": 4, "ms": 16}
 USER_SGPRS = 32
@@ -123,20 +126,25 @@ def main(argv=None):
     ap.add_argument("--expect-no-spill", action="store_true",
                     help="exit 1 if any shader reads a spill-pointer candidate")
     a = ap.parse_args(argv)
-    for other in (a.index, a.carve):
-        if a.json and other:
-            try:
-                if os.path.samefile(other, a.json):
-                    ap.error("--json must not overwrite an input index")
-            except FileNotFoundError:
-                pass
-    with open(a.index, encoding="utf-8") as f:
+    if a.json:
+        if os.path.isdir(a.json):
+            ap.error(f"--json {a.json} is a folder, not a file")
+        for other in (a.index, a.carve):
+            if other and same_report_path(other, a.json):
+                ap.error("--json must not overwrite an input index")
+    if not os.path.exists(a.index):
+        print(f"ERROR: cannot read {a.index}: no such file", file=sys.stderr)
+        return 2
+    if a.carve and not os.path.exists(a.carve):
+        print(f"ERROR: cannot read {a.carve}: no such file", file=sys.stderr)
+        return 2
+    with open(a.index, encoding="utf-8-sig") as f:  # an index saved with a UTF-8 BOM is still JSON
         index = json.load(f)
     if not isinstance(index, dict):
         ap.error(f"{a.index} is not a translator index (expected a JSON object)")
     carve = None
     if a.carve:
-        with open(a.carve, encoding="utf-8") as f:
+        with open(a.carve, encoding="utf-8-sig") as f:  # same for the carve index
             carve = json.load(f)
     # --base overrides the stages it names and keeps the defaults for the rest, so a partial override never drops
     # a stage from the check.
@@ -155,8 +163,14 @@ def main(argv=None):
                 line += f" ({s['max_root_dwords']} of {s['root_dwords_available']} root dwords)"
         print(line)
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(summary, f, indent=1, sort_keys=True)
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(summary, f, indent=1, sort_keys=True)
+                f.write("\n")
+        except OSError as e:
+            print(f"error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
     spilled = {st: s["shaders_with_spill_pointer_candidate"] for st, s in summary["stages"].items()
                if s["shaders_with_spill_pointer_candidate"]}
     if a.expect_no_spill and spilled:

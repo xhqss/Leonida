@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Constant lane masks in wave64 (s_and/or/andn2_saveexec_b64, s_andn2_wrexec_b64, s_and_b64 / s_not_b64 into EXEC,
 ; s_mov_b64 exec/vcc) and s_bcnt1_i32_b64 of a constant. A constant read as a 64-bit lane mask gives lane L bit L
 ; of the 64-bit value: an inline constant is sign-extended (-16 = lanes 4-63), a literal is the low word with a

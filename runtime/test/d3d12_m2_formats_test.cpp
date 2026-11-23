@@ -3,12 +3,13 @@
 // slots 9/10, CreateShaderResourceView, CreateSampler, two root descriptor tables, translated vs_m2/ps_m2) samples:
 //   - bc1: an 8x8 DXGI_FORMAT_BC1_UNORM texture with 4 mips (8, 4, 2, 1), four-colour blocks built by hand;
 //   - bc7: the same in DXGI_FORMAT_BC7_UNORM, mode-6 blocks built by hand;
+//   - bc6h: identical mode-11 blocks in BC6H_UF16 and BC6H_SF16, sampled into an unclamped RGBA32F target;
 //   - arr: an 8x8 R8G8B8A8_UNORM 2D array of 3 slices, read by ps_m2_array.asm (dim:SQ_RSRC_IMG_2D_ARRAY, slice 1.0).
 // Every subresource is uploaded at the layout GetCopyableFootprints returns, with one CopyTextureRegion each.
 // The quad magnifies (64x64 pixels), so a POINT sampler with MinLOD = MaxLOD = k reads level k of the view: four
 // samplers pin levels 0..3. A view with MostDetailedMip 1 checks that the level is relative to the view, and two
 // array views (slices 0..2 and 1..2) that the slice coordinate is. The blocks only use the endpoint colours (BC1
-// indices 0/1, BC7 indices 0/15), whose decode is exact on every GPU, so all 12 cases are compared byte for byte with
+// indices 0/1, BC7 indices 0/15), whose decode is exact on every GPU, so the BC1, BC7 and array cases are compared byte for byte with
 // the CPU (error 0). Each level and slice holds different texels, so a draw that read the wrong one fails.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (0 errors required).
 #include "vk_test_device.h"
@@ -50,7 +51,18 @@ constexpr UINT slice_count = 3;
 constexpr UINT target_size = 64;
 constexpr UINT target_pitch = target_size * 4;  // 256
 
-enum Kind : UINT { bc1, bc7, arr };
+enum Kind : UINT { bc1, bc7, arr, bc6u, bc6s, kind_count };
+
+// BC6H mode 11: prefix 00011 (LSB first), then endpoint 0 RGB = (512, 511, 0)
+// in consecutive 10-bit fields. Endpoint 1 and all indices are zero.
+constexpr std::array<std::uint8_t, 16> bc6_block{0x03, 0xc0, 0xff};
+// UF16 unquantizes the first two channels to 32800 and 32736, then scales by
+// 31/64 to half bits 0x3e0f and 0x3df0. SF16 sign-extends to -512 and +511,
+// the two extremes, yielding half bits 0xfbff and 0x7bff. BC6H supplies alpha 1.
+using FloatTexel = std::array<float, 4>;
+constexpr FloatTexel unsigned_endpoint{1.5146484375f, 1.484375f, 0, 1};
+constexpr FloatTexel signed_endpoint{-65504, 65504, 0, 1};
+constexpr auto float_format = DXGI_FORMAT_R32G32B32A32_FLOAT;
 
 // BC1 block (bx, by) of mip m: c0 > c1 (four-colour mode, red is the top field and r0 >= 16 > r1), texel index
 // (x + y + m) & 1, so every texel is one endpoint exactly.
@@ -151,6 +163,8 @@ int main() {
     }
 
     const Case cases[] = {
+        {"bc6h UF16", false, 5, 0, bc6u, 0, 0},
+        {"bc6h SF16", false, 6, 0, bc6s, 0, 0},
         {"bc1 mip 0", false, 0, 0, bc1, 0, 0},
         {"bc1 mip 1", false, 0, 1, bc1, 1, 0},
         {"bc1 mip 2", false, 0, 2, bc1, 2, 0},
@@ -240,15 +254,19 @@ int main() {
         pso_desc.NumRenderTargets = 1;
         pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         pso_desc.SampleDesc.Count = 1;
-        Ref<ID3D12PipelineState> pso, array_pso;
+        Ref<ID3D12PipelineState> pso, array_pso, float_pso;
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
         pso_desc.PS = {array_container.data(), array_container.size()};
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&array_pso.p))));
 
+        pso_desc.PS = {ps_container.data(), ps_container.size()};
+        pso_desc.RTVFormats[0] = float_format;
+        EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&float_pso.p))));
+
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
         const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
-        D3D12_RESOURCE_DESC descs[3] = {};
+        D3D12_RESOURCE_DESC descs[kind_count] = {};
         for (auto& desc : descs) {
             desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
             desc.Width = desc.Height = texture_size;
@@ -261,8 +279,11 @@ int main() {
         descs[arr].Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         descs[arr].DepthOrArraySize = slice_count;
         descs[arr].MipLevels = 1;
-        Ref<ID3D12Resource> textures[3], uploads[3], index_buffer, readback, target;
-        for (UINT k = 0; k < 3; ++k)
+        descs[bc6u].Format = DXGI_FORMAT_BC6H_UF16;
+        descs[bc6s].Format = DXGI_FORMAT_BC6H_SF16;
+        descs[bc6u].MipLevels = descs[bc6s].MipLevels = 1;
+        Ref<ID3D12Resource> textures[kind_count], uploads[kind_count], index_buffer, readback, target;
+        for (UINT k = 0; k < kind_count; ++k)
             EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &descs[k],
                                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                              IID_PPV_ARGS(&textures[k].p))));
@@ -272,7 +293,11 @@ int main() {
         rt_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &rt_desc,
                                                          D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&target.p))));
-        const auto readback_desc = buffer_desc(std::size_t(target_pitch) * target_size);
+        Ref<ID3D12Resource> float_target;
+        rt_desc.Format = float_format;
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &rt_desc,
+                                                         D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&float_target.p))));
+        const auto readback_desc = buffer_desc(sizeof(FloatTexel) * target_size * target_size);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&readback.p))));
@@ -286,8 +311,8 @@ int main() {
         std::memcpy(index_data, indices, sizeof(indices));
 
         // Each texture's upload buffer is laid out by GetCopyableFootprints; a BC row is a row of 4x4 blocks.
-        std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts[3];
-        for (UINT k = 0; k < 3; ++k) {
+        std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts[kind_count];
+        for (UINT k = 0; k < kind_count; ++k) {
             const UINT count = descs[k].MipLevels * descs[k].DepthOrArraySize;
             layouts[k].resize(count);
             std::vector<UINT> rows(count);
@@ -320,13 +345,14 @@ int main() {
                     for (UINT bx = 0; bx < blocks; ++bx) {
                         std::uint8_t* at = base + by * pitch + bx * block_bytes;
                         if (k == bc1) std::memcpy(at, bc1_block(level, bx, by).data(), 8);
-                        else std::memcpy(at, bc7_block(level, bx, by).data(), 16);
+                        else if (k == bc7) std::memcpy(at, bc7_block(level, bx, by).data(), 16);
+                        else std::memcpy(at, bc6_block.data(), bc6_block.size());
                     }
             }
         }
 
         // The heaps; their start handles come back in RAX (heap slots 9 and 10).
-        const D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 5,
+        const D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 7,
                                                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         const D3D12_DESCRIPTOR_HEAP_DESC sampler_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, mip_count,
                                                            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
@@ -363,6 +389,8 @@ int main() {
         make_srv(2, bc1, 1, mip_count - 1);
         make_srv(3, arr, 0, slice_count);
         make_srv(4, arr, 1, slice_count - 1);
+        make_srv(5, bc6u, 0, 1);
+        make_srv(6, bc6s, 0, 1);
         // Sampler slot k: POINT, CLAMP, MinLOD = MaxLOD = k.
         for (UINT k = 0; k < mip_count; ++k) {
             D3D12_SAMPLER_DESC sampler_desc{};
@@ -374,12 +402,15 @@ int main() {
             device->CreateSampler(&sampler_desc, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(sampler_cpu + k * sampler_step)});
         }
 
-        const D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        const D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         Ref<ID3D12DescriptorHeap> rtv_heap;
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&rtv_heap_desc, IID_PPV_ARGS(&rtv_heap.p))));
         const D3D12_CPU_DESCRIPTOR_HANDLE rtv{
             SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(rtv_heap.p, 9))(rtv_heap.p))};
         device->CreateRenderTargetView(target.p, nullptr, rtv);
+        const D3D12_CPU_DESCRIPTOR_HANDLE float_rtv{
+            rtv.ptr + device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
+        device->CreateRenderTargetView(float_target.p, nullptr, float_rtv);
 
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;
@@ -402,7 +433,7 @@ int main() {
         };
 
         // Upload: one CopyTextureRegion per subresource, at its footprint.
-        for (UINT k = 0; k < 3; ++k)
+        for (UINT k = 0; k < kind_count; ++k)
             for (UINT i = 0; i < layouts[k].size(); ++i) {
                 D3D12_TEXTURE_COPY_LOCATION dst{};
                 dst.pResource = textures[k].p;
@@ -414,23 +445,28 @@ int main() {
                 src.PlacedFootprint = layouts[k][i];
                 list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
             }
-        D3D12_RESOURCE_BARRIER barriers[4];
-        for (UINT k = 0; k < 3; ++k)
+        D3D12_RESOURCE_BARRIER barriers[kind_count + 2];
+        for (UINT k = 0; k < kind_count; ++k)
             barriers[k] = transition(textures[k].p, D3D12_RESOURCE_STATE_COPY_DEST,
                                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        barriers[3] = transition(target.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        list->ResourceBarrier(4, barriers);
+        barriers[kind_count] = transition(target.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        barriers[kind_count + 1] = transition(float_target.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        list->ResourceBarrier(UINT(std::size(barriers)), barriers);
         EXPECT(submit());
 
         const D3D12_INDEX_BUFFER_VIEW ibv{index_buffer->GetGPUVirtualAddress(), sizeof(indices), DXGI_FORMAT_R16_UINT};
         const D3D12_VIEWPORT viewport{0, 0, float(target_size), float(target_size), 0, 1};
         const D3D12_RECT scissor{0, 0, LONG(target_size), LONG(target_size)};
-        std::vector<std::uint8_t> pixels(std::size_t(target_pitch) * target_size);
         for (const Case& c : cases) {
+            const bool hdr = c.kind == bc6u || c.kind == bc6s;
+            auto* draw_target = hdr ? float_target.p : target.p;
+            const auto draw_rtv = hdr ? float_rtv : rtv;
+            const UINT pitch = hdr ? target_size * UINT(sizeof(FloatTexel)) : target_pitch;
+            std::vector<std::uint8_t> pixels(std::size_t(pitch) * target_size);
             EXPECT(SUCCEEDED(allocator->Reset()));
-            EXPECT(SUCCEEDED(list->Reset(allocator.p, c.array_pso ? array_pso.p : pso.p)));
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, hdr ? float_pso.p : c.array_pso ? array_pso.p : pso.p)));
             const FLOAT clear[4] = {1.0f, 0.0f, 1.0f, 1.0f};  // magenta: a pixel the draw missed shows
-            list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+            list->ClearRenderTargetView(draw_rtv, clear, 0, nullptr);
             list->SetGraphicsRootSignature(root.p);
             ID3D12DescriptorHeap* heaps[] = {srv_heap.p, sampler_heap.p};
             list->SetDescriptorHeaps(2, heaps);
@@ -438,23 +474,23 @@ int main() {
             list->IASetIndexBuffer(&ibv);
             list->RSSetViewports(1, &viewport);
             list->RSSetScissorRects(1, &scissor);
-            list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            list->OMSetRenderTargets(1, &draw_rtv, FALSE, nullptr);
             list->SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE{srv_gpu + std::uint64_t(c.srv) * step});
             list->SetGraphicsRootDescriptorTable(
                 1, D3D12_GPU_DESCRIPTOR_HANDLE{sampler_gpu + std::uint64_t(c.sampler) * sampler_step});
             list->DrawIndexedInstanced(6, 1, 0, 0, 0);
-            D3D12_RESOURCE_BARRIER to_copy = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_BARRIER to_copy = transition(draw_target, D3D12_RESOURCE_STATE_RENDER_TARGET,
                                                         D3D12_RESOURCE_STATE_COPY_SOURCE);
             list->ResourceBarrier(1, &to_copy);
             D3D12_TEXTURE_COPY_LOCATION dst{};
             dst.pResource = readback.p;
             dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            dst.PlacedFootprint = {0, {DXGI_FORMAT_R8G8B8A8_UNORM, target_size, target_size, 1, target_pitch}};
+            dst.PlacedFootprint = {0, {hdr ? float_format : DXGI_FORMAT_R8G8B8A8_UNORM, target_size, target_size, 1, pitch}};
             D3D12_TEXTURE_COPY_LOCATION src{};
-            src.pResource = target.p;
+            src.pResource = draw_target;
             src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-            D3D12_RESOURCE_BARRIER back = transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_BARRIER back = transition(draw_target, D3D12_RESOURCE_STATE_COPY_SOURCE,
                                                      D3D12_RESOURCE_STATE_RENDER_TARGET);
             list->ResourceBarrier(1, &back);
             EXPECT(submit());
@@ -466,6 +502,15 @@ int main() {
             unsigned mismatches = 0;
             for (UINT y = 0; y < target_size; ++y)
                 for (UINT x = 0; x < target_size; ++x) {
+                    if (hdr) {
+                        const auto& want = c.kind == bc6u ? unsigned_endpoint : signed_endpoint;
+                        FloatTexel got;
+                        std::memcpy(got.data(), &pixels[y * pitch + x * sizeof(got)], sizeof(got));
+                        if (got != want && mismatches++ < 4)
+                            std::fprintf(stderr, "%s: pixel (%u, %u) got %g,%g,%g,%g want %g,%g,%g,%g\n",
+                                         c.name, x, y, got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+                        continue;
+                    }
                     const Texel want = expected(c.kind, c.level, c.slice, x, y);
                     const std::uint8_t* got = &pixels[std::size_t(y) * target_pitch + x * 4];
                     if (std::memcmp(got, want.data(), 4) == 0) continue;
@@ -483,6 +528,8 @@ int main() {
         for (auto& texture : textures) texture.reset();
         index_buffer.reset();
         readback.reset();
+        float_target.reset();
+        float_pso.reset();
         target.reset();
         pso.reset();
         array_pso.reset();

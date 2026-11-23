@@ -73,6 +73,16 @@ class TimecyclePairsTests(unittest.TestCase):
         self.assertEqual(fc["a_lt_b"], 1)
         self.assertEqual(fc["keyframe_range"], [500.0, 700.0])
 
+    def test_modifier_patterns_do_not_round_values_onto_endpoints(self):
+        values = ("-0.0000001", "0.0000001", "0.9999999", "1.0000001", "0", "1")
+        modifiers = "".join(f"<modifier><v>2 {b}</v></modifier>" for b in values)
+        blob = f"<timecycle_modifier_data>{modifiers}</timecycle_modifier_data>".encode()
+        summary = tp.summarize_documents([("timecycle_modifier_data", blob)])
+        self.assertEqual(summary["per_modifier_b_pattern"], {
+            "outside_0_1": 2, "in_0_1_with_frac": 2, "all_b_eq_0": 1, "all_b_eq_1": 1,
+        })
+        self.assertEqual(summary["second_number"]["distinct_round6"], 2)
+
     def test_cli_xml_directory_and_out(self):
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "kf.xml"), "wb") as f:

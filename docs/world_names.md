@@ -163,6 +163,8 @@ python -I tools\world_names.py resolve --dict <work>\world\names.json `
 
 `resolve` adds the counts of several `--archetypes` files, so make one whole-archive file rather than one per
 window; `--rpf9-names` may be given once per window.
+When several `--maps` files cover different windows of the same world, a child in one can link
+to a parent map in another. Each child row counts once regardless of file order.
 
 `resolve` accepts `world_index`/`world_census` map JSON (or a row list) and an aggregate archetype file:
 

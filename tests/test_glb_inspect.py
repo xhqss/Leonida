@@ -187,6 +187,25 @@ class GlbInspectTests(unittest.TestCase):
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
 
+    def test_extension_only_base_color_image(self):
+        for extension, uri in (("KHR_texture_basisu", "tile.ktx2"), ("EXT_texture_webp", "tile.webp")):
+            with self.subTest(extension=extension):
+                doc = triangle_gltf()
+                doc["extensionsUsed"] = doc["extensionsRequired"] = [extension]
+                doc["images"] = [{"uri": uri}]
+                doc["textures"] = [{"name": "sampler", "extensions": {extension: {"source": 0}}}]
+                result = self.run_bytes(glb(doc, triangle_bin()))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'baseColorTexture="{uri}"', result.stdout)
+
+                # Keep the core report unchanged when the extension is optional.
+                del doc["extensionsRequired"]
+                doc["images"].append({"uri": "tile.png"})
+                doc["textures"][0]["source"] = 1
+                result = self.run_bytes(glb(doc, triangle_bin()))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('baseColorTexture="tile.png"', result.stdout)
+
     def test_minimal_triangle_mesh_and_material(self):
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "triangle.glb")

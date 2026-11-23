@@ -13,6 +13,14 @@ python -I tools/ttpf_mips.py export path/to/pool.ttpf 0 output.dds --calibration
 
 The synthetic test constructs its own BC1 pool and profile, runs the CLI and compares the full mip payload with known blocks. A real profile requires the caller's calibrated tables. The exporter does not derive the tables automatically. A matching file hash verifies reproduction of a previous fitted export. Original pixel fidelity needs independent reference pixels.
 
+## Faster strict decoding
+
+Once built, the same library also speeds up the default strict path. Its `unpack_model` export (`src/model.rs`) is a line-by-line port of the lane-array model in `tools/bcpack.py` (`_decode_lanes_raw`, virtual zero bytes included), and `tools/bcpack.py` passes it its own probability tables. It therefore accepts exactly the streams the Python model accepts, with the same symbols. It is about 30 times faster than the Python model on synthetic chunks, and NumPy is not needed. When the library is not built, or a stream is refused, Python decodes the stream as before and raises its usual error. `python -I tests/test_bcpack_native.py` checks that the two agree, and `LEONIDA_BCPACK_NATIVE=0` turns the native path off.
+
+For BC1, BC3, BC4 and BC5 chunks, `decode_blocks` (`src/blocks.rs`) also rebuilds the blocks in the same call. It takes only the strict path: a chunk with a non-zero lane 1, or one that references a built-in history entry that is not confirmed, is decoded by Python, so errors and provisional entries do not change. On synthetic 16,384-block chunks, it is about 18 times faster than Python end to end for BC1, 38 times for BC4 and, measured the same way on a Windows PC, about 47 times for BC3 and 45 times for BC5.
+
+The `unpack` export above runs `third_party/bcpack-rs`, which follows the hardware RTL. It is faster but refuses some streams the model accepts, for example every `q = 0` fragment whose omitted trailing zero byte comes before a symbol. That is why the strict path does not use it.
+
 ## Automatic asset export
 
 Run the ordinary build or `python -I make_game.py --game <package> --work <work> --stages assets`. The assets stage runs the C# exporter on each new pool and revisits existing pool manifests. It attempts full mip chains for missing and partial BCn entries whose allocation includes BCPack. With no profile, it uses the Python strict decoder. For calibrated 2D textures and arrays, install NumPy, build the library as above and place a matching profile at `<work>/bcpack-calibration.json` before running the stage.

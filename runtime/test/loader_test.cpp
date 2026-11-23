@@ -684,9 +684,18 @@ bool g_use_fls = false;
 DWORD g_fls_index = FLS_OUT_OF_INDEXES;
 int g_fls_callbacks = 0;
 
+// DllMain's lpvReserved for its last DLL_PROCESS_ATTACH, and whether one was seen.
+void* g_attach_reserved = nullptr;
+bool g_attach_seen = false;
+
 void observe_notification(void* base, DWORD reason, void* reserved, bool tls) {
     g_notifications.push_back({base, reason, tls});
-    if (reserved) g_detach_state_live = false;
+    if (reason == DLL_PROCESS_ATTACH && !tls) {
+        g_attach_reserved = reserved;
+        g_attach_seen = true;
+    }
+    // ~Loader unmaps the image after the detach, which is FreeLibrary's case: lpvReserved is NULL there.
+    if (reason == DLL_PROCESS_DETACH && reserved) g_detach_state_live = false;
     if (reason != DLL_PROCESS_DETACH) return;
     for (const auto& m : g_live_modules) {
         MEMORY_BASIC_INFORMATION info{};
@@ -732,6 +741,8 @@ void reset_notifications() {
     g_fail_attach = false;
     g_use_fls = false;
     g_fls_callbacks = 0;
+    g_attach_reserved = nullptr;
+    g_attach_seen = false;
 }
 
 void expect_notifications(const char* what, const std::vector<Notification>& expected) {
@@ -861,6 +872,37 @@ void test_process_detach_without_entry() {
                          {{first_base, DLL_PROCESS_ATTACH, true}, {first_base, DLL_PROCESS_ATTACH, false},
                           {first_base, DLL_PROCESS_DETACH, true}, {first_base, DLL_PROCESS_DETACH, false}});
     reset_notifications();
+}
+
+// DllMain docs (learn.microsoft.com/windows/win32/dlls/dllmain): "If fdwReason is DLL_PROCESS_ATTACH, lpvReserved is
+// NULL for dynamic loads and non-NULL for static loads." Loader::load() from the host is the process-start graph (the
+// executable and the DLLs it imports), a run-time LoadLibrary of a bundled DLL is a dynamic load.
+void test_attach_reserved() {
+    reset_notifications();
+    try {
+        rt::Loader loader(g_dir);
+        loader.load(write_image(make_lifecycle_image()));
+        loader.initialise();
+        if (!g_attach_seen) failed("a static load's DllMain gets a non-NULL lpvReserved", "DllMain was not called");
+        else if (!g_attach_reserved) failed("a static load's DllMain gets a non-NULL lpvReserved", "lpvReserved was NULL");
+        else pass("a static load's DllMain gets a non-NULL lpvReserved");
+    } catch (const std::exception& e) {
+        failed("a static load's DllMain gets a non-NULL lpvReserved", e.what());
+    }
+
+    reset_notifications();
+    try {
+        write_image_as(make_lifecycle_image(), "attach_reserved_dynamic.dll");
+        rt::Loader loader(g_dir);
+        bool handled = false;
+        void* h = loader.load_runtime_module("attach_reserved_dynamic.dll", 0, handled);
+        if (!handled || !h) failed("a run-time load's DllMain gets a NULL lpvReserved", "the run-time load failed");
+        else if (!g_attach_seen) failed("a run-time load's DllMain gets a NULL lpvReserved", "DllMain was not called");
+        else if (g_attach_reserved) failed("a run-time load's DllMain gets a NULL lpvReserved", "lpvReserved was non-NULL");
+        else pass("a run-time load's DllMain gets a NULL lpvReserved");
+    } catch (const std::exception& e) {
+        failed("a run-time load's DllMain gets a NULL lpvReserved", e.what());
+    }
 }
 
 void test_process_detach_dependencies() {
@@ -1303,6 +1345,7 @@ int main() {
         test_process_detach();
         test_process_detach_invalid_tls();
         test_process_detach_without_entry();
+        test_attach_reserved();
         test_process_detach_dependencies();
         test_failed_dependency_not_registered();
         test_delay_descriptor_fields();

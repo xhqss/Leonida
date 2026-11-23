@@ -421,7 +421,8 @@ carry `descriptor`, `type`, `payload_offset`, `size` and `value`; text nodes car
 `--csv PATH` writes one flat row per node. The `parent` column is the parent element's byte offset, `slot` is
 `attribute` or `content`, `sibling` is the index in that list, and `child_index` is the index among child elements;
 `attrs`, `children`, `content_count`, `type`, `length`, `nul`, `utf8` and `value` describe the node. The CSV is a
-convenience view of the same structural tree, not a second parse.
+convenience view of the same structural tree, not a second parse. Use `source` (the starting filename) with
+`resource` (the archive offset) to group rows: two files in a carve directory can specify the same offset.
 
 XML is a rendering, not a round-trip; the JSON tree is the form that encodes back to bytes (9.6). Fixed tags avoid descriptor names that cannot be used as XML element names:
 `<node name="...">`, `<attr>`, `<value>` and `<text>`. A string containing XML markup is escaped by the writer. The

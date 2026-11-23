@@ -242,6 +242,27 @@ class ReportPathTests(unittest.TestCase):
         with open(blocker, "rb") as f:
             self.assertEqual(f.read(), b"keep me")
 
+    def test_rigs_json_with_utf8_bom_is_accepted(self):
+        rigs_path = os.path.join(self.tmp.name, "rigs_bom.json")
+        out = os.path.join(self.tmp.name, "out_bom.json")
+        with open(rigs_path, "w", encoding="utf-8-sig", newline="\n") as f:
+            json.dump({"rbf0": {"rigsets": []}}, f)
+        r = self.run_tool(self.rpf, out, "--rigs", rigs_path)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertIn("rbf0_join", data["summary"])
+
+    def test_malformed_rigs_json_with_utf8_bom_is_reported(self):
+        rigs_path = os.path.join(self.tmp.name, "rigs_bad_bom.json")
+        out = os.path.join(self.tmp.name, "out_bad_bom.json")
+        with open(rigs_path, "w", encoding="utf-8-sig", newline="\n") as f:
+            f.write("{not valid json")
+        r = self.run_tool(self.rpf, out, "--rigs", rigs_path)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("invalid rig report", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

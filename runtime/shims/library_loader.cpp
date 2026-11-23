@@ -58,6 +58,28 @@ std::string narrow(const wchar_t* w) {
     return s;
 }
 
+bool is_ascii(const wchar_t* w) {
+    for (; w && *w; ++w)
+        if (*w >= 0x80) return false;
+    return true;
+}
+
+// module_name for a name narrow() cannot spell: the last path component as given (the loader matches it
+// case-insensitively, as Windows does), ".dll" added when there is no extension.
+std::wstring module_name_w(std::wstring path) {
+    const size_t slash = path.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) path.erase(0, slash + 1);
+    if (!path.empty() && path.back() == L'.') path.pop_back();
+    else if (path.find(L'.') == std::wstring::npos) path += L".dll";
+    return path;
+}
+
+// Whether the module a wide name refers to has an ASCII name. Only the last component decides: the directory may be
+// outside ASCII (narrow() turns it into '?', which the basename-only lookups never see) while the module is a shim's.
+bool ascii_basename(const wchar_t* name) {
+    return is_ascii(module_name_w(name).c_str());
+}
+
 // LoadLibrary's file-name rules for the module a path names: the last path component, lower case, and ".dll" added
 // when there is no extension (a trailing '.' means "no extension, add nothing").
 std::string module_name(std::string path) {
@@ -139,10 +161,20 @@ HMODULE WINAPI load_library_a(LPCSTR name) {
     return LoadLibraryA(name);
 }
 
+// A name with a character outside ASCII names no shim (their names are ASCII) and narrow() would turn it into '?',
+// so it goes to the bundled loader by its wide basename: an image already mapped under that name is returned, as
+// Windows returns the loaded module for LoadLibraryW of its own file.
+HMODULE load_bundled_w(LPCWSTR name, DWORD flags, bool& handled) {
+    handled = false;
+    const std::wstring dll = module_name_w(name);
+    if (dll.empty()) return nullptr;
+    return reinterpret_cast<HMODULE>(load_bundled_module_w(dll, static_cast<uint32_t>(flags), handled));
+}
+
 HMODULE WINAPI load_library_w(LPCWSTR name) {
     if (name) {
         bool handled = false;
-        HMODULE h = load_shim_or_bundled(narrow(name), 0, handled);
+        HMODULE h = ascii_basename(name) ? load_shim_or_bundled(narrow(name), 0, handled) : load_bundled_w(name, 0, handled);
         if (handled) return h;
     }
     return LoadLibraryW(name);
@@ -160,7 +192,8 @@ HMODULE WINAPI load_library_ex_a(LPCSTR name, HANDLE file, DWORD flags) {
 HMODULE WINAPI load_library_ex_w(LPCWSTR name, HANDLE file, DWORD flags) {
     if (name && (flags & kDataFileLoadFlags) == 0) {
         bool handled = false;
-        HMODULE h = load_shim_or_bundled(narrow(name), flags, handled);
+        HMODULE h = ascii_basename(name) ? load_shim_or_bundled(narrow(name), flags, handled)
+                                   : load_bundled_w(name, flags, handled);
         if (handled) return h;
     }
     return LoadLibraryExW(name, file, flags);
@@ -180,11 +213,18 @@ HMODULE WINAPI get_module_handle_a(LPCSTR name) {
 
 HMODULE WINAPI get_module_handle_w(LPCWSTR name) {
     if (name) {
-        const std::string path = narrow(name);
-        if (HMODULE h = owned_handle(path)) return h;
-        const std::string dll = module_name(path);
-        if (!dll.empty())
-            if (void* h = find_loaded_bundled_module(dll)) return reinterpret_cast<HMODULE>(h);
+        if (ascii_basename(name)) {
+            const std::string path = narrow(name);
+            if (HMODULE h = owned_handle(path)) return h;
+            const std::string dll = module_name(path);
+            if (!dll.empty())
+                if (void* h = find_loaded_bundled_module(dll)) return reinterpret_cast<HMODULE>(h);
+        } else {
+            // Outside ASCII: by the wide basename (narrow() would turn it into '?'), as for load_library_w.
+            const std::wstring dll = module_name_w(name);
+            if (!dll.empty())
+                if (void* h = find_loaded_bundled_module_w(dll)) return reinterpret_cast<HMODULE>(h);
+        }
     }
     return GetModuleHandleW(name);
 }

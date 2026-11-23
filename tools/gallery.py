@@ -2,6 +2,7 @@
 
 Launches a lightweight local HTTP server and opens a modern WebGL/glTF
 3D asset inspector in the browser with Vice City / Leonida aesthetic.
+The texture catalog lists DDS, PNG, JPEG (.jpg or .jpeg) and WebP files.
 
 Usage:
     python -I tools/gallery.py [--port 8080] [--models-dir <path>] [--textures-dir <path>]
@@ -23,6 +24,15 @@ try:
     import dds_png
 except ImportError:
     dds_png = None
+
+
+TEXTURE_FORMATS = {
+    ".dds": "DirectDraw Surface (DDS)",
+    ".png": "PNG Image",
+    ".jpg": "JPEG Image",
+    ".jpeg": "JPEG Image",
+    ".webp": "WebP Image",
+}
 
 
 def categorize_model(name: str, folder: str = "") -> str:
@@ -163,6 +173,11 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
             self._serve_textures_json()
             return
 
+        if clean.startswith("/api/dds/"):
+            rel = urllib.parse.unquote(clean[len("/api/dds/"):])
+            self._serve_dds(rel, self.path.partition("?")[2])
+            return
+
         if clean.startswith("/vendor/"):
             rel = urllib.parse.unquote(clean[len("/vendor/"):])
             vpath = safe_subpath(os.path.join(self.viewer_dir, "vendor"), rel)
@@ -240,19 +255,83 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
 
         self.send_error(404, "Not Found")
 
-    def _send_file(self, file_path: str, content_type: str) -> None:
+    def _serve_dds(self, rel: str, query: str) -> None:
+        path = safe_subpath(self.textures_dir, rel)
+        if path is None:
+            self.send_error(403, "Forbidden")
+            return
+        if not rel.lower().endswith(".dds") or not os.path.isfile(path):
+            self.send_error(404, "DDS texture not found")
+            return
+        if dds_png is None:
+            self.send_error(503, "DDS decoder unavailable")
+            return
         try:
-            size = os.path.getsize(file_path)
+            if query == "info":
+                with open(path, "rb") as source:
+                    info = dds_png.parse_dds_header(source.read(148))
+                payload = json.dumps(info).encode("utf-8")
+                mime = "application/json"
+            else:
+                pairs = urllib.parse.parse_qsl(query, keep_blank_values=True, strict_parsing=True,
+                                                 max_num_fields=5)
+                selection = {}
+                for key, value in pairs:
+                    if (key not in ("mip", "layer", "z", "x", "y") or key in selection or
+                            not value.isascii() or not value.isdecimal()):
+                        raise ValueError("Expected a single unsigned index per selector")
+                    selection[key] = int(value)
+                if "x" in selection or "y" in selection:
+                    if "x" not in selection or "y" not in selection:
+                        raise ValueError("Expected both texel coordinates")
+                    payload = json.dumps(dds_png.read_half_texel(path, **selection)).encode("utf-8")
+                    mime = "application/json"
+                else:
+                    payload = dds_png.dds_file_to_png_bytes(path, max_size=1024, **selection)
+                    mime = "image/png"
+        except ValueError:
+            self.send_error(400, "Invalid DDS texture or subresource selection")
+            return
+        except OSError:
+            self.send_error(500, "Could not read DDS texture")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send_file(self, file_path: str, content_type: str) -> None:
+        # Open the file and take its size before the status line goes out. Once 200 and Content-Length are sent,
+        # an error can no longer become a 500: send_error would write a second response into this one's body.
+        try:
+            f = open(file_path, "rb")
+        except OSError as exc:
+            self.send_error(500, f"Could not open the file: {exc.strerror or exc}")
+            return
+        with f:
+            try:
+                size = os.fstat(f.fileno()).st_size
+            except OSError as exc:
+                self.send_error(500, f"Could not read the file: {exc.strerror or exc}")
+                return
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(size))
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            with open(file_path, "rb") as f:
-                while chunk := f.read(65536):
+            remaining = size
+            try:
+                while remaining > 0 and (chunk := f.read(min(65536, remaining))):
                     self.wfile.write(chunk)
-        except Exception as exc:
-            self.send_error(500, str(exc))
+                    remaining -= len(chunk)
+            except OSError:
+                # A read error, or the client went away: the headers are out, so end the connection with a short
+                # body instead of appending an error page to it.
+                remaining = -1
+            if remaining:
+                self.close_connection = True
 
     def _serve_models_json(self) -> None:
         items = []
@@ -306,24 +385,26 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
             for root, dirs, files in os.walk(self.textures_dir):
                 dirs.sort()
                 for fn in sorted(files):
-                    lower = fn.lower()
-                    if lower.endswith((".dds", ".png", ".jpg", ".webp")):
+                    ext = os.path.splitext(fn)[1].lower()
+                    if ext in TEXTURE_FORMATS:
                         full_path = os.path.join(root, fn)
                         rel_path = os.path.relpath(full_path, self.textures_dir).replace("\\", "/")
                         try:
                             fsize = os.path.getsize(full_path)
                         except OSError:
                             fsize = 0
-                        fmt = "DirectDraw Surface (DDS)" if lower.endswith(".dds") else "PNG Image"
-                        preview_rel = os.path.splitext(rel_path)[0] + ".png" if lower.endswith(".dds") else rel_path
-                        items.append({
+                        preview_rel = os.path.splitext(rel_path)[0] + ".png" if ext == ".dds" else rel_path
+                        item = {
                             "name": fn,
                             "path": rel_path,
                             "size": fsize,
-                            "format": fmt,
+                            "format": TEXTURE_FORMATS[ext],
                             "url": f"/textures/{urllib.parse.quote(rel_path)}",
                             "preview": f"/textures/{urllib.parse.quote(preview_rel)}",
-                        })
+                        }
+                        if ext == ".dds":
+                            item["ddsPreview"] = f"/api/dds/{urllib.parse.quote(rel_path)}"
+                        items.append(item)
 
         items.sort(key=lambda x: x["name"])
         payload = json.dumps({
@@ -387,7 +468,7 @@ def start_server(
         max_count = 0
         for cand in candidates:
             if os.path.isdir(cand):
-                c = sum(1 for f in os.listdir(cand) if f.lower().endswith(('.png', '.dds', '.jpg', '.webp')))
+                c = sum(1 for f in os.listdir(cand) if os.path.splitext(f)[1].lower() in TEXTURE_FORMATS)
                 if c > max_count:
                     max_count = c
                     best_cand = cand

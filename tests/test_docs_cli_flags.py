@@ -3,11 +3,13 @@
     python -I tests/test_docs_cli_flags.py
 
 `tests/test_docs_repo_paths.py` checks the paths the docs name; this checks the options. A renamed or removed
-argparse option leaves `python -I tools/x.py --old` in a README or guide that no longer runs. Two checks:
+argparse option leaves `python -I tools/x.py --old` in a README or guide that no longer runs. Three checks:
 
 1. a `--flag` anywhere in a Markdown page appears as a string in some tracked non-Markdown source file;
 2. in a fenced command that starts `python [-I] tools/x.py` (or `scripts/`, or `make_game.py`), every flag appears in
-   that script (a script that builds flags as `"--" + name` is skipped; `--help` is argparse's own).
+   that script (a script that builds flags as `"--" + name` is skipped; `--help` is argparse's own);
+3. in a fenced command running a PowerShell script (`scripts/` or `tools/`), every flag appears in that script's
+   `param()` block.
 
 Reads tracked files only; no game files.
 """
@@ -25,6 +27,11 @@ FOREIGN = {"--search", "--state", "--index-url", "--help"}
 # Pages that quote another project's tree (SCARAB, americas-recomp).
 OTHER_PROJECTS = {"docs/fssm_crosscheck.md", "docs/d3d12_xs_surface.md"}
 COMMAND = re.compile(r"\bpython3?(?: -I)? ((?:tools|scripts)/[\w/]+\.py|make_game\.py)\b")
+PS1_COMMAND = re.compile(
+    r"(?:powershell(?:\.exe)?\s+.*?-File\s+|(?:\./|\.\\|&|\.)\s*|\b)((?:tools|scripts)[\\/][\w./\\-]+\.ps1)\b",
+    re.IGNORECASE
+)
+PS1_FLAG = re.compile(r"(?<![\w-])(-[a-zA-Z][\w-]*)")
 
 
 def tracked_files():
@@ -42,6 +49,80 @@ def tracked_files():
 def read(path):
     with open(os.path.join(ROOT, path), encoding="utf-8", errors="replace") as f:
         return f.read()
+
+
+def strip_ps_comments(src):
+    """Remove PowerShell block comments (<# ... #>) and line comments (# ...) outside strings."""
+    src = re.sub(r"<#.*?#>", "", src, flags=re.DOTALL)
+    lines = []
+    for line in src.splitlines():
+        in_sgl = in_dbl = False
+        res = []
+        for ch in line:
+            if ch == "'" and not in_dbl:
+                in_sgl = not in_sgl
+            elif ch == '"' and not in_sgl:
+                in_dbl = not in_dbl
+            elif ch == "#" and not in_sgl and not in_dbl:
+                break
+            res.append(ch)
+        lines.append("".join(res))
+    return "\n".join(lines)
+
+
+def extract_ps1_params(content):
+    """Set of lowercase parameter names from the first param(...) block in a PowerShell script."""
+    cleaned = strip_ps_comments(content)
+    m = re.search(r"\bparam\s*\(", cleaned, re.IGNORECASE)
+    if not m:
+        return set()
+    start = m.end()
+    depth = 1
+    i = start
+    n = len(cleaned)
+    in_sgl = in_dbl = False
+    while i < n and depth > 0:
+        ch = cleaned[i]
+        if ch == "'" and not in_dbl:
+            in_sgl = not in_sgl
+        elif ch == '"' and not in_sgl:
+            in_dbl = not in_dbl
+        elif not in_sgl and not in_dbl:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+        i += 1
+    param_body = cleaned[start:i - 1 if depth == 0 else i]
+
+    parts, cur, nest = [], [], 0
+    in_sgl = in_dbl = False
+    for ch in param_body:
+        if ch == "'" and not in_dbl:
+            in_sgl = not in_sgl
+        elif ch == '"' and not in_sgl:
+            in_dbl = not in_dbl
+        elif not in_sgl and not in_dbl:
+            if ch in "([{":
+                nest += 1
+            elif ch in ")]}":
+                if nest > 0:
+                    nest -= 1
+            elif ch == "," and nest == 0:
+                parts.append("".join(cur).strip())
+                cur = []
+                continue
+        cur.append(ch)
+    if cur:
+        parts.append("".join(cur).strip())
+
+    params = set()
+    for part in parts:
+        decl = part.split("=", 1)[0]
+        vars_found = re.findall(r"\$([a-zA-Z_][a-zA-Z0-9_]*)", decl)
+        if vars_found:
+            params.add(vars_found[-1].lower())
+    return params
 
 
 def unknown_flags(pages, code):
@@ -93,6 +174,29 @@ def tool_flag_mismatches(pages, sources):
     return out
 
 
+def ps1_flag_mismatches(pages, sources):
+    """[(page:line, tool, flag)] for fenced commands running a .ps1 script with a flag its param() lacks.
+    `sources` maps a script path to its text or parameter set."""
+    param_cache = {}
+    for path, src in sources.items():
+        norm = path.replace("\\", "/")
+        param_cache[norm] = src if isinstance(src, set) else extract_ps1_params(src)
+    out = []
+    for page, text in sorted(pages.items()):
+        for n, cmd in fenced_commands(text):
+            for m in PS1_COMMAND.finditer(cmd):
+                tool = m.group(1).replace("\\", "/")
+                if tool not in param_cache:
+                    continue
+                tail = cmd[m.end():].split("#", 1)[0]
+                allowed = param_cache[tool]
+                for flag in sorted(set(PS1_FLAG.findall(tail))):
+                    flag_name = flag.lstrip("-").lower()
+                    if flag_name not in allowed:
+                        out.append((f"{page}:{n}", tool, flag))
+    return out
+
+
 class DocsCliFlags(unittest.TestCase):
     def test_checkers_report_only_the_missing_flag(self):
         pages = {"docs/a.md": "Use `--real` or `--gone`, and `gh --search`.\n"
@@ -102,6 +206,10 @@ class DocsCliFlags(unittest.TestCase):
         self.assertEqual(tool_flag_mismatches(pages, sources), [("docs/a.md:3", "tools/x.py", "--old")])
         sources["tools/x.py"] += ' "--" + name'
         self.assertEqual(tool_flag_mismatches(pages, sources), [])
+
+        ps1_pages = {"docs/b.md": "```\n.\\scripts\\test.ps1 -ValidParam -BadParam\n```\n"}
+        ps1_sources = {"scripts/test.ps1": "param([string]$ValidParam)"}
+        self.assertEqual(ps1_flag_mismatches(ps1_pages, ps1_sources), [("docs/b.md:2", "scripts/test.ps1", "-BadParam")])
 
     def test_docs_name_existing_flags(self):
         files = tracked_files()
@@ -119,6 +227,11 @@ class DocsCliFlags(unittest.TestCase):
         bad = tool_flag_mismatches(pages, sources)
         self.assertEqual(bad, [], "fenced commands using a flag their script lacks: " +
                          "; ".join(f"{where} {tool} {flag}" for where, tool, flag in bad))
+
+        ps1_sources = {p: read(p) for p in files if p.endswith(".ps1") and p.startswith(("tools/", "scripts/"))}
+        ps1_bad = ps1_flag_mismatches(pages, ps1_sources)
+        self.assertEqual(ps1_bad, [], "fenced commands using a flag their PowerShell script lacks: " +
+                         "; ".join(f"{where} {tool} {flag}" for where, tool, flag in ps1_bad))
 
 
 if __name__ == "__main__":

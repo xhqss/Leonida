@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; The end of an access decides, not its start (docs/design.md, Buffer bounds checking; measured on a Radeon 880M
 ; (gfx1150), a valid proxy for RDNA2: gfx1036 follows the same column, docs/buffer_bounds.md). Mesa's GFX10 column, which
 ; compares only the start, gives different words for out[0], out[1] and out[6]. Thread 0 seeds heap bytes

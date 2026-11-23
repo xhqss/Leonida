@@ -33,6 +33,10 @@ NO_DEST_OPS = ("s_cmp", "s_bitcmp", "v_cmpx", "s_set", "s_rfe", "s_branch", "s_c
 DS_HAS_DST = ("ds_read", "ds_swizzle", "ds_permute", "ds_bpermute", "ds_append", "ds_consume", "ds_ordered_count",
               "ds_nop")
 WAVE64_RE = re.compile(r"exec_hi|v_mbcnt_hi_u32_b32|_saveexec_b64|_wrexec_b64")
+# VOP2/VOP3 "c" dot forms accumulate into D (D = D + dot(S0, S1)); the same list the translator's read-before-write
+# tracking uses in tools/rdna2spirv.py.
+VOP_DOT_ACCUM = ("v_dot2c_f32_f16", "v_dot2c_i32_i16", "v_dot2c_u32_u16",
+                 "v_dot4c_i32_i8", "v_dot4c_u32_u8", "v_dot8c_i32_i4", "v_dot8c_u32_u4")
 
 
 def base_op(op):
@@ -194,19 +198,27 @@ def rbw_registers(insns):
             or (is_gf_atomic and "glc" not in mods)
             or (is_bi_atomic and "glc" not in mods)
             or (op.startswith("ds_") and "_rtn" not in op and not op.startswith(DS_HAS_DST))
+            # A buffer load with lds transfers straight to LDS: args[0] is vaddr, not a written VGPR.
+            or (op.startswith(("buffer_load", "tbuffer_load")) and "lds" in mods)
         )
         reads_imm_dst = op in SGPR_RMW
         # Instructions that read their destination too (buffer/image atomics with glc read and write vdata at args[0];
         # global/flat atomics with glc write vdst at args[0] and read vaddr/vdata/saddr from args[1:]).
         dst_also_read = (
-            reads_imm_dst or "fmac" in op or "mac_" in op or op == "v_writelane_b32"
+            reads_imm_dst or "fmac" in op or "mac_" in op or "dot2c_" in op or "dot4c_" in op or "dot8c_" in op
+            or op == "v_writelane_b32"
             or op == "v_swap_b32" or (not is_gf_atomic and "_atomic_" in op)
+            or op in VOP_DOT_ACCUM
         )
+        # A direct-to-LDS MUBUF/MTBUF load writes LDS, not a VGPR: args[0] holds the 4-dword LDS address and is read.
+        is_lds_load = op.startswith(("buffer_load", "tbuffer_load")) and "lds" in mods
         is_dual_dst = op.startswith("v_") and (
             "_co_" in op or op.startswith(("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64"))
         )
         # Carry-out / scale-out forms write the VGPR and scalar mask first, even when they also take a carry-in source.
-        if not is_no_dest and is_dual_dst and len(args) >= 2:
+        if is_lds_load:
+            dsts, srcs = [], args
+        elif not is_no_dest and is_dual_dst and len(args) >= 2:
             dsts = args[:2]
             srcs = args[2:]
         elif is_no_dest:

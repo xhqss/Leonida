@@ -9,6 +9,7 @@ import os
 import struct
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1097,6 +1098,43 @@ class CliTests(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assertIn("output must not overwrite the input DDS", stderr.getvalue())
 
+    def test_cli_publishes_only_after_a_complete_write(self):
+        original = dds_buffer(4, 4, bc1_block(0xFFFF, 0, [0, 0, 0, 0]),
+                              flags=DDPF_FOURCC, fourcc=b"DXT1")
+        previous = dds.encode_png(1, 1, b"\x10\x20\x30\xff")
+        replacement = dds.dds_to_png_bytes(original)
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as tmp:
+                src = os.path.join(tmp, "in.dds")
+                dst = os.path.join(tmp, "out.png")
+                with open(src, "wb") as f:
+                    f.write(original)
+                if existing:
+                    with open(dst, "wb") as f:
+                        f.write(previous)
+
+                @contextlib.contextmanager
+                def fail_partial_write(path, mode):
+                    with open(path, mode) as f:
+                        def write(data):
+                            f.write(data[:4])
+                            raise OSError("synthetic disk-full write")
+
+                        yield mock.Mock(write=write) if mode == "wb" else f
+
+                err = io.StringIO()
+                with mock.patch.object(dds, "open", side_effect=fail_partial_write, create=True), \
+                        contextlib.redirect_stderr(err):
+                    self.assertEqual(dds.main([src, dst]), 1)
+                self.assertIn("synthetic disk-full write", err.getvalue())
+                self.assertCountEqual(os.listdir(tmp), ["in.dds", "out.png"] if existing else ["in.dds"])
+                if existing:
+                    with open(dst, "rb") as f:
+                        self.assertEqual(f.read(), previous)
+                self.assertEqual(dds.main([src, dst]), 0)
+                with open(dst, "rb") as f:
+                    self.assertEqual(f.read(), replacement)
+
     def test_cli_reports_unsupported_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "in.dds")
@@ -1133,6 +1171,102 @@ class CliTests(unittest.TestCase):
             self.assertEqual(dds.main([src, dst, "--max-size", "0"]), 0)
             with open(dst, "rb") as f:
                 self.assertEqual(f.read(8), dds.PNG_SIGNATURE)
+
+
+def halves(*codes):
+    return struct.pack(f"<{len(codes)}H", *codes)
+
+
+HALF_FLOAT = dict(flags=DDPF_FOURCC, fourcc=b"DX10")
+
+
+class HalfFloatTests(unittest.TestCase):
+    """DXGI 54 (R16_FLOAT) and 10 (R16G16B16A16_FLOAT): clamp to [0, 1], round(v * 255) half up."""
+
+    def test_header_names_the_half_float_formats(self):
+        for dxgi, name in ((54, "R16_FLOAT"), (10, "RGBA16_FLOAT")):
+            with self.subTest(dxgi=dxgi):
+                info = dds.parse_dds_header(dds_buffer(1, 1, dxgi=dxgi, **HALF_FLOAT))
+                self.assertEqual((info["format"], info["dxgi_format"]), (name, dxgi))
+
+    def test_r16_float_fills_red_and_skips_row_padding(self):
+        # 1.0, 0.5 | 2^-8, 2.0 with four padding bytes after each 4-byte row.
+        payload = halves(0x3C00, 0x3800) + b"\xcc" * 4 + halves(0x1C00, 0x4000)
+        width, height, rgba = dds.decode_dds(dds_buffer(2, 2, payload, pitch=8, dxgi=54, **HALF_FLOAT))
+        self.assertEqual((width, height), (2, 2))
+        self.assertEqual(pixels(rgba), [(255, 0, 0, 255), (128, 0, 0, 255), (1, 0, 0, 255), (255, 0, 0, 255)])
+
+    def test_rgba16_float_keeps_alpha_and_skips_row_padding(self):
+        payload = (halves(0x3C00, 0x3800, 0x0000, 0x3C00) + b"\xcc" * 4
+                   + halves(0x3555, 0x1C00, 0x3BFF, 0x3800))
+        width, height, rgba = dds.decode_dds(dds_buffer(1, 2, payload, pitch=12, dxgi=10, **HALF_FLOAT))
+        self.assertEqual((width, height), (1, 2))
+        # 0x3555 = 0.333252 -> 85; 0x3BFF = 0.999512 -> 255.
+        self.assertEqual(pixels(rgba), [(255, 128, 0, 255), (85, 1, 255, 128)])
+
+    def test_tightly_packed_rows_without_a_pitch(self):
+        payload = halves(0x3800, 0x3C00, 0x0000, 0x3400)  # 0.5, 1, 0, 0.25
+        for pitch in (None, 0):
+            with self.subTest(pitch=pitch):
+                self.assertEqual(dds.decode_dds(dds_buffer(2, 2, payload, pitch=pitch, dxgi=54, **HALF_FLOAT)),
+                                 (2, 2, bytes((128, 0, 0, 255, 255, 0, 0, 255, 0, 0, 0, 255, 64, 0, 0, 255))))
+
+    def test_nonfinite_negative_and_subnormal_values(self):
+        cases = (
+            (0x7C00, 255),  # +inf
+            (0xFC00, 0),  # -inf
+            (0x7E00, 0),  # quiet NaN
+            (0x7C01, 0),  # signalling NaN
+            (0xFFFF, 0),  # negative NaN
+            (0x8000, 0),  # -0
+            (0xBC00, 0),  # -1
+            (0x7BFF, 255),  # 65504, largest finite
+            (0x0001, 0),  # smallest subnormal
+            (0x0000, 0),
+        )
+        payload = halves(*(code for code, _ in cases))
+        _, _, r16 = dds.decode_dds(dds_buffer(len(cases), 1, payload, dxgi=54, **HALF_FLOAT))
+        self.assertEqual(list(r16[0::4]), [v for _, v in cases])
+        self.assertEqual(set(r16[3::4]), {255})
+        # Same codes in every RGBA16_FLOAT channel, alpha included.
+        rgba_payload = b"".join(halves(code, code, code, code) for code, _ in cases)
+        _, _, rgba = dds.decode_dds(dds_buffer(len(cases), 1, rgba_payload, dxgi=10, **HALF_FLOAT))
+        self.assertEqual(pixels(rgba), [(v, v, v, v) for _, v in cases])
+
+    def test_every_half_code_maps_deterministically(self):
+        payload = struct.pack("<65536H", *range(65536))
+        data = dds_buffer(256, 256, payload, dxgi=54, **HALF_FLOAT)
+        _, _, rgba = dds.decode_dds(data)
+        red = rgba[0::4]
+        self.assertEqual(dds.decode_dds(data)[2], rgba)
+        positive = red[:0x7C00]  # +0 up to 65504, in increasing order
+        self.assertTrue(all(a <= b for a, b in zip(positive, positive[1:])))
+        self.assertEqual((red[0x3C00], red[0x7C00]), (255, 255))
+        self.assertFalse(any(red[0x7C01:0x8000]), "NaN must be 0")
+        self.assertFalse(any(red[0x8000:]), "the sign bit must give 0")
+
+    def test_pitch_and_truncation_errors(self):
+        with self.assertRaisesRegex(dds.DdsError, "RGBA16_FLOAT row pitch"):
+            dds.decode_dds(dds_buffer(1, 2, bytes(16), pitch=4, dxgi=10, **HALF_FLOAT))
+        with self.assertRaisesRegex(dds.DdsError, "Truncated R16_FLOAT"):
+            dds.decode_dds(dds_buffer(2, 2, bytes(11), pitch=8, dxgi=54, **HALF_FLOAT))
+        # The last row needs only its own bytes, not a full pitch.
+        self.assertEqual(dds.decode_dds(dds_buffer(2, 2, bytes(12), pitch=8, dxgi=54, **HALF_FLOAT))[0:2], (2, 2))
+
+    def test_cli_writes_the_png(self):
+        payload = halves(0x3C00, 0x0000, 0x3800, 0x3C00, 0x7E00, 0x7C00, 0x3400, 0x3800)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.dds")
+            dst = os.path.join(tmp, "out.png")
+            with open(src, "wb") as f:
+                f.write(dds_buffer(2, 1, payload, pitch=16, dxgi=10, **HALF_FLOAT))
+            self.assertEqual(dds.main([src, dst]), 0)
+            with open(dst, "rb") as f:
+                chunks = png_chunks(f.read())
+        ihdr = next(p for t, p, _ in chunks if t == b"IHDR")
+        self.assertEqual(struct.unpack(">II", ihdr[:8]), (2, 1))
+        raw = zlib.decompress(b"".join(p for t, p, _ in chunks if t == b"IDAT"))
+        self.assertEqual(raw[1:], bytes((255, 0, 128, 255, 0, 255, 64, 128)))
 
 
 if __name__ == "__main__":

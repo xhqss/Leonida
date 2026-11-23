@@ -48,7 +48,10 @@ Set-Alias -Name (Join-Path $PWD 'runtime\build\gta6rt.exe') -Value Write-Output
                      "-Command", script], cwd=root, env=env, capture_output=True, timeout=30,
                 )
                 self.assertEqual(run.returncode, 0, run.stderr)
-                self.assertTrue((reports / "fixture.exe.gdk_calls.json").is_file(), run.stdout)
+                # A failed find_hash_lookup step is only a warning in the script and later steps reset
+                # $LASTEXITCODE, so the exit status doesn't show it: check that each step wrote its report.
+                for report in ("fixture.exe.gdk_calls.json", "hash_lookup.json"):
+                    self.assertTrue((reports / report).is_file(), (report, run.stdout, run.stderr))
                 imports = json.loads((reports / "fixture.exe.json").read_text("utf-8"))["imports"]
                 return {entry["dll"].lower() for entry in imports if entry["where"] == "shim"}
 

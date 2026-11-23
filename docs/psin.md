@@ -399,11 +399,12 @@ python -I tools/psin_data.py <PSIN file or carve directory> [--json] [--limit N]
 python -I tools/psin_data.py <PSIN file> --dump
 ```
 
-The default output is the counts above, for one file or every `.bin` in a carve directory. `--dump` prints one
-container's decoded tree (hashes as hex) on stdout, for local inspection only. It writes no file and must not be
-pasted into an issue or a pull request. `tests/test_psin_data.py` builds containers from invented names and covers
-every layout above, the end padding, a bad fill, pointers out of range, an unlisted enum value, a skipped type and
-the CLI.
+The default output is the counts above, for one file or every `.bin` in a carve directory. A single file that does
+not start with the `PSIN` magic is one `ERROR:` line and exit 2; inside a directory such a file is skipped, since a
+carve folder holds other streams too. `--dump` prints one container's decoded tree (hashes as hex) on stdout, for
+local inspection only. It writes no file and must not be pasted into an issue or a pull request.
+`tests/test_psin_data.py` builds containers from invented names and covers every layout above, the end padding, a
+bad fill, pointers out of range, an unlisted enum value, a skipped type and the CLI.
 
 ### Name hashes in the data
 
@@ -583,7 +584,10 @@ python -I tools/script_qtable.py <carve_dir_or_rpf_or_bin> [--root-hash HEX] [--
 Accepts an `rpf9_carve.py` carve directory (`script`), a `script.rpf` archive or a joined `.bin` payload.
 Default stdout and `--json` output emit aggregate counts, histograms and structural invariant checks only; `--root-hash`
 and `--type-hash` report local tree/type counts in hex. `tests/test_script_qtable.py` covers synthetic multi-tree parsing,
-64 KiB stream reassembly across a carve folder, pointer validation and output collision guards.
+64 KiB stream reassembly across a carve folder, pointer validation and output collision guards. A target that does not
+exist, or that cannot be read, stops the tool with one `ERROR:` line and exit 2 before anything is parsed; a readable
+file that is not an object-tree payload is exit 1, the scan's verdict, and a `--json` file that cannot be written is
+exit 2 as well.
 
 ## Limits
 

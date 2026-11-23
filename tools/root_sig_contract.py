@@ -3,6 +3,8 @@ r"""Reconcile a root signature against the translator's user-SGPR reads (stdlib 
 A shader is identified by its index.json entry (user_sgpr_reads from
 tools/shader_meta.py); the candidate root signature is a hand-written JSON
 file in this tool's format (see --example), never game data.
+When a 64-bit pointer read names both source SGPRs in `pair`, they must supply
+the low and high DWORDs of the same root address, in that order.
 
 Usage:
     python -I tools/root_sig_contract.py <index.json> --rootsig <sig.json>
@@ -108,7 +110,20 @@ def reconcile(shader_reads, dwords):
         if type(sgpr) is not int:  # bool is an int subclass, but not a valid SGPR index.
             issues.append(f"invalid SGPR index {sgpr!r}: expected an integer")
             continue
-        by_sgpr.setdefault(sgpr, []).append(read["kind"])
+        kind = read["kind"]
+        if kind in ("ptr64_lo", "ptr64_hi") and "pair" in read:
+            # shader_meta records the source SGPRs, which need not be neighbours.
+            # Checking each slot's kind alone accepts a VA spliced from two parameters.
+            lo = sgpr if kind == "ptr64_lo" else sgpr - 1
+            hi = lo + 1
+            pair = read["pair"]
+            if not (pair == [lo, hi] and all(type(i) is int for i in pair)
+                    and 0 <= lo < hi < len(dwords)
+                    and dwords[lo]["ptype"] in ("descriptor", "table")
+                    and dwords[lo]["sub"] == 0 and dwords[hi]["sub"] == 1
+                    and dwords[lo]["param"] == dwords[hi]["param"]):
+                issues.append(f"s{sgpr} ({kind}): pair {pair!r} does not name both halves of one root address")
+        by_sgpr.setdefault(sgpr, []).append(kind)
     for sgpr in sorted(by_sgpr):
         kinds = by_sgpr[sgpr]
         if sgpr < 0 or sgpr >= len(dwords):

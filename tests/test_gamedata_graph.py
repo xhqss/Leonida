@@ -97,6 +97,24 @@ class GamedataGraphTest(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", TOOL, *args], cwd=self.root,
                               capture_output=True, text=True, errors="replace")
 
+    def test_unknown_encoding_counts_as_unparsed_beside_valid_document(self):
+        unsupported = os.path.join(self.root, "unsupported.xml")
+        valid = os.path.join(self.root, "valid.xml")
+        out = os.path.join(self.root, "graph.json")
+        with open(unsupported, "wb") as f:
+            f.write(b'<?xml version="1.0" encoding="x-fixture-unknown"?><Unparsed/>')
+        with open(valid, "wb") as f:
+            f.write(ALPHA)
+        result = self.run_tool(unsupported, valid, "--json", out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(out, encoding="utf-8") as f:
+            summary = json.load(f)["summary"]
+        self.assertEqual(summary["payloads"], 2)
+        self.assertEqual(summary["parsed"], 1)
+        self.assertEqual(summary["unparsed"], 1)
+        self.assertEqual(summary["rootless"], 0)
+        self.assertEqual(summary["include_sites"], 2)
+
     def test_cli_reports_unwritable_graph_report(self):
         self.finish()
         out = os.path.join(self.root, "missing", "graph.json")

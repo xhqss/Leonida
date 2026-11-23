@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; VOP3 output modifiers on v_cvt_f16_f32, in the order an RX 6800 applies them (@shelbykb2, #718): round to f16, then
 ; omod, then clamp. With an omod a zero or denormal f16 gives +0. The destination's high half is kept.
 ;   1.5 clamp -> 1.0 (0x3c00), high half 0xaaaa kept    0.375 mul:4 -> 1.5 (0x3e00)

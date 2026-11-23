@@ -174,6 +174,8 @@ public:
         device_ = device;
     }
 
+    IUnknown* attached_device() const { return device_; }
+
     HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;

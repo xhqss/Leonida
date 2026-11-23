@@ -4,6 +4,7 @@ Sources: printable runs in carved blobs (selected archives fully; PSO/RBF blobs 
 any extra text/binary files given (e.g. the exe once it arrives: run with --extra path\\to\\exe).
 When multiple names share a hash, the dictionary keeps the lexicographically first spelling.
 The output cannot overwrite an input index, extra file, or harvested blob (including hard-link aliases).
+An index.json saved with a UTF-8 BOM (Windows PowerShell 5.1, old Notepad) is read, not refused.
 
 Usage:
     python -I hashdict.py <carve dir> --out hashes.json [--archives a,b] [--extra f1 f2 ...] [--min 3]
@@ -136,7 +137,8 @@ def main():
         if not os.path.isfile(p):
             continue
         try:
-            with open(p, encoding="utf-8") as f:
+            # utf-8-sig: PowerShell 5.1 and old Notepad write JSON with a UTF-8 BOM, as the other readers here accept.
+            with open(p, encoding="utf-8-sig") as f:
                 rows = json.load(f)["files"]
             if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
                 raise ValueError('"files" is not a list of entries')

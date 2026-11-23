@@ -10,6 +10,9 @@ tens of thousands of small blobs a spotty one. ``docs/gamedata.md`` uses these c
 `Channel` numbers to texture channels.
 
 Only counts are written. The input is the user's own export and stays local.
+
+`--json` is published from a staging file next to the destination, creating the folder when it is missing, so
+a run that fails while writing leaves an older report in place; a write error is one `ERROR:` line and exit 2.
 """
 from __future__ import annotations
 
@@ -17,11 +20,13 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 import dds_png  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 
 CHANNELS = "RGBA"
 
@@ -78,7 +83,7 @@ def same_file(first: str, second: str) -> bool:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("dds", help="an exported .dds texture")
-    ap.add_argument("--thresholds", default="64,128,192", help="comma-separated 0..255 levels (default 64,128,192)")
+    ap.add_argument("--thresholds", default="64,128,192", help="comma-separated 1..255 levels (default 64,128,192)")
     ap.add_argument("--json", help="also write the counts here")
     a = ap.parse_args(argv)
     try:
@@ -89,8 +94,15 @@ def main(argv=None) -> int:
         ap.error("--thresholds must be within 1..255")
     if a.json and same_file(a.dds, a.json):
         ap.error("--json names the input texture; writing it would replace the DDS")
-    with open(a.dds, "rb") as fh:
-        width, height, rgba = dds_png.decode_dds(fh.read())
+    if a.json and os.path.isdir(a.json):
+        print(f"error: --json path is a directory: {a.json}", file=sys.stderr)
+        return 2
+    try:
+        with open(a.dds, "rb") as fh:
+            width, height, rgba = dds_png.decode_dds(fh.read())
+    except (OSError, ValueError) as e:
+        print(f"error: cannot read {a.dds}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
+        return 2
     counts = channel_counts(width, height, rgba, thresholds)
     print(f"{width}x{height}")
     for name, row in counts.items():
@@ -99,8 +111,20 @@ def main(argv=None) -> int:
         print(f"{name} min {row['min']} max {row['max']} mean {row['mean']} distinct {row['distinct']} | "
               + " | ".join(parts))
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump({"width": width, "height": height, "channels": counts}, fh, indent=2)
+        out_dir = os.path.dirname(os.path.abspath(a.json))
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=".mask-json-", dir=out_dir) as staging:
+                staged = os.path.join(staging, "masks.json")
+                with open(staged, "w", encoding="utf-8", newline="\n") as fh:
+                    json.dump({"width": width, "height": height, "channels": counts}, fh, indent=2)
+                os.chmod(staged, published_mode(a.json))    # tempfile creates 0600; the report gets the usual bits
+                os.replace(staged, a.json)
+        except OSError as error:
+            # A failed write must not leave a half-written report where the last good one was.
+            reason = error.strerror or str(error)
+            print(f"ERROR: {a.json}: {reason}", file=sys.stderr)
+            return 2
     return 0
 
 

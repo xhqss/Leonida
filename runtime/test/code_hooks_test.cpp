@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace {
 
@@ -40,10 +41,26 @@ void caller(uint8_t* at, const uint8_t* to) {
     put(at + 9, {0x48, 0x83, 0xC4, 0x28, 0xC3});
 }
 
+void init_pe64(uint8_t* img, uint32_t size_of_image, const std::vector<IMAGE_SECTION_HEADER>& sections) {
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(img);
+    dos->e_magic = IMAGE_DOS_SIGNATURE;
+    dos->e_lfanew = 0x80;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(img + dos->e_lfanew);
+    nt->Signature = IMAGE_NT_SIGNATURE;
+    nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+    nt->FileHeader.NumberOfSections = static_cast<WORD>(sections.size());
+    nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+    nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    nt->OptionalHeader.SizeOfImage = size_of_image;
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    for (std::size_t i = 0; i < sections.size(); ++i) sec[i] = sections[i];
+}
+
 }  // namespace
 
 int main() {
     using namespace leonida::hooks;
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     uint8_t* mem = alloc_near(reinterpret_cast<const void*>(&remap_lucia), 4096);
     check(mem != nullptr, "executable memory near the module");
     if (!mem) return 1;
@@ -122,6 +139,157 @@ int main() {
         check(original_calls == 2, "the override sees every call, after the original ran");
     }
     check(!hook_image_results(mem, 0, first_person_on_foot).ok, "hook_image_results refuses memory without a PE");
+
+    // Test A: PE64 executable section with Misc.VirtualSize == 0 falls back to SizeOfRawData (matching pe_loader.cpp).
+    uint8_t* img_a = alloc_near(reinterpret_cast<const void*>(&remap_lucia), 0x2000);
+    check(img_a != nullptr, "synthetic PE64 image A allocated near module");
+    if (img_a) {
+        std::memset(img_a, 0, 0x2000);
+        IMAGE_SECTION_HEADER sec_a{};
+        std::memcpy(sec_a.Name, ".text", 5);
+        sec_a.Misc.VirtualSize = 0;
+        sec_a.VirtualAddress = 0x1000;
+        sec_a.SizeOfRawData = 0x200;
+        sec_a.Characteristics = IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE;
+        init_pe64(img_a, 0x2000, {sec_a});
+        put(img_a + 0x1000, {0x89, 0xC8, 0xC3});  // mov eax, ecx ; ret
+        caller(img_a + 0x1020, img_a + 0x1000);
+        DWORD old_a = 0;
+        check(VirtualProtect(img_a + 0x1000, 0x1000, PAGE_EXECUTE_READ, &old_a) != FALSE,
+              "image A code page marked PAGE_EXECUTE_READ");
+        FlushInstructionCache(GetCurrentProcess(), img_a + 0x1000, 0x1000);
+
+        const HookResult ra = hook_image_calls(img_a, 0x1000, &remap_lucia, 0);
+        check(ra.ok && ra.redirected == 1,
+              "VirtualSize == 0 executable section uses SizeOfRawData and redirects its caller");
+        if (ra.ok) {
+            check(reinterpret_cast<Fn1>(img_a + 0x1020)(lucia) == mandy,
+                  "hooked caller in VirtualSize == 0 section remaps Lucia to Mandy");
+            check(reinterpret_cast<Fn1>(img_a + 0x1020)(1234) == 1234,
+                  "hooked caller in VirtualSize == 0 section passes other hashes through");
+        }
+    }
+
+    // Test B: a 0-byte executable section (VirtualSize == 0 && SizeOfRawData == 0) is skipped rather than failing VirtualProtect.
+    uint8_t* img_b = alloc_near(reinterpret_cast<const void*>(&remap_lucia), 0x2000);
+    check(img_b != nullptr, "synthetic PE64 image B allocated near module");
+    if (img_b) {
+        std::memset(img_b, 0, 0x2000);
+        IMAGE_SECTION_HEADER sec_empty{};
+        std::memcpy(sec_empty.Name, ".empty", 6);
+        sec_empty.Misc.VirtualSize = 0;
+        sec_empty.VirtualAddress = 0x1000;
+        sec_empty.SizeOfRawData = 0;
+        sec_empty.Characteristics = IMAGE_SCN_MEM_EXECUTE;
+        IMAGE_SECTION_HEADER sec_text{};
+        std::memcpy(sec_text.Name, ".text", 5);
+        sec_text.Misc.VirtualSize = 0x200;
+        sec_text.VirtualAddress = 0x1000;
+        sec_text.SizeOfRawData = 0x200;
+        sec_text.Characteristics = IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE;
+        init_pe64(img_b, 0x2000, {sec_empty, sec_text});
+        put(img_b + 0x1040, {0xB8, 0x02, 0x00, 0x00, 0x00, 0xC3});  // mov eax, 2 ; ret
+        caller(img_b + 0x1060, img_b + 0x1040);
+        DWORD old_b = 0;
+        check(VirtualProtect(img_b + 0x1000, 0x1000, PAGE_EXECUTE_READ, &old_b) != FALSE,
+              "image B code page marked PAGE_EXECUTE_READ");
+        FlushInstructionCache(GetCurrentProcess(), img_b + 0x1000, 0x1000);
+
+        const int before_calls = original_calls;
+        const HookResult rb = hook_image_results(img_b, 0x1040, first_person_on_foot);
+        check(rb.ok && rb.redirected == 1,
+              "0-byte executable section is skipped and the non-empty section is hooked");
+        if (rb.ok) {
+            using Ctx = uint32_t (*)(uint32_t);
+            check(reinterpret_cast<Ctx>(img_b + 0x1060)(0) == 4,
+                  "result hook in PE64 image overrides context 0");
+            check(reinterpret_cast<Ctx>(img_b + 0x1060)(3) == 2,
+                  "result hook in PE64 image preserves non-overridden contexts");
+            check(original_calls == before_calls + 2,
+                  "result hook invokes the original getter on each call");
+        }
+    }
+
+    // Test C: sections extending past SizeOfImage are clamped and 32-bit VirtualAddress + VirtualSize wraparound is safe.
+    uint8_t* img_c = alloc_near(reinterpret_cast<const void*>(&remap_lucia), 0x2000);
+    check(img_c != nullptr, "synthetic PE64 image C allocated near module");
+    if (img_c) {
+        std::memset(img_c, 0, 0x2000);
+        IMAGE_SECTION_HEADER sec_wrap{};
+        std::memcpy(sec_wrap.Name, ".wrap", 5);
+        sec_wrap.Misc.VirtualSize = 0x200u;
+        sec_wrap.VirtualAddress = 0xFFFFFF00u;
+        sec_wrap.Characteristics = IMAGE_SCN_MEM_EXECUTE;
+        IMAGE_SECTION_HEADER sec_over{};
+        std::memcpy(sec_over.Name, ".text", 5);
+        sec_over.Misc.VirtualSize = 0x1800u;  // spans 0x0800..0x2000, past SizeOfImage = 0x1000
+        sec_over.VirtualAddress = 0x0800u;
+        sec_over.Characteristics = IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE;
+        init_pe64(img_c, 0x1000, {sec_wrap, sec_over});
+        put(img_c + 0x0800, {0x89, 0xC8, 0xC3});  // mov eax, ecx ; ret
+        caller(img_c + 0x0820, img_c + 0x0800);   // in-image caller
+        caller(img_c + 0x1020, img_c + 0x0800);   // out-of-image bytes past SizeOfImage
+        uint8_t out_before[16];
+        std::memcpy(out_before, img_c + 0x1020, sizeof(out_before));
+        FlushInstructionCache(GetCurrentProcess(), img_c, 0x2000);
+
+        const HookResult rc = hook_image_calls(img_c, 0x0800, &remap_lucia, 0);
+        check(rc.ok && rc.redirected == 1,
+              "section past SizeOfImage is clamped and wraparound section is ignored");
+        if (rc.ok) {
+            check(reinterpret_cast<Fn1>(img_c + 0x0820)(lucia) == mandy,
+                  "in-image caller inside clamped section is remapped");
+            check(std::memcmp(img_c + 0x1020, out_before, sizeof(out_before)) == 0,
+                  "bytes beyond SizeOfImage are left untouched");
+        }
+    }
+
+    // Test D: malformed headers, PE32 optional header, out-of-image section table, and null arguments/callbacks.
+    uint8_t* bad = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    check(bad != nullptr, "scratch buffer for malformed PE checks allocated");
+    if (bad) {
+        std::memset(bad, 0, 0x1000);
+        auto* bad_dos = reinterpret_cast<IMAGE_DOS_HEADER*>(bad);
+        bad_dos->e_magic = IMAGE_DOS_SIGNATURE;
+        bad_dos->e_lfanew = 0;
+        check(!hook_image_calls(bad, 0x200, &remap_lucia, 0).ok, "MZ with e_lfanew == 0 is refused");
+        bad_dos->e_lfanew = -16;
+        check(!hook_image_calls(bad, 0x200, &remap_lucia, 0).ok, "MZ with negative e_lfanew is refused");
+
+        std::memset(bad, 0, 0x1000);
+        init_pe64(bad, 0x1000, {});
+        auto* bad_nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(bad + 0x80);
+        bad_nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+        check(!hook_image_calls(bad, 0x200, &remap_lucia, 0).ok, "PE32 optional header magic is refused");
+
+        std::memset(bad, 0, 0x1000);
+        init_pe64(bad, 0x200, {});
+        bad_nt->FileHeader.NumberOfSections = 100;
+        check(!hook_image_calls(bad, 0x100, &remap_lucia, 0).ok,
+              "section table extending past SizeOfImage is refused");
+        VirtualFree(bad, 0, MEM_RELEASE);
+    }
+
+    if (img_a) {
+        check(!hook_image_calls(img_a, 0x1000, nullptr, 0).ok, "hook_image_calls refuses null callback");
+        VirtualFree(img_a, 0, MEM_RELEASE);
+    }
+    if (img_b) {
+        check(!hook_image_results(img_b, 0x1040, nullptr).ok, "hook_image_results refuses null callback");
+        VirtualFree(img_b, 0, MEM_RELEASE);
+    }
+    if (img_c) VirtualFree(img_c, 0, MEM_RELEASE);
+
+    check(!hook_image_calls(nullptr, 0x1000, &remap_lucia, 0).ok, "hook_image_calls refuses null base");
+    check(!hook_image_results(nullptr, 0x1000, first_person_on_foot).ok, "hook_image_results refuses null base");
+    check(make_remap_thunk(target0, 0, nullptr, target0) == nullptr, "make_remap_thunk refuses null callback");
+    check(make_remap_thunk(nullptr, 0, &remap_lucia, target0) == nullptr, "make_remap_thunk refuses null close_to");
+    check(make_result_thunk(getter, nullptr, getter) == nullptr, "make_result_thunk refuses null callback");
+    check(make_result_thunk(getter, first_person_on_foot, nullptr) == nullptr,
+          "make_result_thunk refuses null original");
+    check(redirect_direct_branches(nullptr, 16, target0, thunk0) == 0,
+          "redirect_direct_branches returns 0 for null begin");
+    VirtualFree(mem, 0, MEM_RELEASE);
 
     std::printf("code_hooks_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

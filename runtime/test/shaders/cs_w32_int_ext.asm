@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Integer ops added with CPU-only checks (#445 #448 #449 #440 #544 #577), run once on a GPU.
 ; Lane 0 of a wave32 group computes one result per op and stores eight dwords:
 ;   out[0] = s_absdiff_i32(0x7FFFFFFF, 0x80000000)    = 1           (the 32-bit difference wraps to -1 first)

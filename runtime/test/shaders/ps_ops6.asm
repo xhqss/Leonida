@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Packed b16 shifts with op_sel: independent per-half shift amounts and source halves.
 ; Expected mrt0 bits: 0xf800ffff, 0x01000010, 0x00800800, 0x8000fff0
 v_mov_b32_e32 v0, 0x00040004

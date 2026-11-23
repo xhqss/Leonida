@@ -14,9 +14,11 @@ The output is pcm_s16le at the stream's own sample rate and channel count (Opus 
 stream is trimmed to its Ogg Opus end granule minus pre-skip, because ffmpeg can keep samples beyond its declared
 end. For chained streams, ffmpeg handles each link's timing. ffmpeg must be on PATH or given with
 --ffmpeg; without it the tool exits with an explanation instead of a traceback.
+The decode queue holds at most one outstanding job per worker, even for a large input tree.
 
 For PCM copies of the AWC banks' Opus streams, first repackage the banks with awc_opus.py, then run this tool on
 its output (make_game.py does both, the second only with --wav).
+Usage: `python -I tools/audio_wav.py --help` lists the options.
 """
 import argparse
 import concurrent.futures
@@ -433,6 +435,24 @@ def decode(ffmpeg: str, src: str, dst: str):
         return False, str(e)
 
 
+def _decode_jobs(pool, ffmpeg, todo, workers):
+    """Yield (relative name, completed future) without retaining a future for every input."""
+    jobs = iter(todo)
+    pending = {}
+    while True:
+        while len(pending) < workers:
+            job = next(jobs, None)
+            if job is None:
+                break
+            path, rel, dst = job
+            pending[pool.submit(decode, ffmpeg, path, dst)] = rel
+        if not pending:
+            return
+        ready, _ = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+        for future in ready:
+            yield pending.pop(future), future
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Decode Ogg Opus audio to 16-bit PCM WAV with ffmpeg.")
     ap.add_argument("src", help="a directory to search recursively, or one .ogg/.opus file")
@@ -494,13 +514,22 @@ def main(argv=None) -> int:
     t0 = time.time()
     written = skipped = 0
     todo = []
-    failures: list[tuple[str, str]] = []
+    failed = 0
+    failure_samples: list[tuple[str, str]] = []
+
+    def record_failure(rel: str, message: str) -> None:
+        nonlocal failed
+        failed += 1
+        if len(failure_samples) < 10:
+            first = next((line.strip() for line in message.splitlines() if line.strip()), "unknown error")
+            failure_samples.append((rel, first))
+
     for path, rel in items:
         dst = os.path.join(out, rel + ".wav")
         if os.path.isfile(dst):
             skipped += 1
         elif os.path.exists(dst):
-            failures.append((rel, f"output path is not a file: {dst}"))
+            record_failure(rel, f"output path is not a file: {dst}")
         else:
             todo.append((path, rel, dst))
 
@@ -509,10 +538,7 @@ def main(argv=None) -> int:
     if todo:
         print(f"Decoding {len(todo)} file(s) with {workers} job(s)...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(decode, ffmpeg, path, dst): (path, rel)
-                   for path, rel, dst in todo}
-        for future in concurrent.futures.as_completed(futures):
-            path, rel = futures[future]
+        for rel, future in _decode_jobs(pool, ffmpeg, todo, workers):
             try:
                 ok, message = future.result()
             except Exception as e:                  # never lose the summary to an unexpected worker error
@@ -521,23 +547,22 @@ def main(argv=None) -> int:
             if ok:
                 written += 1
             else:
-                failures.append((rel, message))
+                record_failure(rel, message)
             if done % 200 == 0:
                 print(f"  {done}/{len(todo)} decoded", flush=True)
 
     seconds = time.time() - t0
     summary = f"{len(items)} Ogg Opus file(s): {written} WAV written, {skipped} already present"
-    if failures:
-        summary += f", {len(failures)} failed"
+    if failed:
+        summary += f", {failed} failed"
     print(summary + f" ({seconds:.1f}s)")
     if not_opus:
         print(f"  {not_opus} .ogg/.opus file(s) skipped: not Ogg Opus")
-    for rel, message in failures[:10]:
-        first = next((line.strip() for line in message.splitlines() if line.strip()), "unknown error")
+    for rel, first in failure_samples:
         print(f"  FAILED {rel}: {first}")
-    if len(failures) > 10:
-        print(f"  ... and {len(failures) - 10} more failures")
-    return 1 if failures else 0
+    if failed > len(failure_samples):
+        print(f"  ... and {failed - len(failure_samples)} more failures")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -224,6 +225,20 @@ class RadvBinary(unittest.TestCase):
             P.radv_arch("NVIDIA GeForce RTX 3090")
 
 
+class HarnessEnvironment(unittest.TestCase):
+    def test_child_receives_selected_format_even_when_shell_sets_one(self):
+        # Use Python as the child to observe the actual harness environment, without a GPU.
+        args = (sys.executable, "-c", "import os; print(os.environ['VKH_COLOR_FORMAT'])",
+                "unused.raw", (1, 1), {})
+        with patch.dict(os.environ, VKH_COLOR_FORMAT="107:16"):
+            default = P.run_harness(*args)
+            narrow = P.run_harness(*args, fmt="r32u")
+            self.assertEqual(os.environ["VKH_COLOR_FORMAT"], "107:16")
+        for result, expected in ((default, "109:16"), (narrow, "98:4")):
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), expected)
+
+
 class RadvOracleWithoutGpu(unittest.TestCase):
     """The Oracle on a stand-in vk_harness that hands back RADV binaries: the RDNA4 refusal and --set."""
 
@@ -264,6 +279,20 @@ class Cli(unittest.TestCase):
     def test_no_harness_is_unavailable(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(P.main(["--build", d, "--show-template"]), 77)
+
+    def test_json_overwriting_an_input_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            asm = os.path.join(d, "prog.txt")
+            with open(asm, "w", encoding="utf-8") as f:
+                f.write("s_endpgm\n")
+            with self.assertRaises(SystemExit) as cm:    # the report is written after the run, so the guard comes first
+                P.main(["--build", d, "--asm", asm, "--json", asm])
+            self.assertEqual(cm.exception.code, 2)
+            with open(asm, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "s_endpgm\n")
+            with self.subTest(flag="--ps"), self.assertRaises(SystemExit) as cm:
+                P.main(["--build", d, "--asm", asm, "--ps", asm, "--json", asm])
+            self.assertEqual(cm.exception.code, 2)
 
 
 @unittest.skipUnless(os.environ.get("LEONIDA_PS_ORACLE_BUILD"), "set LEONIDA_PS_ORACLE_BUILD to a runtime build "

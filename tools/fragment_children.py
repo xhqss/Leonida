@@ -348,8 +348,15 @@ def main(argv=None):
         print(f"error: {a.archive} is not a file", file=sys.stderr)
         return 2
     for out in (a.records, a.json):
-        if out and (os.path.isdir(out) or ss.same_output_path(out, a.archive)):
+        if not out:
+            continue
+        if os.path.isdir(out) or ss.same_output_path(out, a.archive):
             print(f"error: {out} is a directory or the input", file=sys.stderr)
+            return 2
+        parent = os.path.dirname(os.path.abspath(out))
+        if not os.path.isdir(parent):
+            # checked before the scan: the scan can run for hours and would raise only at write time
+            print(f"error: {out} is in a folder that does not exist: {parent}", file=sys.stderr)
             return 2
     t0 = time.time()
     stats = scan_archive(a.archive, a.start, a.end, a.jobs, a.records, lambda text: print(text, flush=True))

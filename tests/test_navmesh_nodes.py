@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import navmesh_decode as nd  # noqa: E402
 import navmesh_nodes as nn  # noqa: E402
-from test_navmesh_decode import build_navmesh, make_rpf  # noqa: E402
+from test_navmesh_decode import build_0drp, build_navmesh, make_rpf  # noqa: E402
 from test_world_lights_paths import GRAPH_NODES, node_resource, write_rpf  # noqa: E402
 
 TOOL = os.path.join(ROOT, "tools", "navmesh_nodes.py")
@@ -200,6 +200,25 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(s["flags18"]["13"]["nodes"], 3)
         self.assertEqual(s["flags18"]["12"]["nodes"], 0)
         self.assertEqual(s["flags28"]["17"]["nodes"], 3)
+
+    def test_missing_continuation_does_not_swallow_the_next_tile(self):
+        """A resource whose second stream is missing is not completed with the tile after it: the tile is read
+        on its own, and a navmesh tile cut off the same way is dropped while the tile after it is kept."""
+        nodes, _read = nn.node_positions(self.levels)
+        near = build_tile([(0.0, 0.0, 2.5, 8.0, 0.0, ROAD, MARK), (2.5, 0.0, 6.0, 8.0, 8.0, OTHER, 0)])
+        cover, _rest = build_0drp(total_size=0x1000, split_at=0x1000, node_count=2, override_n4e=0)
+        split_tile = bytearray(build_tile([(0.0, 0.0, 128.0, 128.0, 0.0, OTHER, 0)], sector=(300 << 9) | 300))
+        struct.pack_into("<Q", split_tile, nd.offset_of(nd._u64(split_tile, 8)) + 8, 2)   # declares two streams
+        for name, streams in (("0DRP", [cover, near]), ("navmesh", [bytes(split_tile), near])):
+            with self.subTest(cut_off=name):
+                make_rpf(self.navmeshes, streams)
+                tiles = list(nn.navmesh_resources(self.navmeshes))
+                self.assertEqual(len(tiles), 1)
+                self.assertTrue(tiles[0] == near, "the tile read is not the one after the cut-off resource")
+                s = nn.cross_check(self.navmeshes, nodes)
+                self.assertEqual(s["tiles_with_nodes"], 1)
+                self.assertEqual(s["nodes_over_a_polygon"], 4)
+                self.assertEqual(s["flags18"]["13"]["nodes"], 3)
 
     def test_cli_writes_counts(self):
         out = os.path.join(self.tmp.name, "reports", "nodes.json")

@@ -162,6 +162,18 @@ class Parse(unittest.TestCase):
         with self.assertRaises(sl.LibraryError):
             sl.parse(bytes(bad))
 
+    def test_compute_with_missing_program_or_blob(self):
+        # A compute record may name no program or no layout blob (0xFFFFFFFF, "a missing stage is program
+        # 0xFFFFFFFF"): it must not crash parse(), take a "cs" stage, or link a digest to a missing program.
+        blobs = [kind0(), layout_blob(3, D_CS)]
+        programs = [prog(0x11112222)]
+        b = build([], [(0, 0, NONE, NONE), (0, NONE, 0, NONE)], blobs, programs)
+        lib = sl.parse(b)
+        self.assertEqual([c["program"] for c in lib["compute"]], [None, 0])
+        self.assertEqual(lib["compute"][0]["layout"], None)
+        self.assertEqual(lib["stage"], {0: {"cs"}})
+        self.assertEqual(lib["digest"], {})
+
     def test_find_in_archive(self):
         lib = sample() + b""
         # make it span several 64 KiB blocks

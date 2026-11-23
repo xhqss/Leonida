@@ -1,4 +1,5 @@
-// XGameEventImpl, XGameUiImpl and XGameStreamingImpl through QueryApiImpl, called the way xgameruntime.lib's thunks
+// XGameEventImpl, XGameUiImpl, XGameStreamingImpl, XDisplayImpl, XUserDeviceImpl, XAccessibilityImpl and XLauncherImpl
+// through QueryApiImpl, called the way xgameruntime.lib's thunks
 // call them: QueryApiImpl with the class id (or an interface id), one vtable slot with `this` first. Slots follow
 // xgameruntime-docs' layout; arguments follow the public GDK reference. No game data; nothing online.
 #include <windows.h>
@@ -67,6 +68,21 @@ using FindControllerResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, ui
 constexpr GUID kDisplayClass = {0x03f0fe74, 0xfdd9, 0x4e5c, {0xb6, 0x30, 0xf9, 0x33, 0x9c, 0x47, 0xac, 0xc5}};
 constexpr GUID kUserDeviceClass = {0x7d824997, 0x10dc, 0x45ab, {0x86, 0xb7, 0x27, 0x37, 0x76, 0x7c, 0x0b, 0xf1}};
 constexpr GUID kUserClass = {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
+
+constexpr GUID kAccessibilityClass = {0x3e241977, 0x6237, 0x41e9, {0x85, 0x59, 0x10, 0x2c, 0x2d, 0x99, 0x83, 0xf1}};
+constexpr GUID kAccessibility2 = {0xd722b373, 0x8c4d, 0x4692, {0x9e, 0x51, 0xd6, 0xad, 0x9b, 0x37, 0xaa, 0x7d}};
+constexpr GUID kLauncherClass = {0x1b339674, 0x328d, 0x4283, {0xa2, 0x00, 0x31, 0x71, 0xf1, 0x8d, 0x36, 0x39}};
+
+using EnumVoices = HRESULT(STDMETHODCALLTYPE*)(void*, void*, void*);
+using SpeechCreate = HRESULT(STDMETHODCALLTYPE*)(void*, void**);
+using SpeechClose = HRESULT(STDMETHODCALLTYPE*)(void*, void*);
+using SpeechStream = HRESULT(STDMETHODCALLTYPE*)(void*, void*, const char*, void**);
+using StreamSize = HRESULT(STDMETHODCALLTYPE*)(void*, void*, size_t*);
+using StreamData = HRESULT(STDMETHODCALLTYPE*)(void*, void*, size_t, void*, size_t*);
+using HighContrast = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t*);
+using SetEnabled = HRESULT(STDMETHODCALLTYPE*)(void*, bool);
+using LaunchUri = HRESULT(STDMETHODCALLTYPE*)(void*, void*, const char*);
+using AcquireDeferral = HRESULT(STDMETHODCALLTYPE*)(void*, void**);
 
 void* user_object(HRESULT(WINAPI* query)(const GUID*, REFIID, void**)) {
     void* user = nullptr;
@@ -178,6 +194,58 @@ int main() {
           "XUserFindControllerForUserWithUi completes without UI");
     for (uint8_t b : found) zero = zero && b == 0;
     check(zero, "with an all-zero device id, as on desktop");
+
+    // ---- XAccessibility ----
+    void* acc = nullptr;
+    void* acc2 = nullptr;
+    check(query(&kAccessibilityClass, kAccessibilityClass, &acc) == S_OK && acc &&
+              query(&kAccessibilityClass, kAccessibility2, &acc2) == S_OK && acc2 == acc,
+          "XAccessibilityImpl for its class id and IXAccessibilityImpl2");
+    if (!acc) return 1;
+    uint32_t contrast = 7;
+    check(at<HighContrast>(acc, 5)(acc, &contrast) == S_OK && contrast == 0 &&
+              at<HighContrast>(acc, 5)(acc, nullptr) == E_POINTER,
+          "XHighContrastGetMode reports Off");
+    check(at<SetEnabled>(acc, 4)(acc, true) == S_OK, "XClosedCaptionSetEnabled is accepted");
+    check(FAILED(at<NoArgs>(acc, 3)(acc)), "the closed-caption properties are not available offline");
+    check(at<EnumVoices>(acc, 8)(acc, reinterpret_cast<void*>(&on_state), nullptr) == S_OK &&
+              at<EnumVoices>(acc, 8)(acc, nullptr, nullptr) == E_INVALIDARG,
+          "XSpeechSynthesizerEnumerateInstalledVoices: no voices, S_OK (a callback is required)");
+    void* synth = reinterpret_cast<void*>(1);
+    check(at<SpeechCreate>(acc, 9)(acc, &synth) == E_FAIL && synth == nullptr,
+          "XSpeechSynthesizerCreate fails offline and nulls the handle");
+    void* stream = reinterpret_cast<void*>(1);
+    size_t size = 5, got = 5;
+    check(at<SpeechClose>(acc, 10)(acc, nullptr) == E_INVALIDARG && at<SpeechClose>(acc, 11)(acc, nullptr) == E_INVALIDARG &&
+              at<SpeechClose>(acc, 12)(acc, nullptr) == E_INVALIDARG && at<SpeechClose>(acc, 14)(acc, nullptr) == E_INVALIDARG,
+          "close and set-voice calls on a null handle: E_INVALIDARG");
+    check(at<SpeechStream>(acc, 13)(acc, nullptr, "hi", &stream) == E_INVALIDARG && stream == nullptr,
+          "CreateStreamFromText on a null synthesizer: E_INVALIDARG, no stream");
+    stream = reinterpret_cast<void*>(1);
+    check(at<SpeechStream>(acc, 21)(acc, nullptr, "<speak/>", &stream) == E_INVALIDARG && stream == nullptr,
+          "CreateStreamFromSsml on a null synthesizer: E_INVALIDARG, no stream");
+    check(at<StreamSize>(acc, 15)(acc, nullptr, &size) == E_INVALIDARG && size == 0 &&
+              at<StreamData>(acc, 16)(acc, nullptr, 8, nullptr, &got) == E_INVALIDARG && got == 0,
+          "stream size and data on a null stream: E_INVALIDARG, zero written");
+    bool speech_to_text_fails = true;
+    for (int slot : {6, 7, 17, 18, 19, 20}) speech_to_text_fails = speech_to_text_fails && FAILED(at<NoArgs>(acc, slot)(acc));
+    check(speech_to_text_fails, "speech-to-text display calls fail offline");
+
+    // ---- XLauncher ----
+    void* launcher = nullptr;
+    check(query(&kLauncherClass, kLauncherClass, &launcher) == S_OK && launcher, "XLauncherImpl for its class id");
+    if (!launcher) return 1;
+    void* deferral = reinterpret_cast<void*>(1);
+    check(at<LaunchUri>(launcher, 3)(launcher, nullptr, "https://example.com") == E_FAIL,
+          "XLaunchUri is not available offline");
+    check(at<AcquireDeferral>(launcher, 4)(launcher, &deferral) == E_FAIL && deferral == nullptr &&
+              at<NoArgs>(launcher, 5)(launcher) == E_FAIL,
+          "the display timeout deferral is not available offline");
+    GUID other = kLauncherClass;
+    other.Data1 ^= 1;
+    void* none = reinterpret_cast<void*>(1);
+    check(query(&kLauncherClass, other, &none) == E_NOINTERFACE && none == nullptr,
+          "XLauncherImpl refuses an interface id it doesn't implement");
 
     std::printf("xgameruntime_offline_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

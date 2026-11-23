@@ -240,7 +240,7 @@ PR description.
 
 ```
 python -I tests/test_fssm_crosscheck.py
-# 4 tests, 1 expected failure (the duplicate-XBCH loss)
+# 6 tests, all pass (the duplicate-XBCH payloads are pinned; no expected failure)
 ```
 
 The test uses synthetic `FSSM` and `DXBC` bytes only. No game data is read or written.

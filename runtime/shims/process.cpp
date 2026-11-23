@@ -2,7 +2,7 @@
 //
 // `gta6rt --run` calls a mapped EXE's entry point inside the gta6rt process. The EXE's CRT startup asks for its
 // arguments and finally calls exit(); both go through the EXE's own import table, so they can be answered here:
-//   - argv/argc and the command line are the game's (set by run_entry), not gta6rt's;
+//   - the command line is the game's, and its CRT configures its own argv/argc at startup;
 //   - exit(), _exit(), quick_exit(), ExitProcess() and abort() from the game end the game's run, not the host:
 //     the exit code is recorded, the run is signalled as finished and the calling thread waits for the host to
 //     exit;
@@ -22,10 +22,12 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cerrno>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
 #include <new>
 #include <string>
@@ -38,6 +40,8 @@
 namespace rt::process {
 namespace {
 
+std::vector<std::string> g_input_args;
+std::vector<std::wstring> g_input_wargs;
 std::vector<std::string> g_args;
 std::vector<std::wstring> g_wargs;
 std::vector<char*> g_argv;
@@ -186,7 +190,86 @@ void __cdecl game_abort() {
 int* __cdecl game_p_argc() { return &g_argc; }
 char*** __cdecl game_p_argv() { return &g_argv_ptr; }
 wchar_t*** __cdecl game_p_wargv() { return &g_wargv_ptr; }
-int __cdecl game_configure_argv(int) { return 0; }  // already parsed: run_entry set them
+
+std::wstring widen_argument(const std::string& text) {
+    const int size = MultiByteToWideChar(CP_ACP, 0, text.c_str(), -1, nullptr, 0);
+    std::wstring wide(size > 0 ? static_cast<size_t>(size - 1) : 0, L'\0');
+    if (size > 1) MultiByteToWideChar(CP_ACP, 0, text.c_str(), -1, wide.data(), size);
+    return wide;
+}
+
+// UCRT startup expands each wildcard argument against the host working directory, even when the argument was
+// quoted. A failed search retains the pattern; a successful search omits "." and ".." and keeps the path prefix.
+// Narrow startup searches its ACP-converted text, which can have different wildcard matches from wide startup.
+template <typename C>
+std::vector<std::basic_string<C>> expand_arguments(const std::vector<std::basic_string<C>>& input) {
+    std::vector<std::basic_string<C>> result;
+    for (const auto& argument : input) {
+        std::wstring pattern;
+        if constexpr (std::is_same_v<C, wchar_t>) pattern = argument;
+        else pattern = widen_argument(argument);
+        const size_t wildcard = pattern.find_first_of(L"*?");
+        if (wildcard == std::wstring::npos) {
+            result.push_back(argument);
+            continue;
+        }
+        const size_t separator = pattern.find_last_of(L"\\/:", wildcard);
+        if (separator != std::wstring::npos && pattern[separator] == L':' && separator != 1) {
+            result.push_back(argument);
+            continue;
+        }
+        WIN32_FIND_DATAW found{};
+        const HANDLE handle = ::FindFirstFileExW(pattern.c_str(), FindExInfoStandard, &found,
+                                                 FindExSearchNameMatch, nullptr, 0);
+        if (handle == INVALID_HANDLE_VALUE) {
+            result.push_back(argument);
+            continue;
+        }
+        struct Search {
+            HANDLE handle;
+            ~Search() { ::FindClose(handle); }
+        } search{handle};
+        const std::wstring prefix = pattern.substr(0, separator == std::wstring::npos ? 0 : separator + 1);
+        do {
+            if (std::wcscmp(found.cFileName, L".") == 0 || std::wcscmp(found.cFileName, L"..") == 0) continue;
+            const std::wstring match = prefix + found.cFileName;
+            if constexpr (std::is_same_v<C, wchar_t>) result.push_back(match);
+            else result.push_back(narrow(match));
+        } while (::FindNextFileW(handle, &found));
+    }
+    return result;
+}
+
+template <typename C>
+int configure_argv(int mode, const std::vector<std::basic_string<C>>& input,
+                   std::vector<std::basic_string<C>>& strings, std::vector<C*>& pointers, C**& published) {
+    // _crt_argv_no_arguments is a no-op, including after another width or mode has been configured.
+    if (mode == 0) return 0;
+    if (mode != 1 && mode != 2) return errno = EINVAL;
+    try {
+        auto next_strings = mode == 2 ? expand_arguments(input) : input;
+        std::vector<C*> next_pointers;
+        next_pointers.reserve(next_strings.size() + 1);
+        for (auto& argument : next_strings) next_pointers.push_back(argument.data());
+        next_pointers.push_back(nullptr);
+        // Publish only after every allocation succeeds. The other width keeps its own strings and pointer table.
+        strings.swap(next_strings);
+        pointers.swap(next_pointers);
+        published = pointers.data();
+        g_argc = static_cast<int>(strings.size());
+        return 0;
+    } catch (const std::bad_alloc&) {
+        return errno = ENOMEM;
+    }
+}
+
+int __cdecl game_configure_narrow_argv(int mode) {
+    return configure_argv(mode, g_input_args, g_args, g_argv, g_argv_ptr);
+}
+int __cdecl game_configure_wide_argv(int mode) {
+    return configure_argv(mode, g_input_wargs, g_wargs, g_wargv, g_wargv_ptr);
+}
+
 LPSTR __stdcall game_get_command_line_a() { return g_cmdline.data(); }
 LPWSTR __stdcall game_get_command_line_w() { return g_wcmdline.data(); }
 char** __cdecl game_p_acmdln_storage() {
@@ -243,12 +326,14 @@ wchar_t** current_wide_environment() {
 
 // msvcrt.dll: int __getmainargs(int* argc, char*** argv, char*** env, int expand, void* startinfo)
 int __cdecl game_getmainargs(int* argc, char*** argv, char*** env, int, void*) {
+    if (const int error = game_configure_narrow_argv(1)) return error;
     *argc = g_argc;
     *argv = g_argv_ptr;
     if (env) *env = current_environment();
     return 0;
 }
 int __cdecl game_wgetmainargs(int* argc, wchar_t*** argv, wchar_t*** env, int, void*) {
+    if (const int error = game_configure_wide_argv(1)) return error;
     *argc = g_argc;
     *argv = g_wargv_ptr;
     if (env) *env = current_wide_environment();
@@ -270,26 +355,25 @@ DWORD WINAPI game_thread(void* p) {
 }  // namespace
 
 void set_command_line(const std::wstring& program, const std::vector<std::wstring>& args) {
-    g_wargs.clear();
-    g_wargs.push_back(program);
-    g_wargs.insert(g_wargs.end(), args.begin(), args.end());
-    g_args.clear();
+    g_input_wargs.clear();
+    g_input_wargs.push_back(program);
+    g_input_wargs.insert(g_input_wargs.end(), args.begin(), args.end());
+    g_input_args.clear();
     g_wcmdline.clear();
-    for (auto& a : g_wargs) {
-        g_args.push_back(narrow(a));
+    for (const auto& a : g_input_wargs) {
+        g_input_args.push_back(narrow(a));
         if (!g_wcmdline.empty()) g_wcmdline += L' ';
         g_wcmdline += quote(a);
     }
     g_cmdline = narrow(g_wcmdline);
+    // GetCommandLine is available before TLS/DllMain, but CRT argv starts unconfigured on every run.
+    g_args.clear();
+    g_wargs.clear();
     g_argv.clear();
     g_wargv.clear();
-    for (auto& a : g_args) g_argv.push_back(a.data());
-    for (auto& a : g_wargs) g_wargv.push_back(a.data());
-    g_argv.push_back(nullptr);
-    g_wargv.push_back(nullptr);
-    g_argc = static_cast<int>(g_args.size());
-    g_argv_ptr = g_argv.data();
-    g_wargv_ptr = g_wargv.data();
+    g_argc = 0;
+    g_argv_ptr = nullptr;
+    g_wargv_ptr = nullptr;
 }
 
 int run_entry(void* entry, size_t stack_bytes) {
@@ -345,8 +429,8 @@ using namespace rt::process;
     {dll, "abort", reinterpret_cast<void*>(&game_abort)}, {dll, "__p___argc", reinterpret_cast<void*>(&game_p_argc)}, \
     {dll, "__p___argv", reinterpret_cast<void*>(&game_p_argv)}, \
     {dll, "__p___wargv", reinterpret_cast<void*>(&game_p_wargv)}, \
-    {dll, "_configure_narrow_argv", reinterpret_cast<void*>(&game_configure_argv)}, \
-    {dll, "_configure_wide_argv", reinterpret_cast<void*>(&game_configure_argv)}, \
+    {dll, "_configure_narrow_argv", reinterpret_cast<void*>(&game_configure_narrow_argv)}, \
+    {dll, "_configure_wide_argv", reinterpret_cast<void*>(&game_configure_wide_argv)}, \
     {dll, "__p__acmdln", reinterpret_cast<void*>(&game_p_acmdln_storage)}, \
     {dll, "__p__wcmdln", reinterpret_cast<void*>(&game_p_wcmdln_storage)}, \
     {dll, "_get_narrow_winmain_command_line", reinterpret_cast<void*>(&game_get_narrow_winmain_command_line)}, \

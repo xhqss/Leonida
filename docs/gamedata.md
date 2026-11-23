@@ -29,6 +29,8 @@ python -I tools/gamedata_index.py <work>\carve\common --csv common.csv --json co
 
 The CSV/JSON contain offsets, sizes, the coarse type and the XML root element. They contain no element values
 or entry names, but they are still local work products and must not be committed or attached to an issue.
+`--csv` and `--json` refuse a path that would replace the carve's `index.json` or one of its
+`<offset>.bin`/`.bk2` streams, so a report cannot be written over a carved input.
 
 ### Coverage
 

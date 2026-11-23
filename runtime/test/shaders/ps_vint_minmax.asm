@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Two-operand integer min/max (VOP2), signed and unsigned on the same pair. vN holds hN.
 ; Inputs come from memory at run time (not inline constants, which the driver could fold). The V# in s[0:3]
 ; points at 0x1000 (num_records 32); the test seeds 0x1000..0x101c with h0..h7 =

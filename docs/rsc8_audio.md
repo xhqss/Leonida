@@ -158,14 +158,68 @@ The name word is 0 on 96 records (78 tags start with one); what a nameless recor
   `0xE5C74063` (418,838 records, 402,357 of them on speech streams with a `0x5c` clip) and `0xdbedd43c` (330,756,
   all on such streams and all with `extra = 0`) are not known.
 - **`value`** is a whole number stored as `f32` on every record of those six names. On five of the other names it
-  is `joaat("start")` or `joaat("end")` in equal or near-equal numbers (196/197, 101/101, 54/54, 49/49, 20/19),
-  which reads as region start/end pairs (hypothesis: the split was counted, not matched record by record).
+  is `joaat("start")` (`0x84dc271f`) or `joaat("end")` (`0xb0c485d7`). Matched record by record, 418 of the 420
+  `start` records are followed by their `end`; see [Region cues](#region-cues-start-and-end-records).
 - The same reference states that an AWC tag id is the low byte of the joaat of the chunk name. That holds for
   `markers` (`0xbd`), `data` (`0x55`), `peak` (`0x36`), `seektable` (`0xa3`) and `streamformat` (`0x48`), which
   `tests/test_rsc8_audio.py` checks, and by the same rule `0x5a` and `0xd9` are `granulargrains` and
   `granularloops`. Those spellings are this document's: the reference prints the last two as `seek_table` and
   `stream_format`, and with the underscore the rule fails (`0xb8` and `0xf9`). It does not hold for `0x5c`,
   `0x76` and `0xb2` under the names `animation`, `format` and `metadata` either, so those three names stay open.
+
+#### Region cues: `start` and `end` records
+
+The five names whose `value` is the hash of `start` or `end` have 841 records in 22 tags of `audio.rpf`: 420
+`start`, 420 `end` and one with a third value. An earlier version of this page read the near-equal counts per name
+(196/197, 101/101, 54/54, 49/49, 20/19) as region pairs without matching them. `tools/rsc8_audio.py` now matches
+them (`pair_marker_regions`, the `marker_regions` block of every scan summary): inside one tag it takes the
+records of one name in stored order, and a pair is a `start` whose next record of the same name is an `end` at the
+same or a later offset. Every other record of such a name is counted as an exception.
+
+| Name | Tags | `start` | `end` | Pairs | Not paired | Pair length in samples (min / median / max) |
+|---|---:|---:|---:|---:|---|---:|
+| `0xda559149` | 22 | 196 | 197 | 196 | 1 `end` | 172,602 / 857,823 / 3,899,077 |
+| `0x1df219ec` | 1 | 101 | 101 | 101 | none | 25,289 / 95,237 / 497,606 |
+| `0x77edd3a2` | 1 | 54 | 54 | 53 | 1 `start`, 1 `end`, the record with the third value | 44,984 / 90,546 / 209,958 |
+| `0x994ee645` | 1 | 49 | 49 | 49 | none | 22,233 / 93,644 / 212,156 |
+| `0xccb465d1` | 1 | 20 | 19 | 19 | 1 `start` | 36,146 / 92,928 / 186,375 |
+| **Total** | **22** | **420** | **420** | **418** | **5 records** | |
+
+So the reading holds for 418 pairs, and equal counts did not prove it: the 54/54 name has two unpaired records.
+20 of the 22 tags pair completely (a tag holds 1 to 181 pairs, median 3). The five exceptions sit in two tags:
+
+- `0xda559149` has a second `end` 16,717 samples after the `end` that closes the region before it (record 744 of
+  its tag's 1,435). Nothing opens it.
+- A `0x77edd3a2` `start` (record 40 of 834) is followed, 118,171 samples later, by a record of the same name whose
+  value is `0xdaa2d5ec`, the only value on these names that is neither word. Hypothesis: that record closes the
+  region under another word; the distance is inside the name's pair lengths.
+- A `0xccb465d1` `start` (record 773 of the same tag, the last record of its name) is directly followed by a
+  `0x77edd3a2` `end` that no `start` opens (record 774), 114,697 samples later. Hypothesis: one region whose two
+  records carry different names; the distance is inside the pair lengths of both.
+
+If both hypotheses hold, every one of the 420 `start` records has a closing record and only the second `end`
+is left over. None of the five is a region left open at an edge of its tag: none is the tag's first or last
+record, the nearest to an edge is 40 records in, and the unclosed `0xccb465d1` `start` is 18,219,408 samples
+before its tag's last offset.
+
+Also measured on the 418 pairs:
+
+- No pair has a zero length, and `extra` is the same on a pair's two records (418 / 418).
+- Regions of one name cannot overlap under this matching; an overlap would show as an unpaired `start` followed
+  by a `start`, and there is none. Regions of different names do overlap: 54 pairs of regions share samples, 43
+  with one region inside the other and 11 crossing (each starts or ends inside the other). All 54 are between
+  `0xda559149` and one of the other four names (`0x1df219ec` 13 inside / 7 crossing, `0x77edd3a2` 19 / 4,
+  `0x994ee645` 2 / 0, `0xccb465d1` 9 / 0); the other four never overlap each other. So a sample can lie in
+  regions of two names at once.
+- None of the 22 streams has a `0x76` tag (`tags_with_sample_count` is 0), so this parser has no sample count to
+  compare a region's end with.
+
+The other three archives with `ADAT` banks have `0xbd` tags as well (226,788 in `story000.rpf`, 1,959 in
+`shared_minigame000.rpf`, 22 in `story000_restofworld.rpf`) and not one record with either value.
+
+Not known: the words behind the five names and behind `0xdaa2d5ec`, what a region does in the game, and whether
+the two hypotheses above are right. The lengths are in the unit of `offset`; they were not converted to seconds,
+because the rate of these 22 streams is not read here.
 
 ## Binary format of `RSC8` (version `8001`)
 
@@ -367,6 +421,10 @@ python -I tools/rsc8_audio.py <package>\pack\story000_restofworld\story000_resto
 python -I tools/rsc8_audio.py <package>\pack\shared_minigame000\shared_minigame000.rpf --summary-only
 python -I tools/rsc8_audio.py <package>\pack\story000\story000.rpf --summary-only
 python -I tools/rsc8_audio.py <package>\audio.rpf --summary-only
+
+# Every summary also has the cue counts (marker_* keys) and the region pairing (marker_regions): pairs and
+# exceptions per name hash, pair lengths, overlaps between names and where each exception sits in its tag.
+# The numbers of "Region cues" above are the audio.rpf summary's (57 to 87 s over three runs of the 28.5 GB archive).
 
 # Also decode every clip's keyframes and count the outcome (slower: about 40 clips per second per process;
 # split a large archive with --start/--limit and add the summaries)

@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; v_perm_b32 (byte selects 0-7, 12 = 0x00, >= 13 = 0xff, 8-11 = sign of bytes 1/3/5/7 of {S0, S1}),
 ; v_alignbit_b32 (shift taken mod 32), v_med3_i32 vs v_med3_u32 on the same operands.
 ; Expected mrt0 bits: 0x00ff8077, 0xff0000ff, 0x89abcdef, 0x00070003

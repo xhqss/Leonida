@@ -534,7 +534,8 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
                 self.assertEqual(run.call_args_list, expected)
 
     def test_pending_exports_refresh_the_existing_helper_once(self) -> None:
-        output = os.path.join(self.work_dir, "tools", "rpf9dump")
+        # Built under the repo (not --work) so `dotnet -o` is not pointed at a locked remote path.
+        output = os.path.join(self.tmp.name, "tools", "rpf9dump", "bin", "Release", "net8.0")
         os.makedirs(output)
         exe = os.path.join(output, "rpf9dump.exe" if os.name == "nt" else "rpf9dump")
         with open(exe, "wb") as f:
@@ -550,6 +551,8 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
 
         commands = [call.args[0] for call in run.call_args_list]
         self.assertEqual(commands[0][:2], ["dotnet", "build"])
+        self.assertIn("-o", commands[0])
+        self.assertEqual(commands[0][commands[0].index("-o") + 1], output)
         self.assertEqual([(cmd[0], cmd[1]) for cmd in commands[1:]],
                          [(exe, mode) for mode in ("models", "textures", "audio", "xma")])
 

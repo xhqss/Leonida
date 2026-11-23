@@ -20,6 +20,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <map>
 #include <string>
@@ -179,9 +180,15 @@ int wmain(int argc, wchar_t** argv) {
                              r.error);
         }
         if (run) rt::process::set_command_line(image.filename().wstring(), game_args);
+        std::exception_ptr init_failure;
         if (init || run) {
-            loader.initialise();  // TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) for DLLs
-            std::printf("%zu module(s) initialised\n", loader.modules().size());
+            try {
+                loader.initialise();  // TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) for DLLs
+                std::printf("%zu module(s) initialised\n", loader.modules().size());
+            } catch (const std::exception&) {
+                // Keep the mapped modules available for the binding report on an attach failure.
+                init_failure = std::current_exception();
+            }
         }
         int unimplemented = 0, unimplemented_hresult = 0;
         for (auto* m : loader.modules()) {
@@ -205,6 +212,10 @@ int wmain(int argc, wchar_t** argv) {
         std::printf("%zu module(s) mapped, %d unimplemented import(s)\n", loader.modules().size(), unimplemented);
         std::printf("unimplemented by return policy: hresult=%d other=%d\n", unimplemented_hresult,
                     unimplemented - unimplemented_hresult);
+        if (init_failure) {
+            std::fflush(stdout);
+            std::rethrow_exception(init_failure);
+        }
         if (!run) {
             rt::startup_trace::event("exit", "\"code\":0");
             return 0;

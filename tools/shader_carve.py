@@ -21,6 +21,10 @@ import sys
 import tempfile
 import zlib
 
+# `python -I` leaves the script's directory off sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from replace_retry import replace as replace_retry  # noqa: E402
+
 ENTRY = re.compile(rb"([\x21-\x7e]{3,200})\x00(.)(....)(....)\3(....)", re.DOTALL)
 STAGES = {0: "ps", 1: "vs", 2: "gs", 3: "hs", 4: "ds", 5: "cs", 6: "lib", 13: "ms", 14: "as"}
 RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
@@ -134,7 +138,7 @@ def main(argv=None) -> int:
             json.dump(index, f, indent=1)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, os.path.join(out, "index.json"))
+        replace_retry(tmp, os.path.join(out, "index.json"))
     from collections import Counter
     print(f"{len(index)} shaders carved, {bad} candidates rejected")
     print("stages:", dict(Counter(e["stage"] for e in index)))

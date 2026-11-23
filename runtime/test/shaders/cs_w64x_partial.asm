@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Partial wave64: a 40x1x1 group is one wave with lanes 0-39 enabled, lanes 40-63 disabled (EXEC = 0xff_ffffffff).
 ; Only what the ISA defines is asserted (no readlane of a nonexistent lane): EXEC and ballot counts, ds_bpermute
 ; reads from a disabled lane return 0, readfirstlane on the enabled lanes of the upper half.

@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; v_mac_f32 is the VOP2 form of v_mad_f32: the product is rounded before the add (not fused). VOP3 clamp and
 ; output modifiers on conversions: v_cvt_f32_ubyte1 with clamp, v_cvt_f32_u32 with mul:4, v_cvt_f32_f16 with
 ; div:2 and v_rcp_iflag_f32 with mul:4, the last two summed (0.5 + 1.0; each modifier missing gives a different sum).

@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; ds_write_b64 / ds_write_b96 / ds_write_b128, ds_read_b64 / ds_read_b96 / ds_read_b128 and ds_read2st64_b32
 ; (RDNA2 ISA, "Data Share Instructions"). ADDR = vaddr + offset: (bytes); an N-dword access covers
 ; MEM[ADDR .. ADDR + 4N - 1], lowest register first. ds_read2st64_b32 reads MEM[ADDR + offset0 * 256] and

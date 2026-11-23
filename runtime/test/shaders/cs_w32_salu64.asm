@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; 64-bit scalar data ops and v_mad_u64_u32 (#723 #726 #729 #733 #549 #613 #546), run once on a GPU.
 ; Lane 0 of a wave32 group computes one result per op and stores eight dwords:
 ;   out[0] = low word of s_brev_b64(0x12345678_0000000F)          = 0x1E6A2C48  (reverse(S0.hi))

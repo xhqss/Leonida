@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Output modifiers on v_add_f64 (VOP3_Profile<VOP_F64_F64_F64>: clamp and omod): omod scales, then clamp to [0, 1].
 ; a = 0.75, b = 0.5 as doubles (low word first); each export is the high word of one double result (low words are 0).
 ; mul:2 (a+b)*2 = 2.5, clamp min(a+b, 1) = 1.0, div:2 clamp (a+b)/2 = 0.625 (clamp before scaling would give 0.5),

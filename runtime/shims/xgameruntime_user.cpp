@@ -12,8 +12,9 @@
 // characters at most, "Player" otherwise). Nothing goes online: token and gamer-picture requests fail as they would
 // without a network, and the user never changes, so registered change callbacks are never called.
 //
-// ASSUMPTION: the console executable is not available, so which of these slots it calls is unknown until its first
-// boot. Private and PC-only slots log once when called, so that boot lists them.
+// The executable links thunks for IXUserImpl slots 3-5, 7-14, 19-25 and 33-34 and IXUserGamertagImpl slot 3
+// (tools/gdk_runtime_calls.py, from the file alone; docs/runtime_imports.md). None of them is a private or PC-only
+// slot; those still log once when called.
 #include <windows.h>
 
 #include <atomic>

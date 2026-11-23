@@ -15,6 +15,7 @@
 //     and the adapter provider still reaches it, so the Vulkan device hands out the layer's adapter there too.
 // Exits 77 when neither a host D3D12 device nor a Vulkan device can be made. No shaders, game data or Xbox DLLs.
 #include "vk_test_device.h"
+#include "window_station.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 
@@ -131,9 +132,12 @@ int check_backend(const char* label, ID3D12Device* device, ID3D12Device* real, b
     }
     // The next step of the sequence. Which answer comes back is the adapter's business (a software adapter has no
     // output; the layer's adapter has none before D3D-313): it is one of the two, and an output only with S_OK.
+    // Without an interactive window station (SSH, a service) the host has no outputs to give and answers
+    // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE.
     Ref<IDXGIOutput> output;
     const HRESULT output_hr = adapter->EnumOutputs(0, &output.p);
-    EXPECT((output_hr == S_OK && output.p) || (output_hr == DXGI_ERROR_NOT_FOUND && !output.p));
+    EXPECT((output_hr == S_OK && output.p) || (output_hr == DXGI_ERROR_NOT_FOUND && !output.p) ||
+           (output_hr == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE && !output.p && !has_interactive_window_station()));
 
     // IDXGIDevice1's own state: kept and read back.
     UINT latency = 0;
@@ -226,7 +230,19 @@ int check_direct(const char* label, ID3D12Device* real, bool vulkan) {
         EXPECT(dxgi->GetAdapter(&none) == E_ABORT && !none);
         EXPECT(xs::set_device_adapter_provider(proxy, nullptr));  // back to the default (the host's adapter)
         Ref<IDXGIAdapter> host;
-        EXPECT(dxgi->GetAdapter(&host.p) == S_OK && host.p);
+        const HRESULT default_hr = dxgi->GetAdapter(&host.p);
+        // The default asks the host's DXGI for the adapter with the device's LUID. Under Wine 9 the Vulkan device's
+        // LUID is not one Wine's DXGI enumerates, so the host answers DXGI_ERROR_NOT_FOUND: a host difference (the
+        // Wine 11.22 run in docs/testing.md doesn't list this test as failing), checked as a failure that hands nothing
+        // out.
+        static const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+        if (vulkan && wine && default_hr == DXGI_ERROR_NOT_FOUND) {
+            std::printf("%s: the default adapter provider: Wine's DXGI has no adapter with the Vulkan device's LUID "
+                        "(DXGI_ERROR_NOT_FOUND), not compared\n", label);
+            EXPECT(!host.p);
+        } else {
+            EXPECT(default_hr == S_OK && host.p);
+        }
         void* not_a_proxy = nullptr;  // pointer-sized: the helpers read a vtable pointer from what they are given
         EXPECT(!xs::set_device_adapter_provider(&not_a_proxy, refuse) && !xs::set_device_adapter_provider(real, refuse));
         EXPECT(!xs::device_proxy_primary(&not_a_proxy) && !xs::device_proxy_primary(nullptr));

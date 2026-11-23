@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; v_med3_f16 with a quiet NaN in S2, or in two operands: the f16 form of ps_fnan_med3_s2. Inputs are read from memory
 ; at run time; each word holds one f16 in its low half. The V# in s[0:3] points at 0x1000 (num_records 16); the test
 ; seeds 0x1000..0x100c with a..d = 0x00004500 0x00004700 0x00007e01 0x0000c100 (5.0, 7.0, NaN, -2.5 as f16).

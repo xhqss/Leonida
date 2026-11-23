@@ -1007,7 +1007,7 @@ def main(argv=None):
             return 2
         kernels = [k for k in kernels if k.label in args.kernel]
     if args.json_out is not None and (not args.json_out.strip() or os.path.isdir(args.json_out)):
-        print(f"error: --json {args.json_out!r} is not a file path", file=sys.stderr)
+        print(f"error: --json {args.json_out.strip() or '(empty)'} is not a file path", file=sys.stderr)
         return 2
     if args.list:
         for k in kernels:

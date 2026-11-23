@@ -20,6 +20,8 @@ Dictionary sources:
 ``--conversations`` files or directories whose conversation data pairs a dialogue key with line labels
                     (``<ROOT>AU_<XXXX>\\0<LABEL>\\0``). A key with N labels yields the waves ``<key>_01`` ..
                     ``<key>_<N>``: wave ``_01`` speaks the first label, ``_02`` the second, and so on.
+                    In a carve folder a ``.bin`` stream of a whole number of 64 KiB blocks is read together with the
+                    streams that continue it (docs/page_directory.md), so a pair across that boundary still counts.
 
 Bank sources (positional; each one is reported and thresholded on its own): ``.awc`` files, directories searched
 for ``.awc`` files, or an ``audio_manifest.json`` written by ``rpf9dump audio``. Sources with the same basename
@@ -33,6 +35,7 @@ A JSON inventory from ``awc_manifest.py`` can also supply the bank names and str
 
 Standard library only. The output names game files: it is a local work product and must not be committed or
 attached to an issue. The tests use synthetic banks and words.
+Usage: `python -I tools/awc_names.py --help` lists the options.
 """
 import argparse
 import collections
@@ -56,6 +59,10 @@ CONTROL_LIMIT = 0.02
 FAMILY_SIZES = range(2, 12)
 MIN_TOKEN = 5
 MAX_SCAN_BYTES = 256 << 20
+# A carved stream that inflates to a whole number of 64 KiB blocks continues in the next one (docs/page_directory.md);
+# these heads start a stream of their own instead.
+CONTINUATION_BLOCK = 65536
+NEW_STREAM_HEADS = (b"PSIN", b"RBF0", b"<?xml", b"\xef\xbb\xbf<?xml")
 
 
 # ---- joaat ----
@@ -89,12 +96,17 @@ def bank_ids(path: str) -> list:
         head = fh.read(16)
         if len(head) < 16 or head[:4] != b"ADAT":
             raise ValueError(f"{path}: not a little-endian AWC")
-        flags, n, _header_size = struct.unpack_from("<III", head, 4)
+        flags, n, header_size = struct.unpack_from("<III", head, 4)
         skip = (4 if flags & 0x400000 else 0) + (n * 2 if flags & 0x10000 else 0) \
             + ((n + 1) * 4 if flags & 0x200000 else 0)
         table_end = 16 + skip + 4 * n
-        if table_end > os.fstat(fh.fileno()).st_size:
+        file_size = os.fstat(fh.fileno()).st_size
+        if table_end > file_size:
             raise ValueError(f"{path}: stream table extends past the end of the file")
+        if header_size > file_size:
+            raise ValueError(f"{path}: declared header extends past the end of the file")
+        if header_size < 16 or table_end > header_size:
+            raise ValueError(f"{path}: stream table extends past the declared header")
         fh.seek(16 + skip)
         table = fh.read(4 * n)
     if len(table) < 4 * n:
@@ -178,14 +190,7 @@ def conversation_waves(paths) -> list:
     """Dialogue wave names from conversation key/label pairs: <key>_01 .. <key>_<labels>."""
     labels = collections.defaultdict(list)
     for path in paths:
-        for full in _files(path):
-            try:
-                if os.path.getsize(full) > MAX_SCAN_BYTES:
-                    continue
-                with open(full, "rb") as fh:
-                    data = fh.read()
-            except OSError:
-                continue
+        for data in _blobs(path):
             if b"AU_" not in data:
                 continue
             for key, label in CONVERSATION_PAIR.findall(data):
@@ -193,6 +198,42 @@ def conversation_waves(paths) -> list:
                 if label not in seen:
                     seen.append(label)
     return [f"{key.decode().lower()}_{n:02d}" for key, ls in labels.items() for n in range(1, len(ls) + 1)]
+
+
+def _blobs(path: str):
+    """The contents of the files under `path`, a carved stream joined with the streams that continue it.
+
+    rpf9_carve.py writes every zlib stream as its own `<offset>.bin`, and a stream that inflates to a whole number
+    of 64 KiB blocks continues in the next one: the next `.bin` of the same folder in name (offset) order, unless
+    that one starts a stream of its own. Matched apart, a pair across that boundary would be lost."""
+    parts, folder, size = [], None, 0
+    for full in _files(path):
+        try:
+            if os.path.getsize(full) > MAX_SCAN_BYTES:
+                data = None
+            else:
+                with open(full, "rb") as fh:
+                    data = fh.read()
+        except OSError:
+            data = None
+        here, carved = os.path.dirname(full), full.lower().endswith(".bin")
+        continues = (data is not None and carved and parts and here == folder
+                     and len(parts[-1]) and len(parts[-1]) % CONTINUATION_BLOCK == 0
+                     and not data.startswith(NEW_STREAM_HEADS) and size + len(data) <= MAX_SCAN_BYTES)
+        if not continues:
+            if parts:
+                yield b"".join(parts)
+            parts, size = [], 0
+        if data is None:
+            continue
+        if not carved:
+            yield data                       # not a carved stream: read on its own
+            continue
+        parts.append(data)
+        size += len(data)
+        folder = here
+    if parts:
+        yield b"".join(parts)
 
 
 class Dictionary:
@@ -391,7 +432,7 @@ def main(argv=None) -> int:
         for (b, i), (name, rule, _k) in sorted(found.items()):
             rows.append({"source": label, "bank": index.labels[b], "stream_id": f"{i:08x}", "name": name,
                          "rule": rule})
-        print(f"{label}: {stats['banks']} banks, {stats['streams']} streams, {stats['named']} named "
+        print(f"{label}: {stats['banks']} banks, {stats['streams']} distinct bank/ID pairs, {stats['named']} named "
               f"({stats['dialogue']} dialogue, {stats['family']} family, family size >= {stats['family_min_size']}); "
               f"control {stats['control_dialogue']} dialogue, {stats['control_family']} family", flush=True)
     if a.out:

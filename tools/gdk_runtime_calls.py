@@ -58,6 +58,7 @@ import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pe_inspect import DIR_EXCEPTION, MACHINES, PeFormatError, PeImage  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_TABLE = os.path.join(HERE, "gdk_runtime_classes.json")
@@ -216,7 +217,7 @@ def decode(buf, off: int, base_rva: int) -> Insn | None:
         if b in _M1_IMM8:
             imm = 1
         elif b in _M1_IMMZ:
-            imm = 2 if p66 else 4
+            imm = 2 if (p66 and not (rex & 8)) else 4
         elif b in _M1_REL8:
             rel = 1
         elif b in (0xE8, 0xE9):
@@ -265,7 +266,7 @@ def decode(buf, off: int, base_rva: int) -> Insn | None:
             disp = struct.unpack_from("<i", buf, p)[0]
         p += dsize
         if op in (0xF6, 0xF7) and reg & 7 in (0, 1):    # test r/m, imm
-            imm = 1 if op == 0xF6 else (2 if p66 else 4)
+            imm = 1 if op == 0xF6 else (2 if (p66 and not (rex & 8)) else 4)
     target = None
     if rel:
         if p + rel > n:
@@ -336,7 +337,7 @@ class RuntimeTable:
 
     @classmethod
     def load(cls, path: str) -> "RuntimeTable":
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             return cls(json.load(f))
 
     def ids(self) -> set[str]:
@@ -1030,11 +1031,25 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{path}: another input is also named {r['file']}; report written as {name}.gdk_calls.txt/.json",
                   file=sys.stderr)
         stem = os.path.join(a.out, name + ".gdk_calls")
+        json_path = stem + ".json"
+        txt_path = stem + ".txt"
+        inputs = list(a.image) + [a.table]
+        if os.path.isfile(a.runtime_source):
+            inputs.append(a.runtime_source)
+        collision = next(
+            (out_path for out_path in (json_path, txt_path)
+             if any(same_report_path(inp, out_path) for inp in inputs)),
+            None,
+        )
+        if collision:
+            print(f"{path}: report {collision} would overwrite input file", file=sys.stderr)
+            rc = 1
+            continue
         try:
-            with open(stem + ".json", "w", encoding="utf-8", newline="\n") as f:
+            with open(json_path, "w", encoding="utf-8", newline="\n") as f:
                 json.dump({"table": table.source, **r}, f, indent=1)
                 f.write("\n")
-            with open(stem + ".txt", "w", encoding="utf-8", newline="\n") as f:
+            with open(txt_path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(to_text(r))
         except OSError as e:
             print(f"{path}: cannot write report ({e.strerror or e})", file=sys.stderr)

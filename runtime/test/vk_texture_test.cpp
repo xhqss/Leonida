@@ -5,8 +5,9 @@
 // registers that T# -> image index 1 and the shader's literal S# -> sampler index 1, binds an 8x8 gradient at
 // index 1 and a magenta fallback at index 0, draws a full-screen triangle and dumps the RGBA32F result.
 //
-//   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3> [--two-mip|--two-mip-sint]   (S# words as hex)
-//   --two-mip: expose a 128x128 quadrant texture and its solid cyan mip 1 to the 64x64 draw.
+//   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3> [--two-mip|--two-mip-sint|--two-mip-uint]   (S# words as hex)
+//   --two-mip: expose a 128x128 quadrant texture and its solid cyan mip 1 to the 64x64 draw; the SINT and UINT
+//   forms bind the same image as a signed or unsigned integer view instead of the default UNORM one.
 //   vk_texture_test cube [out.raw]: ps_cube_sample against two 8x8 cubes, a 12-layer 2D array at binding 3 (the
 //   translator's view of a cube array); every pixel must be the texel a cube sample of its direction reads.
 //   vk_texture_test dref [out.raw]: ps_sample_c_lz against an 8x8 D32 texture at index 1 (texel x holds depth
@@ -25,6 +26,7 @@
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
+#include "spirv_capability.h"
 
 #include <algorithm>
 #include <cmath>
@@ -85,12 +87,17 @@ int main(int argc, char** argv) {
         return cube_alpha_self_test();
     const uint32_t W = 64, H = 64, TW = 8;
     const bool signed_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-sint") == 0;
-    const bool two_mip = signed_mips || (argc == 10 && std::strcmp(argv[9], "--two-mip") == 0);
+    const bool uint_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-uint") == 0;
+    const bool two_mip = signed_mips || uint_mips || (argc == 10 && std::strcmp(argv[9], "--two-mip") == 0);
     // With vs_ids spanning UV [0,1] over the viewport, adjacent fragments differ by two base texels.
     const uint32_t texture_side = two_mip ? 2 * W : TW;
     const uint32_t levels = two_mip ? 2 : 1;
     std::string vs_path, fs_path, out_path;
     int ptr_sgpr = 0;
+    // Fixed shader only: fetch (0,0) is in bounds on both the fallback and the integer image.
+    const bool fetch_uint = argc >= 2 && !std::strcmp(argv[1], "fetch-uint");
+    const bool fetch_miss = argc >= 2 && !std::strcmp(argv[1], "fetch-miss");
+    const bool fetch = fetch_uint || fetch_miss || (argc >= 2 && !std::strcmp(argv[1], "fetch-sint"));
     const bool cube = argc >= 2 && !std::strcmp(argv[1], "cube");
     // dref_c / dref_c_b: image_sample_c / image_sample_c_b (implicit LOD, bias), same texture and expected results.
     const char* dref_ps = nullptr;
@@ -104,13 +111,13 @@ int main(int argc, char** argv) {
     bool autonomous = false;
     uint32_t ssharp[8] = {0x92, 0xc00000, 0x14500000, 0,
                           0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
-    if (argc == 9 || two_mip) {
+    if (!fetch && (argc == 9 || two_mip)) {
         vs_path = argv[1];
         fs_path = argv[2];
         out_path = argv[3];
         ptr_sgpr = std::atoi(argv[4]);
         for (int i = 0; i < 4; ++i) ssharp[i] = (uint32_t)strtoul(argv[5 + i], 0, 16);
-    } else if (argc <= 2 || ((cube || dref) && argc == 3)) {
+    } else if (argc <= 2 || ((cube || dref || fetch) && argc == 3)) {
         // Autonomous mode using synthetic hand-written shaders (no game files required)
         autonomous = true;
         auto find_spv = [](const char* name) -> std::string {
@@ -129,20 +136,21 @@ int main(int argc, char** argv) {
             return std::string("runtime/build/shaders/spirv/") + name;
         };
         vs_path = find_spv("vs_ids.spv");
-        fs_path = find_spv(cube ? "ps_cube_sample.spv" : dref ? dref_ps : "ps_texture_sample.spv");
-        const int out_arg = cube || dref ? 2 : 1;
+        fs_path = find_spv(fetch ? "ps_table_fetch.spv" : cube ? "ps_cube_sample.spv" : dref ? dref_ps : "ps_texture_sample.spv");
+        const int out_arg = cube || dref || fetch ? 2 : 1;
         out_path = argc > out_arg ? argv[out_arg] : "runtime/build/vk_texture_test_out.raw";
         ptr_sgpr = 0;
         if (dref)
             ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b|fetch-uint|fetch-sint|fetch-miss] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint|--two-mip-uint]\n");
         return 2;
     }
     // Word 1 also selects the numeric type when the shader fetches through this key. Word 3 keeps BASE_LEVEL [15:12]
     // at 0, as the views here start at level 0: image_get_resinfo minifies a 2D array's layers from BASE_LEVEL.
     const VkFormat sampled_format = dref ? VK_FORMAT_D32_SFLOAT :
-        signed_mips ? VK_FORMAT_R8G8B8A8_SINT : VK_FORMAT_R8G8B8A8_UNORM;
+        (uint_mips || fetch_uint) ? VK_FORMAT_R8G8B8A8_UINT :
+        (signed_mips || fetch) ? VK_FORMAT_R8G8B8A8_SINT : VK_FORMAT_R8G8B8A8_UNORM;
     uint32_t tsharp[8] = {0x11111111, leonida::gfx10::format_from_vulkan(sampled_format) << 20, 0x33333333, 0x44440444,
                           0x55555555, 0x66666666, 0x77777777, 0x88888888};
     const uint32_t tsharp_va = 256;
@@ -208,7 +216,6 @@ int main(int argc, char** argv) {
     f12.pNext = &f11;
     f12.bufferDeviceAddress = VK_TRUE; f12.runtimeDescriptorArray = VK_TRUE; f12.descriptorIndexing = VK_TRUE;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; f2.pNext = &f12;
-    f2.features.shaderInt64 = VK_TRUE;
     // Texel offsets: the limits the shader's Offset operands must stay inside, and the two optional features.
     LI(vkEnumerateDeviceExtensionProperties); LI(vkGetPhysicalDeviceFeatures);
     VkPhysicalDeviceProperties pdp; vkGetPhysicalDeviceProperties(pd, &pdp);
@@ -227,6 +234,14 @@ int main(int argc, char** argv) {
     f2.features.shaderSampledImageArrayDynamicIndexing = dynamic_sampled;
     f2.features.shaderImageGatherExtended = have.shaderImageGatherExtended;
     f2.features.shaderResourceMinLod = have.shaderResourceMinLod;
+    // shaderInt64 only when a stage has 64-bit integers: SHADER-423's address pairs need none (TEST-468).
+    const bool int64 = leonida::vk_test::needs_shader_int64(read_spv(vs_path.c_str())) ||
+                       leonida::vk_test::needs_shader_int64(fragment_code);
+    if (int64 && !have.shaderInt64) {
+        std::printf("unsupported: shaderInt64 (a stage declares Int64)\n");
+        return 77;
+    }
+    f2.features.shaderInt64 = int64 ? VK_TRUE : VK_FALSE;
     if (spirv_declares_capability(fragment_code.data(), fragment_code.size() * 4, 42) &&
         !have.shaderResourceMinLod) {   // 42 = MinLod
         std::printf("unsupported: shaderResourceMinLod (the shader clamps its LOD with MinLod)\n");
@@ -310,6 +325,8 @@ int main(int argc, char** argv) {
     VkDeviceAddress heap_base = vkGetBufferDeviceAddress(dev, &bdai);
     // Descriptor hash table: 16 slots.
     leonida::DescriptorTable desc_table(16);
+    // The heap already holds the original key. Change only the registered key for the miss control.
+    if (fetch_miss) tsharp[7] ^= 1;
     desc_table.insert(tsharp, 1);
     desc_table.insert(ssharp, 1);
     const auto table = desc_table.build_gpu_buffer(true);
@@ -350,6 +367,7 @@ int main(int argc, char** argv) {
                                          : (x * 32u) | ((y * 32u) << 8) | (128u << 16) | (255u << 24);
         }
     }
+    if (fetch) texels[0] = 0x4df82282u;
     // The signed two-mip fixture uses 0 or -128 in each channel, including the alpha channel.
     if (signed_mips)
         for (auto& texel : texels) texel &= 0x80808080u;
@@ -618,7 +636,27 @@ int main(int argc, char** argv) {
         }
         std::printf("vk_texture_test dref: PASSED (%u pixels, f32 and d16 depth compares exact)\n", W * H);
     }
-    if (autonomous && !cube && !dref) {
+    if (fetch) {
+        // The PS converts each raw VGPR word as a signed integer. On a miss magenta's
+        // UNORM 1.0 channels therefore export float(0x3f800000).
+        const float fallback_one = static_cast<float>(0x3f800000);
+        const float expected[] = {
+            fetch_miss ? fallback_one : fetch_uint ? 130.f : -126.f,
+            fetch_miss ? 0.f : 34.f,
+            fetch_miss ? fallback_one : fetch_uint ? 248.f : -8.f,
+            fetch_miss ? fallback_one : 77.f
+        };
+        const auto* pixels = static_cast<const float*>(rbp);
+        for (uint32_t i = 0; i < W * H * 4; ++i) {
+            if (pixels[i] != expected[i % 4]) {
+                std::fprintf(stderr, "%s pixel %u channel %u: got %g, expected %g\n",
+                             argv[1], i / 4, i % 4, pixels[i], expected[i % 4]);
+                return 1;
+            }
+        }
+        std::printf("%s: %u exact pixels\n", argv[1], W * H);
+    }
+    if (autonomous && !cube && !dref && !fetch) {
         const float* pixels = static_cast<const float*>(rbp);
         // Sample center pixel (32, 32)
         int idx = (32 * W + 32) * 4;

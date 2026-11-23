@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; v_subrev_f16 (VOP2 0x34 on GFX10): D.f16 = S1.f16 - S0.f16. Like the other f16 VOP2 ops it is a partial write
 ; (docs/design.md, "16-bit results", from Mesa ACO): the low halves are read, the result goes to the low half and the
 ; high half of the destination is kept, in the VOP2 (_e32) and the VOP3 (_e64) form. neg/clamp in the _e64 form.

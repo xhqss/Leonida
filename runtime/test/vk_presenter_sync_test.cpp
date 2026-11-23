@@ -21,6 +21,7 @@
 #include "vk_test_device.h"
 #include "../src/vulkan_present.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -367,37 +368,34 @@ int main() {
             const CommandList* ptr = &red;
             queue.wait(gate.semaphore(), 1);
             EXPECT(queue.execute({&ptr, 1}) == ReplayResult::success);   // held
-            const auto center = [&](int& cr, int& cg, int& cb) {
+            const auto capture_matches = [&](const std::array<int, 3>& rgb, int tolerance) {
                 std::vector<std::uint8_t> shot;
                 VkExtent2D e{};
                 VkFormat f{};
                 if (!presenter.read_back(shot, &e, &f)) return false;
-                const std::size_t at = (std::size_t(e.height / 2) * e.width + e.width / 2) * 4;
+                const VkExtent2D current = presenter.extent();
+                if (e.width != current.width || e.height != current.height) return false;
                 const bool bgr = (f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_B8G8R8A8_SRGB);
-                cr = bgr ? shot[at + 2] : shot[at + 0];
-                cg = shot[at + 1];
-                cb = bgr ? shot[at + 0] : shot[at + 2];
-                return true;
+                return presenter_capture_matches_rgb(shot, e.width, e.height, bgr, rgb, tolerance);
             };
             const std::uint64_t shown = presenter.presented();
             PresentPlanes planes;
             planes.count = 1;
             planes.plane[0].source = 2;
-            int cr = 0, cg = 0, cb = 0;
             EXPECT(presenter.present(1, true) == VK_SUCCESS);            // queued: returns at once
             EXPECT(presenter.present_blank(true) == VK_SUCCESS);         // queued behind the one before it
             EXPECT(presenter.present_planes(planes, true) == VK_SUCCESS);
             EXPECT(presenter.presented() == shown && !presenter.last_present_tore());
-            EXPECT(center(cr, cg, cb) && std::abs(cr - 51) <= 2 && std::abs(cg - 153) <= 2 && std::abs(cb - 230) <= 2);
+            EXPECT(capture_matches({51, 153, 230}, 2));
             EXPECT(gate.signal(1));   // releases the render, then the presents, in order, on this thread
             EXPECT(queue.idle());
             EXPECT(presenter.presented() == shown + 3 && presenter.composed_presents() >= 1);
             // The composed frame (0.2, 0.8, 0.4 in the plane) is the last one shown; a blank last would be black.
-            EXPECT(center(cr, cg, cb) && std::abs(cr - 51) <= 12 && std::abs(cg - 204) <= 12 && std::abs(cb - 102) <= 12);
+            EXPECT(capture_matches({51, 204, 102}, 12));
             // The blit alone, with nothing held, is the plain path again and shows the red the render drew.
             EXPECT(presenter.present(1, true) == VK_SUCCESS);
-            EXPECT(center(cr, cg, cb) && std::abs(cr - 230) <= 2 && std::abs(cg - 26) <= 2 && std::abs(cb - 51) <= 2);
-            std::printf("presenter sync: three Presents queued behind held work ran in order (%d,%d,%d)\n", cr, cg, cb);
+            EXPECT(capture_matches({230, 26, 51}, 2));
+            std::printf("presenter sync: three Presents queued behind held work ran in order\n");
             context.remove_resource(2);
         }
 

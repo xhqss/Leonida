@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; group: 8,1,1
 ; mattr: +wavefrontsize32,-wavefrontsize64
 ; v_cvt_pk_u8_f32 (VOP3 opcode 0x15e): lane i converts one binary32 value into byte (i & 3) of 0x11223344.

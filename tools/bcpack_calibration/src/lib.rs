@@ -2,6 +2,9 @@
 // of bits established by an archive observation or an earlier decoded block.
 use std::slice;
 
+mod blocks;
+mod model;
+
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 struct Cell {
@@ -266,4 +269,86 @@ pub unsafe extern "C" fn unpack(
         }
     }
     decoded.consumed as isize
+}
+
+// The lane-array model of tools/bcpack.py: same streams accepted, same symbols.
+// `tables` is the flat i32 table of `model::Tables::new`; `output` receives
+// `lanes * target` u16 symbols, lane-major. Returns the bytes used, or -1.
+#[no_mangle]
+pub unsafe extern "C" fn unpack_model(
+    data: *const u8,
+    size: usize,
+    widths: *const u8,
+    lanes: usize,
+    target: usize,
+    tables: *const i32,
+    tables_len: usize,
+    output: *mut u16,
+) -> isize {
+    let stream = slice::from_raw_parts(data, size);
+    let bits = slice::from_raw_parts(widths, lanes);
+    let Some(t) = model::Tables::new(slice::from_raw_parts(tables, tables_len)) else {
+        return -1;
+    };
+    let Some((symbols, used)) = model::decode(stream, bits, target, &t) else {
+        return -1;
+    };
+    if stream[used..].iter().any(|&b| b != 0) {
+        return -1;
+    }
+    slice::from_raw_parts_mut(output, lanes * target).copy_from_slice(&symbols);
+    used as isize
+}
+
+// Lanes and the strict block rebuild of codec 1 (BC1), 3 (BC3), 4 (BC4) or 5
+// (BC5) in one call. `lut` is BC1_QUADRANT, the flattened BC3_ALPHA_PAIR then
+// BC3_COLOUR_QUADRANT, the flattened BC4_PAIR or the flattened BC5_PAIR,
+// `builtin` the confirmed built-in history (rows of 6, 8, 2 or 4 values, -1 where absent). Returns the bytes
+// used, or -1: then Python decodes the chunk itself.
+#[no_mangle]
+pub unsafe extern "C" fn decode_blocks(
+    data: *const u8,
+    size: usize,
+    codec: u32,
+    widths: *const u8,
+    lanes: usize,
+    target: usize,
+    tables: *const i32,
+    tables_len: usize,
+    lut: *const u8,
+    lut_len: usize,
+    builtin: *const i32,
+    builtin_len: usize,
+    output: *mut u8,
+    output_len: usize,
+) -> isize {
+    if lanes != 12 {
+        return -1;
+    }
+    let stream = slice::from_raw_parts(data, size);
+    let bits = slice::from_raw_parts(widths, lanes);
+    let Some(t) = model::Tables::new(slice::from_raw_parts(tables, tables_len)) else {
+        return -1;
+    };
+    let Some((symbols, used)) = model::decode(stream, bits, target, &t) else {
+        return -1;
+    };
+    if stream[used..].iter().any(|&b| b != 0) {
+        return -1;
+    }
+    let lut = slice::from_raw_parts(lut, lut_len);
+    let builtin = slice::from_raw_parts(builtin, builtin_len);
+    let out = slice::from_raw_parts_mut(output, output_len);
+    let done = match codec {
+        1 => blocks::bc1(&symbols, target, lut, builtin, out),
+        3 => blocks::bc3(&symbols, target, lut, builtin, out),
+        4 => blocks::bc4(&symbols, target, lut, builtin, out),
+        5 => blocks::bc5(&symbols, target, lut, builtin, out),
+        _ => None,
+    };
+    if done.is_some() {
+        used as isize
+    } else {
+        -1
+    }
 }

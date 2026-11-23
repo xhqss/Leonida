@@ -6,6 +6,7 @@ Reads both archives in place using `anim_index.scan_rpf`, extracts `SKEL_[A-Za-z
 inflated streams, and compares the animation bone set against the model skeletons (both exact and
 case-insensitive, plus `joaat32` of lowercased ASCII). Writes counts only (no bone names, offsets
 or archive bytes) when `--out` is given. Standard library only; no game data.
+Usage: `python -I tools/anim_skeleton_match.py --help` lists the options.
 """
 import argparse
 import json

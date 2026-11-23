@@ -144,6 +144,23 @@ class GamedataXmlTest(unittest.TestCase):
         for value in ("fixture.bk2", "synthetic note", "synthetic_set", "0 1", "fixture.xml"):
             self.assertNotIn(value, blob)
 
+    def test_well_formed_roots_group_by_namespace_not_prefix(self):
+        bare = self.write("bare.xml", b"<CTuningFile/>")
+        default = self.write("default.xml", b'<CTuningFile xmlns="urn:example"/>')
+        prefix = self.write("prefix.xml", b'<t:CTuningFile xmlns:t="urn:example"/>')
+        out = os.path.join(self.root, "catalog.json")
+        p = self.run_tool(bare, default, prefix, "--json", out, "--check")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(out, encoding="utf-8") as f:
+            report = json.load(f)
+        qualified = "{urn:example}CTuningFile"
+        self.assertEqual(set(report["roots"]), {"CTuningFile", qualified})
+        self.assertEqual(report["roots"][qualified]["files"], 2)
+        self.assertEqual(report["roots"][qualified]["element_names"], {qualified: 2})
+        self.assertEqual(report["roots"][qualified]["category"], "uncatalogued")
+        self.assertEqual(report["roots"]["CTuningFile"]["files"], 1)
+        self.assertEqual(report["summary"]["catalog_roots"], 1)
+
     def test_counts_tail_references_across_parser_buffer_boundary(self):
         start = b"<root><child>"
         close = b"</child>"

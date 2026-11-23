@@ -10,13 +10,19 @@ target is a candidate; candidates are ranked by how many of the hashes lead to t
 the whole image makes to them. RAGE's archetype lookup by hash takes the hash and is called from hundreds of places,
 so it should rank first; pass its RVA to `gta6rt --archetype-lookup`.
 
-Standard library only. No game data is written: the report holds RVAs and counts.
+Standard library only. No game data is written: the report holds RVAs and counts. The report destination must not
+name the scanned executable, which it would truncate.
 """
 import argparse
 import json
+import os
 import struct
 import sys
 from collections import Counter, defaultdict
+
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
 
@@ -118,6 +124,11 @@ def main(argv=None):
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--json", help="also write the report here")
     a = ap.parse_args(argv)
+    if a.json:
+        if os.path.isdir(a.json):
+            ap.error(f"--json {a.json} is a folder, not a file")
+        if same_report_path(a.json, a.exe):
+            ap.error(f"--json {a.json} would overwrite the scanned executable {a.exe}")
     try:
         hashes = [(h, parse_hash(h)) for h in (a.hash or ["player_story000_00", "cs_mandy"])]
     except ValueError as e:
@@ -137,9 +148,13 @@ def main(argv=None):
     for c in report["candidates"]:
         print(f"  {c['rva']:>12}  callers {c['direct_callers']:>6}  led by {', '.join(c['led_by'])}")
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
-            f.write("\n")
+        try:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=1)
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
     return 0
 
 

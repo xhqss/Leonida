@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; v_pack_b32_f16 with NEG and ABS on a source: each acts on the selected 16-bit half as a plain bit move
 ; (ABS clears bit 15, NEG flips it, ABS first), before the half is packed. The rule and its words were measured
 ; on a Radeon 680M (gfx1036, RDNA2 iGPU, AMD Windows driver 32.0.21044.64) with raw kernels: -v0 turned 0x7c01

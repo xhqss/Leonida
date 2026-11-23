@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; VOP3 output modifiers on v_interp_p2_f32_e64 and v_interp_mov_f32_e64 (docs/design.md "v_fmac_f16,
 ; v_interp_p2/mov_f32 output modifiers"). Drawn with vs_interp_consts: attr2 = (0.25, 3.0, 0, 0) interpolated,
 ; attr1 = (1.5, -0.5, 0.25, 4.0) read only with v_interp_mov (so its location is Flat).

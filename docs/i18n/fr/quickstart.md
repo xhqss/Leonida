@@ -57,7 +57,8 @@ l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
     20 à 40 minutes.
   - Plus rapide si vous utilisez [conda](https://docs.conda.io/) : `conda install -c conda-forge llvm-tools` (sa
     version Windows inclut la cible AMDGPU), puis faites pointer `LLVM_MC` vers le chemin complet du `llvm-mc.exe`
-    installé (`where llvm-mc` l'affiche une fois l'environnement activé).
+    installé (`where.exe llvm-mc` l'affiche une fois l'environnement activé ; le `where` seul est
+    l'alias `Where-Object` de PowerShell).
   - Avec WSL, installez `llvm-21` dans Ubuntu et donnez la commande entière à `LLVM_MC`, dans la session PowerShell
     où vous lancerez `make_game.py` :
 

@@ -81,6 +81,27 @@ class AuditShader4RegsTests(unittest.TestCase):
         )]
         self.assertEqual(audit_mod.rbw_registers(nsa_insns), (list(range(4, 16)), [1, 3], []))
 
+    def test_direct_to_lds_load_and_accumulating_dot_forms(self):
+        def rbw(*lines):
+            return audit_mod.rbw_registers([audit_mod.shader_ir.parse_line("\t" + line) for line in lines])
+
+        # A direct-to-LDS load writes LDS: its vdst is the LDS address, so a later read of it is read-before-write.
+        self.assertEqual(rbw("buffer_load_dword v5, v1, s[4:7], 0 offen lds", "v_mov_b32 v6, v5"),
+                         ([4, 5, 6, 7], [1, 5], []))
+        self.assertEqual(rbw("buffer_load_dword lds:v5, v1, s[4:7], 0 offen", "v_mov_b32 v6, v5"),
+                         ([4, 5, 6, 7], [1, 5], []))
+        # The same load without the lds bit writes v5, so the later read is not one.
+        self.assertEqual(rbw("buffer_load_dword v5, v1, s[4:7], 0 offen", "v_mov_b32 v6, v5"),
+                         ([4, 5, 6, 7], [1], []))
+
+        # The "c" dot forms accumulate into D; the plain forms overwrite it.
+        for op, dst in (("v_dot2c_f32_f16", 5), ("v_dot2c_i32_i16", 5), ("v_dot2c_u32_u16", 5),
+                        ("v_dot4c_i32_i8", 6), ("v_dot4c_u32_u8", 6),
+                        ("v_dot8c_i32_i4", 7), ("v_dot8c_u32_u4", 7)):
+            self.assertEqual(rbw(f"{op} v{dst}, v1, v2"), ([], [1, 2, dst], []), op)
+        for op, dst in (("v_dot2_f32_f16", 5), ("v_dot4_i32_i8", 6)):
+            self.assertEqual(rbw(f"{op} v{dst}, v1, v2"), ([], [1, 2], []), op)
+
     def test_non_returning_ds_ops_read_every_operand(self):
         def rbw(*lines):
             return audit_mod.rbw_registers([audit_mod.shader_ir.parse_line("\t" + line) for line in lines])
@@ -405,8 +426,26 @@ class AuditShader4RegsTests(unittest.TestCase):
             self.assertEqual(rep["gs"]["rbw_vgpr_counts"], {"v0": 1, "v1": 1})
             self.assertEqual(rep["gs"]["s3_rbw_op_patterns"], {"s_bfe_u32 D, s3, 0x80008": 1})
 
+    def test_buffer_load_lds_reads_vaddr_and_writes_no_vgpr(self):
+        # The lds modifier sends the load straight to LDS: args[0] is vaddr (a source), not a destination.
+        insns = [audit_mod.shader_ir.parse_line(line) for line in (
+            "\tbuffer_load_dword v0, s[0:3], s4 offen lds",
+            "\tv_mov_b32 v7, v0",
+        )]
+        s_rbw, v_rbw, _patterns = audit_mod.rbw_registers(insns)
+        self.assertIn(0, v_rbw)          # vaddr read before write, as the repro requires
+
+    def test_dot_accumulate_ops_read_their_destination(self):
+        insns = [audit_mod.shader_ir.parse_line(line) for line in (
+            "\tv_dot2c_f32_f16 v2, v3, v4",
+            "\tv_dot4c_i32_i8 v5, v3, v4",
+        )]
+        _s_rbw, v_rbw, _patterns = audit_mod.rbw_registers(insns)
+        self.assertEqual(v_rbw, [2, 3, 4, 5])
+
 
 def setUpModule():
+
     # The tools' main() prints its report; keep it out of the test log (tests that check it redirect again).
     quiet = contextlib.redirect_stdout(io.StringIO())
     quiet.__enter__()

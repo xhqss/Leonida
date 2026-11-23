@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; The 14 v_cmpx forms no test ran: v_cmpx_{eq,gt,le,lt,ngt,nle}_f32, v_cmpx_f_i32, v_cmpx_t_u32,
 ; v_cmpx_{eq,gt,le}_i64 and v_cmpx_{ge,lt,ne}_u64. RDNA2 ISA: EXEC = EXEC & compare(S0, S1), per lane; a v_cmpx
 ; writes EXEC only, so VCC is kept. Each one runs alone: EXEC is copied out and put back after it (s20 holds the

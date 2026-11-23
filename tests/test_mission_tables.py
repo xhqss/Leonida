@@ -413,6 +413,28 @@ class TestCli(unittest.TestCase):
             self.assertEqual(completed.stdout.count(" records="), 2)
             self.assertIn("2 files,", completed.stdout)
 
+    def test_a_single_file_without_the_magic_is_refused(self):
+        # A lone argument is a PSIN file; a folder is where the bare carved .bin streams live. Naming a file
+        # that is neither used to end in "1 files, 0 records" and exit 0, so a wrong path looked like a run.
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "not-a-container.bin")
+            with open(path, "wb") as handle:
+                handle.write(b"\x01" * 64)
+            completed = subprocess.run([sys.executable, "-I", TOOL, path], capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("not a PSIN container", completed.stderr)
+            self.assertEqual(completed.stdout, "")
+
+    def test_a_folder_still_scans_a_stream_without_the_magic(self):
+        # Negative control: the same bytes in a folder are a carved stream and are still counted.
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "bare.bin"), "wb") as handle:
+                handle.write(b"\x01" * 64)
+            completed = subprocess.run([sys.executable, "-I", TOOL, folder], capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("1 files, 0 records", completed.stdout)
+            self.assertIn("skipped bytes 64", completed.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

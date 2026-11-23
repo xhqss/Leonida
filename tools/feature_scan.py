@@ -73,19 +73,24 @@ def parts(d: bytes) -> dict:
     return {tag: d[off:off + size] for tag, (off, size) in dxbc_part_ranges(d).items()}
 
 
-def streams(sig: bytes) -> set:
-    """Stream index of every element of an ISG1/OSG1 signature (32-byte elements, stream first).
-
-    A part shorter than its declared element table, or with its first element inside the 8-byte
-    count/offset header, carries no usable stream information: report no streams rather than let
-    struct.error abort the whole count-only scan. Well-formed signatures are read as before.
-    """
+def signature_offsets(sig: bytes) -> range:
+    """Offsets of the 32-byte elements in a complete ISG1 or OSG1 table."""
     if len(sig) < 8:
-        return set()
+        raise ValueError("truncated signature header")
     count, first = struct.unpack_from("<II", sig, 0)
-    if first < 8 or first + 32 * count > len(sig):
+    end = first + 32 * count
+    if first < 8 or end > len(sig):
+        raise ValueError("invalid signature table")
+    return range(first, end, 32)
+
+
+def streams(sig: bytes) -> set:
+    """Stream indices from a complete signature, or an empty set for an unusable table."""
+    try:
+        offsets = signature_offsets(sig)
+    except ValueError:
         return set()
-    return {struct.unpack_from("<I", sig, first + 32 * i)[0] for i in range(count)}
+    return {struct.unpack_from("<I", sig, offset)[0] for offset in offsets}
 
 
 # DXC include/dxc/DxilContainer/DxilPipelineStateValidation.h (PSVResourceType) and DxilConstants.h
@@ -503,7 +508,7 @@ def scan_typed_buffers(disasm_dir: str, stage_of: dict) -> dict:
 
 
 def scan_spirv(spirv_index: str) -> dict:
-    with open(spirv_index, encoding="utf-8") as f:
+    with open(spirv_index, encoding="utf-8-sig") as f:
         idx = json.load(f)
     # An object maps shader names to rows; a list is the other accepted shape. A scalar is a
     # broken index, not something to iterate -- report no translated shaders for it.
@@ -572,7 +577,7 @@ def main() -> int:
         print(f"ERROR: {index_path} is missing. Run the shaders stage of make_game.py first.", file=sys.stderr)
         return 2
     try:
-        with open(index_path, encoding="utf-8") as f:
+        with open(index_path, encoding="utf-8-sig") as f:
             index = json.load(f)
     except (OSError, ValueError) as e:
         print(f"ERROR: cannot read {index_path}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)

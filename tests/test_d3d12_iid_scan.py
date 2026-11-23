@@ -45,7 +45,8 @@ def pe32plus(imports, payload=b""):
         return sect_rva + at
 
     descriptors = []
-    for dll, funcs in imports.items():
+    entries = imports.items() if isinstance(imports, dict) else imports
+    for dll, funcs in entries:
         thunks = []
         for f in funcs:
             if isinstance(f, int):
@@ -121,6 +122,52 @@ class IidScan(unittest.TestCase):
         r = scan.scan(path, iids)
         self.assertEqual(r["d3d12_xs_imports"], ["D3D12CreateRootSignatureDeserializer"])
         self.assertEqual(r["possible_iid_imports"], [])
+
+    def test_collects_imports_across_multiple_d3d12_xs_descriptors(self):
+        iids = scan.read_iids(self.header)
+        path = self.image("multi.dll", pe32plus([
+            ("d3d12_xs.dll", ["D3D12CreateRootSignatureDeserializer"]),
+            ("KERNEL32.dll", ["Sleep"]),
+            ("D3D12_XS.DLL", [80, "IID_ID3D12Fence"]),
+        ]))
+        r = scan.scan(path, iids)
+        self.assertEqual(
+            r["d3d12_xs_imports"],
+            ["D3D12CreateRootSignatureDeserializer", "#80", "IID_ID3D12Fence"],
+        )
+        self.assertEqual(r["possible_iid_imports"], ["#80", "IID_ID3D12Fence"])
+
+    def test_rva_in_virtual_tail_past_raw_data_does_not_read_next_section(self):
+        # Section 1 (.rdata) has VirtualSize > SizeOfRawData; an import descriptor's Name RVA
+        # falls in the unbacked virtual tail (va + rsize), which must not alias section 2's raw bytes.
+        sect1_rva, sect1_raw, sect1_rsize, sect1_vsize = 0x1000, 0x200, 0x200, 0x1000
+        sect2_rva, sect2_raw = 0x2000, 0x400
+        # Place one import descriptor at sect1_rva pointing Name RVA into sect1's virtual tail (0x1200)
+        # and Lookup/IAT at 0x1040 (single ordinal #80 + null terminator).
+        sect1 = bytearray(sect1_rsize)
+        struct.pack_into("<IIIII", sect1, 0, 0x1040, 0, 0, sect1_rva + sect1_rsize, 0x1040)
+        struct.pack_into("<QQ", sect1, 0x40, (1 << 63) | 80, 0)
+        # Section 2 begins at file offset sect1_raw + sect1_rsize (0x400) with "d3d12_xs.dll\0".
+        sect2 = bytearray(b"d3d12_xs.dll\0")
+
+        pe, opt_size = 0x80, 240
+        hdr = bytearray(sect1_raw)
+        hdr[0:2] = b"MZ"
+        struct.pack_into("<I", hdr, 0x3C, pe)
+        hdr[pe:pe + 4] = b"PE\0\0"
+        struct.pack_into("<HHIIIHH", hdr, pe + 4, 0x8664, 2, 0, 0, 0, opt_size, 0x2022)
+        opt = pe + 24
+        struct.pack_into("<H", hdr, opt, 0x20B)
+        struct.pack_into("<I", hdr, opt + 108, 16)
+        struct.pack_into("<II", hdr, opt + 112 + 8, sect1_rva, 40)
+        sec1 = opt + opt_size
+        hdr[sec1:sec1 + 8] = b".rdata\0\0"
+        struct.pack_into("<IIII", hdr, sec1 + 8, sect1_vsize, sect1_rva, sect1_rsize, sect1_raw)
+        sec2 = sec1 + 40
+        hdr[sec2:sec2 + 8] = b".data\0\0\0"
+        struct.pack_into("<IIII", hdr, sec2 + 8, len(sect2), sect2_rva, len(sect2), sect2_raw)
+
+        self.assertIsNone(scan.d3d12_xs_imports(bytes(hdr) + bytes(sect1) + bytes(sect2)))
 
     def test_not_a_pe_still_scans_bytes(self):
         iids = scan.read_iids(self.header)

@@ -46,6 +46,8 @@ struct Env {
     Ref<ID3D12DescriptorHeap> rtv_heap, dsv_heap;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv{}, dsv{};
     Ref<ID3D12QueryHeap> occlusion;
+    Ref<ID3D12CommandAllocator> closed_bundle_allocator;
+    Ref<ID3D12GraphicsCommandList> closed_bundle;
     // The list being recorded, and the same list as ID3D12GraphicsCommandList2 (null when not given).
     ID3D12GraphicsCommandList* list = nullptr;
     ID3D12GraphicsCommandList2* list2 = nullptr;
@@ -98,6 +100,11 @@ struct Env {
         device->CreateDepthStencilView(depth.p, nullptr, dsv);
         const D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 8, 0};
         CHECK(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&occlusion.p))));
+        CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                                                       IID_PPV_ARGS(&closed_bundle_allocator.p))));
+        CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, closed_bundle_allocator.p,
+                                                  nullptr, IID_PPV_ARGS(&closed_bundle.p))));
+        CHECK(SUCCEEDED(closed_bundle->Close()));
         return true;
     }
 };
@@ -298,12 +305,46 @@ std::vector<Case> cases() {
         {"IASetVertexBuffers(30, 4): slots past 31", true, stricter,
          CALLS(const D3D12_VERTEX_BUFFER_VIEW v[4] = {}; e.list->IASetVertexBuffers(30, 4, v))},
         {"IASetVertexBuffers(0, 0, nullptr)", true, match, CALLS(e.list->IASetVertexBuffers(0, 0, nullptr))},
+        {"IASetIndexBuffer(nullptr)", true, match, CALLS(e.list->IASetIndexBuffer(nullptr))},
+        {"IASetIndexBuffer as R16_UINT", true, match,
+         CALLS(const D3D12_INDEX_BUFFER_VIEW v{e.buffer->GetGPUVirtualAddress(), 64, DXGI_FORMAT_R16_UINT};
+               e.list->IASetIndexBuffer(&v))},
+        {"IASetIndexBuffer as R32_UINT", true, match,
+         CALLS(const D3D12_INDEX_BUFFER_VIEW v{e.buffer->GetGPUVirtualAddress(), 64, DXGI_FORMAT_R32_UINT};
+               e.list->IASetIndexBuffer(&v))},
+        {"IASetIndexBuffer as UNKNOWN, size 0", true, match,
+         CALLS(const D3D12_INDEX_BUFFER_VIEW v{0, 0, DXGI_FORMAT_UNKNOWN}; e.list->IASetIndexBuffer(&v))},
+        {"IASetIndexBuffer as UNKNOWN, size 64", true, match,
+         CALLS(const D3D12_INDEX_BUFFER_VIEW v{e.buffer->GetGPUVirtualAddress(), 64, DXGI_FORMAT_UNKNOWN};
+               e.list->IASetIndexBuffer(&v))},
         {"IASetIndexBuffer as R8_UINT", true, match,
          CALLS(const D3D12_INDEX_BUFFER_VIEW v{e.buffer->GetGPUVirtualAddress(), 64, DXGI_FORMAT_R8_UINT};
                e.list->IASetIndexBuffer(&v))},
+        {"IASetIndexBuffer as R32_FLOAT", true, match,
+         CALLS(const D3D12_INDEX_BUFFER_VIEW v{e.buffer->GetGPUVirtualAddress(), 64, DXGI_FORMAT_R32_FLOAT};
+               e.list->IASetIndexBuffer(&v))},
         {"IASetPrimitiveTopology(UNDEFINED)", true, match,
          CALLS(e.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_UNDEFINED))},
+        {"IASetPrimitiveTopology(TRIANGLELIST)", true, match,
+         CALLS(e.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST))},
+        {"IASetPrimitiveTopology(7) (gap value)", true, match,
+         CALLS(e.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(7)))},
+        {"IASetPrimitiveTopology(32_CONTROL_POINT_PATCHLIST)", true, match,
+         CALLS(e.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_32_CONTROL_POINT_PATCHLIST))},
+        {"IASetPrimitiveTopology(65) (past 32-cp patch)", true, match,
+         CALLS(e.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(65)))},
         {"IASetPrimitiveTopology(99)", true, match, CALLS(e.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(99)))},
+        {"OMSetBlendFactor", true, match,
+         CALLS(const FLOAT factor[4] = {0.25f, 0.5f, 0.75f, 1.0f}; e.list->OMSetBlendFactor(factor))},
+        {"OMSetStencilRef(7)", true, match, CALLS(e.list->OMSetStencilRef(7))},
+        {"ExecuteBundle after post-close state calls on bundle", true, match,
+         CALLS(const FLOAT factor[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+               e.closed_bundle->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+               e.closed_bundle->IASetIndexBuffer(nullptr);
+               e.closed_bundle->OMSetBlendFactor(factor);
+               e.closed_bundle->OMSetStencilRef(9);
+               e.closed_bundle->ClearState(nullptr);
+               e.list->ExecuteBundle(e.closed_bundle.p))},
         {"RSSetViewports(0, nullptr)", true, match, CALLS(e.list->RSSetViewports(0, nullptr))},
         {"RSSetViewports(17)", true, stricter,
          CALLS(D3D12_VIEWPORT v[17]; for (auto& x : v) x = {0, 0, 8, 8, 0, 1}; e.list->RSSetViewports(17, v))},

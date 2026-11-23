@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Wave64 s_bfm_b64 lane-mask tracking (low half and high half bitfields).
 ; Assemble (as scripts/run_gpu_tests.py / build.py do): llvm-mc -triple=amdgcn--amdpal -mcpu=gfx1013 -show-encoding (wave64 is inferred by the translator from exec_hi/_b64 EXEC use)
 ; Run: VKC_SUBGROUP_SIZE=64 vk_compute_test cs_wm_bfm64.spv 1 dump

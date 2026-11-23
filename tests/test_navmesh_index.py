@@ -118,6 +118,39 @@ class NavmeshIndexTest(unittest.TestCase):
         self.assertIsNone(row["stored"])
         self.assertEqual(row["size"], 0x80)
 
+    def test_recursive_pattern_counts_each_nested_path_once(self):
+        folder = os.path.join(self.root, "carve")
+        nested = os.path.join(folder, "group", "tiles")
+        os.makedirs(nested)
+        for directory in (folder, nested):
+            with open(os.path.join(directory, "page.bin"), "wb") as f:
+                f.write(page(pages=2))
+        out = os.path.join(self.root, "recursive.json")
+        self.run_tool(folder, "--out", out, "--pattern", "**/*.bin")
+        with open(out, encoding="utf-8") as f:
+            report = json.load(f)
+        self.assertCountEqual([r["source"] for r in report["pages"]],
+                              ["page.bin", os.path.join("group", "tiles", "page.bin")])
+        self.assertEqual(report["summary"]["streams"], 2)
+        self.assertEqual(report["summary"]["span"], 2 * 0x80)
+        self.assertEqual(report["summary"]["page_counts"], {"2": 2})
+
+    def test_explicit_recursive_prefix_does_not_rescan_directories(self):
+        nav = load_tool_module()
+        folder = os.path.join(self.root, "carve")
+        leaf = os.path.join(folder, "tiles", "nested", "tiles")
+        os.makedirs(leaf)
+        with open(os.path.join(leaf, "page.bin"), "wb") as f:
+            f.write(page())
+        scans = []
+        for pattern in ("*.bin", "**/*.bin", "**/tiles/**/*.bin"):
+            with mock.patch.object(os, "scandir", wraps=os.scandir) as calls:
+                rows, summary = nav.scan_directory(folder, pattern)
+            self.assertEqual(summary["streams"], 1)
+            self.assertEqual(rows[0]["source"], os.path.join("tiles", "nested", "tiles", "page.bin"))
+            scans.append(calls.call_count)
+        self.assertEqual(scans[1], scans[0])
+
     def test_directory_with_glob_metacharacters_in_its_name(self):
         # Before: os.path.join(root, "**", pattern) fed a root like "carve[1]" straight to glob, which read
         # the "[1]" as a character class and matched nothing -- the index came back empty.
@@ -148,6 +181,24 @@ class NavmeshIndexTest(unittest.TestCase):
             doc = json.load(f)
         self.assertEqual(doc["summary"]["streams"], 1)
         self.assertEqual(doc["summary"]["matched"], 1)
+
+    def test_a_non_archive_input_is_a_usage_error(self):
+        # Before: a non-RPF7/8/9 file (or a truncated header) raised SystemExit -> exit 1 with a bare message;
+        # the convention is one error line and exit 2 (the tool's own ap.error cases above).
+        bad = os.path.join(self.root, "notrpf.bin")
+        with open(bad, "wb") as f:
+            f.write(b"\x00" * 64)
+        r = subprocess.run([sys.executable, "-I", TOOL, bad], cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("error:", r.stderr)
+        self.assertIn("not an RPF7/8/9 archive", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        short = os.path.join(self.root, "short.rpf")
+        with open(short, "wb") as f:
+            f.write(b"7")
+        r = subprocess.run([sys.executable, "-I", TOOL, short], cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("not an RPF7/8/9 archive", r.stderr)
 
     def test_hard_link_to_a_scanned_file_in_a_glob_named_input_is_refused(self):
         folder = os.path.join(self.root, "carve [v1]")
@@ -397,7 +448,8 @@ class NavmeshIndexTest(unittest.TestCase):
 
         try:
             with mock.patch.object(mod.mmap, "mmap", side_effect=tracking_mmap):
-                with self.assertRaises(SystemExit):
+                # main() turns this into one usage error line (ap.error, exit 2); the mmap must still close.
+                with self.assertRaises(ValueError):
                     mod.scan_archive(rpf, start=size)
             self.assertEqual(len(created), 1)
             self.assertTrue(created[0].closed)

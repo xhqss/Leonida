@@ -1,5 +1,6 @@
 // mods.h: mod.json manifests and archetype swaps (docs/modding.md). No game files.
 #include "../src/mods.h"
+#include "test_temp_dir.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -56,6 +57,36 @@ int main() {
     check(!parse_mod("[1,2]", "m", mod, error), "a manifest that is not an object is refused");
     check(parse_mod("{}", "folder_name", mod, error) && mod.name == "folder_name", "the name defaults to the folder");
 
+    // The encodings Windows editors and shells write. A UTF-8 byte-order mark is skipped; UTF-16 is named.
+    const std::string manifest =
+        R"({"name":"Mandy","archetype_swaps":[{"from":"player_story000_00","to":"cs_mandy"}]})";
+    const std::string bom = "\xEF\xBB\xBF";
+    check(parse_mod(bom + manifest, "m", mod, error) && mod.name == "Mandy" && mod.archetype_swaps.size() == 1 &&
+              mod.archetype_swaps[0].to == 0xD7C0CDFFu,
+          "a manifest saved as UTF-8 with a byte-order mark parses");
+    check(parse_mod(bom + "{\r\n  \"name\": \"crlf\"\r\n}\r\n", "m", mod, error) && mod.name == "crlf",
+          "a byte-order mark before CRLF text parses");
+    check(!parse_mod(bom + "[1,2]", "m", mod, error) && error == "mod.json is not a JSON object",
+          "a byte-order mark does not make a list a manifest");
+    check(!parse_mod(bom, "m", mod, error) && !parse_mod(bom + bom + manifest, "m", mod, error),
+          "a byte-order mark alone, or two of them, is still refused");
+    const auto utf16 = [&manifest](bool little_endian, bool mark) {
+        std::string out;
+        if (mark) out = little_endian ? std::string("\xFF\xFE", 2) : std::string("\xFE\xFF", 2);
+        for (const char c : manifest) {
+            if (!little_endian) out.push_back('\0');
+            out.push_back(c);
+            if (little_endian) out.push_back('\0');
+        }
+        return out;
+    };
+    for (const std::string& text : {utf16(true, true), utf16(false, true), utf16(true, false), utf16(false, false)})
+        check(!parse_mod(text, "m", mod, error) && error == "mod.json is UTF-16; save it as UTF-8",
+              "a UTF-16 manifest is refused by name, with or without a byte-order mark");
+    check(!parse_mod("", "m", mod, error) && !parse_mod("{", "m", mod, error) &&
+              error == "mod.json is not a JSON object",
+          "an empty or one-byte manifest is not mistaken for UTF-16");
+
     // "camera": first-person view (docs/modding.md, "First-person view")
     check(parse_mod(R"({"camera":{"view_mode":"first_person","first_person_value":4,"contexts":[0]}})", "fp", mod,
                     error) && mod.camera.set && mod.camera.first_person && mod.camera.first_person_value == 4 &&
@@ -69,6 +100,25 @@ int main() {
           "a fractional enum value is refused");
     check(!parse_mod(R"({"camera":{"view_mode":"first_person","contexts":"all"}})", "x", mod, error),
           "contexts must be a list");
+    // A context is a uint32: every whole value up to 4294967295 is taken, and nothing is cast before it is bounded.
+    check(parse_mod(R"({"camera":{"view_mode":"first_person","contexts":[2147483647,2147483648,4294967295]}})", "x",
+                    mod, error) && mod.camera.contexts.size() == 3 && mod.camera.contexts[0] == 2147483647u &&
+              mod.camera.contexts[1] == 2147483648u && mod.camera.contexts[2] == 4294967295u,
+          "contexts past INT_MAX are whole numbers too");
+    for (const char* value : {"4294967296", "1e300", "-1", "1.5", "-0.5"}) {
+        const std::string text = std::string(R"({"camera":{"view_mode":"first_person","contexts":[)") + value + "]}}";
+        check(!parse_mod(text, "x", mod, error) &&
+                  error.find("whole numbers from 0 to 4294967295") != std::string::npos,
+              "a context that is not a whole uint32 is refused");
+    }
+    for (const char* value : {"256", "-1", "1e300", "4.5"}) {
+        const std::string text =
+            std::string(R"({"camera":{"view_mode":"first_person","first_person_value":)") + value + "}}";
+        check(!parse_mod(text, "x", mod, error), "a first_person_value outside 0-255 is refused");
+    }
+    check(parse_mod(R"({"camera":{"view_mode":"first_person","first_person_value":255}})", "x", mod, error) &&
+              mod.camera.first_person_value == 255,
+          "255 is the largest first_person_value");
 
     Mod fp_on_foot, fp_everywhere, off;
     check(parse_mod(R"({"camera":{"view_mode":"first_person","contexts":[0]}})", "a", fp_on_foot, error) &&
@@ -84,8 +134,8 @@ int main() {
     set_active_camera(camera_of({}));
     check(override_view_mode(3, 0) == 3, "with no camera mod the game's view mode passes through");
 
-    const auto dir = std::filesystem::temp_directory_path() / "leonida_mods_test";
-    std::filesystem::remove_all(dir);
+    const testfiles::ScratchDir scratch("leonida_mods_test");
+    const auto& dir = scratch.path();
     write(dir / "a_mandy" / "mod.json",
           R"({"name":"Mandy","archetype_swaps":[{"from":"player_story000_00","to":"cs_mandy","when":"always"}]})");
     write(dir / "b_off" / "mod.json",
@@ -107,7 +157,6 @@ int main() {
     check(mandy_only.remap(0xE472B687u) == 0xD7C0CDFFu, "the Mandy mod swaps Lucia's player model for cs_mandy");
 
     check(load_mods(dir / "missing").mods.empty(), "no mods folder is no mods");
-    std::filesystem::remove_all(dir);
 
     std::printf("mods_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

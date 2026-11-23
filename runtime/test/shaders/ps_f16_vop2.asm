@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; f16 VOP2 ops read the low halves and are partial writes: the high half of the destination is kept. The VOP3
 ; (_e64) form adds neg/abs. The accumulator of v_fmac_f16 is the low half of its destination.
 ; v0 = 1.5 | 4.0 << 16, v1 = 0.5 | 2.0 << 16 (low | high half); destinations start as 0xaaaa5555, v5 as 1.0 | 3.0 << 16.

@@ -3,6 +3,7 @@
 // arguments follow the public GDK reference. No game data; nothing online.
 #include <windows.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -30,7 +31,7 @@ void check(bool condition, const char* what) {
 }
 
 using Handle = void*;
-struct GameLicense {   // XStoreGameLicense with the UNVERIFIED sizes of xgameruntime_store.cpp
+struct GameLicense {   // XStoreGameLicense with the measured sizes of xgameruntime_store.cpp
     char skuStoreId[18];
     bool isActive;
     bool isTrialOwnedByThisUser;
@@ -40,6 +41,10 @@ struct GameLicense {   // XStoreGameLicense with the UNVERIFIED sizes of xgameru
     char trialUniqueId[64];
     time_t expirationDate;
 };
+static_assert(sizeof(GameLicense) == 104, "XStoreGameLicense is 104 bytes");
+static_assert(offsetof(GameLicense, isTrialOwnedByThisUser) == 0x13, "measured flag offset");
+static_assert(offsetof(GameLicense, trialUniqueId) == 0x1C, "measured trial-id offset");
+static_assert(offsetof(GameLicense, expirationDate) == 0x60, "measured expiration offset");
 struct CanAcquire {
     char licensableSku[5];
     uint32_t status;
@@ -110,9 +115,12 @@ int main() {
     XAsyncBlock async{};
     GameLicense license;
     std::memset(&license, 0xCD, sizeof(license));
-    check(at<CtxAsync>(store, 28)(store, context, &async) == S_OK && finished(&async) &&
-              at<LicenseResult>(store, 29)(store, &async, &license) == S_OK,
-          "XStoreQueryGameLicenseAsync / Result");
+    check(at<CtxAsync>(store, 28)(store, context, &async) == S_OK && finished(&async),
+          "XStoreQueryGameLicenseAsync completes");
+    size_t license_size = 0;
+    check(XAsyncGetResultSize(&async, &license_size) == S_OK && license_size == 104,
+          "the game license result size is the measured 104 bytes");
+    check(at<LicenseResult>(store, 29)(store, &async, &license) == S_OK, "XStoreQueryGameLicenseResult");
     check(license.isActive && !license.isTrial && !license.isTrialOwnedByThisUser && !license.isDiscLicense &&
               license.trialTimeRemainingInSeconds == 0 && license.trialUniqueId[0] == '\0' &&
               std::strcmp(license.skuStoreId, "0010") == 0,

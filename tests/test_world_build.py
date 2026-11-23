@@ -18,6 +18,7 @@ import json
 import math
 import os
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -1244,6 +1245,15 @@ def _uniform_bgra_dds(rgba, size=4):
     return make_bgra8_dds(size, size, bytes(rgba) * (size * size))
 
 
+def _half_float_dds(dxgi, texel_codes, size=4, pad=4):
+    """A DX10 R16_FLOAT (54) or R16G16B16A16_FLOAT (10) DDS of one repeated texel, rows padded by pad bytes."""
+    texel = struct.pack(f"<{len(texel_codes)}H", *texel_codes)
+    row = texel * size
+    data = bytearray(make_dx10_dds(size, size, dxgi, (row + bytes(pad)) * size))
+    struct.pack_into("<I", data, 20, len(row) + pad)  # DDSD_PITCH is already set
+    return bytes(data)
+
+
 def _param_ref(param, texture_index, id64="0000000000000000"):
     ref = {"TextureIndex": texture_index, "Name": "00000000", "Id64": id64, "Tag": "00000000"}
     if param is not None:
@@ -1358,6 +1368,24 @@ class BaseColorParamTest(unittest.TestCase):
         with self.subTest(case="no-materials"):
             # Legacy fallback maps the first sorted DDS to shader 0.
             self._assert_textured(NORMAL_RGBA, [], materials=False)
+
+    def test_half_float_textures_are_embedded(self):
+        # 0.5, 0.25, 1, 1 -> (128, 64, 255, 255); 0.75 -> 191 in red only.
+        cases = (("normal-first", "000_normal.dds", _half_float_dds(10, (0x3800, 0x3400, 0x3C00, 0x3C00)),
+                  (128, 64, 255, 255)),
+                 ("unannotated", "002_plain.dds", _half_float_dds(54, (0x3A00,)), (191, 0, 0, 255)))
+        for case, name, data, expected in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                assets_dir = os.path.join(tmp, "assets")
+                out_dir = os.path.join(tmp, "world")
+                _write_param_fixture(assets_dir, PARAM_CASES[case])
+                with open(os.path.join(assets_dir, "models", "tri_tex", name), "wb") as f:
+                    f.write(data)
+                proc = self._run_cli(assets_dir, out_dir)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                stats, _, pixel = self._read_world(out_dir)
+                self.assertEqual(stats["textures_embedded"], 1)
+                self.assertEqual(pixel, expected)
 
     def test_selected_param_picks_albedo_regardless_of_order(self):
         for case in ("normal-first", "albedo-first"):
@@ -1902,10 +1930,109 @@ class WorldBuildStagingTest(unittest.TestCase):
     def test_world_json_write_failure_restores_previous_chunks(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets, output, before = self._previous_world(tmp)
-            with unittest.mock.patch.object(world_build, "_write_json_atomic",
-                                            side_effect=OSError("synthetic world.json write error")):
-                with self.assertRaises(OSError):
+            world_path = os.path.join(output, "world.json")
+            replace = glb_writer._replace
+
+            def fail_manifest_replace(source, destination):
+                if destination == world_path:
+                    raise OSError("synthetic world.json rename error")
+                replace(source, destination)
+
+            with unittest.mock.patch.object(glb_writer, "_replace", fail_manifest_replace):
+                with self.assertRaisesRegex(OSError, "world.json rename"):
                     world_build.build_world(assets, output)
+            self.assertEqual(self._snapshot(output), before)
+
+    def _kill_during_publication(self, assets, output, point):
+        child = """
+import os
+import sys
+tools, assets, output, point = sys.argv[1:]
+sys.path.insert(0, tools)
+import glb_writer
+import world_build
+
+replace = glb_writer._replace
+chunks = os.path.join(output, 'chunks')
+def kill_after_rename(src, dst):
+    adds_chunk = os.path.dirname(dst) == chunks and not os.path.lexists(dst)
+    replace(src, dst)
+    if ((point == 'backup' and os.path.basename(os.path.dirname(dst)) == 'previous')
+            or (point == 'new' and adds_chunk)
+            or (point == 'manifest' and dst == os.path.join(output, 'world.json'))):
+        os._exit(77)
+
+glb_writer._replace = kill_after_rename
+world_build.build_world(assets, output)
+"""
+        run = subprocess.run([sys.executable, "-I", "-c", child, TOOLS, assets, output, point],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(run.returncode, 77, run.stderr)
+
+    def _rerun_with_missing_assets(self, tmp, output):
+        # Recovery has to happen even if the new export cannot start.
+        run = subprocess.run([sys.executable, "-I", WorldBuildTest.TOOL,
+                              os.path.join(tmp, "missing"), "--out", output],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("assets path does not exist:", run.stderr)
+
+    def test_killed_after_backing_up_live_chunk_restores_previous_world(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output, before = self._previous_world(tmp)
+            self._kill_during_publication(assets, output, "backup")
+            self.assertEqual(len(os.listdir(os.path.join(output, "chunks"))), 1)
+            self._rerun_with_missing_assets(tmp, output)
+            self.assertEqual(self._snapshot(output), before)
+
+    @unittest.skipUnless(os.name == "nt", "Windows refuses to replace a read-only destination")
+    def test_killed_after_installing_readonly_chunk_restores_previous_world(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output, before = self._previous_world(tmp)
+            chunk_dir = os.path.join(output, "chunks")
+            chunks = [os.path.join(chunk_dir, name) for name in os.listdir(chunk_dir)]
+            for chunk in chunks:
+                os.chmod(chunk, stat.S_IREAD)
+
+            self._kill_during_publication(assets, output, "new")
+            self.assertNotEqual(self._snapshot(output), before)
+            self._rerun_with_missing_assets(tmp, output)
+
+            self.assertEqual(self._snapshot(output), before)
+            for chunk in chunks:
+                self.assertFalse(os.stat(chunk).st_mode & stat.S_IWRITE)
+
+    def test_killed_after_installing_new_chunk_removes_it_on_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output, _ = self._previous_world(tmp)
+            world_build.build_world(assets, output, limit=0)
+            before = self._snapshot(output)
+            self._kill_during_publication(assets, output, "new")
+            self.assertEqual(len(os.listdir(os.path.join(output, "chunks"))), 1)
+            self._rerun_with_missing_assets(tmp, output)
+            self.assertEqual(self._snapshot(output), before)
+
+    def test_killed_after_manifest_commit_keeps_the_new_world(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output, before = self._previous_world(tmp)
+            reference = os.path.join(tmp, "reference")
+            world_build.build_world(assets, reference)
+            expected = self._snapshot(reference)
+            self.assertNotEqual(expected, before)
+            self._kill_during_publication(assets, output, "manifest")
+            self._rerun_with_missing_assets(tmp, output)
+            self.assertEqual(self._snapshot(output), expected)
+
+    def test_recovery_that_cannot_restore_a_chunk_can_be_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output, before = self._previous_world(tmp)
+            self._kill_during_publication(assets, output, "backup")
+            interrupted = self._snapshot(output)
+            with unittest.mock.patch.object(glb_writer, "_replace", side_effect=PermissionError("file in use")):
+                with self.assertRaisesRegex(OSError, "could not recover the previous world"):
+                    world_build.build_world(assets, output)
+            self.assertEqual(self._snapshot(output), interrupted)
+            self._rerun_with_missing_assets(tmp, output)
             self.assertEqual(self._snapshot(output), before)
 
     def test_staging_left_by_a_killed_build_is_removed_on_the_next_build(self):

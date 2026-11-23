@@ -21,6 +21,8 @@ guess. A malformed container, a file with no skin, or a skin whose
 inverseBindMatrices count differs from its joint count exits nonzero. Structural
 problems also exit nonzero with a one-line ``ERROR:`` message.
 
+Each joint's inverse bind matrix must have the affine fourth row (0, 0, 0, 1).
+
 Only the standard library is used, and the input is read, never modified.
 """
 from __future__ import annotations
@@ -195,6 +197,8 @@ def parse_glb(data):
     try:
         text = json_chunk.decode("utf-8")
         gltf = json.loads(text, parse_constant=_reject_json_constant)
+    except RecursionError as exc:
+        raise GlbSkinError("invalid GLB JSON chunk: nesting is too deep") from exc
     except (UnicodeDecodeError, ValueError) as exc:
         raise GlbSkinError(f"invalid GLB JSON chunk: {exc}") from exc
     if not isinstance(gltf, dict):
@@ -496,8 +500,18 @@ def _validate_skins(gltf, reader, warnings, errors):
                     f"{meta['component_type_name']} is not FLOAT"
                 )
             bad = 0
-            for row in values:
+            first_non_affine = None
+            for index, row in enumerate(values):
                 bad += sum(1 for value in row if not math.isfinite(value))
+                # glTF stores MAT4 columns consecutively; translation is in the last column.
+                if (first_non_affine is None and index < len(joints) and meta["type"] == "MAT4"
+                        and row[3::4] != (0.0, 0.0, 0.0, 1.0)):
+                    first_non_affine = index
+            if first_non_affine is not None:
+                errors.append(
+                    f"{_skin_label(skin_index, name)}: inverseBindMatrices[{first_non_affine}] "
+                    "fourth row must be [0, 0, 0, 1]"
+                )
             inverse["non_finite_count"] = bad
             if bad:
                 errors.append(

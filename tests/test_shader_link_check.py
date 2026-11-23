@@ -408,6 +408,26 @@ class CommandLineTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("compatible (1 links checked)", result.stdout)
 
+    def test_direct_entry_overrides(self):
+        vertex, pixel = output(), input()
+        vertex.entry("Vertex", vertex.ids)
+        pixel.entry("Pixel", pixel.ids)
+        paths = ("--vs", self.module("v", vertex), "--ps", self.module("p", pixel))
+        for options in (("--vs-entry", "Vertex", "--ps-entry", "Pixel"),
+                        ("--entry", "Vertex", "--ps-entry", "Pixel")):
+            with self.subTest(options=options):
+                result = self.command("check", *paths, *options)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("compatible (1 links checked)", result.stdout)
+        missing = self.command("check", *paths, "--entry", "Vertex")
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("[module-error]", missing.stdout)
+
+    def test_direct_entry_requires_its_stage(self):
+        result = self.command("check", "--vs", self.vs, "--ps", self.ps, "--gs-entry", "Geometry")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--gs-entry requires --gs", result.stderr)
+
     def test_incompatible_pipeline_returns_one_and_reports_location(self):
         result = self.command("check", "--vs", self.vs, "--ps", self.bad)
         self.assertEqual(result.returncode, 1)
@@ -481,6 +501,14 @@ class CommandLineTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("shader_link_check: error:", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
+
+    def test_manifest_saved_with_a_windows_bom_is_read(self):
+        # Notepad and PowerShell 5's Out-File -Encoding utf8 put a BOM first; that is not a manifest error.
+        self.manifest.write_bytes(b"\xef\xbb\xbf" + json.dumps(
+            {"version": 1, "pipelines": [{"name": "bom", "vs": "vertex", "ps": "pixel"}]}).encode("utf-8"))
+        result = self.run_batch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("bom: compatible", result.stdout)
 
     def test_corpus_style_names_are_accepted_and_paths_are_not(self):
         # make_game's corpus names (shader_carve stems) contain "~", "!", "&", "(", a leading "." and more: 21,043 of

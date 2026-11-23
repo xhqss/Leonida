@@ -732,8 +732,34 @@ def regs_in(line):
     return out | set(re.findall(r"\b[vs]\d+\b", line))
 
 
-def run_suite(programs, seed, max_ops, ops, waves=(32,), backends=("translator",), oracle=None):
-    counts = {"pass": 0, "mismatch": 0, "skip": {}}
+def vk_judge(progs, hw, build=None, work=None):
+    """The programs on a Vulkan GPU, every lane judged against the hardware's words. A program is one wave of its own
+    size (the lines already spell it); returns ({class: n}, [(i, detail, program)])."""
+    import vk_fuzz_run
+    counts, bad = {}, []
+    for wave in sorted({p.wave for p in progs}):
+        idx = [i for i, p in enumerate(progs) if p.wave == wave]
+        got = vk_fuzz_run.run_programs([progs[i].lines() for i in idx], 4, wave, build, work, opaque=False,
+                                       rewrite=False, per_lane=True)
+        for i, g in zip(idx, got):
+            h = hw[i]
+            if isinstance(h, str) or isinstance(g, str):
+                why = "skip: " + (("hardware: " + h) if isinstance(h, str) else g)
+                counts[why] = counts.get(why, 0) + 1
+                continue
+            first = next(((lane, k) for lane in range(wave) for k in range(4) if tuple(g[lane])[k] != h[lane][k]), None)
+            if first is None:
+                counts["match"] = counts.get("match", 0) + 1
+                continue
+            lane, k = first
+            counts["mismatch"] = counts.get("mismatch", 0) + 1
+            bad.append((i, f"wave{wave} lane {lane} word {k} (v{progs[i].obs[k]}): hardware 0x{h[lane][k]:08x}, "
+                           f"translated on the GPU 0x{g[lane][k]:08x}", progs[i]))
+    return counts, bad
+
+
+def run_suite(programs, seed, max_ops, ops, waves=(32,), backends=("translator",), oracle=None, build=None, work=None):
+    counts = {"pass": 0, "mismatch": 0, "skip": {}, "vk": {}, "vk_failures": []}
     failures = []
     rng = random.Random(seed)
     progs = [generate(rng, rng.randrange(1, max_ops + 1), ops, waves[i % len(waves)]) for i in range(programs)]
@@ -742,6 +768,9 @@ def run_suite(programs, seed, max_ops, ops, waves=(32,), backends=("translator",
         hw = [hw_words(w, p.wave) for w, p in zip(raw, progs)]
     else:
         hw = [None] * programs
+    if "vk" in backends:
+        counts["vk"], counts["vk_failures"] = vk_judge(progs, hw, build, work)
+    backends = tuple(b for b in backends if b != "vk")
     for i, prog in enumerate(progs):
         try:
             problem = check(prog, backends, hw[i])
@@ -795,12 +824,17 @@ def main(argv=None):
                     help="comma-separated comparison targets: translator (default), hw (natively on an AMD GPU; see "
                          "tools/hw_oracle/). 'hw' alone compares the hardware with the reference only")
     ap.add_argument("--hw-arch", default=None, help="GPU architecture to assemble for (default: detected)")
+    ap.add_argument("--build", default=os.path.join(os.path.dirname(HERE), "runtime", "build"),
+                    help="with vk: the folder with vk_compute_test")
+    ap.add_argument("--work", default=None, help="with vk: a folder for the temporary files (VK_FUZZ_KEEP=1 keeps them)")
     a = ap.parse_args(argv)
     if a.programs < 1 or a.max_ops < 1:
         ap.error("--programs and --max-ops must be at least 1")
     backends = tuple(dict.fromkeys(t.strip() for t in a.oracle.split(",")))
-    if not backends or any(t not in ("translator", "hw") for t in backends):
-        ap.error("--oracle takes translator, hw or translator,hw")
+    if not backends or any(t not in ("translator", "hw", "vk") for t in backends):
+        ap.error("--oracle takes translator, hw, vk (with hw) or a comma-separated mix")
+    if "vk" in backends and "hw" not in backends:
+        ap.error("--oracle vk judges the translated programs against the hardware's words: use --oracle hw,vk")
     global KNOWN
     KNOWN = a.known or backends == ("hw",)
     if a.list_ops:
@@ -838,13 +872,23 @@ def main(argv=None):
             return 77
         print(f"hardware oracle: {oracle.device}")
     try:
-        counts, failures = run_suite(a.programs, a.seed, a.max_ops, ops, waves, backends, oracle)
+        counts, failures = run_suite(a.programs, a.seed, a.max_ops, ops, waves, backends, oracle, a.build, a.work)
+        vk_bad = counts.pop("vk_failures")
         skips = sum(counts["skip"].values())
         print(f"{a.programs} programs (seed {a.seed}, wave {a.wave}, {'+'.join(backends)}"
               f"{', known' if KNOWN else ''}): {counts['pass']} pass, {counts['mismatch']} mismatch, "
               f"{skips} skipped")
         for reason, n in sorted(counts["skip"].items(), key=lambda kv: -kv[1]):
             print(f"  skip x{n}: {reason}")
+
+        want_vk = "vk" in backends
+        if want_vk:
+            print("translated on the Vulkan GPU against the hardware, every lane: "
+                  + ", ".join(f"{k} {n}" for k, n in sorted(counts["vk"].items(), key=lambda kv: kv[0].startswith("skip"))))
+            for i, detail, prog in vk_bad[: None if a.all_failures else 3]:
+                print(f"VK MISMATCH program {i}: {detail}")
+                print("\n".join("\t" + line for line in prog.lines()))
+        backends = tuple(b for b in backends if b != "vk")
 
         def check_fn(prog):
             return check(prog, backends,
@@ -859,11 +903,16 @@ def main(argv=None):
     finally:
         if oracle:
             oracle.close()
-    if failures:
+    if failures or vk_bad:
         return 1
     if not counts["pass"]:   # nothing was compared: every program was skipped
         print("no program ran: every one was skipped")
         return 2
+    if want_vk:
+        import vk_fuzz_run
+        if vk_fuzz_run.all_skipped(counts["vk"]):
+            print("no Vulkan program ran: every one was skipped")
+            return 2
     return 0
 
 

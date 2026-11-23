@@ -5,6 +5,7 @@ Run from the repository root:
 """
 import os
 import random
+import re
 import sys
 
 import pytest
@@ -13,6 +14,37 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import shader_diff as sd
+
+
+@pytest.mark.parametrize("seed", [3179, 1, 99])
+def test_integer_operands_never_read_float_results(seed):
+    # Seed 3179 exhausts the clean register pool before an integer add. Floating
+    # results may differ in NaN payload, so their bits cannot feed integer checks.
+    # Seeds 1 and 99 check the general invariant without requiring exhaustion.
+    lines, writers = sd.generate_program(random.Random(seed), 150)
+    float_results = set()
+    recovered = False
+    for line in lines:
+        op = line.split()[0]
+        regs = [int(value) for value in re.findall(r"\bv(\d+)\b", line)]
+        if not regs:
+            continue
+        dst, *sources = regs
+        if op in sd._FLOAT_OPS:
+            float_results.add(dst)
+        else:
+            assert not (set(sources) & float_results), line
+            if op == "v_mov_b32" and float_results == set(sd.SCRATCH):
+                recovered = True
+            float_results.discard(dst)
+    if seed == 3179:
+        assert recovered, "fixture must reach the exhausted-pool boundary"
+    for reg, (op, index) in writers.items():
+        assert lines[index - 1].startswith(f"{op.split('/')[0]} v{reg},")
+        assert not any(line.split()[1] == f"v{reg}," for line in lines[index:])
+    assert (lines, writers) == sd.generate_program(random.Random(seed), 150)
+
+
 
 
 @pytest.mark.parametrize("seed", [1, 17, 99])

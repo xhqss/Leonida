@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; SHADER-85: ds_read_u8_d16 / ds_read_u8_d16_hi / ds_read_i8_d16 / ds_read_i8_d16_hi (RDNA2 ISA, DS opcodes 162-165).
 ; An 8-bit LDS read lands in ONE 16-bit half of the destination VGPR and the other half is kept:
 ;   u8_d16    D[15:0]  = zext16(byte)   D[31:16] kept     u8_d16_hi  D[31:16] = zext16(byte)  D[15:0] kept

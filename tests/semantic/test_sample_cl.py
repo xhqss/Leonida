@@ -114,8 +114,6 @@ class SampleCl(unittest.TestCase):
                  ("image_sample_cl_o", "v[0:3]", "v[4:7]", 0xf)]
         for op, dst, regs, dmask in cases:
             for name in ("ps_val", "vs_val"):
-                if name == "vs_val" and "_b_" in op:
-                    continue          # no bias without derivatives
                 with self.subTest(op=op, shader=name):
                     spv = translate(name, f"{op} {dst}, {regs}, {DESC} dmask:{dmask:#x} {D2}")
                     with tempfile.TemporaryDirectory() as tmp:

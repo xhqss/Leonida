@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Wave64 cross-half v_readlane_b32 (RDNA2 ISA: lane = S1 % 64, EXEC ignored). Crosses: lane >= 32 sources read by
 ; lanes of both halves, and a lane < 32 source read by an upper-half lane. A 32-wide subgroup wraps the lane
 ; select modulo 32 (the issue #94 symptom), so lane 40 would return lane 8's value.

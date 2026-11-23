@@ -9,12 +9,13 @@ carries a mud range (`MudMin`/`MudMax` above zero), and how the rain fields (`Di
 
     python -I veh_spawn_intensities.py <CGraphicsDefinitionsData.xml | rpf9_carve dir> [--json FILE]
 
-Accepts one rebuilt XML payload file or a carve directory made by `tools/rpf9_carve.py` (the
-`CGraphicsDefinitionsData` document is found by its root element among the inflated streams).
+Accepts one rebuilt XML payload file or a carve directory made by `tools/rpf9_carve.py`.
+In both modes the document root must be `CGraphicsDefinitionsData`.
 The CLI prints one aggregate JSON object and never prints entry keys, names or per-entry rows:
 those are game values. The Python API (`records`) returns entries that contain the table's own
 text, so call sites must not write them anywhere public. A bad input gives one ERROR line and
 exit 2. Standard library only; no game data is required beyond the local rebuilt file.
+Usage: `python -I tools/veh_spawn_intensities.py --help` lists the options.
 """
 from __future__ import annotations
 
@@ -56,6 +57,8 @@ def _number(item, tag):
 
 def records(root):
     """The table's entries as dicts with `key` (game data, local use only), `sets` and `rain`."""
+    if root.tag != DOC_ROOT:
+        raise CensusError(f"expected {DOC_ROOT} document root")
     section = root.find(SECTION)
     if section is None:
         raise CensusError("no VehSpawnIntensities section")

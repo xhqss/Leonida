@@ -211,6 +211,21 @@ class CommandLine(unittest.TestCase):
                     self.assertEqual(probe.main(argv), 2)
                 self.assertIn("error:", err.getvalue())
 
+    def test_json_directory_is_named_as_typed(self):
+        # every other diagnostic in this tool prints the path the user typed; repr() doubled each backslash
+        with tempfile.TemporaryDirectory() as tmp:
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(probe.main(["--json", tmp]), 2)
+            self.assertEqual(err.getvalue(), f"error: --json {tmp} is not a file path\n")
+
+    def test_json_empty_is_a_named_error(self):
+        # an empty --json value cannot be echoed as a path; the message says (empty) instead of showing ''
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(probe.main(["--json", "  "]), 2)
+        self.assertEqual(err.getvalue(), "error: --json (empty) is not a file path\n")
+
     def test_write_kernels(self):
         with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()):
             self.assertEqual(probe.main(["--write-kernels", tmp, "--kernel", "tri_g4b"]), 0)

@@ -591,9 +591,18 @@ def main(argv=None) -> int:
             check_report_path(a.json, a.target, rows=rows)
         blob, meta = load_qtable_payload(a.target)
         report = parse_qtable(blob, root_hash=root_h, type_hash=type_h)
-    except (OSError, ValueError, KeyError, TypeError, struct.error, RuntimeError) as e:
-        print("error:", e, file=sys.stderr)
-        return 2 if isinstance(e, UsageError) else 1
+    except UsageError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    except FileNotFoundError:
+        print(f"ERROR: {a.target}: does not exist", file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f"ERROR: cannot read {a.target}: {e.strerror or e}", file=sys.stderr)
+        return 2
+    except (ValueError, KeyError, TypeError, struct.error, RuntimeError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
 
     out = {"location": meta, **report}
     _print_summary(out)
@@ -604,8 +613,8 @@ def main(argv=None) -> int:
             with open(a.json, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(out, f, indent=1)
         except OSError as e:
-            print(f"error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
-            return 1
+            print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
         print("wrote", a.json)
 
     return 0 if report["valid"] else 1

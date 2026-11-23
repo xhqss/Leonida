@@ -109,9 +109,11 @@ public:
     VulkanPresenter(VulkanContext& context, PFN_vkGetInstanceProcAddr get_instance, VkInstance instance,
                     VkPhysicalDevice physical, VkQueue queue, std::uint32_t family, VkSurfaceKHR surface,
                     bool swapchain_maintenance1 = false,
-                    std::function<VkExtent2D()> extent_fn = nullptr)
+                    std::function<VkExtent2D()> extent_fn = nullptr,
+                    std::function<VkSurfaceKHR()> recreate_surface_fn = nullptr)
         : context_(context), instance_(instance), physical_(physical), queue_(queue), surface_(surface),
-          maintenance1_(swapchain_maintenance1), extent_fn_(std::move(extent_fn)) {
+          maintenance1_(swapchain_maintenance1), extent_fn_(std::move(extent_fn)),
+          recreate_surface_fn_(std::move(recreate_surface_fn)) {
 #define LEONIDA_INSTANCE_FN(name) name##_ = reinterpret_cast<PFN_##name>(get_instance(instance, #name));
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceSupportKHR)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)
@@ -421,6 +423,18 @@ private:
                         bool srgb, bool tear = false, const PresentPlanes* planes = nullptr) {
         last_tore_ = false;
         if (!ok_) return VK_ERROR_INITIALIZATION_FAILED;
+        if (surface_lost_) {  // the window's display went away under a presented swapchain
+            // Try to make a new surface for the same window (the hwnd is retained by the factory's callback).
+            // Until that succeeds, vkd3d's precedent keeps rendering to nothing: the frame is not shown, but
+            // the run continues instead of wedging on a sticky E_FAIL.
+            surface_ = recreate_surface_fn_ ? recreate_surface_fn_() : VK_NULL_HANDLE;
+            if (!surface_) {
+                captured_ = false;  // nothing was shown: read_back() must not hand out the frame
+                return VK_SUCCESS;
+            }
+            surface_lost_ = false;
+            stale_ = true;  // the old swapchain is gone: rebuild on the new surface below
+        }
         // The swapchain's HDR10 format is only for composed planes that ask for it; a blit of an SDR source or a blank
         // frame keeps whatever the swapchain has (black is black), except that a blit needs the SDR one.
         bool want_hdr = swapchain_hdr_req_;
@@ -457,6 +471,11 @@ private:
                 return VK_SUCCESS;
             }
             acquired = acquire(frame.acquired, &image);
+        }
+        if (acquired == VK_ERROR_SURFACE_LOST_KHR) {
+            captured_ = false;  // nothing was acquired, nothing was shown
+            mark_surface_lost();
+            return VK_SUCCESS;
         }
         if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) return acquired;  // nothing was acquired
         if (acquired == VK_SUBOPTIMAL_KHR) stale_ = true;
@@ -576,6 +595,13 @@ private:
             captured_extent_ = extent_;
             captured_format_ = format_;
         }
+        if (result == VK_ERROR_SURFACE_LOST_KHR) {
+            // The surface was lost during the present (display disconnected, a driver reset of the window's
+            // plane): vkd3d keeps rendering to nothing, and the next present recreates surface and swapchain.
+            captured_ = false;
+            mark_surface_lost();
+            result = VK_SUCCESS;
+        }
         if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
             stale_ = true;
             result = VK_SUCCESS;
@@ -633,6 +659,25 @@ private:
     VkResult stop(VkResult failure) {
         ok_ = false;
         return failure;
+    }
+
+    // The window's surface is dead (VK_ERROR_SURFACE_LOST_KHR): the swapchain that presented into it is retired
+    // and the surface destroyed. The next submit_now() first tries the factory's recreate-surface callback; until
+    // it succeeds the presenter keeps the vkd3d "render to nothing" behaviour, not a sticky failure.
+    void mark_surface_lost() {
+        auto& vk = context_.vk;
+        const VkDevice device = context_.device();
+        {
+            std::lock_guard lock(context_.submit_mutex());
+            vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use
+            release(swapchain_);
+        }
+        swapchain_ = VK_NULL_HANDLE;
+        if (surface_ && vkDestroySurfaceKHR_) vkDestroySurfaceKHR_(instance_, surface_, nullptr);
+        surface_ = VK_NULL_HANDLE;
+        surface_lost_ = true;
+        stale_ = true;
+        captured_ = false;
     }
 
     void record(VkCommandBuffer commands, const ResourceBinding& binding, ResourceId source, std::uint32_t image,
@@ -1250,6 +1295,8 @@ private:
     std::unique_ptr<PresentComposer> composer_;
     std::function<bool()> abort_;
     std::function<VkExtent2D()> extent_fn_;
+    std::function<VkSurfaceKHR()> recreate_surface_fn_;  // makes a new Win32 surface for the same window
+    bool surface_lost_ = false;  // set by mark_surface_lost(); cleared once a new surface was created
     std::map<VkFormat, VkFormatFeatureFlags> features_;
     bool warned_srgb_ = false;
     bool capture_ = false;

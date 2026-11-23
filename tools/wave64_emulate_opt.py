@@ -117,28 +117,268 @@ _NO_DEST_PREFIXES = (
     "buffer_gl", "buffer_wbinvl", "ds_gws", "ds_nop",
 )
 
+_SOP2_B32_LOGIC = frozenset({
+    "s_and_b32", "s_or_b32", "s_xor_b32", "s_andn2_b32", "s_orn2_b32",
+    "s_nand_b32", "s_nor_b32", "s_xnor_b32", "s_not_b32",
+})
+
+_FORBIDDEN_FOLD_OPS = frozenset({
+    "s_barrier", "s_sendmsg", "s_setpc_b64", "s_swappc_b64", "s_trap",
+    "s_sethalt", "s_setkill", "s_sleep", "s_setprio",
+    "s_round_mode", "s_denorm_mode",
+    "v_readlane_b32", "v_readfirstlane_b32", "v_writelane_b32",
+    "v_permlane16_b32", "v_permlanex16_b32",
+    "ds_bpermute_b32", "ds_permute_b32", "ds_swizzle_b32",
+    "ds_gws_init", "ds_gws_sema_v", "ds_gws_sema_br", "ds_gws_sema_p", "ds_gws_barrier",
+    "ds_consume", "ds_append", "ds_ordered_count",
+    "s_wqm_b32", "s_wqm_b64", "s_quadmask_b32", "s_quadmask_b64",
+})
+
+_ALWAYS_BARRIER_OPS = frozenset({
+    "s_barrier", "v_readlane_b32", "v_readfirstlane_b32",
+    "v_permlane16_b32", "v_permlanex16_b32",
+    "ds_bpermute_b32", "ds_permute_b32", "ds_swizzle_b32",
+    "s_wqm_b32", "s_wqm_b64",
+})
+
+_VOTED_BRANCHES = frozenset({
+    "s_cbranch_execz", "s_cbranch_execnz", "s_cbranch_vccz", "s_cbranch_vccnz",
+})
+
+_SCALAR_NO_SCC_PREFIXES = (
+    "s_mov", "s_cselect", "s_load", "s_buffer_load", "s_getpc",
+    "s_nop", "s_waitcnt", "s_clause", "s_inst_prefetch", "s_pack",
+    "s_mul_i32", "s_mul_hi", "s_mulk", "s_ff", "s_flbit", "s_bfm",
+    "s_get_waveid",
+)
+
+# Bounded caches for opcode normalization and static per-opcode classification.
+_OP_CACHE_MAX = 4096
+_BASE_OP_CACHE = {}
+_OP_META_CACHE = {}
+
+# _scalar_rw dispatch modes
+_RW_MOVREL = 0
+_RW_TERM = 1
+_RW_NO_DEST = 2
+_RW_VCMP = 3
+_RW_ATOMIC = 4
+_RW_DS_RET = 5
+_RW_DS_NORET = 6
+_RW_SOPK_RW = 7
+_RW_DEFAULT = 8
+_RW_VOP3B = 9
+
+# Bit flags in meta[8]
+_FLAG_CMOV_RD_DEST = 1
+_FLAG_NO_KILL_DEST = 2
+_FLAG_FORBIDDEN_FOLD = 4
+_FLAG_ALWAYS_BARRIER = 8
+_FLAG_WRITES_EXEC_OP = 16
+_FLAG_SCC_VOTE_ALWAYS_MASK = 32
+_FLAG_SOP2_B32_LOGIC = 64
+_FLAG_VOTED_BRANCH = 128
+
+# Mask check categories in meta[11]
+_MASK_CHK_NONE = 0
+_MASK_CHK_WORD_READER = 1
+_MASK_CHK_MBCNT = 2
+_MASK_CHK_SCMP = 3
+_MASK_CHK_SCC_VOTE = 4
+
+# 4-bit dirty-state bitmask: bit0=("mem","r"), bit1=("mem","w"), bit2=("lds","r"), bit3=("lds","w")
+_DIRTY_MEM_R = 1
+_DIRTY_MEM_W = 2
+_DIRTY_LDS_R = 4
+_DIRTY_LDS_W = 8
+_DIRTY_MASK_TO_FROZENSET = tuple(
+    frozenset(
+        tok
+        for bit, tok in (
+            (_DIRTY_MEM_R, ("mem", "r")),
+            (_DIRTY_MEM_W, ("mem", "w")),
+            (_DIRTY_LDS_R, ("lds", "r")),
+            (_DIRTY_LDS_W, ("lds", "w")),
+        )
+        if m & bit
+    )
+    for m in range(16)
+)
+
+_EMPTY_MEM_STATS = (0, False, False, 0, False, False)
+
 
 def base_op(op):
+    res = _BASE_OP_CACHE.get(op)
+    if res is not None:
+        return res
+    res = op
     for suffix in ("_e32", "_e64", "_sdwa", "_dpp"):
         if op.endswith(suffix):
-            return op[:-len(suffix)]
-    return op
+            res = op[:-len(suffix)]
+            break
+    if len(_BASE_OP_CACHE) >= _OP_CACHE_MAX:
+        _BASE_OP_CACHE.clear()
+    _BASE_OP_CACHE[op] = res
+    return res
+
+
+def _get_op_meta(raw_op):
+    """Return cached static metadata tuple for raw opcode `raw_op`."""
+    meta = _OP_META_CACHE.get(raw_op)
+    if meta is not None:
+        return meta
+
+    op = base_op(raw_op)
+    is_term = op == "s_endpgm" or op in BRANCHES
+    scc_imp_read = op in _SCC_IMPLICIT_READS or op.startswith(("s_getreg", "s_setreg", "s_save_status"))
+    scc_uncond_write = op in _SCC_UNCONDITIONAL_WRITES
+
+    if op.startswith("s_movrel"):
+        rw_mode = _RW_MOVREL
+    elif is_term:
+        rw_mode = _RW_TERM
+    elif op.startswith(("s_cmp", "s_bitcmp")) or op.startswith("v_cmpx") or op.startswith(_NO_DEST_PREFIXES):
+        rw_mode = _RW_NO_DEST
+    elif op.startswith("v_cmp"):
+        rw_mode = _RW_VCMP
+    elif op.startswith(("buffer_atomic", "global_atomic", "flat_atomic", "image_atomic")):
+        rw_mode = _RW_ATOMIC
+    elif op.startswith("ds_"):
+        returns = (op.startswith(("ds_read", "ds_bpermute", "ds_permute", "ds_swizzle", "ds_consume", "ds_append"))
+                   or "_rtn" in op)
+        rw_mode = _RW_DS_RET if returns else _RW_DS_NORET
+    elif op in ("s_addk_i32", "s_mulk_i32", "s_cmovk_i32"):
+        rw_mode = _RW_SOPK_RW
+    elif op == "s_movk_i32":
+        rw_mode = _RW_DEFAULT
+    elif op.startswith("v_") and (
+            "_co_" in op or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64")):
+        rw_mode = _RW_VOP3B
+    else:
+        rw_mode = _RW_DEFAULT
+
+    base_rd = 0
+    if op in _IMPLICIT_VCC_READS:
+        base_rd |= 1 << _BIT_VCC
+    if scc_imp_read:
+        base_rd |= 1 << _BIT_SCC
+    if op.startswith(("ds_", "s_sendmsg", "v_interp", "v_movrel", "v_swaprel")):
+        base_rd |= 1 << _BIT_M0
+
+    base_mw = 0
+    base_mk = 0
+    if scc_uncond_write:
+        base_mw |= 1 << _BIT_SCC
+        base_mk |= 1 << _BIT_SCC
+    elif op.startswith("s_") and not op.startswith(_SCALAR_NO_SCC_PREFIXES):
+        base_mw |= 1 << _BIT_SCC
+
+    x_mem_acc = _x_memory_order_access(op)
+    x_mem_dirty = 0
+    scratch_acc = None
+    if x_mem_acc is not None:
+        kind, r, w = x_mem_acc
+        if kind == "lds":
+            if r:
+                x_mem_dirty |= _DIRTY_LDS_R
+            if w:
+                x_mem_dirty |= _DIRTY_LDS_W
+        else:
+            if r:
+                x_mem_dirty |= _DIRTY_MEM_R
+            if w:
+                x_mem_dirty |= _DIRTY_MEM_W
+    elif op.startswith("scratch_"):
+        if "store" in op or "atomic" in op:
+            scratch_acc = ("atomic" in op, True)
+        else:
+            scratch_acc = (True, False)
+
+    flags = 0
+    if op == "s_cmov_b32" or op == "s_cmov_b64":
+        flags |= _FLAG_CMOV_RD_DEST | _FLAG_NO_KILL_DEST
+    elif op == "s_cmovk_i32":
+        flags |= _FLAG_NO_KILL_DEST
+
+    is_dpp = raw_op.endswith(("_dpp", "_dpp8"))
+    if (is_dpp
+            or op in _FORBIDDEN_FOLD_OPS
+            or op.startswith(("s_movrel", "s_setreg", "s_getreg", "s_store", "s_buffer_store", "s_atomic",
+                              "ds_gws", "exp"))
+            or (x_mem_acc is None and scratch_acc is None
+                and not op.startswith(("image_sample", "image_gather", "image_bvh"))
+                and ("store" in op or "atomic" in op))):
+        flags |= _FLAG_FORBIDDEN_FOLD
+
+    if is_dpp or op in _ALWAYS_BARRIER_OPS or op.startswith("s_movrel"):
+        flags |= _FLAG_ALWAYS_BARRIER
+    if op.startswith("v_cmpx") or "saveexec" in op or "wrexec" in op:
+        flags |= _FLAG_WRITES_EXEC_OP
+    if op in _MASK_SCC_VOTE_OPS and ("saveexec" in op or "wrexec" in op or op.endswith("_mask")):
+        flags |= _FLAG_SCC_VOTE_ALWAYS_MASK
+    if op in _SOP2_B32_LOGIC:
+        flags |= _FLAG_SOP2_B32_LOGIC
+    if op in _VOTED_BRANCHES:
+        flags |= _FLAG_VOTED_BRANCH
+
+    if op in _MASK_WORD_READERS:
+        mask_chk = _MASK_CHK_WORD_READER
+    elif op in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"):
+        mask_chk = _MASK_CHK_MBCNT
+    elif op.startswith(("s_cmp", "s_bitcmp")):
+        mask_chk = _MASK_CHK_SCMP
+    elif op in _MASK_SCC_VOTE_OPS:
+        mask_chk = _MASK_CHK_SCC_VOTE
+    else:
+        mask_chk = _MASK_CHK_NONE
+
+    meta = (
+        op,                # 0
+        is_term,           # 1
+        scc_imp_read,      # 2
+        scc_uncond_write,  # 3
+        rw_mode,           # 4
+        base_rd,           # 5
+        base_mw,           # 6
+        base_mk,           # 7
+        flags,             # 8
+        x_mem_acc,         # 9
+        scratch_acc,       # 10
+        mask_chk,          # 11
+        x_mem_dirty,       # 12
+    )
+    if len(_OP_META_CACHE) >= _OP_CACHE_MAX:
+        _OP_META_CACHE.clear()
+    _OP_META_CACHE[raw_op] = meta
+    return meta
 
 
 def _active_insns(blk):
     """Instructions of a basic block up to and including its terminator (branch or s_endpgm)."""
-    out = []
-    for ins in blk:
-        out.append(ins)
-        op = base_op(ins["op"])
-        if op == "s_endpgm" or op in BRANCHES:
-            break
-    return out
+    meta_get = _OP_META_CACHE.get
+    n = len(blk)
+    for i, ins in enumerate(blk):
+        raw_op = ins["op"]
+        m = meta_get(raw_op)
+        if m is None:
+            m = _get_op_meta(raw_op)
+        if m[1]:
+            return blk if i == n - 1 else blk[:i + 1]
+    return blk
 
 
-def reads_scc(ins):
-    op = base_op(ins["op"])
-    if op in _SCC_IMPLICIT_READS or op.startswith(("s_getreg", "s_setreg", "s_save_status")):
+def _has_vcc_or_exec(x):
+    k = x.get("k")
+    if k == "special":
+        return x.get("t", "").startswith(("exec", "vcc"))
+    if k == "slist":
+        return any(isinstance(item, str) and item.startswith("vcc") for item in x.get("r", ()))
+    return False
+
+
+def _reads_scc_with_meta(ins, meta):
+    if meta[2]:
         return True
     for x in ins["args"]:
         if x.get("k") == "special" and x.get("t") in ("scc", "src_scc"):
@@ -146,8 +386,12 @@ def reads_scc(ins):
     return False
 
 
+def reads_scc(ins):
+    return _reads_scc_with_meta(ins, _get_op_meta(ins["op"]))
+
+
 def writes_scc(ins):
-    return base_op(ins["op"]) in _SCC_UNCONDITIONAL_WRITES
+    return _get_op_meta(ins["op"])[3]
 
 
 def scc_live_outs(blocks, succ):
@@ -162,15 +406,29 @@ def scc_live_outs(blocks, succ):
     use = [False] * n
     kill = [False] * n
     active = [_active_insns(blk) for blk in blocks]
+    meta_get = _OP_META_CACHE.get
     for b, insns in enumerate(active):
         k = False
         u = False
         for ins in insns:
-            if not k and reads_scc(ins):
+            raw_op = ins["op"]
+            m = meta_get(raw_op)
+            if m is None:
+                m = _get_op_meta(raw_op)
+            if m[2]:
                 u = True
                 break
-            if writes_scc(ins):
+            rd_explicit = False
+            for x in ins["args"]:
+                if x.get("k") == "special" and x.get("t") in ("scc", "src_scc"):
+                    rd_explicit = True
+                    break
+            if rd_explicit:
+                u = True
+                break
+            if m[3]:
                 k = True
+                break
         use[b] = u
         kill[b] = k
     live_in = list(use)
@@ -190,7 +448,20 @@ def scc_live_outs(blocks, succ):
         for ins in reversed(insns):
             if live:
                 out.add(id(ins))
-            live = (live and not writes_scc(ins)) or reads_scc(ins)
+            raw_op = ins["op"]
+            m = meta_get(raw_op)
+            if m is None:
+                m = _get_op_meta(raw_op)
+            if m[2]:
+                live = True
+            else:
+                if live and m[3]:
+                    live = False
+                if not live:
+                    for x in ins["args"]:
+                        if x.get("k") == "special" and x.get("t") in ("scc", "src_scc"):
+                            live = True
+                            break
     return out
 
 
@@ -200,124 +471,167 @@ def _operand_scalar_mask(x):
     if k == "sgpr":
         r = x["r"]
         cnt = x.get("n", 1)
-        m = 0
-        for i in range(cnt):
-            if 0 <= r + i < 128:
-                m |= 1 << (r + i)
-        return m
+        if cnt == 1:
+            return (1 << r) if 0 <= r < 128 else 0
+        lo = 0 if r < 0 else r
+        hi = r + cnt
+        if hi > 128:
+            hi = 128
+        return (((1 << (hi - lo)) - 1) << lo) if hi > lo else 0
     if k == "special":
         t = x.get("t", "")
         if t.startswith("vcc"):
             return 1 << _BIT_VCC
-        if t == "scc":
+        if t in ("scc", "src_scc"):
             return 1 << _BIT_SCC
         if t == "m0":
             return 1 << _BIT_M0
+        return 0
+    if k == "slist":
+        m = 0
+        for item in x.get("r", ()):
+            if isinstance(item, int):
+                if 0 <= item < 128:
+                    m |= 1 << item
+            elif isinstance(item, str) and item.startswith("vcc"):
+                m |= 1 << _BIT_VCC
+        return m
     return 0
+
+
+def _scalar_rw_with_meta(ins, meta):
+    """Return `(read_mask, may_write_mask, must_kill_mask)` over scalar bits 0..130 for `ins`."""
+    rw_mode = meta[4]
+    if rw_mode == _RW_MOVREL:
+        return _ALL_SGPRS | (1 << _BIT_M0), _ALL_SGPRS, 0
+    if rw_mode == _RW_TERM:
+        return meta[5], 0, 0
+
+    a = ins["args"]
+    len_a = len(a)
+    vcc_imp_w = 0
+    if rw_mode == _RW_DEFAULT:
+        dest_n = 1 if len_a else 0
+        src_start = 1
+    elif rw_mode == _RW_NO_DEST or rw_mode == _RW_DS_NORET:
+        dest_n = 0
+        src_start = 0
+    elif rw_mode == _RW_VCMP:
+        if len_a == 2:
+            dest_n = 0
+            src_start = 0
+            vcc_imp_w = 1 << _BIT_VCC
+        else:
+            dest_n = 1 if len_a else 0
+            src_start = 1
+    elif rw_mode == _RW_VOP3B:
+        if len_a > 2 and a[1].get("k") in ("sgpr", "special", "slist"):
+            dest_n = 2
+            src_start = 2
+        else:
+            dest_n = 1 if len_a else 0
+            src_start = 1
+    elif rw_mode == _RW_DS_RET:
+        dest_n = 1 if len_a else 0
+        src_start = 1
+    elif rw_mode == _RW_SOPK_RW:
+        dest_n = 1 if len_a else 0
+        src_start = 0
+    else:  # _RW_ATOMIC
+        mods = ins.get("mods")
+        dest_n = 1 if (len_a and mods and "glc" in mods) else 0
+        src_start = 0
+
+    rd = meta[5]
+    may_w = meta[6] | vcc_imp_w
+    flags = meta[8]
+    no_kill_dest = flags & _FLAG_NO_KILL_DEST
+    must_kill = meta[7] | (0 if no_kill_dest else vcc_imp_w)
+    cmov_rd_dest = flags & _FLAG_CMOV_RD_DEST
+
+    for idx in range(len_a):
+        x = a[idx]
+        k = x.get("k")
+        if k == "vgpr" or k == "imm":
+            continue
+        if k == "sgpr":
+            r = x["r"]
+            cnt = x.get("n", 1)
+            if cnt == 1:
+                m = (1 << r) if 0 <= r < 128 else 0
+            else:
+                lo = 0 if r < 0 else r
+                hi = r + cnt
+                if hi > 128:
+                    hi = 128
+                m = (((1 << (hi - lo)) - 1) << lo) if hi > lo else 0
+            if idx >= src_start:
+                rd |= m
+            if idx < dest_n:
+                if cmov_rd_dest:
+                    rd |= m
+                may_w |= m
+                if not no_kill_dest:
+                    must_kill |= m
+        elif k == "special":
+            t = x.get("t", "")
+            if t.startswith("vcc"):
+                m = 1 << _BIT_VCC
+            elif t in ("scc", "src_scc"):
+                m = 1 << _BIT_SCC
+                rd |= m  # reads_scc scans all args
+            elif t == "m0":
+                m = 1 << _BIT_M0
+            else:
+                continue
+            if idx >= src_start:
+                rd |= m
+            if idx < dest_n:
+                if cmov_rd_dest:
+                    rd |= m
+                may_w |= m
+                if not no_kill_dest and t not in ("vcc_lo", "vcc_hi"):
+                    must_kill |= m
+        elif k == "slist":
+            regs = x.get("r", ())
+            m = 0
+            for item in regs:
+                if isinstance(item, int):
+                    if 0 <= item < 128:
+                        m |= 1 << item
+                elif isinstance(item, str) and item.startswith("vcc"):
+                    m |= 1 << _BIT_VCC
+            if idx >= src_start:
+                rd |= m
+            if idx < dest_n:
+                if cmov_rd_dest:
+                    rd |= m
+                may_w |= m
+                if not no_kill_dest:
+                    has_lo = False
+                    has_hi = False
+                    for item in regs:
+                        if isinstance(item, int):
+                            if 0 <= item < 128:
+                                must_kill |= 1 << item
+                        elif item == "vcc_lo":
+                            has_lo = True
+                        elif item == "vcc_hi":
+                            has_hi = True
+                    if has_lo and has_hi:
+                        must_kill |= 1 << _BIT_VCC
+
+    return rd, may_w, must_kill
 
 
 def _scalar_rw(ins):
     """Return `(read_mask, may_write_mask, must_kill_mask)` over scalar bits 0..130 for `ins`."""
-    op = base_op(ins["op"])
-    a = ins["args"]
-    mods = ins.get("mods") or ()
-    # Dynamic SGPR indexing reads/writes arbitrary SGPRs + m0: never kill, conservatively read/write all SGPRs.
-    if op.startswith("s_movrel"):
-        return _ALL_SGPRS | (1 << _BIT_M0), _ALL_SGPRS, 0
-    if op == "s_endpgm" or op in BRANCHES:
-        rd = 0
-        if op in ("s_cbranch_scc0", "s_cbranch_scc1"):
-            rd |= 1 << _BIT_SCC
-        elif op in ("s_cbranch_vccz", "s_cbranch_vccnz"):
-            rd |= 1 << _BIT_VCC
-        return rd, 0, 0
-    # Split destination vs source operands conservatively.
-    dests, srcs = [], list(a)
-    if op.startswith(("s_cmp", "s_bitcmp")) or op.startswith("v_cmpx") or op.startswith(_NO_DEST_PREFIXES):
-        dests, srcs = [], list(a)
-    elif op.startswith("v_cmp"):
-        if len(a) == 2:
-            dests, srcs = [], list(a)
-        elif a:
-            dests, srcs = [a[0]], list(a[1:])
-    elif op.startswith(("buffer_atomic", "global_atomic", "flat_atomic", "image_atomic")):
-        dests = [a[0]] if ("glc" in mods and a) else []
-        srcs = list(a)
-    elif op.startswith("ds_"):
-        returns = (op.startswith(("ds_read", "ds_bpermute", "ds_permute", "ds_swizzle", "ds_consume", "ds_append"))
-                   or "_rtn" in op)
-        dests, srcs = ([a[0]], list(a[1:])) if (returns and a) else ([], list(a))
-    elif op in ("s_addk_i32", "s_mulk_i32", "s_cmovk_i32", "s_movk_i32") and a:
-        # SOPK reads and writes a[0] (except s_movk_i32 which only writes a[0]).
-        dests = [a[0]]
-        srcs = list(a[1:]) if op == "s_movk_i32" else list(a)
-    elif a:
-        dests, srcs = [a[0]], list(a[1:])
-        if op.startswith("v_") and len(a) > 2 and (
-                "_co_" in op or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64")) \
-                and a[1].get("k") in ("sgpr", "special"):
-            dests, srcs = [a[0], a[1]], list(a[2:])
-
-    rd = 0
-    for x in srcs:
-        rd |= _operand_scalar_mask(x)
-    if op in _IMPLICIT_VCC_READS:
-        rd |= 1 << _BIT_VCC
-    if reads_scc(ins):
-        rd |= 1 << _BIT_SCC
-    if op.startswith(("ds_", "s_sendmsg", "v_interp", "v_movrel", "v_swaprel")):
-        rd |= 1 << _BIT_M0
-    if op == "s_cmov_b32" or op == "s_cmov_b64":
-        # Conditional move preserves destination when SCC == 0, so it also reads destination.
-        for d in dests:
-            rd |= _operand_scalar_mask(d)
-
-    may_w = 0
-    for d in dests:
-        may_w |= _operand_scalar_mask(d)
-    if op.startswith("v_cmp") and not op.startswith("v_cmpx") and len(a) == 2:
-        may_w |= 1 << _BIT_VCC
-    if writes_scc(ins):
-        may_w |= 1 << _BIT_SCC
-    elif op.startswith("s_") and not op.startswith(("s_mov", "s_cselect", "s_load", "s_buffer_load", "s_getpc",
-                                                    "s_nop", "s_waitcnt", "s_clause", "s_inst_prefetch", "s_pack",
-                                                    "s_mul_i32", "s_mul_hi", "s_mulk", "s_ff", "s_flbit", "s_bfm",
-                                                    "s_get_waveid")):
-        # Any uncategorized scalar op could touch SCC: include in may_w (never in must_kill).
-        may_w |= 1 << _BIT_SCC
-
-    # Only kill registers unconditionally overwritten (never conditional moves or half-VCC writes).
-    must_kill = 0
-    if op not in ("s_cmov_b32", "s_cmov_b64", "s_cmovk_i32"):
-        for d in dests:
-            if d.get("k") == "special" and d.get("t") in ("vcc_lo", "vcc_hi"):
-                continue  # half-write preserves the other half in wave64
-            must_kill |= _operand_scalar_mask(d)
-        if op.startswith("v_cmp") and not op.startswith("v_cmpx") and len(a) == 2:
-            must_kill |= 1 << _BIT_VCC
-    if writes_scc(ins):
-        must_kill |= 1 << _BIT_SCC
-    return rd, may_w, must_kill
+    return _scalar_rw_with_meta(ins, _get_op_meta(ins["op"]))
 
 
-def _scalar_liveness(active_blocks, succ):
-    """Exact conservative backward scalar liveness `live_in[b]` (int bitmask) for each block."""
-    n = len(active_blocks)
-    preds = [[] for _ in range(n)]
-    for b in range(n):
-        for s in succ[b]:
-            preds[s].append(b)
-    use = [0] * n
-    kill = [0] * n
-    for b, insns in enumerate(active_blocks):
-        u = 0
-        k = 0
-        for ins in insns:
-            rd, _, mk = _scalar_rw(ins)
-            u |= rd & ~k
-            k |= mk
-        use[b] = u
-        kill[b] = k
+def _solve_scalar_liveness(use, kill, preds):
+    """Run backward scalar liveness worklist given per-block `(use, kill)` bitmasks and `preds`."""
+    n = len(use)
     live_in = list(use)
     live_out = [0] * n
     in_work = [bool(u) for u in live_in]
@@ -337,6 +651,32 @@ def _scalar_liveness(active_blocks, succ):
                         in_work[p] = True
                         work.append(p)
     return live_in
+
+
+def _scalar_liveness(active_blocks, succ):
+    """Exact conservative backward scalar liveness `live_in[b]` (int bitmask) for each block."""
+    n = len(active_blocks)
+    preds = [[] for _ in range(n)]
+    for b in range(n):
+        for s in succ[b]:
+            preds[s].append(b)
+    use = [0] * n
+    kill = [0] * n
+    meta_get = _OP_META_CACHE.get
+    for b, insns in enumerate(active_blocks):
+        u = 0
+        k = 0
+        for ins in insns:
+            raw_op = ins["op"]
+            m = meta_get(raw_op)
+            if m is None:
+                m = _get_op_meta(raw_op)
+            rd, _, mk = _scalar_rw_with_meta(ins, m)
+            u |= rd & ~k
+            k |= mk
+        use[b] = u
+        kill[b] = k
+    return _solve_scalar_liveness(use, kill, preds)
 
 
 def _postdominators(succ):
@@ -396,6 +736,13 @@ def _postdominators(succ):
 
 def _holds_lane_mask(ins, x, lm_map):
     k = x.get("k")
+    if k == "slist":
+        regs = x.get("r", ())
+        return bool(regs) and any(
+            (item in lm_map) if isinstance(item, int)
+            else (isinstance(item, str) and item.startswith("vcc") and "vcc" in lm_map)
+            for item in regs
+        )
     if k == "special":
         t = x.get("t", "")
         return t.startswith("exec") or (t.startswith("vcc") and "vcc" in lm_map)
@@ -408,7 +755,7 @@ def _is_mask_op(ins, x, lm_map):
     """Matches Gen.is_mask_op in tools/rdna2spirv.py (special exec/vcc operands always take the mask path)."""
     if _holds_lane_mask(ins, x, lm_map):
         return True
-    return x.get("k") == "special" and x.get("t", "").startswith(("exec", "vcc"))
+    return _has_vcc_or_exec(x)
 
 
 def _is_exec_op_arg(x):
@@ -453,88 +800,79 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
     may_w = 0
     exec_writes = []
     sgpr_write_ops = []
-    empty_stats = (0, False, False, 0, False, False)
+    meta_get = _OP_META_CACHE.get
+    has_mask_writes = bool(mask_writes)
+    has_scc_live = bool(scc_live)
 
     for ins in insns:
         raw_op = ins["op"]
-        op = base_op(raw_op)
-        if op == "s_endpgm" or op in BRANCHES:
+        m = meta_get(raw_op)
+        if m is None:
+            m = _get_op_meta(raw_op)
+        if m[1]:
             break
-        if id(ins) in mask_writes:
+        if has_mask_writes and id(ins) in mask_writes:
             # write_all_lanes VGPR store (parked lane mask): runs even when EXEC == 0, so must not be skipped.
-            return False, empty_stats, 0, (), ()
-        a = ins["args"]
-        lm = lane_masks.get(id(ins), {})
-
+            return False, _EMPTY_MEM_STATS, 0, (), ()
+        flags = m[8]
         # 1. Strictly forbidden opcodes inside a lane-local folded region (cross-lane, barrier, unmasked writes).
-        if raw_op.endswith(("_dpp", "_dpp8")):
-            return False, empty_stats, 0, (), ()
-        if op in ("s_barrier", "s_sendmsg", "s_setpc_b64", "s_swappc_b64", "s_trap",
-                  "s_sethalt", "s_setkill", "s_sleep", "s_setprio",
-                  "s_round_mode", "s_denorm_mode",
-                  "v_readlane_b32", "v_readfirstlane_b32", "v_writelane_b32",
-                  "v_permlane16_b32", "v_permlanex16_b32",
-                  "ds_bpermute_b32", "ds_permute_b32", "ds_swizzle_b32",
-                  "ds_gws_init", "ds_gws_sema_v", "ds_gws_sema_br", "ds_gws_sema_p", "ds_gws_barrier",
-                  "ds_consume", "ds_append", "ds_ordered_count",
-                  "s_wqm_b32", "s_wqm_b64", "s_quadmask_b32", "s_quadmask_b64"):
-            return False, empty_stats, 0, (), ()
-        if op.startswith(("s_movrel", "s_setreg", "s_getreg", "s_store", "s_buffer_store", "s_atomic",
-                          "ds_gws", "exp")):
-            return False, empty_stats, 0, (), ()
+        if flags & _FLAG_FORBIDDEN_FOLD:
+            return False, _EMPTY_MEM_STATS, 0, (), ()
 
-        acc = _x_memory_order_access(op)
+        acc = m[9]
         if acc is not None:
             kind, r, w = acc
             if kind == "lds":
                 lds_ops += 1
-                lds_r = lds_r or r
-                lds_w = lds_w or w
+                if r:
+                    lds_r = True
+                if w:
+                    lds_w = True
             else:
                 mem_ops += 1
-                mem_r = mem_r or r
-                mem_w = mem_w or w
-        elif op.startswith("scratch_"):
-            if "store" in op or "atomic" in op:
-                mem_ops += 1
-                mem_w = True
-                if "atomic" in op:
+                if r:
                     mem_r = True
-            else:
+                if w:
+                    mem_w = True
+        else:
+            sacc = m[10]
+            if sacc is not None:
                 mem_ops += 1
-                mem_r = True
-        elif op.startswith(("image_sample", "image_gather", "image_bvh")):
-            pass  # read-only sampled-image / BVH queries: not ordered against buffer/image stores by x_memory_order
-        elif "store" in op or "atomic" in op:
-            return False, empty_stats, 0, (), ()
+                if sacc[0]:
+                    mem_r = True
+                if sacc[1]:
+                    mem_w = True
 
         # 2. Cross-lane mask readers (`wave_mask`, `wave_equal`, live-SCC `scc_from_mask`).
-        if op in _MASK_WORD_READERS:
-            if len(a) > 1 and _holds_lane_mask(ins, a[1], lm):
-                return False, empty_stats, 0, (), ()
-        elif op in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"):
-            if len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lm):
-                return False, empty_stats, 0, (), ()
-        elif op.startswith(("s_cmp", "s_bitcmp")):
-            if any(_holds_lane_mask(ins, x, lm) for x in a):
-                return False, empty_stats, 0, (), ()
-        elif op in _MASK_SCC_VOTE_OPS and id(ins) in scc_live:
-            # Would emit scc_from_mask -> x_round if operating on a lane mask (matches Gen.is_mask_op).
-            is_mask_dst = bool(a) and a[0].get("k") == "special" and a[0].get("t", "").startswith(("exec", "vcc"))
-            if "saveexec" in op or "wrexec" in op or op.endswith("_mask") or is_mask_dst \
-                    or any(_is_mask_op(ins, x, lm) for x in a[1:]):
-                return False, empty_stats, 0, (), ()
+        a = ins["args"]
+        mask_chk = m[11]
+        if mask_chk:
+            if mask_chk == _MASK_CHK_SCC_VOTE:
+                if has_scc_live and id(ins) in scc_live:
+                    if (flags & _FLAG_SCC_VOTE_ALWAYS_MASK) or (bool(a) and _has_vcc_or_exec(a[0])):
+                        return False, _EMPTY_MEM_STATS, 0, (), ()
+                    lm = lane_masks.get(id(ins), {})
+                    if any(_is_mask_op(ins, x, lm) for x in a[1:]):
+                        return False, _EMPTY_MEM_STATS, 0, (), ()
+            elif mask_chk == _MASK_CHK_WORD_READER:
+                if len(a) > 1 and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {})):
+                    return False, _EMPTY_MEM_STATS, 0, (), ()
+            elif mask_chk == _MASK_CHK_MBCNT:
+                if len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {})):
+                    return False, _EMPTY_MEM_STATS, 0, (), ()
+            else:  # _MASK_CHK_SCMP
+                lm = lane_masks.get(id(ins), {})
+                if any(_holds_lane_mask(ins, x, lm) for x in a):
+                    return False, _EMPTY_MEM_STATS, 0, (), ()
 
         # 3. Track scalar writes and EXEC writes.
-        _, ins_mw, _ = _scalar_rw(ins)
+        _, ins_mw, _ = _scalar_rw_with_meta(ins, m)
         may_w |= ins_mw
         s_bits = ins_mw & _ALL_SGPRS
         if s_bits:
-            sgpr_write_ops.append((s_bits, op, a))
-        writes_exec = (op.startswith("v_cmpx") or "saveexec" in op or "wrexec" in op
-                       or (bool(a) and a[0].get("k") == "special" and a[0].get("t", "").startswith("exec")))
-        if writes_exec:
-            exec_writes.append((op, a))
+            sgpr_write_ops.append((s_bits, m[0], a))
+        if (flags & _FLAG_WRITES_EXEC_OP) or (bool(a) and a[0].get("k") == "special" and a[0].get("t", "").startswith("exec")):
+            exec_writes.append((m[0], a))
 
     return True, (mem_ops, mem_r, mem_w, lds_ops, lds_r, lds_w), may_w, exec_writes, sgpr_write_ops
 
@@ -583,6 +921,13 @@ def _exec_writes_stay_inactive(region_blocks, blk_info, run_live_in):
     `s[r:r+1]` and every write to `EXEC` produces 0 whenever `EXEC == 0` and all such pairs are 0, then
     an inactive lane stays inactive across arbitrary nested / reused saveexec if-else diamonds.
     """
+    has_exec_write = False
+    for u in region_blocks:
+        if blk_info[u][3]:
+            has_exec_write = True
+            break
+    if not has_exec_write:
+        return True
     sgpr_writers = collections.defaultdict(list)
     for u in region_blocks:
         for item in blk_info[u][4]:
@@ -592,11 +937,10 @@ def _exec_writes_stay_inactive(region_blocks, blk_info, run_live_in):
                 sgpr_writers[lsb.bit_length() - 1].append(item)
                 s_bits ^= lsb
     zero_pairs = set()
-    for r in range(127):
-        if (3 << r) & run_live_in:
+    for r, w0 in sgpr_writers.items():
+        if r >= 127 or ((3 << r) & run_live_in):
             continue  # entry value could be read before first write in R
-        w0 = sgpr_writers.get(r)
-        if not w0 or w0 != sgpr_writers.get(r + 1):
+        if w0 != sgpr_writers.get(r + 1):
             continue
         pair_mask = 3 << r
         if all(s_bits == pair_mask and bool(a) and _sgpr_pair(a[0]) == r for s_bits, _, a in w0):
@@ -798,20 +1142,115 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
             preds[s].add(b)
 
     ipdom = _postdominators(succ)
-    scalar_live_in = _scalar_liveness(active_blocks, succ)
 
-    blk_info = []
-    terms = []
+    # Single fused pass over active_blocks: compute scalar liveness (use/kill),
+    # block-body classification (blk_info), and block terminators (terms).
+    use = [0] * n
+    kill = [0] * n
+    blk_info = [None] * n
+    terms = [None] * n
+    meta_get = _OP_META_CACHE.get
+    has_mask_writes = bool(mask_writes)
+    has_scc_live = bool(scc_live)
+
     for b, insns in enumerate(active_blocks):
-        blk_info.append(_classify_block_body(insns, lane_masks, scc_live, mask_writes))
-        last = insns[-1] if insns else None
-        op = base_op(last["op"]) if last is not None else None
-        if op == "s_endpgm":
-            terms.append(("end", None))
-        elif op in BRANCHES:
-            terms.append(("br", op))
+        u_mask = 0
+        k_mask = 0
+        clean = True
+        mem_ops = lds_ops = 0
+        mem_r = mem_w = lds_r = lds_w = False
+        may_w = 0
+        exec_writes = []
+        sgpr_write_ops = []
+        term = ("fall", None)
+
+        for ins in insns:
+            raw_op = ins["op"]
+            m = meta_get(raw_op)
+            if m is None:
+                m = _get_op_meta(raw_op)
+            rd, ins_mw, mk = _scalar_rw_with_meta(ins, m)
+            u_mask |= rd & ~k_mask
+            k_mask |= mk
+            if m[1]:
+                op = m[0]
+                term = ("end", None) if op == "s_endpgm" else ("br", op)
+                break
+            if not clean:
+                continue
+            if has_mask_writes and id(ins) in mask_writes:
+                clean = False
+                continue
+            flags = m[8]
+            if flags & _FLAG_FORBIDDEN_FOLD:
+                clean = False
+                continue
+            acc = m[9]
+            if acc is not None:
+                kind, r, w = acc
+                if kind == "lds":
+                    lds_ops += 1
+                    if r:
+                        lds_r = True
+                    if w:
+                        lds_w = True
+                else:
+                    mem_ops += 1
+                    if r:
+                        mem_r = True
+                    if w:
+                        mem_w = True
+            else:
+                sacc = m[10]
+                if sacc is not None:
+                    mem_ops += 1
+                    if sacc[0]:
+                        mem_r = True
+                    if sacc[1]:
+                        mem_w = True
+
+            a = ins["args"]
+            mask_chk = m[11]
+            if mask_chk:
+                if mask_chk == _MASK_CHK_SCC_VOTE:
+                    if has_scc_live and id(ins) in scc_live:
+                        if (flags & _FLAG_SCC_VOTE_ALWAYS_MASK) or (bool(a) and _has_vcc_or_exec(a[0])):
+                            clean = False
+                            continue
+                        lm = lane_masks.get(id(ins), {})
+                        if any(_is_mask_op(ins, x, lm) for x in a[1:]):
+                            clean = False
+                            continue
+                elif mask_chk == _MASK_CHK_WORD_READER:
+                    if len(a) > 1 and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {})):
+                        clean = False
+                        continue
+                elif mask_chk == _MASK_CHK_MBCNT:
+                    if len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {})):
+                        clean = False
+                        continue
+                else:  # _MASK_CHK_SCMP
+                    lm = lane_masks.get(id(ins), {})
+                    if any(_holds_lane_mask(ins, x, lm) for x in a):
+                        clean = False
+                        continue
+
+            may_w |= ins_mw
+            s_bits = ins_mw & _ALL_SGPRS
+            if s_bits:
+                sgpr_write_ops.append((s_bits, m[0], a))
+            if (flags & _FLAG_WRITES_EXEC_OP) or (bool(a) and a[0].get("k") == "special" and a[0].get("t", "").startswith("exec")):
+                exec_writes.append((m[0], a))
+
+        use[b] = u_mask
+        kill[b] = k_mask
+        terms[b] = term
+        if clean:
+            blk_info[b] = (True, (mem_ops, mem_r, mem_w, lds_ops, lds_r, lds_w), may_w, exec_writes, sgpr_write_ops)
         else:
-            terms.append(("fall", None))
+            blk_info[b] = (False, _EMPTY_MEM_STATS, 0, (), ())
+
+    scalar_live_in = _solve_scalar_liveness(use, kill, preds)
 
     # Gather candidate s_cbranch_execz / s_cbranch_execnz blocks with single-entry/single-exit post-dominated regions.
     candidates = []
@@ -979,56 +1418,59 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
     return selected, fold_chain, absorbed
 
 
-_SOP2_B32_LOGIC = frozenset({
-    "s_and_b32", "s_or_b32", "s_xor_b32", "s_andn2_b32", "s_orn2_b32",
-    "s_nand_b32", "s_nor_b32", "s_xnor_b32", "s_not_b32",
-})
-
-
 def _is_uniform_scc_safe(active_blocks, lane_masks, scc_live):
     """True iff no instruction triggers wave64's per-lane 32-bit half-mask SCC write (rdna2spirv.py scc_logic)
     with live SCC. When True, %scc is guaranteed identical across all 64 lanes of each wave."""
+    if not scc_live:
+        return True
+    meta_get = _OP_META_CACHE.get
     for insns in active_blocks:
         for ins in insns:
-            op = base_op(ins["op"])
-            if op not in _SOP2_B32_LOGIC or id(ins) not in scc_live:
+            ins_id = id(ins)
+            if ins_id not in scc_live:
+                continue
+            raw_op = ins["op"]
+            m = meta_get(raw_op)
+            if m is None:
+                m = _get_op_meta(raw_op)
+            if not (m[8] & _FLAG_SOP2_B32_LOGIC):
                 continue
             a = ins["args"]
-            lm = lane_masks.get(id(ins), {})
+            lm = lane_masks.get(ins_id, {})
             writes_exec = bool(a) and a[0].get("k") == "special" and a[0].get("t", "").startswith("exec")
             if writes_exec or any(_holds_lane_mask(ins, x, lm) for x in a[1:]):
                 return False
     return True
 
 
+def _insn_may_barrier_with_meta(ins, meta, lane_masks, scc_live):
+    if meta[1]:
+        return False
+    flags = meta[8]
+    if flags & _FLAG_ALWAYS_BARRIER:
+        return True
+    mask_chk = meta[11]
+    if not mask_chk:
+        return False
+    a = ins["args"]
+    if mask_chk == _MASK_CHK_SCC_VOTE:
+        if not scc_live or id(ins) not in scc_live:
+            return False
+        if (flags & _FLAG_SCC_VOTE_ALWAYS_MASK) or (bool(a) and _has_vcc_or_exec(a[0])):
+            return True
+        lm = lane_masks.get(id(ins), {})
+        return any(_is_mask_op(ins, x, lm) for x in a[1:])
+    if mask_chk == _MASK_CHK_WORD_READER:
+        return len(a) > 1 and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {}))
+    if mask_chk == _MASK_CHK_MBCNT:
+        return len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {}))
+    lm = lane_masks.get(id(ins), {})
+    return any(_holds_lane_mask(ins, x, lm) for x in a)
+
+
 def _insn_may_barrier(ins, lane_masks, scc_live):
     """Conservative (over-approximate) check: True if `ins` may emit x_round or OpControlBarrier in --wave64-emulate."""
-    raw_op = ins["op"]
-    op = base_op(raw_op)
-    if op == "s_endpgm" or op in BRANCHES:
-        return False
-    if raw_op.endswith(("_dpp", "_dpp8")):
-        return True
-    if op in ("s_barrier", "v_readlane_b32", "v_readfirstlane_b32",
-              "v_permlane16_b32", "v_permlanex16_b32",
-              "ds_bpermute_b32", "ds_permute_b32", "ds_swizzle_b32",
-              "s_wqm_b32", "s_wqm_b64"):
-        return True
-    if op.startswith("s_movrel"):
-        return True
-    a = ins["args"]
-    lm = lane_masks.get(id(ins), {})
-    if op in _MASK_WORD_READERS:
-        return len(a) > 1 and _holds_lane_mask(ins, a[1], lm)
-    if op in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"):
-        return len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lm)
-    if op.startswith(("s_cmp", "s_bitcmp")):
-        return any(_holds_lane_mask(ins, x, lm) for x in a)
-    if op in _MASK_SCC_VOTE_OPS and id(ins) in scc_live:
-        is_mask_dst = bool(a) and a[0].get("k") == "special" and a[0].get("t", "").startswith(("exec", "vcc"))
-        return ("saveexec" in op or "wrexec" in op or op.endswith("_mask") or is_mask_dst
-                or any(_is_mask_op(ins, x, lm) for x in a[1:]))
-    return False
+    return _insn_may_barrier_with_meta(ins, _get_op_meta(ins["op"]), lane_masks, scc_live)
 
 
 def _dirty_conflicts(dirty, reads, writes):
@@ -1107,6 +1549,9 @@ def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorb
     sb_has_endpgm = {}
     sb_may_barrier = {}
     sb_mem_stats = {}
+    sb_clears_dirty = {}
+    sb_gen_dirty = {}
+    meta_get = _OP_META_CACHE.get
 
     for b in eff_blocks:
         has_sb = False
@@ -1114,114 +1559,104 @@ def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorb
         may_bar = False
         mem_ops = lds_ops = 0
         mem_r = mem_w = lds_r = lds_w = False
+        clears_dirty = False
+        gen_dirty = 0
         chain = chain_of[b]
+        last_c = len(chain) - 1
         for idx_c, cur in enumerate(chain):
             insns = active_blocks[cur]
             for ins in insns:
-                op = base_op(ins["op"])
-                if op == "s_endpgm":
-                    has_end = True
-                    break
-                if op in BRANCHES:
-                    if idx_c == len(chain) - 1 and cur not in folds:
-                        if op in ("s_cbranch_execz", "s_cbranch_execnz", "s_cbranch_vccz", "s_cbranch_vccnz"):
-                            may_bar = True
+                raw_op = ins["op"]
+                m = meta_get(raw_op)
+                if m is None:
+                    m = _get_op_meta(raw_op)
+                op = m[0]
+                if m[1]:
+                    if op == "s_endpgm":
+                        has_end = True
+                    elif idx_c == last_c and cur not in folds and (m[8] & _FLAG_VOTED_BRANCH):
+                        may_bar = True
+                        clears_dirty = True
+                        gen_dirty = 0
                     break
                 if op == "s_barrier":
                     has_sb = True
                     may_bar = True
-                elif _insn_may_barrier(ins, lane_masks, scc_live):
+                    clears_dirty = True
+                    gen_dirty = 0
+                    continue
+                if not may_bar and _insn_may_barrier_with_meta(ins, m, lane_masks, scc_live):
                     may_bar = True
-                acc = _x_memory_order_access(op)
+                acc = m[9]
                 if acc is not None:
                     kind, r, w = acc
                     if kind == "lds":
                         lds_ops += 1
-                        lds_r = lds_r or r
-                        lds_w = lds_w or w
+                        if r:
+                            lds_r = True
+                        if w:
+                            lds_w = True
                     else:
                         mem_ops += 1
-                        mem_r = mem_r or r
-                        mem_w = mem_w or w
-                elif op.startswith("scratch_"):
-                    mem_ops += 1
-                    if "store" in op or "atomic" in op:
-                        mem_w = True
-                        if "atomic" in op:
+                        if r:
                             mem_r = True
-                    else:
-                        mem_r = True
+                        if w:
+                            mem_w = True
+                    gen_dirty |= m[12]
+                else:
+                    sacc = m[10]
+                    if sacc is not None:
+                        mem_ops += 1
+                        if sacc[0]:
+                            mem_r = True
+                        if sacc[1]:
+                            mem_w = True
             if cur in folds:
-                mo, mr, mw, lo, lr, lw = folds[cur]["mem_stats"]
+                fd = folds[cur]
+                mo, mr, mw, lo, lr, lw = fd["mem_stats"]
                 mem_ops += mo
-                mem_r = mem_r or mr
-                mem_w = mem_w or mw
+                if mr:
+                    mem_r = True
+                if mw:
+                    mem_w = True
                 lds_ops += lo
-                lds_r = lds_r or lr
-                lds_w = lds_w or lw
+                if lr:
+                    lds_r = True
+                if lw:
+                    lds_w = True
+                for k in fd["mem_reads"]:
+                    gen_dirty |= _DIRTY_LDS_R if k == "lds" else _DIRTY_MEM_R
+                for k in fd["mem_writes"]:
+                    gen_dirty |= _DIRTY_LDS_W if k == "lds" else _DIRTY_MEM_W
         sb_has_sbarrier[b] = has_sb
         sb_has_endpgm[b] = has_end
         sb_may_barrier[b] = may_bar
         sb_mem_stats[b] = (mem_ops, mem_r, mem_w, lds_ops, lds_r, lds_w)
-
-    def transfer_superblock(b, d_in):
-        """Strictly monotone GEN/KILL dirty transfer over superblock `b`.
-
-        Only unconditional barriers (`s_barrier` and voted branches `s_cbranch_execz/nz/vccz/nz`) clear `d`.
-        Never clears on `d_in`-induced or intra-block memory conflicts: if an earlier `x_round` (e.g.
-        `v_readlane_b32`) or an earlier conflict cleared `g.x_dirty` in codegen, a phantom clear here could
-        wipe a live dirty domain written afterward and drop a required cross-block `OpControlBarrier`.
-        """
-        d = set(d_in)
-        chain = chain_of[b]
-        for idx_c, cur in enumerate(chain):
-            insns = active_blocks[cur]
-            for ins in insns:
-                op = base_op(ins["op"])
-                if op == "s_endpgm":
-                    break
-                if op in BRANCHES:
-                    if idx_c == len(chain) - 1 and cur not in folds:
-                        if op in ("s_cbranch_execz", "s_cbranch_execnz", "s_cbranch_vccz", "s_cbranch_vccnz"):
-                            d.clear()  # branch_condition unconditionally runs g_vote -> x_round -> barrier
-                    break
-                if op == "s_barrier":
-                    d.clear()
-                    continue
-                acc = _x_memory_order_access(op)
-                if acc is not None:
-                    kind, r, w = acc
-                    if r:
-                        d.add((kind, "r"))
-                    if w:
-                        d.add((kind, "w"))
-            if cur in folds:
-                fd = folds[cur]
-                for k in fd["mem_reads"]:
-                    d.add((k, "r"))
-                for k in fd["mem_writes"]:
-                    d.add((k, "w"))
-        return frozenset(d)
+        sb_clears_dirty[b] = clears_dirty
+        sb_gen_dirty[b] = gen_dirty
 
     # ---- Mode 1: Single-wave (`x_lanes == 64`) -> 100% inline structured SPIR-V, 0 OpSwitch ----
     if x_lanes == 64:
-        dirty_in = {b: set() for b in eff_blocks}
+        dirty_in = {b: 0 for b in eff_blocks}
         work = collections.deque(eff_blocks)
         in_work = set(eff_blocks)
         while work:
             u = work.popleft()
             in_work.discard(u)
-            d_out = transfer_superblock(u, dirty_in[u])
-            for v in eff_succ[u]:
-                if not d_out <= dirty_in[v]:
-                    dirty_in[v].update(d_out)
-                    if v not in in_work:
-                        in_work.add(v)
-                        work.append(v)
+            d_out = sb_gen_dirty[u] if sb_clears_dirty[u] else (dirty_in[u] | sb_gen_dirty[u])
+            if d_out:
+                for v in eff_succ[u]:
+                    old_v = dirty_in[v]
+                    new_v = old_v | d_out
+                    if new_v != old_v:
+                        dirty_in[v] = new_v
+                        if v not in in_work:
+                            in_work.add(v)
+                            work.append(v)
         return {
             "mode": "inline_all",
             "tree": tree,
-            "dirty_in": {b: frozenset(d) for b, d in dirty_in.items()},
+            "dirty_in": {b: _DIRTY_MASK_TO_FROZENSET[d] for b, d in dirty_in.items()},
             "inline_blocks": set(eff_blocks),
             "sync_free_blocks": set(),
             "mini_of_block": {},
@@ -1317,7 +1752,7 @@ def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorb
     mini_of_block = {}
     mini_blocks = {}
     tail_blocks = set()
-    cur_dirty = frozenset()
+    cur_dirty = 0
     mini_idx = 0
 
     for idx_it, it in enumerate(flat_top):
@@ -1325,9 +1760,9 @@ def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorb
         has_end = any(sb_has_endpgm[u] for u in it_blocks)
         if it[0] == "block" and (not has_end or idx_it == len(flat_top) - 1):
             b = it[1]
-            dirty_in[b] = cur_dirty
+            dirty_in[b] = _DIRTY_MASK_TO_FROZENSET[cur_dirty]
             inline_blocks.add(b)
-            cur_dirty = transfer_superblock(b, cur_dirty)
+            cur_dirty = sb_gen_dirty[b] if sb_clears_dirty[b] else (cur_dirty | sb_gen_dirty[b])
             steps.append(("inline_block", b))
             continue
         if has_end:
@@ -1337,24 +1772,25 @@ def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorb
                 rem.update(_blocks_in_tree(rem_it))
             tail_blocks = rem
             steps.append(("tail_scheduler", rem, bool(cur_dirty)))
-            cur_dirty = frozenset()
+            cur_dirty = 0
             break
         ok_sf, sf_reads, sf_writes = check_sync_free(it)
         if ok_sf:
-            pre_bar = _dirty_conflicts(cur_dirty, sf_reads, sf_writes)
+            pre_bar = _dirty_conflicts(_DIRTY_MASK_TO_FROZENSET[cur_dirty], sf_reads, sf_writes)
             if pre_bar:
-                cur_dirty = frozenset()
+                cur_dirty = 0
             for u in it_blocks:
                 dirty_in[u] = frozenset()  # pre_bar cleared conflicts before entering sync-free region
                 inline_blocks.add(u)
                 sync_free_blocks.add(u)
-            cur_dirty = frozenset(set(cur_dirty)
-                                  | {(k, "r") for k in sf_reads}
-                                  | {(k, "w") for k in sf_writes})
+            for k in sf_reads:
+                cur_dirty |= _DIRTY_LDS_R if k == "lds" else _DIRTY_MEM_R
+            for k in sf_writes:
+                cur_dirty |= _DIRTY_LDS_W if k == "lds" else _DIRTY_MEM_W
             steps.append(("inline_sync_free", it, pre_bar))
         else:
             pre_bar = bool(cur_dirty)
-            cur_dirty = frozenset()  # mini-scheduler ends with OpControlBarrier %c2 %c2 %c948
+            cur_dirty = 0  # mini-scheduler ends with OpControlBarrier %c2 %c2 %c948
             mini_blocks[mini_idx] = it_blocks
             for u in it_blocks:
                 mini_of_block[u] = mini_idx

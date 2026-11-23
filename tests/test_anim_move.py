@@ -363,6 +363,40 @@ class AnimMoveTest(unittest.TestCase):
         self.assertEqual(ok.returncode, 0, ok.stderr)
         self.assertTrue(os.path.isfile(nested_out))
 
+    def test_cli_refuses_to_overwrite_scanned_directory_stream(self):
+        carved = os.path.join(self.tmp.name, "carved")
+        os.makedirs(carved)
+        stream = os.path.join(carved, "00010000.bin")
+        payload = self._sample_state_machine_resource()
+        with open(stream, "wb") as f:
+            f.write(payload)
+        res = subprocess.run([sys.executable, "-I", TOOL, carved, stream], capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("refuses to overwrite", res.stderr)
+        with open(stream, "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    def test_cli_refuses_relative_alias_to_input_archive(self):
+        one = self._sample_state_machine_resource()
+        rpf = os.path.join(self.tmp.name, "in.rpf")
+        write_rpf(rpf, [one])
+        with open(rpf, "rb") as f:
+            original = f.read()
+        alias = os.path.join(self.tmp.name, ".", "in.rpf")
+        res = subprocess.run([sys.executable, "-I", TOOL, rpf, alias], capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("refuses to overwrite", res.stderr)
+        with open(rpf, "rb") as f:
+            self.assertEqual(f.read(), original)
+
+    def test_module_docstring_has_no_double_encoded_characters(self):
+        """The preamble layout uses U+00D7; it was once stored as the pair U+00C3 U+2014."""
+        with open(TOOL, encoding="utf-8") as f:
+            source = f.read()
+        for broken in ("\u00c3\u2014", "\u00e2\u20ac", "\u00c2"):
+            self.assertNotIn(broken, source)
+        self.assertIn("N_req \u00d7 u32 request hashes", source)
+
 
 if __name__ == "__main__":
     unittest.main()

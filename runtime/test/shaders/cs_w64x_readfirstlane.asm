@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Wave64 v_readfirstlane_b32 with the first active lane in the upper half (lowest set EXEC bit; lane 0 if EXEC = 0).
 ; A 32-wide subgroup sees only its own half's EXEC bits and returns lane 0 of the low half instead.
 ; v2 = lane + 100, v1 = lane. EXEC (hi:lo) and result:

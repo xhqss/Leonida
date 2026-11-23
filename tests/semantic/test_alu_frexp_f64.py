@@ -289,12 +289,16 @@ class FrexpF64Tests(unittest.TestCase):
         validate_spirv(spv)
 
     def test_mant_output_modifiers_and_validation(self):
-        for mods, want_mul, want_clamp in (
-            ("mul:2", True, False),
-            ("mul:4", True, False),
-            ("div:2", True, False),
-            ("clamp", False, True),
-            ("clamp div:2", True, True),
+        # Measured on gfx1036 through tools/hw_oracle (wave32 and wave64 identical, tools/f64_omod_probe.py):
+        # a binary64 result ignores mul:2/mul:4/div:2 while denorm_mode_16_64 = 3, the MODE the translator
+        # assumes, so those forms keep the integer-only lowering. clamp applies in every MODE. See
+        # docs/design.md, "v_frexp_mant_f64, v_frexp_exp_i32_f64".
+        for mods, clamp_requested in (
+            ("mul:2", False),
+            ("mul:4", False),
+            ("div:2", False),
+            ("clamp", True),
+            ("clamp div:2", True),
         ):
             with self.subTest(mods=mods):
                 spv = translate_lines([
@@ -302,16 +306,20 @@ class FrexpF64Tests(unittest.TestCase):
                     "v_mov_b32 v3, 0x40080000",
                     f"v_frexp_mant_f64_e64 v[0:1], v[2:3] {mods}",
                 ])
-                self.assertIn("OpCapability Float64", spv)
-                if want_mul:
-                    self.assertRegex(spv, r"OpFMul %double")
-                else:
-                    self.assertNotRegex(spv, r"OpFMul %double")
-                if want_clamp:
+                self.assertNotRegex(spv, r"OpFMul %double")
+                if clamp_requested:
+                    self.assertIn("OpCapability Float64", spv)
                     self.assertIn("FClamp", spv)
                 else:
+                    self.assertNotIn("OpCapability Float64", spv)
                     self.assertNotIn("FClamp", spv)
                 validate_spirv(spv)
+
+        for mods in ("mul:2", "mul:4", "div:2", "mul:2 div:2"):
+            with self.subTest(ignored=mods):
+                # 3.0 has mantissa 0.75; the scaling would make it 1.5, 3.0 or 0.375.
+                self.assertEqual(run_mant(f"v_frexp_mant_f64_e64 v[0:1], v[2:3] {mods}", d2u(3.0)), d2u(0.75))
+                self.assertEqual(run_mant(f"v_frexp_mant_f64_e64 v[0:1], v[2:3] {mods}", d2u(-1.75)), d2u(-0.875))
 
     def test_rejects_invalid_forms(self):
         with self.assertRaises(rdna2spirv.Unsupported):

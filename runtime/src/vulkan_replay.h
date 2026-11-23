@@ -709,11 +709,18 @@ struct OcclusionSegmentPool {
     VkDevice device = VK_NULL_HANDLE;
     PFN_vkDestroyQueryPool destroy = nullptr;
     VkQueryPool pool = VK_NULL_HANDLE;
+    // Pipeline-statistics segments only: a second pool with the counters a mesh draw allows (D3D-291), and for each
+    // segment index whether it runs there. Empty when no segment of the submission holds a mesh draw.
+    VkQueryPool mesh_pool = VK_NULL_HANDLE;
+    std::vector<std::uint8_t> mesh;
 
     OcclusionSegmentPool() = default;
     OcclusionSegmentPool(const OcclusionSegmentPool&) = delete;
     OcclusionSegmentPool& operator=(const OcclusionSegmentPool&) = delete;
-    ~OcclusionSegmentPool() { if (pool) destroy(device, pool, nullptr); }
+    ~OcclusionSegmentPool() {
+        if (pool) destroy(device, pool, nullptr);
+        if (mesh_pool) destroy(device, mesh_pool, nullptr);
+    }
 };
 
 struct OcclusionResult {
@@ -758,6 +765,7 @@ struct GraphicsPipeline {
     std::uint32_t vertex_slots = 0;       // bit per input slot the input layout uses
     std::uint32_t zero_step_slots = 0;    // per-instance slots with InstanceDataStepRate 0: stride 0 at draw time
     std::uint32_t strip_cut = 0;          // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE (0: off, 1: 0xFFFF, 2: 0xFFFFFFFF)
+    bool mesh = false;                    // a mesh shader instead of a vertex shader: drawn by DispatchMesh only
     // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
     // and stencil. Null when it cannot be built.
@@ -788,6 +796,7 @@ enum class ReplayResult {
     invalid_predication,
     invalid_query,
     invalid_indirect_arguments,
+    invalid_draw,  // DispatchMesh with a pipeline that has no mesh shader, or a vertex draw with one that has
     unsupported
 };
 
@@ -843,6 +852,7 @@ struct ReplayFunctions {
     PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
     PFN_vkCmdDraw draw = nullptr;
+    PFN_vkCmdDrawMeshTasksEXT draw_mesh_tasks = nullptr;  // VK_EXT_mesh_shader; null: mesh draws are unsupported
     PFN_vkCmdDrawIndexed draw_indexed = nullptr;
     std::function<const GraphicsPipeline*(std::uintptr_t)> graphics_pipeline;
     // The buffer and offset a console VA range starts in (from ResourceBinding::va), false when none does. `size` is
@@ -861,9 +871,11 @@ struct ReplayFunctions {
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
                        VkBuffer dst, VkDeviceSize offset)> resolve_binary_occlusion;
     // Adds `count` pipeline-statistics results into one D3D12_QUERY_DATA_PIPELINE_STATISTICS, outside conditional
-    // rendering: the segments of a statistics query split around resolves (D3D-162).
-    std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
-                       VkBuffer dst, VkDeviceSize offset)> sum_statistics;
+    // rendering: the segments of a statistics query split around resolves (D3D-162) and mesh draws (D3D-291).
+    // Segment i is in the second pool when mesh[i] is set (mesh may be null: none is).
+    std::function<void(VkCommandBuffer, VkQueryPool, VkQueryPool mesh_pool, const std::uint8_t* mesh,
+                       std::uint32_t first, std::uint32_t count, VkBuffer dst, VkDeviceSize offset)>
+        sum_statistics;
     // Sums `count` binary-occlusion segments and normalizes the total to a 64-bit 0 or 1, outside conditional
     // rendering: a binary query split over physical segments because it overlaps other occlusion queries (D3D-252).
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
@@ -937,6 +949,9 @@ struct QueryResolveRun {
     std::uint32_t count = 0;
     VkDeviceSize offset = 0;
     bool sum = false;
+    // Statistics segments: the mesh-compatible pool and the kind of each segment (OcclusionSegmentPool::mesh).
+    VkQueryPool mesh_pool = VK_NULL_HANDLE;
+    const std::uint8_t* mesh = nullptr;
 };
 
 struct PreparedQuery {
@@ -958,7 +973,8 @@ struct PreparedQuery {
 };
 
 struct Prepared {
-    // Helper commands split the active statistics query just like query resolves.
+    // Helper commands split the active statistics query just like query resolves, and so does a draw whose kind (mesh
+    // or vertex) differs from the draws before it in the current segment (plan_statistics_segments, D3D-291).
     std::uint32_t statistics_end = PreparedQuery::no_segment;
     std::uint32_t statistics_begin = PreparedQuery::no_segment;
     PredicateCapture predicate;
@@ -2068,6 +2084,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         return ReplayResult::unsupported;
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
     if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+    if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
+    if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
     if (pipeline->color_formats.size() > max_render_targets) return ReplayResult::unsupported;
     p.graphics = pipeline;
@@ -2262,6 +2280,9 @@ public:
     // The list's statistics queries overlap (D3D-252): without a statistics pool they cannot run whole, because
     // two Vulkan queries of one type may not be active at once; QueryReplay::plan refuses such a list.
     bool statistics_overlaps = false;
+    // For each of those segments, whether it holds mesh draws and so runs in statistics_mesh_pool (D3D-291).
+    std::vector<std::uint8_t> statistics_mesh;
+    VkQueryPool statistics_mesh_pool = VK_NULL_HANDLE;
     // Copies, resolves and UAV clears that run as transfers, recorded while a predicate was set. D3D12 skips them
     // when the predicate says so, but Vulkan's conditional rendering does not cover transfer commands, so they run
     // unconditionally (docs/d3d12_vulkan.md section 4.7). Counted so the caller can report it.
@@ -2305,37 +2326,74 @@ inline ReplayResult plan_occlusion_segments(PreparedList& out) {
 // Helper dispatches must not contribute to the application's CSInvocations (D3D-162). Query resolves and
 // ordinary helper commands share one sequence of physical statistics segments. Resolve dispatch requirements
 // depend on heap state at planning time, so every non-timestamp resolve splits conservatively.
+// A mesh draw cannot run while a query with the input-assembly, vertex, geometry or tessellation counters is active
+// (VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076), though D3D12 allows it and reads those fields as 0. A query
+// that holds a mesh draw is split as well (D3D-291): a segment's first draw decides whether it runs in the full pool
+// or in the mesh one (statistics_mesh), and a later draw of the other kind ends it and begins one of its own kind.
+// Dispatches and segments without draws use the full pool; ExecuteIndirect draws count as vertex draws. Each draw
+// has its own rendering scope, so a split before one stays outside rendering, as a helper's does.
 inline void plan_statistics_segments(PreparedList& out) {
     detail::PreparedQuery* begin = nullptr;
-    struct Split { std::uint32_t* end; std::uint32_t* begin; };
-    std::vector<Split> inner;
+    // A split point (a helper or a resolve), or a draw: kind 0 vertex, 1 mesh.
+    struct Event { std::uint32_t* end; std::uint32_t* begin; int kind; };
+    std::vector<Event> inner;
+    bool splits = false, mesh = false;
     std::size_t next_query = 0;
+    const auto commands = out.list->commands();
     for (std::size_t i = 0; i < out.commands.size(); ++i) {
         auto& p = out.commands[i];
         if (begin && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 ||
-                      p.counted_dispatch.indirect))
-            inner.push_back({&p.statistics_end, &p.statistics_begin});
+                      p.counted_dispatch.indirect)) {
+            inner.push_back({&p.statistics_end, &p.statistics_begin, -1});
+            splits = true;
+        }
+        if (begin) {
+            int kind = -1;
+            if (const auto* draw = std::get_if<Draw>(&commands[i])) kind = draw->mesh ? 1 : 0;
+            else if (const auto* indirect = std::get_if<ExecuteIndirect>(&commands[i]))
+                kind = indirect->kind == IndirectKind::dispatch ? -1 : 0;
+            if (kind >= 0) inner.push_back({&p.statistics_end, &p.statistics_begin, kind});
+            mesh |= kind == 1;
+        }
         if (next_query == out.queries.size() || out.queries[next_query].command != i) continue;
         auto& query = out.queries[next_query++];
-        const Command& command = out.list->commands()[i];
+        const Command& command = commands[i];
         const auto range = query_range(command);
         if (std::holds_alternative<ResolveQueries>(command)) {
             // A stream-output resolve only fills zeros (no dispatch), so it needs no split.
-            if (begin && range.type != d3d12_query::timestamp && !is_so_statistics(range.type))
-                inner.push_back({&query.statistics_end, &query.statistics_begin});
+            if (begin && range.type != d3d12_query::timestamp && !is_so_statistics(range.type)) {
+                inner.push_back({&query.statistics_end, &query.statistics_begin, -1});
+                splits = true;
+            }
         } else if (range.type == d3d12_query::pipeline_statistics) {
             if (std::holds_alternative<BeginQuery>(command)) {
                 begin = &query;
                 inner.clear();
+                splits = mesh = false;
             } else if (begin) {
-                if (!inner.empty()) {
+                if (splits || mesh) {
                     const std::uint32_t first = out.statistics_segment_count;
-                    begin->statistics_begin = out.statistics_segment_count++;
-                    for (auto split : inner) {
-                        *split.end = out.statistics_segment_count - 1;
-                        *split.begin = out.statistics_segment_count++;
+                    const auto open = [&] {
+                        out.statistics_mesh.push_back(0);
+                        return out.statistics_segment_count++;
+                    };
+                    std::uint32_t current = begin->statistics_begin = open();
+                    int kind = -1;  // of the current segment's draws, -1 before its first
+                    for (const auto& event : inner) {
+                        if (event.kind < 0) {
+                            *event.end = current;
+                            current = *event.begin = open();
+                            kind = -1;
+                            continue;
+                        }
+                        if (kind >= 0 && event.kind != kind) {
+                            *event.end = current;
+                            current = *event.begin = open();
+                        }
+                        kind = event.kind;
+                        out.statistics_mesh[current] = std::uint8_t(kind);
                     }
-                    query.statistics_end = out.statistics_segment_count - 1;
+                    query.statistics_end = current;
                     query.statistics_first = first;
                     query.statistics_count = out.statistics_segment_count - first;
                 }
@@ -2355,6 +2413,14 @@ inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
     std::map<std::pair<QueryHeapId, std::uint32_t>, std::uint32_t> active;
     std::uint32_t current = detail::PreparedQuery::no_segment;
     std::size_t next_query = 0;
+    // Each physical segment's draw kind (D3D-291): -1 before its first draw, 0 vertex, 1 mesh.
+    int kind = -1;
+    const auto open = [&] {
+        out.statistics_mesh.push_back(0);
+        kind = -1;
+        return out.statistics_segment_count++;
+    };
+    const auto commands = out.list->commands();
     for (std::size_t i = 0; i < out.commands.size(); ++i) {
         auto& p = out.commands[i];
         detail::PreparedQuery* query = nullptr;
@@ -2366,8 +2432,23 @@ inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
             if (!active.empty() && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 ||
                                     p.counted_dispatch.indirect)) {
                 p.statistics_end = current;
-                current = out.statistics_segment_count++;
+                current = open();
                 p.statistics_begin = current;
+                continue;
+            }
+            // A draw of the other kind than the open segment's starts a segment in its own pool (D3D-291).
+            int draw = -1;
+            if (const auto* d = std::get_if<Draw>(&commands[i])) draw = d->mesh ? 1 : 0;
+            else if (const auto* indirect = std::get_if<ExecuteIndirect>(&commands[i]))
+                draw = indirect->kind == IndirectKind::dispatch ? -1 : 0;
+            if (!active.empty() && draw >= 0) {
+                if (kind >= 0 && draw != kind) {
+                    p.statistics_end = current;
+                    current = open();
+                    p.statistics_begin = current;
+                }
+                kind = draw;
+                out.statistics_mesh[current] = std::uint8_t(draw);
             }
             continue;
         }
@@ -2391,11 +2472,11 @@ inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
         } else {
             if (current == detail::PreparedQuery::no_segment || range.type == d3d12_query::timestamp) continue;
             query->statistics_end = current;
-            current = out.statistics_segment_count++;
+            current = open();
             query->statistics_begin = current;
             continue;
         }
-        current = active.empty() ? detail::PreparedQuery::no_segment : out.statistics_segment_count++;
+        current = active.empty() ? detail::PreparedQuery::no_segment : open();
         query->statistics_begin = current;
     }
     return active.empty() ? ReplayResult::success : ReplayResult::invalid_query;
@@ -2466,8 +2547,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.segment_pool = VK_NULL_HANDLE;
     out.segment_base = out.segment_count = 0;
     out.precise_segments = false;
-    out.statistics_pool = VK_NULL_HANDLE;
+    out.statistics_pool = out.statistics_mesh_pool = VK_NULL_HANDLE;
     out.statistics_base = out.statistics_segment_count = 0;
+    out.statistics_mesh.clear();
     const bool rendering = vk.begin_rendering && vk.end_rendering && vk.clear_attachments && vk.image_view;
     const bool copies = vk.copy_buffer && vk.copy_buffer_to_image && vk.copy_image_to_buffer && vk.copy_image;
     const bool conditional = vk.begin_conditional_rendering && vk.end_conditional_rendering;
@@ -3037,10 +3119,16 @@ public:
             list.segment_base = base;
         }
         if (list.statistics_segment_count) {
-            if (statistics_pool) {
+            const bool mesh = std::find(list.statistics_mesh.begin(), list.statistics_mesh.end(), 1) !=
+                              list.statistics_mesh.end();
+            if (statistics_pool && (!mesh || statistics_pool->mesh_pool)) {
                 retain(statistics_pool);
                 list.statistics_pool = statistics_pool->pool;
+                list.statistics_mesh_pool = statistics_pool->mesh_pool;
                 list.statistics_base = statistics_base;
+            } else if (mesh) {
+                // Unsplit, the query would be active around a mesh draw with counters Vulkan forbids there.
+                return ReplayResult::unsupported;
             } else if (list.statistics_overlaps) {
                 // Whole queries on the heap pool would keep two pipeline-statistics queries active at once.
                 return ReplayResult::unsupported;
@@ -3087,7 +3175,14 @@ public:
                         if (resolve.type != d3d12_query::occlusion && !binary && !statistics)
                             return ReplayResult::invalid_query;
                         const auto& saved = value.occlusion;
-                        run = {saved.segments->pool, saved.first, saved.count, run.offset, saved.count > 1};
+                        const std::uint8_t* kinds = saved.segments->mesh.empty() ? nullptr
+                                                                                 : saved.segments->mesh.data();
+                        // A mesh segment's four counters go through the sum to land in their D3D12 fields.
+                        const bool any_mesh = kinds && std::find(kinds + saved.first, kinds + saved.first + saved.count,
+                                                                 std::uint8_t(1)) != kinds + saved.first + saved.count;
+                        run = {saved.segments->pool, saved.first, saved.count, run.offset,
+                               saved.count > 1 || any_mesh, saved.segments->mesh_pool, kinds};
+                        if (any_mesh && !statistics) return ReplayResult::invalid_query;
                         if (!can_sum || (run.sum && !uncounted)) return ReplayResult::unsupported;
                         if (statistics) needs_statistics_sum |= run.sum;
                         else if (binary) (run.sum ? needs_sum_binary : needs_binary) = true;
@@ -3142,6 +3237,29 @@ private:
     std::map<std::pair<QueryPool*, std::uint32_t>, Value> pending_;
 };
 
+namespace detail {
+
+// A physical pipeline-statistics segment (plan_statistics_segments), in the pool its kind needs.
+inline VkQueryPool statistics_segment_pool(const PreparedList& list, std::uint32_t segment) {
+    return list.statistics_mesh[segment] ? list.statistics_mesh_pool : list.statistics_pool;
+}
+
+inline void end_statistics_segment(const PreparedList& list, std::uint32_t segment, VkCommandBuffer cb,
+                                   const ReplayFunctions& vk) {
+    if (segment == PreparedQuery::no_segment) return;
+    vk.end_query(cb, statistics_segment_pool(list, segment), list.statistics_base + segment);
+}
+
+inline void begin_statistics_segment(const PreparedList& list, std::uint32_t segment, VkCommandBuffer cb,
+                                     const ReplayFunctions& vk) {
+    if (segment == PreparedQuery::no_segment) return;
+    const auto pool = statistics_segment_pool(list, segment);
+    vk.reset_query_pool(cb, pool, list.statistics_base + segment, 1);
+    vk.begin_query(cb, pool, list.statistics_base + segment, 0);
+}
+
+}  // namespace detail
+
 inline void emit_query(const PreparedList& list, const detail::PreparedQuery& query, VkCommandBuffer cb,
                        const ReplayFunctions& vk, const VkConditionalRenderingBeginInfoEXT& predicate) {
     constexpr auto none = detail::PreparedQuery::no_segment;
@@ -3155,16 +3273,8 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
         return;
     }
     // A split pipeline-statistics query (plan_statistics_segments): its counters run in the physical segments.
-    const auto end_statistics = [&] {
-        if (query.statistics_end != none)
-            vk.end_query(cb, list.statistics_pool, list.statistics_base + query.statistics_end);
-    };
-    const auto begin_statistics = [&] {
-        if (query.statistics_begin == none) return;
-        const auto index = list.statistics_base + query.statistics_begin;
-        vk.reset_query_pool(cb, list.statistics_pool, index, 1);
-        vk.begin_query(cb, list.statistics_pool, index, 0);
-    };
+    const auto end_statistics = [&] { detail::end_statistics_segment(list, query.statistics_end, cb, vk); };
+    const auto begin_statistics = [&] { detail::begin_statistics_segment(list, query.statistics_begin, cb, vk); };
     const auto& command = list.list->commands()[query.command];
     const QueryPool& heap = *query.heap;
     if (!std::holds_alternative<ResolveQueries>(command) &&
@@ -3206,7 +3316,7 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
             if (!run.pool) {
                 vk.fill_buffer(cb, dst, run.offset, VkDeviceSize(run.count) * size, 0);
             } else if (run.sum && resolve.type == d3d12_query::pipeline_statistics) {
-                vk.sum_statistics(cb, run.pool, run.first, run.count, dst, run.offset);
+                vk.sum_statistics(cb, run.pool, run.mesh_pool, run.mesh, run.first, run.count, dst, run.offset);
             } else if (run.sum && binary) {
                 vk.sum_binary_occlusion(cb, run.pool, run.first, run.count, dst, run.offset);
             } else if (run.sum || binary) {
@@ -3260,15 +3370,17 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         }
         // Helpers run outside the per-command rendering scopes; both segment endpoints stay outside too.
         const auto end_statistics = [&] {
-            if (p.statistics_end != detail::PreparedQuery::no_segment)
-                vk.end_query(command_buffer, prepared.statistics_pool, prepared.statistics_base + p.statistics_end);
+            detail::end_statistics_segment(prepared, p.statistics_end, command_buffer, vk);
         };
         const auto begin_statistics = [&] {
-            if (p.statistics_begin == detail::PreparedQuery::no_segment) return;
-            const auto index = prepared.statistics_base + p.statistics_begin;
-            vk.reset_query_pool(command_buffer, prepared.statistics_pool, index, 1);
-            vk.begin_query(command_buffer, prepared.statistics_pool, index, 0);
+            detail::begin_statistics_segment(prepared, p.statistics_begin, command_buffer, vk);
         };
+        // A draw of the other kind inside a statistics query starts a segment in its pool (D3D-291), before the
+        // draw's own rendering scope begins.
+        if (std::holds_alternative<Draw>(command) || std::holds_alternative<ExecuteIndirect>(command)) {
+            end_statistics();
+            begin_statistics();
+        }
         if (const auto* predication = std::get_if<Predication>(&command)) {
             // Conditional rendering cannot nest, so a new predicate ends the previous one first.
             if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
@@ -3974,12 +4086,16 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                    {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
                                     std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
             vk.set_scissor(command_buffer, 0, 1, &scissor);
-            const VkPrimitiveTopology topology = detail::vulkan_topology(draw->topology);
-            vk.set_primitive_topology(command_buffer, topology);
-            const bool restart = draw->indexed && detail::strip_topology(topology) &&
-                                 ((graphics.strip_cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
-                                  (graphics.strip_cut == 2 && d.index_type == VK_INDEX_TYPE_UINT32));
-            vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
+            // A mesh pipeline has no input assembly: its topology comes from the shader, and neither the topology
+            // nor primitive restart is dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065).
+            if (!draw->mesh) {
+                const VkPrimitiveTopology topology = detail::vulkan_topology(draw->topology);
+                vk.set_primitive_topology(command_buffer, topology);
+                const bool restart = draw->indexed && detail::strip_topology(topology) &&
+                                     ((graphics.strip_cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
+                                      (graphics.strip_cut == 2 && d.index_type == VK_INDEX_TYPE_UINT32));
+                vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
+            }
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
             vk.set_blend_constants(command_buffer, draw->blend_factor.data());
@@ -3988,7 +4104,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
             }
-            if (draw->indexed) {
+            if (draw->mesh) {
+                vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
+            } else if (draw->indexed) {
                 vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
                 vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,
                                 draw->first_instance);

@@ -270,9 +270,54 @@ Before this the 2,531 were tied to their buffers only as "followed by". The cens
 by other streams; this walk, with `bvh_index.classify`, finds all 2,531 followed by a `bvh4`, and all 271,637 BVH
 streams preceded by an instance descriptor (269,106 + 2,531). The 3 are not reproduced. What is new is what such a
 buffer holds: N BLAS, not one. 4,170 of the 6,701 BLAS sit past the first header of their stream, where an index
-that reads only the first `0x140` bytes of each stream does not see them. The matrices pair with the slots by
-position; that each is the geometry transform of the BLAS in its slot, as §4a measured for N = 1, is a
-**hypothesis** for N > 1 that needs the source geometry to test.
+that reads only the first `0x140` bytes of each stream does not see them. The descriptor stores one matrix per
+slot. ASSET-520 tests whether each matrix is the geometry transform of the BLAS at that position, as section 4a
+measured for N = 1.
+
+**Multi-slot geometry comparison.** Generate a local stream index with
+`python -I tools/rpf9_carve.py <core_bvh4.rpf> <index-dir> --index-only`. Supply that index and the manifests
+from one or more primary-LOD `rpf9dump models` exports, with each manifest beside its OBJs.
+
+```text
+python -I tools/bvh_slot_check.py <core_bvh4.rpf> <index-dir>/index.json <models>/manifest.json [...]
+```
+
+For incremental scans, pass `--save-evidence <private-file>` when checking a window. Add another
+manifest with `--prior <private-file>`, or combine independent saved scans by repeating `--prior`
+without any manifests. Either form can save the combined evidence. Keep these files local.
+Each run still checks the core archive and carve index. Evidence is tied to the index bytes, the
+multi-slot descriptor and BLAS contents, and the evidence-format version. A SHA-256 digest over the
+ordered, length-prefixed candidate buffers identifies repeats across scans. Two distinct candidates
+leave the slot ambiguous even if their matrix verdicts agree. `manifest_items` counts entries read
+across the input histories, including overlaps. The CLI prints an aggregate report to stdout.
+
+The tool splits each descriptor's following buffer by the low entry sizes, preserving empty slot indices.
+For descriptors with distinct matrices it searches the supplied drawables for an ordered sequence of geometries
+within one model. Triangle counts must agree per geometry, and the BLAS must have at least 30 paired leaves.
+In every pair, the two indexed triangles must share exactly two indices and the corner selected by the stored
+vertex-order byte must be the unshared vertex of the second triangle. A source is eligible only if this leaves
+one distinct sequence of float32 vertex and uint32 index buffers across the supplied exports. Additional exports
+can reveal a second source with the same topology. No transform, bounds or internal area enters this choice.
+
+For an eligible source the tool calls `bvh_geometry_check.check` with each distinct matrix in the descriptor,
+keeping the vertex and index buffers fixed. An `own_only` result requires the slot matrix to pass, every
+different matrix to fail and the passing matrix to occur in just one slot. Identical matrices or several passing
+slot choices that include the proposed one are non-discriminating. The output counts competing-only passes and
+cases where no matrix passes separately. A missing or ambiguous source leaves the slot unknown.
+
+On Xbox 1.0.2.1 the full core scan covered 2,531 descriptors, 6,701 occupied slots and 19 empty slots.
+Four primary-LOD export windows supplied 7,513 drawable manifest entries. Ten occupied slots across five
+descriptors passed with their own matrix and failed with the other distinct matrix. Zero passed only with an
+alternative. This supports positional pairing for those ten slots. In 2,679 slots all descriptor matrices were
+identical, 308 slots lacked sufficient topology, 3,694 had no topology match in these exports, and 10 had
+multiple distinct source buffers. Pairing remains unknown for those 6,691 slots.
+
+Two additional 1 GiB primary-LOD windows brought the total to 15,064 manifest entries. In the
+six-window scan, 43 slots in 25 descriptors passed only their own matrix, each rejecting one
+distinct alternative. Zero passed only an alternative. Of the remaining 6,658 occupied slots,
+2,679 had identical matrices, 308 lacked sufficient topology, 3,659 had no source match, 11 had
+multiple source buffers and one passed multiple matrix choices. Source uniqueness is relative
+to these exports.
 
 **Table template** (22,301 streams in core, 81 in the shared pack). Two arrays, each a pointer followed by a
 `u16 count, u16 capacity` pair:
@@ -499,7 +544,8 @@ the 10 samples, of its second LOD for most of the interior's other BLAS (below).
 is left out exactly when its shader is one of a set of shaders: the 65 geometries left out use 7 shader hashes, the
 67 kept use 8 others, and no hash is in both. Two of the 7 cover 54 of the 65; the other five occur only in the two
 drawables that hold decals and baked room dressing. (On the 8 samples identified first, the skipped geometries were
-read as using only two shaders; the decals drawable among them skips geometries of all 7.) The hashes stay out of
+read as using only two shaders; the decals drawable among them skips geometries of all 7.) The 7 hashes are not the
+rule: the material's render bucket is (ASSET-349, "Which geometries the BVH leaves out" below). The hashes stay out of
 this repository (§8). They are the shader-group
 hashes (first word of the shader record; shader group at drawable `+0x10`, pointer array at group `+0x10`, `u16`
 count at `+0x18`, shader index per geometry in the model's `u16` array at `+0x20`) that only skipped geometries
@@ -508,6 +554,42 @@ are the RAGE9 quantized-8 form: a 32-byte origin/axis/scale header at the vertex
 then one contiguous stream of 8-byte records; the other vertex attributes follow in their own streams, so the bytes
 per vertex of the whole block are not a position stride. The leaves address triangles in primitive order of the
 meshlet index buffer.
+
+**Which geometries the BVH leaves out (ASSET-349, measured; one rule with known exceptions).** The choice follows the
+render bucket of the geometry's material: the byte at `+57` of the shader record, with the bucket mask at `+60`
+(`third_party/rpf9-explorer/Core/RageModelDecoder.cs:680`; `rpf9dump models` writes the byte as `RenderBucket`). A
+geometry is kept when the low 7 bits of that byte are 0 or 3 and left out otherwise; bit 7 does not change the
+choice. What the buckets mean is not measured here (in earlier RAGE games 1 and 2 are the alpha and decal buckets;
+that is a hypothesis for this one).
+
+* *The 10 samples:* 132 of 132 geometries follow it (all 65 left out are bucket 1 or 2, all 67 kept bucket 0 or 3),
+  and for each of the 10 the kept geometries are exactly the BLAS's signature, with one consistent drawable each
+  (re-run against the 3 GiB window export).
+* *The whole archive:* a `rpf9dump models` export of all of `levels.rpf` (343,327 drawables, 346,785 models,
+  2,251,094 materials, 3,854,587 geometries; first LOD only) has bucket bytes 0-6 and 128-131: 3,091,235 geometries
+  kept by the rule and 763,352 left out, 70,334 models with both. Bit 7 is set on 35,339 materials.
+* *Signature equality over every stream:* of the 271,637 BVH streams of `core_bvh4.rpf`, 242,388 have a model whose
+  rule-kept triangle counts equal the stream's signature exactly (96,267 of the 125,180 streams with at least two
+  geometries and 64 triangles). Every other bucket set scores lower: keeping 0 and 3 but not 128 and 131 gives
+  240,984; keeping every geometry 197,117; keeping bucket 0 only 208,364; adding 1 to the kept set 228,214; adding 2
+  204,227; adding any of 4, 5, 6, 129 or 130 lowers the count by 5 to 128 streams. Second-LOD BLAS and drawables
+  outside the export cannot match a first-LOD export, so the rest are not counted against the rule.
+* *Geometry check:* of 300 random exact hits (at least two geometries, at most 40,000 triangles), 241 pass
+  `bvh_geometry_check.py` with the instance transform, and 59 do not. Those 59 have the same triangle counts as a
+  drawable that is not where the BLAS is (the check tests the geometry, not the counts); the checker tries at most 8
+  models per stream.
+* *Exceptions:* 511 such streams have no exact hit but match a model with one geometry's choice flipped. For 22 of
+  them that flipped candidate passes the geometry check: 34 geometries of bucket 1 (13) or 2 (21) that the BVH keeps.
+  No consistent candidate leaves out a bucket-0 or bucket-3 geometry. So the rule fails on at least 22 BLAS, always by
+  keeping a bucket-1 or bucket-2 geometry. What else marks those geometries is **open**.
+* *Shader hashes:* of the 309 shader-group hashes the export's geometries use, 212 occur only in kept buckets, 96 only
+  in left-out ones, and 1 in both (87 geometries in bucket 0, 1 each in buckets 1 and 2). That is why a hash list
+  cannot express the rule, and it is probably the one hash below that the interior's 130 BLAS both keep and leave out.
+  The note below says those 3 left-out geometries have the same bucket as the kept ones; that was not re-measured
+  here, and if it holds they belong with the exceptions above.
+
+`tools/bvh_match.py` applies the rule by default whenever every geometry of a model has a bucket in the manifest
+(`--no-bucket-rule` turns it off; `--skip-shaders` still adds hashes on top).
 
 **How a match is verified.** A byte-identical library result checks the packing, not the geometry: the model and
 the library agree on any input. These checks use what the dehydrated stream recorded from the true geometry:
@@ -640,8 +722,7 @@ converse fails: 1,008 (BLAS header, transform) pairs occur under more than one k
 can share both the BLAS and its transform: the key identifies something finer than that pair. What it hashes is open;
 #4199 (open) finds no more matches between these keys and the values of the table descriptors than chance gives.
 
-**Open:** what decides which geometries the BVH leaves out (13 shader hashes over the interior's 130 BLAS, and one
-hash both kept and left out); what decides the LOD a BLAS is built from; what the rest of the band of streams 231,012
+**Open:** why the BVH keeps the bucket-1 and bucket-2 geometries of at least 22 BLAS (ASSET-349 above); what decides the LOD a BLAS is built from; what the rest of the band of streams 231,012
 to 261,585 holds, and how the pack is ordered; why 4 exported archetypes with a kept shader have no BLAS; what
 the descriptor key at `+0x40` hashes; how the game picks the entity of a BLAS when the BLAS does not name it (the
 drawable match does it here); whether the game composes TLAS instances as `I * E * M^-1`; whether the runtime
@@ -788,9 +869,9 @@ export rather than a second decoder. It reads the leaf signature (triangles per 
 primitives counting as two), keeps every (drawable, model) of a `rpf9dump models` manifest whose per-geometry triangle
 counts contain that signature as an ordered subsequence, and checks the survivors with
 `tools/bvh_geometry_check.py` from the model's exported OBJ and the 3x4 at `+0x50` of the instance descriptor. The
-geometries of the shaders the BVH leaves out are filtered with `--skip-shaders`: those name hashes are game data,
-as §4a says, so the rule is off unless the user passes them. A geometry whose shader index the manifest cannot resolve
-keeps its place and the checks decide. Measured on the ten BLAS of the sample pack, against the first 1 GiB window of
+geometries the BVH leaves out are filtered by render bucket (§4a, ASSET-349: kept when the low 7 bits are 0 or 3);
+`--no-bucket-rule` turns that off and `--skip-shaders` adds shader name hashes on top (game data, local use only). A
+model with a geometry whose bucket the manifest cannot resolve keeps every geometry and the checks decide. Measured on the ten BLAS of the sample pack, against the first 1 GiB window of
 `levels.rpf` cut at 3 GB (exported as a whole slice): 1,228 models, 1 to 374 candidates from the signature per BLAS,
 and exactly one consistent candidate each. A window holds one region's drawables, so a BLAS whose drawable is
 elsewhere in the archive finds no candidate in it at all, and the tool says so instead of reporting a rejection. The
@@ -805,7 +886,7 @@ from its own compression blocks; a sub-range is never written to the index cache
 ```powershell
 dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
 dotnet tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll models <levels.rpf> <out> --start 3221225472 --length 1073741824
-python -I tools/bvh_match.py <dehydrated.bin> <out>/levels/models/manifest.json --descriptor <instance208.bin> [--skip-shaders H,H,...]
+python -I tools/bvh_match.py <dehydrated.bin> <out>/levels/models/manifest.json --descriptor <instance208.bin> [--no-bucket-rule] [--skip-shaders H,H,...]
 python -I tests/test_bvh_match.py
 ```
 

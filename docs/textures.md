@@ -32,7 +32,12 @@ resumes from the DDS files already written.
 stdlib-only BCPack decoder (`tools/bcpack.py`, `tools/bcpack_tables.py`,
 `tools/bcpack_tables_bptc.py`) now decodes the rANS entropy layer and rebuilds BC blocks
 for all six active modes (BC1, BC3, BC4, BC5, BC6H and BC7 — 100% of BCPack codecs in the
-corpus). Strict confirmed-history mode is the default; `--allow-provisional` enables the
+corpus). To inspect or decode one raw BCPack stream from the command line, `tools/bcpack_tool.py`
+wraps the same decoder: `inspect <in.bin> --codec <1..7> --size <uncompressed_bytes> [--json]` prints
+the stream's header, entropy statistics and validation results; `decode <in.bin> <out.bin> --codec <1..7>
+--size <uncompressed_bytes> [--provisional]` writes the rebuilt BC blocks; `profile <in.bin> --codec <1..7>
+--size <uncompressed_bytes>` reports per-symbol frequency statistics. Strict confirmed-history mode is
+the default; `--allow-provisional` enables the
 provisional and last-resort history entries, and `--history <path>` supplies locally
 calibrated BC6H/BC7 initial history JSON tables at run time (no fitted BC6H/BC7 history
 data is embedded in the repository). `rpf9dump`'s C# `TtpfReader` (submodule pin `e293917`,
@@ -183,6 +188,15 @@ mode 1/32 descriptors have a known element size (4 mode 1, 11 mode 32); all fift
 64 KiB allocation span and one (`maps_4_7` #6034) decodes at 0.00–0.33 levels (see below). The
 other 19 mode 1 records formerly counted as unknown-format 2D entries are two-slice 2D arrays
 (`depth = 2`, DXGI 28/71/83/98; see `docs/textures_arrays.md`).
+
+Where one descriptor's mode is still in doubt, `tools/tex_mode_probe.py <textures index.json>
+<carve dir> [--fmt BC1] [--n 12]` scores every 4 KiB and 64 KiB addrlib colour pattern of the
+element size, crossed with both placements of the top mip (at the data offset, or at the end of
+the chain, since GFX10 stores mips smallest first), by the smoothness of the decoded BC1/BC2/BC3
+average colours. It prints the best and second-best pattern with the placement and the linear
+(untiled) score per texture, then a tally of the winners and how many textures no candidate fit.
+It needs numpy, like `tests/test_tex_mode_probe.py`, which covers it on synthetic blobs with no
+game files.
 
 ### The layout is the AMD mip tail
 
@@ -1046,7 +1060,7 @@ All 1,315 system streams are RAGE `pgDictionary<grcTexture>` pages containing de
 
 ## Reproduce
 
-The normal `make_game.py` assets stage now fills missing and partial BCPack DDS entries in the same pool manifests used for model texture lookup. It uses strict decoding by default and discovers an optional local reconstruction profile at `<work>/bcpack-calibration.json`. The single-entry exporter accepts the same profile through `--calibration`. Build instructions, the JSON schema and the game-independent test are in the [calibrated export guide](../tools/bcpack_calibration/README.md).
+The normal `make_game.py` assets stage now fills missing and partial BCPack DDS entries in the same pool manifests used for model texture lookup. It uses strict decoding by default and discovers an optional local reconstruction profile at `<work>/bcpack-calibration.json`. The pass stamp in each pool manifest hashes the decoder modules (`ttpf_assets.DECODER_SOURCES`) and the profile, so a pool is done again after either changes. The single-entry exporter accepts the same profile through `--calibration`. Build instructions, the JSON schema and the game-independent test are in the [calibrated export guide](../tools/bcpack_calibration/README.md).
 
 `tools/ttpf_mips.py` is the read-only measurement and decode tool (with `tools/bcpack.py`
 enabled in strict confirmed-history mode by default), and `tools/bcpack_history_calib.py`

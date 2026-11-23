@@ -13,7 +13,7 @@ rsc8_audio.decode_marker_records, which checks one tag, where this tool reports 
 An archive is walked for `ADAT` banks with rsc8_audio.parse_adat_at_file, the same header parser and the same bank
 set as rsc8_audio.scan_rpf, but each parsed bank is jumped over, so only the headers, the gaps between banks and the
 marker tags are read (under a minute for the 28.5 GB audio.rpf on an NVMe drive). A directory is scanned
-recursively for *.awc.
+recursively for *.awc. An unreadable bank or directory fails the scan without publishing partial counts.
 
 Banks are reported in two groups: `streamed_music` (the bank has a 0x48 descriptor) and `other`. A chunk is compared
 with the length of its own stream in 48 kHz frames: for streamed music the descriptor channel with the stream's id
@@ -172,8 +172,11 @@ def _finish(group: dict) -> dict:
 def scan(src: str) -> dict:
     """The report for an archive, one bank or a directory of banks."""
     if os.path.isdir(src):
-        paths = sorted(os.path.join(root, f) for root, _dirs, files in os.walk(src) for f in files
-                       if f.lower().endswith(".awc"))
+        def scan_failed(error):
+            raise error
+
+        paths = sorted(os.path.join(root, f) for root, _dirs, files in os.walk(src, onerror=scan_failed)
+                       for f in files if f.lower().endswith(".awc"))
     else:
         paths = [src]
     groups = {"streamed_music": _new_group(), "other": _new_group()}
@@ -201,7 +204,11 @@ def main(argv=None) -> int:
     if not os.path.exists(a.src):
         print(f"awc_markers: error: {a.src}: no such file or directory", file=sys.stderr)
         return 2
-    report = scan(a.src)
+    try:
+        report = scan(a.src)
+    except OSError as error:
+        print(f"awc_markers: error: cannot read {error.filename or a.src}: {error.strerror or error}", file=sys.stderr)
+        return 1
     if a.out:
         with open(a.out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(report, f, indent=2)

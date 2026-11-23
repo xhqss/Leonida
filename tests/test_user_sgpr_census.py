@@ -1,16 +1,19 @@
 """tools/user_sgpr_census.py on hand-written index.json data (no game files, no GPU)."""
+import contextlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
+import report_paths  # noqa: E402
 import user_sgpr_census as usc  # noqa: E402
 
 
@@ -97,8 +100,9 @@ def test_the_two_packing_models_are_told_apart():
     assert b["below_base"] == {"s1:const32": 1}
 
 
-@pytest.mark.parametrize("output_kind", ["same-path", "relative-alias", "hard-link"])
+@pytest.mark.parametrize("output_kind", ["same-path", "relative-alias", "hard-link", "folding-volume-case"])
 def test_json_report_refuses_to_overwrite_index(tmp_path, capsys, output_kind):
+    assert usc.same_report_path is report_paths.same_report_path
     index = tmp_path / "index.json"
     original = json.dumps(INDEX).encode("utf-8")
     index.write_bytes(original)
@@ -113,9 +117,19 @@ def test_json_report_refuses_to_overwrite_index(tmp_path, capsys, output_kind):
             output.hardlink_to(index)
         except OSError as err:
             pytest.skip(f"hard links unavailable: {err}")
+    elif output_kind == "folding-volume-case":
+        output = tmp_path / "INDEX.JSON"
 
-    with pytest.raises(SystemExit) as exc:
-        usc.main([str(index), "--json", str(output)])
+    probe = mock.Mock(return_value=True)
+    ctx = (mock.patch.multiple(report_paths, path_key=mock.Mock(side_effect=str),
+                               same_name_on_folding_volume=probe)
+           if output_kind == "folding-volume-case" else contextlib.nullcontext())
+    with ctx, (mock.patch.object(os.path, "samefile", side_effect=OSError("not same"))
+               if output_kind == "folding-volume-case" else contextlib.nullcontext()):
+        with pytest.raises(SystemExit) as exc:
+            usc.main([str(index), "--json", str(output)])
+    if output_kind == "folding-volume-case":
+        probe.assert_called_once()
 
     assert exc.value.code == 2
     assert "--json must not overwrite the input index" in capsys.readouterr().err
@@ -257,6 +271,16 @@ def test_entries_without_stage_or_reads_are_still_counted(tmp_path, capsys):
     assert capsys.readouterr().err == ""
 
 
+def test_load_index_accepts_utf8_bom(tmp_path):
+    index = tmp_path / "index.json"
+    index.write_bytes(b"\xef\xbb\xbf" + json.dumps(INDEX).encode("utf-8"))
+    assert usc.load_index(index) == INDEX
+    report = tmp_path / "report.json"
+    result = run_cli(index, "--json", report)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(report.read_text(encoding="utf-8"))["ps"]["lowest_pointer_sgpr"] == {"s8": 2, "s9": 1}
+
+
 @pytest.mark.parametrize("kind", ["missing-folder", "folder", "under-a-file"])
 def test_cli_unwritable_report_is_one_error_line(tmp_path, kind):
     index = tmp_path / "index.json"
@@ -339,6 +363,24 @@ def test_unpaired_shaders_only_feed_the_control():
     pc = usc.pair_census(index)
     assert pc["techniques_with_vs_and_ps"] == 0 and pc["combinations"] == 0
     assert pc["control_all_vs_ps"] == {"combinations": 1, "shared_same_kind": 1, "shared_different_kind": 1}
+
+
+def test_index_saved_with_a_utf8_bom_is_read(tmp_path, capsys):
+    """A carve index edited on Windows can carry a BOM; it is still the same JSON."""
+    p = tmp_path / "index.json"
+    p.write_bytes(b"\xef\xbb\xbf" + json.dumps(INDEX).encode("utf-8"))
+    assert usc.main([str(p)]) == 0
+    out = capsys.readouterr()
+    assert "ps: 3 shaders" in out.out
+    assert "ERROR" not in out.err
+
+
+def test_bom_does_not_hide_broken_json(tmp_path, capsys):
+    """Skipping the BOM still leaves a strict JSON parse: a broken index is one ERROR line and exit 2."""
+    p = tmp_path / "index.json"
+    p.write_bytes(b"\xef\xbb\xbf{\"a.ps\": }")
+    assert usc.main([str(p)]) == 2
+    assert "ERROR: cannot read" in capsys.readouterr().err
 
 
 def test_pairs_cli_writes_the_report_and_no_names():

@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 TOOLS_DIR = os.path.join(os.path.dirname(TESTS_DIR), "tools")
@@ -13,6 +14,7 @@ if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
 import fog_volumes as fv  # noqa: E402
+import pool_workers  # noqa: E402
 
 SYS = 0x50000000
 
@@ -230,6 +232,45 @@ class FogVolumesTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 fv.main([os.path.join(td, "missing.rpf")])
             self.assertEqual(cm.exception.code, 2)
+
+    def test_jobs_below_one_is_a_usage_error(self):
+        # A --jobs of 0 used to run with max(1, 0) = one worker and exit 0, so a caller that meant to ask for
+        # an impossible worker count got a silent sequential run instead of an error.
+        with tempfile.TemporaryDirectory() as td:
+            for bad in ("0", "-3"):
+                with self.assertRaises(SystemExit) as cm:
+                    fv.main([td, "--jobs", bad])
+                self.assertEqual(cm.exception.code, 2)
+
+
+    def test_pool_is_capped_at_the_platform_limit(self):
+        # A --jobs above the worker-process limit used to reach ProcessPoolExecutor unchanged; on Windows the
+        # constructor then raises ValueError(max_workers must be <= 61). The other pool tools lower it with
+        # pool_workers.process_workers. 61 is forced here so the check does not depend on the host OS.
+        seen = []
+
+        class RecordingPool:
+            def __init__(self, max_workers=None):
+                seen.append(max_workers)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def map(self, fn, iterable):
+                return [([], 0, 0) for _ in iterable]
+
+        with tempfile.TemporaryDirectory() as td:
+            rpf = os.path.join(td, "big.rpf")
+            with open(rpf, "wb") as f:
+                f.write(b"\x00" * (9 * 1024 * 1024))     # three 4 MiB chunks, so the pool branch is taken
+            with mock.patch.object(pool_workers, "MAX_PROCESS_WORKERS", 61), \
+                    mock.patch.object(fv.concurrent.futures, "ProcessPoolExecutor", RecordingPool):
+                offs, complete, incomplete = fv._scan_rpf_offsets(rpf, jobs=200)
+        self.assertEqual((offs, complete, incomplete), ([], 0, 0))
+        self.assertEqual(seen, [61])
 
 
 if __name__ == "__main__":

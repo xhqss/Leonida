@@ -797,6 +797,7 @@ class QueryTest(unittest.TestCase):
                     "native64_compute": want_native64 or label == "missing_mesh_stage_bit",
                     "native64": want_native64,
                     "per_vertex_inputs": True,
+                    "barycentric_fallback": False,
                     "max_push_constants_size": 256,
                     "vendor_id": 0,
                     "device_id": 0,
@@ -819,6 +820,54 @@ class QueryTest(unittest.TestCase):
             with self.subTest(case=label):
                 res, _vk = self._run_query(FakeDevice(fragment_shader_barycentric=bary, driver_id=driver))
                 self.assertIs(res["per_vertex_inputs"], want)
+
+    def test_barycentric_fallback(self):
+        for label, driver, want in (("anv", vk_info.VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, True),
+                                    ("radv", 3, False), ("intel_windows", 5, False)):
+            with self.subTest(case=label):
+                res, _vk = self._run_query(FakeDevice(driver_id=driver))
+                self.assertIs(res["barycentric_fallback"], want)
+        self.assertEqual(vk_info.VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, 6)
+
+    def test_barycentric_fallback_rejects_an_intel_windows_fake(self):
+        """Intel Windows uses its Windows driver ID, not ANV; the fake must carry Intel's vendor ID."""
+        res, _vk = self._run_query(FakeDevice(name="Intel Arc", vendor_id=0x8086, device_id=0xE20B,
+                                               driver_id=5))
+        self.assertFalse(res["barycentric_fallback"])
+        self.assertEqual(vk_info.VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, 6)
+
+    def test_barycentric_fallback_gfx90c_amd_windows(self):
+        """#5933: gfx90c iGPUs (amdgpu's CHIP_RENOIR IDs) under AMD's proprietary driver (driver ID 1) take the
+        fallback; RADV on the same chip, other GCN 5 parts, RDNA iGPUs and other vendors do not. Literal IDs, so a
+        changed constant or table fails here."""
+        cases = (("vega8_barcelo", 0x1002, 0x15E7, 1, True), ("renoir", 0x1002, 0x1636, 1, True),
+                 ("cezanne", 0x1002, 0x1638, 1, True), ("lucienne", 0x1002, 0x164C, 1, True),
+                 ("vega8_radv", 0x1002, 0x15E7, 3, False), ("vega8_amdvlk_open", 0x1002, 0x15E7, 2, False),
+                 ("raven_gfx902", 0x1002, 0x15DD, 1, False), ("picasso_gfx902", 0x1002, 0x15D8, 1, False),
+                 ("vega10_card", 0x1002, 0x687F, 1, False), ("vega20_card", 0x1002, 0x66AF, 1, False),
+                 ("raphael_rdna2_igpu", 0x1002, 0x164E, 1, False), ("rdna3_780m", 0x1002, 0x15BF, 1, False),
+                 ("other_vendor_same_id", 0x10DE, 0x15E7, 1, False),
+                 ("intel_windows", 0x8086, 0x15E7, 5, False), ("anv", 0x8086, 0xE20B, 6, True))
+        for label, vendor, device, driver, want in cases:
+            with self.subTest(case=label):
+                self.assertIs(vk_info.barycentric_fallback(vendor, device, driver), want)
+                self.assertIs(vk_info.gfx90c_amd_windows(vendor, device, driver), want and driver == 1)
+                res, _vk = self._run_query(FakeDevice(vendor_id=vendor, device_id=device, driver_id=driver))
+                self.assertEqual((res["vendor_id"], res["device_id"], res["driver_id"]), (vendor, device, driver))
+                self.assertIs(res["barycentric_fallback"], want)
+
+    def test_barycentric_fallback_answer_is_for_the_runtime_gpu(self):
+        """A Vega 8 iGPU next to an NVIDIA card: the runtime takes the discrete card, so no fallback; alone, it does."""
+        vega8 = FakeDevice(name="AMD Radeon(TM) Graphics", device_type=1, vendor_id=0x1002, device_id=0x15E7)
+        nvidia = FakeDevice(name="NVIDIA GeForce", vendor_id=0x10DE, device_id=0x2882, driver_id=4,
+                            min_subgroup_size=32, max_subgroup_size=32)
+        for devs in ((vega8, nvidia), (nvidia, vega8)):
+            with self.subTest(order=[d.name for d in devs]):
+                res, _vk = self._run_query(*devs)
+                self.assertEqual(res["device"], "NVIDIA GeForce")
+                self.assertIs(res["barycentric_fallback"], False)
+        res, _vk = self._run_query(vega8)
+        self.assertIs(res["barycentric_fallback"], True)
 
     def test_stage_caps_preserve_graphics_stage_bits(self):
         supported = 0x01 | 0x08 | 0x10 | 0x20

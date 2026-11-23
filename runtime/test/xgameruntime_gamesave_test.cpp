@@ -296,6 +296,72 @@ int main() {
     check(at<FilesQuota>(save, 32)(save, user, "SCID", &fquota) == S_OK && fquota == (int64_t{1} << 30),
           "FilesGetRemainingQuota of an empty folder");
 
+    // ---- a handle that outlives its container, after the heap hands the address out again ----
+    // An update and an async read keep the container handle they were made from. Once that container is closed, the
+    // next container may get the same address; the stale update and read must still be refused, not write into or
+    // read from the newer container (another save).
+    {
+        Handle first = nullptr, stale_update = nullptr;
+        check(at<Create>(save, 16)(save, provider, "first", &first) == S_OK &&
+                  at<Create>(save, 23)(save, first, nullptr, &stale_update) == S_OK &&
+                  at<Write>(save, 25)(save, stale_update, "mine", reinterpret_cast<const uint8_t*>("first's"), 7) == S_OK,
+              "an update of container \"first\" buffers a blob");
+        XTaskQueueHandle manual = nullptr;
+        XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &manual);
+        XAsyncBlock stale_read{};
+        stale_read.queue = manual;
+        check(manual && at<ReadAsync>(save, 21)(save, first, nullptr, 0, &stale_read) == S_OK,
+              "a ReadBlobDataAsync of \"first\" waits on a manual queue");
+        at<Close>(save, 17)(save, first);
+
+        // Containers are made until one lands at the closed container's address (most heaps hand it back at once).
+        Handle second = nullptr;
+        std::vector<Handle> others;
+        for (int i = 0; i < 4096 && !second; ++i) {
+            Handle c = nullptr;
+            if (at<Create>(save, 16)(save, provider, "second", &c) != S_OK) break;
+            if (c == first) second = c;
+            else others.push_back(c);
+        }
+        for (Handle c : others) at<Close>(save, 17)(save, c);
+        if (!second) {
+            std::printf("SKIP the heap never reused a closed container's address; the stale-handle checks need it\n");
+        } else {
+            Handle theirs = nullptr;
+            check(at<Create>(save, 23)(save, second, nullptr, &theirs) == S_OK &&
+                      at<Write>(save, 25)(save, theirs, "theirs", reinterpret_cast<const uint8_t*>("second's"), 8) ==
+                          S_OK &&
+                      at<Submit>(save, 27)(save, theirs) == S_OK,
+                  "container \"second\", at the closed container's address, gets a blob of its own");
+            at<Close>(save, 24)(save, theirs);
+            check(at<Submit>(save, 27)(save, stale_update) == E_GS_HANDLE_EXPIRED,
+                  "SubmitUpdate of an update whose container was closed is refused, though a new container has its "
+                  "address");
+            check(!std::filesystem::exists(root / L"local-user" / L"second" / L"mine"),
+                  "the stale update wrote nothing into the container that took its container's address");
+        }
+        while (XTaskQueueDispatch(manual, XTaskQueuePort::Work, 0) ||
+               XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0)) {}
+        if (second) {
+            size_t stale_size = 0;
+            const HRESULT read_hr = XAsyncGetStatus(&stale_read, false);
+            XAsyncGetResultSize(&stale_read, &stale_size);
+            check(read_hr == E_GS_HANDLE_EXPIRED && stale_size == 0,
+                  "ReadBlobDataAsync of a closed container completes with E_GS_HANDLE_EXPIRED, not with the blobs of "
+                  "the container that took its address");
+            at<Close>(save, 17)(save, second);
+        }
+        if (XAsyncGetStatus(&stale_read, false) == S_OK) {   // collect a result so the async state is released
+            std::vector<uint64_t> drain(1024);
+            uint32_t drained = 0;
+            at<ReadResult>(save, 22)(save, &stale_read, drain.size() * 8, reinterpret_cast<Blob*>(drain.data()), &drained);
+        }
+        at<Close>(save, 24)(save, stale_update);
+        if (manual) XTaskQueueCloseHandle(manual);
+        std::filesystem::remove_all(root / L"local-user" / L"first", ec);
+        std::filesystem::remove_all(root / L"local-user" / L"second", ec);
+    }
+
     at<Close>(save, 6)(save, provider);
     at<Close>(save, 6)(save, provider2);
     at<Close>(save, 6)(save, provider);   // twice: ignored

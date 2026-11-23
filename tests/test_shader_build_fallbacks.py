@@ -21,6 +21,7 @@ import types
 import unittest
 from pathlib import Path
 from unittest import mock
+from types import SimpleNamespace
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "runtime", "test", "shaders", "build.py")
@@ -100,10 +101,19 @@ class BuildUnderFallbackTest(unittest.TestCase):
         self.assertIn("ps_interp_f16_high", published)   # the f16 halves still translate under this fallback
 
     def test_without_a_fallback_ps_ij_computed_is_still_built(self):
-        status, printed = self.run_build(["cs_store", "ps_ij_computed"], {})
+        status, printed = self.run_build(["cs_store", "ps_ij_computed"], {"LEONIDA_BARY_FALLBACK": "0"})
         self.assertEqual(status, 0, printed)
         self.assertEqual(self.asked, [["cs_store", "ps_ij_computed"]])
         self.assertTrue((self.out / "spirv" / "ps_ij_computed.spv").is_file())
+
+    def test_standalone_barycentric_override_and_probe(self):
+        for value, probe, want in (("1", False, True), ("0", True, False),
+                                   ("", True, True), ("", False, False)):
+            with self.subTest(value=value, probe=probe), \
+                    mock.patch.dict(os.environ, {"LEONIDA_BARY_FALLBACK": value}, clear=False):
+                proc = SimpleNamespace(stdout=json.dumps({"barycentric_fallback": probe}) + "\n")
+                with mock.patch.object(self.build.subprocess, "run", return_value=proc):
+                    self.assertIs(self.build.barycentric_fallback(), want)
 
     def test_a_missing_module_without_a_fallback_still_fails_the_batch(self):
         keep = self.fake_translate

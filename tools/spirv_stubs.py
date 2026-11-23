@@ -294,7 +294,7 @@ def main(argv=None):
     if not os.path.isfile(idx_path):
         sys.exit(f"missing {idx_path}")
     try:
-        with open(idx_path, encoding="utf-8") as f:
+        with open(idx_path, encoding="utf-8-sig") as f:
             index = json.load(f)
     except (OSError, ValueError) as e:
         sys.exit(f"cannot read {idx_path}: {e}")

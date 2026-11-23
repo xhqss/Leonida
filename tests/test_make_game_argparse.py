@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -147,6 +147,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
             "--game", self.game_dir,
             "--out", self.out_dir,
             "--work", self.work_dir,
+            "--no-tui",
             *extra_args,
         ]
         with patch.object(sys, "argv", base_argv):
@@ -222,36 +223,40 @@ class StageValidationAndSequencingTest(unittest.TestCase):
         mocks["runtime"].assert_not_called()
         mocks["pipelines"].assert_not_called()
 
-    def test_stage_sequencing_preserves_canonical_order(self):
-        """Even if user specifies stages out of order, execution follows shaders -> assets -> runtime -> pipelines.
+    def test_independent_stages_all_run_when_listed_out_of_order(self):
+        """shaders/assets/runtime overlap; pipelines starts after shaders and a selected runtime finish.
         wave64_settings is patched: left to probe the installed GPU it returns keep_emulated=False on native-wave64
         RDNA2 under the AMD Windows driver, and the test then failed there (TEST-461)."""
         manager = MagicMock()
         with patch.object(sys, "argv", ["make_game.py", "--game", self.game_dir,
-                                        "--out", self.out_dir, "--work", self.work_dir,
+                                        "--out", self.out_dir, "--work", self.work_dir, "--no-tui",
                                         "--stages", "pipelines,runtime,assets,shaders"]), \
                 patch("make_game.wave64_settings", return_value=(False, True)):
             with patch("make_game.below_normal"):
                 with patch("make_game.check", return_value={"expected_exe": "Leonida.exe"}):
                     with patch("make_game.preflight"):
                         with patch("make_game.log"):
-                            with patch("make_game.shaders", manager.shaders):
-                                with patch("make_game.assets", manager.assets):
-                                    with patch("make_game.runtime", manager.runtime):
-                                        with patch("make_game.pipelines", manager.pipelines):
-                                            ret = make_game.main()
-                                            self.assertEqual(ret, 0)
+                            with patch("make_game.pipeline_check_exe", return_value="vk_pipeline_check"):
+                                with patch("make_game.shaders", manager.shaders):
+                                    with patch("make_game.assets", manager.assets):
+                                        with patch("make_game.runtime", manager.runtime):
+                                            with patch("make_game.pipelines", manager.pipelines):
+                                                ret = make_game.main()
+                                                self.assertEqual(ret, 0)
 
-        expected_calls = [
-            call.shaders(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), unittest.mock.ANY,
-                         emulate=unittest.mock.ANY, keep_emulated=True, fallbacks=unittest.mock.ANY),
-            call.assets(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), False, unittest.mock.ANY),
-            call.runtime(os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY, None,
-                         unittest.mock.ANY, work=os.path.abspath(self.work_dir)),
-            call.pipelines(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir), unittest.mock.ANY,
-                           runtime_build=None),
-        ]
-        self.assertEqual(manager.mock_calls, expected_calls)
+        manager.shaders.assert_called_once_with(
+            os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), unittest.mock.ANY,
+            emulate=unittest.mock.ANY, keep_emulated=True, fallbacks=unittest.mock.ANY)
+        manager.assets.assert_called_once_with(
+            os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), False, unittest.mock.ANY,
+            dump_jobs=unittest.mock.ANY)
+        self.assertIsNotNone(manager.assets.call_args.kwargs["dump_jobs"])
+        manager.runtime.assert_called_once_with(
+            os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY, None,
+            unittest.mock.ANY, work=os.path.abspath(self.work_dir))
+        manager.pipelines.assert_called_once_with(
+            os.path.abspath(self.work_dir), os.path.abspath(self.out_dir), unittest.mock.ANY,
+            runtime_build=None)
 
     def test_single_stage_execution_isolates_stages(self):
         for stage in ("shaders", "assets", "runtime", "pipelines"):
@@ -314,7 +319,7 @@ class JobsHandlingTest(unittest.TestCase):
             work = os.path.join(tmp, "work")
             os.makedirs(game)
             with patch.object(sys, "argv", ["make_game.py", "--game", game, "--out", out, "--work", work,
-                                            "--stages", "shaders", "--jobs", "6"]):
+                                            "--no-tui", "--stages", "shaders", "--jobs", "6"]):
                 with patch("make_game.below_normal"):
                     with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
                         with patch("make_game.preflight") as mock_preflight:
@@ -322,6 +327,7 @@ class JobsHandlingTest(unittest.TestCase):
                                 with patch("make_game.shaders") as mock_shaders, \
                                         patch("make_game.wave64_settings", return_value=(True, True)) as probe, \
                                         patch("make_game.runtime_gpu_per_vertex", return_value=None), \
+                                        patch("make_game.runtime_gpu_barycentric_fallback", return_value=None), \
                                         patch("make_game.runtime_gpu_max_push_constants", return_value=None):
                                     ret = make_game.main()
                                     self.assertEqual(ret, 0)
@@ -339,7 +345,7 @@ class JobsHandlingTest(unittest.TestCase):
             work = os.path.join(tmp, "work")
             os.makedirs(game)
             with patch.object(sys, "argv", ["make_game.py", "--game", game, "--out", out, "--work", work,
-                                            "--stages", "assets", "--wav", "--jobs", "10"]):
+                                            "--no-tui", "--stages", "assets", "--wav", "--jobs", "10"]):
                 with patch("make_game.below_normal"):
                     with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
                         with patch("make_game.preflight"):
@@ -347,7 +353,8 @@ class JobsHandlingTest(unittest.TestCase):
                                 with patch("make_game.assets") as mock_assets:
                                     ret = make_game.main()
                                     self.assertEqual(ret, 0)
-                                    mock_assets.assert_called_once_with(os.path.abspath(game), os.path.abspath(work), True, 10)
+                                    mock_assets.assert_called_once_with(
+                                        os.path.abspath(game), os.path.abspath(work), True, 10, dump_jobs=None)
 
     def test_translate_spawns_exact_job_count(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -355,7 +362,7 @@ class JobsHandlingTest(unittest.TestCase):
             spirv = os.path.join(tmp, "spirv")
             os.makedirs(disasm)
             mock_proc = MagicMock()
-            mock_proc.wait.return_value = 0
+            mock_proc.poll.return_value = 0
             with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
                 with patch("make_game.py") as mock_py:
                     with patch("make_game.log"):

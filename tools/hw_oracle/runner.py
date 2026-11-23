@@ -291,7 +291,9 @@ class Oracle:
                            capture_output=True, text=True)
         if r.returncode:
             return None, r.stderr
-        r = subprocess.run([self.lld, "-shared", o, "-o", co], capture_output=True, text=True)
+        # Some Windows LLD builds default to PE even when the input object is AMDGPU ELF.
+        r = subprocess.run([self.lld, "-m", "elf64_amdgpu", "-shared", o, "-o", co],
+                           capture_output=True, text=True)
         if r.returncode:
             return None, r.stderr
         return co, ""

@@ -35,8 +35,10 @@ import tempfile
 import zlib
 from collections import Counter
 
+# `python -I` leaves the script's directory off sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from shader_stage_manifest import shader_stems  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 # Defensive per-blob ceiling, not a maximum defined by the XBCH format.
 # 64 MiB matches the repository's existing per-resource cap in tools/world_index.py.
@@ -220,7 +222,7 @@ def main(argv=None) -> int:
             json.dump(rows, f)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, os.path.join(src, "fssm_index.json"))
+        replace_retry(tmp, os.path.join(src, "fssm_index.json"))   # a scanner or sync client may hold tmp briefly on Windows
     print("magic:", dict(Counter(r["magic"] for r in rows)))
     print("s_endpgm per blob:", dict(Counter(len(r["endpgm"]) for r in rows)))
     sizes = sorted(r["size"] for r in rows)

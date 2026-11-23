@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; s_buffer_load with a stride (limit = NUM_RECORDS * stride bytes) and SMEM address truncation: base, soffset and
 ; imm are each truncated to a multiple of 4 before they are added. Rules measured on an AMD Radeon RX 6800 (gfx1030)
 ; as a raw compute kernel (docs/design.md, Scalar/buffer memory).

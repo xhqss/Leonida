@@ -16,7 +16,7 @@ the AnyPS5 project, in all four IEEE/DX10_CLAMP mode combinations and in wave32 
     - The custom mantissa payload in bits [21:0] is preserved where possible by unary rounding / transcendental
       ops (v_floor_f32, v_ceil_f32, v_trunc_f32, v_rndne_f32).
   * v_min/v_max (f32, f16, each half of v_pk_min/max_f16): one NaN operand gives the other operand, bits
-    unchanged; -0 < +0. Both NaN: here only "a NaN", since NMin/NMax leave the payload open.
+    unchanged; -0 < +0. Both NaN: returns src0's exact bits (preserving quiet/signalling NaN payloads).
   * v_min3/v_max3 = f(f(s0, s1), s2) with that min/max.
   * v_med3: with any NaN operand the result is min3(s0, s1, s2); otherwise the median.
   * v_fract_f32: a result that rounds to 1.0 is 0x3f7fffff instead (f16: 0x3bff); fract(-0) = +0,
@@ -389,6 +389,129 @@ class GpuFixtures(unittest.TestCase):
         words = support.mrt0_words(spv, push_constants=[0x1000, 0, 16, 0] + [0] * 28,
                                    memory={0x1000 + 4 * i: w for i, w in enumerate(heap)})
         self.assertEqual(words, [0xAAAA4500, 0xAAAA4500, 0xAAAAC100, 0xAAAA4700])
+
+
+class AllNaNSrc0PayloadTests(unittest.TestCase):
+    """All-NaN operands in f16 and 3-input min/max/med3 preserve src0's NaN bits (including sNaN under IEEE=0)."""
+
+    @staticmethod
+    def _run_with_old(line: str, inputs: tuple[int, ...], old: int = 0xDEADBEEF) -> int:
+        spv = translate_text(LOAD + f"v_mov_b32_e32 v0, {old:#x}\n" + line + "\nexp mrt0 v0, v0, v0, v0 done vm\ns_endpgm")
+        mem = {0x1000 + 4 * i: w for i, w in enumerate((list(inputs) + [0] * 4)[:4])}
+        return support.mrt0_words(spv, push_constants=PUSH, memory=mem)[0]
+
+    def test_f16_all_nan_keeps_src0_and_mods(self):
+        snan, qnan_a, qnan_b = 0x7C01, 0x7E02, 0xFE22
+        for op in ("v_min_f16_e32", "v_max_f16_e32"):
+            with self.subTest(op=op):
+                self.assertEqual(self._run_with_old(f"{op} v0, v1, v2", (0xAAAA0000 | snan, 0xBBBB0000 | qnan_a)),
+                                 0xDEAD0000 | snan)
+                self.assertEqual(self._run_with_old(f"{op} v0, v1, v2", (0xAAAA0000 | qnan_b, 0xBBBB0000 | snan)),
+                                 0xDEAD0000 | qnan_b)
+        self.assertEqual(
+            self._run_with_old("v_min_f16_e64 v0, -v1, v2 op_sel:[1,0,1]", ((snan << 16) | 0x3C00, qnan_a)),
+            ((snan ^ 0x8000) << 16) | 0xBEEF,
+        )
+        self.assertEqual(
+            self._run_with_old("v_max_f16_e64 v0, |v1|, v2", (snan | 0x8000, qnan_a)),
+            0xDEAD0000 | snan,
+        )
+        self.assertEqual(
+            self._run_with_old(
+                "v_min_f16_sdwa v0, -v1, v2 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1 src1_sel:WORD_0",
+                ((snan << 16) | 0x1111, 0x22220000 | qnan_a),
+            ),
+            ((snan ^ 0x8000) << 16) | 0xBEEF,
+        )
+        for op in ("v_min3_f16", "v_max3_f16", "v_med3_f16"):
+            with self.subTest(op=op):
+                self.assertEqual(self._run_with_old(f"{op} v0, v1, v2, v3", (snan, qnan_a, qnan_b)), 0xDEAD0000 | snan)
+                self.assertEqual(
+                    self._run_with_old(f"{op} v0, -|v1|, v2, v3 op_sel:[1,0,0,1]", ((snan << 16), qnan_a, qnan_b)),
+                    ((snan ^ 0x8000) << 16) | 0xBEEF,
+                )
+                self.assertEqual(
+                    self._run_with_old(f"{op} v0, v1, v2, v3", (snan, qnan_a, 0x3C00)),
+                    0xDEAD3C00,
+                )
+                self.assertEqual(
+                    self._run_with_old(f"{op} v0, 0x7c01, v1, v2", (qnan_a, qnan_b)),
+                    0xDEAD7C01,
+                )
+
+    def test_pk_minmax_f16_all_nan_per_lane(self):
+        # Lane 0 all-NaN keeps src0 sNaN (0x7C01), lane 1 picks finite -2.5 (0xC100) over qNaN.
+        for op in ("v_pk_min_f16", "v_pk_max_f16"):
+            with self.subTest(op=op):
+                self.assertEqual(run_op(f"{op} v0, v1, v2", (0xFE117C01, 0xC1007E02)), 0xC1007C01)
+                self.assertEqual(run_op(f"{op} v0, v1, v2", (0xFC053C00, 0x7E007C01)), 0xFC053C00)
+        self.assertEqual(
+            run_op("v_pk_min_f16 v0, v1, v2 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[1,0] neg_hi:[0,1]",
+                   (0x7C01FE22, 0x7E037E04)),
+            ((0xFE22) << 16) | (0x7C01 ^ 0x8000),
+        )
+        # NaN literal in high half + non-NaN in low half: high preserves 0x7C01, low keeps 0x3C00.
+        self.assertEqual(run_op("v_pk_min_f16 v0, 0x7c013c00, v1", (0x7E027E03,)), 0x7C013C00)
+
+    def test_f32_three_input_all_nan_keeps_src0(self):
+        snan_a, snan_b = 0x7F800001, 0xFF800005
+        for op in ("v_min3_f32", "v_max3_f32", "v_med3_f32"):
+            with self.subTest(op=op):
+                self.assertEqual(run_op(f"{op} v0, v1, v2, v3", (snan_a, NAN_A, NAN_B)), snan_a)
+                self.assertEqual(run_op(f"{op} v0, v1, v2, v3", (NAN_A, NAN_B, snan_b)), NAN_A)
+                self.assertEqual(run_op(f"{op} v0, -v1, v2, v3", (snan_a, NAN_A, NAN_B)), snan_a ^ SIGN_BIT32)
+                for args in ((snan_a, NAN_B, M25), (snan_a, M25, NAN_B), (M25, snan_a, NAN_B)):
+                    self.assertEqual(run_op(f"{op} v0, v1, v2, v3", args), M25)
+
+    def test_f32_two_input_minmax_modifiers_keep_signaling_nan(self):
+        snan = 0x7F800001
+        for op in ("v_min_f32_e64", "v_max_f32_e64"):
+            with self.subTest(op=op):
+                self.assertEqual(run_op(f"{op} v0, -v1, v2", (snan, NAN_A)), snan ^ SIGN_BIT32)
+                self.assertEqual(run_op(f"{op} v0, |v1|, v2", (snan, NAN_A)), snan)
+
+    def test_non_nan_constant_fast_path(self):
+        # f16_bits emits 1 OpUGreaterThan (%float |x| > inf); all-NaN tracking adds 0 when a constant is non-NaN.
+        for line, reg_line, extra_gt in (
+            ("v_min_f16_e32 v0, v1, 1.0", "v_min_f16_e32 v0, v1, v2", 2),
+            ("v_min3_f16 v0, v1, v2, 1.0", "v_min3_f16 v0, v1, v2, v3", 3),
+        ):
+            spv_const = translate_text(LOAD + line + "\nexp mrt0 v0, v0, v0, v0 done vm\ns_endpgm")
+            spv_reg = translate_text(LOAD + reg_line + "\nexp mrt0 v0, v0, v0, v0 done vm\ns_endpgm")
+            self.assertEqual(spv_const.count("OpUGreaterThan "), 1, line)
+            self.assertEqual(spv_reg.count("OpUGreaterThan "), 1 + extra_gt, reg_line)
+        # v_pk_min_f16 emits 2 f16_bits conversions -> 2 OpUGreaterThan when fast-pathed vs 6 with 2 registers x 2 lanes.
+        self.assertEqual(
+            translate_text(LOAD + "v_pk_min_f16 v0, v1, 1.0\nexp mrt0 v0, v0, v0, v0 done vm\ns_endpgm").count("OpUGreaterThan "),
+            2,
+        )
+        self.assertEqual(
+            translate_text(LOAD + "v_pk_min_f16 v0, v1, v2\nexp mrt0 v0, v0, v0, v0 done vm\ns_endpgm").count("OpUGreaterThan "),
+            6,
+        )
+        spv_min3_f32 = translate_text(LOAD + "v_min3_f32 v0, v1, v2, 1.0\nexp mrt0 v0, v0, v0, v0 done vm\ns_endpgm")
+        self.assertEqual(spv_min3_f32.count("OpIsNan"), 1)
+
+    def test_spirv_val_all_nan_variants(self):
+        import shutil
+        import subprocess
+        spirv_as = shutil.which("spirv-as")
+        spirv_val = shutil.which("spirv-val")
+        if not (spirv_as and spirv_val):
+            self.skipTest("spirv-as / spirv-val not found")
+        spv = translate_text(LOAD + "\n".join([
+            "v_min_f16_e32 v0, v1, v2",
+            "v_min3_f16 v0, -|v1|, v2, v3 op_sel:[1,0,0,1]",
+            "v_med3_f16 v0, v1, v2, v3",
+            "v_pk_max_f16 v0, v1, v2 neg_lo:[1,0] op_sel:[0,1]",
+            "v_min3_f32 v0, v1, v2, v3",
+            "v_med3_f32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]))
+        bin_spv = subprocess.run([spirv_as, "--target-env", "vulkan1.2", "-o", "-", "-"],
+                                 input=spv.encode("utf-8"), check=True, stdout=subprocess.PIPE).stdout
+        subprocess.run([spirv_val, "--target-env", "vulkan1.2", "-"], input=bin_spv, check=True)
 
 
 class InterpreterOps(unittest.TestCase):

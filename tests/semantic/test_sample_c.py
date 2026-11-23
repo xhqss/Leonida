@@ -4,7 +4,7 @@ Standard library only (spirv-val is used when it is on PATH); no GPU, no LLVM, n
 
 The GPU fixtures are runtime/test/shaders/ps_sample_c.asm and ps_sample_c_b.asm (vk_texture_test dref_c, dref_c_b). Here:
 the shape of the SPIR-V in a pixel shader (OpImageSampleDrefImplicitLod, a Bias operand for _c_b, the Offset for _o),
-LOD 0 for _c outside the pixel stage, the refusal of _c_b there, d16 and a16 forms, and that the module validates.
+LOD 0 for _c and explicit bias LOD for _c_b outside the pixel stage, d16 and a16 forms, and that the module validates.
 """
 import os
 import re
@@ -64,9 +64,12 @@ class SampleC(unittest.TestCase):
                 (line,) = samples(spv)
                 self.assertRegex(line, r"= OpImageSampleDrefExplicitLod %float %\w+ %\w+ %\w+ Lod %f0$")
 
-    def test_c_b_outside_a_pixel_shader_is_refused(self):
-        with self.assertRaises(support.rdna2spirv.Unsupported):
-            translate("vs_samplecb", f"image_sample_c_b v9, v[4:7], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D")
+    def test_c_b_outside_a_pixel_shader_samples_bias_as_explicit_lod(self):
+        for name in ("vs_samplecb", "cs_samplecb"):
+            with self.subTest(shader=name):
+                spv = translate(name, f"image_sample_c_b v9, v[4:7], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D")
+                (line,) = samples(spv)
+                self.assertRegex(line, r"= OpImageSampleDrefExplicitLod %float %\w+ %\w+ %\w+ Lod %\w+$")
 
     def test_the_bias_comes_before_the_compare(self):
         # GFX10 address order after the offset: bias, z-compare, coordinates (the compare in v5, the bias in v4).

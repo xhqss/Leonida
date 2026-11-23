@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; VOP3 output modifiers on v_fmac_f16_e64 (docs/design.md "v_fmac_f16, v_interp_p2/mov_f32 output modifiers"):
 ; On RDNA2 with denorms kept (default MODE), omod (mul:2 / mul:4 / div:2) is ignored on f16;
 ; clamp to [0, 1] applies; the destination's high half (0xAAAA) is kept.

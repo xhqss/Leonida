@@ -454,6 +454,19 @@ and a valid zlib checksum. That restores the normal draw binding. Both the
 diagnostic and the pinned model reader recover the containing dictionary's 11
 children.
 
+`rpf9_carve.py` and the carved-folder model join use the same short final-system-page
+exception, so a carve retains that page and can reproduce the archive join. Unrelated
+streams still need at least 64 inflated bytes. When a carve has an `index.json`, the folder join uses its file list, offsets,
+compressed sizes and preceding bytes to check root alignment and zero padding just
+as the archive join does. An omitted stream between pages therefore interrupts the
+join. Extra files are ignored, and missing indexed files or size mismatches are errors.
+The index describes the original archive and cannot authenticate a same-size replacement
+payload. Without an index, folder mode still uses file order and inflated file sizes
+and can join across bytes the carver omitted.
+The folder reader follows the carver's file types: `.bin` contains an inflated zlib
+payload and `.bk2` contains raw video. A `KB2` prefix inside a `.bin` remains resource
+data, while a raw `.bk2` interrupts the model's continuation run.
+
 | Pointed-to group start relative to the target stream (original survey) | Blocks |
 |---|---:|
 | Preceding stream | 68 |

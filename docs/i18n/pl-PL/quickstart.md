@@ -50,8 +50,8 @@ Projekt jest na wczesnym etapie: **gra jeszcze się nie uruchamia**.
 - [ffmpeg](https://ffmpeg.org/download.html) w `PATH` *(opcjonalnie: dekoduje strumienie XMA2 i jest wymagany przy
   `--wav`)*.
 
-**Mało miejsca na dysku:** około 350 GB dotyczy pełnego builda. Do *uruchomienia* portu etapy
-`--stages check,shaders,runtime` potrzebują około 30 GB; etap `assets` (~300 GB) służy tylko narzędziom do zasobów,
+**Mało miejsca na dysku:** około 400 GB dotyczy pełnego builda. Do *uruchomienia* portu etapy
+`--stages check,shaders,runtime` potrzebują około 30 GB; etap `assets` (~370 GB) służy tylko narzędziom do zasobów,
 a `--wav` dodaje kilkakrotność rozmiaru Ogg Opus. `--work` i `--out` mogą leżeć na innym dysku; paczka na dysku
 tylko do odczytu wymaga `--overlay` (opcja `gta6rt`) na dysku zapisywalnym. Nie usuwaj plików `.s` z
 `work/shaders/dxbc/disasm`: skasowanie ich z pozostawieniem folderu sprawia, że etap wygląda na ukończony z zerem
@@ -118,7 +118,7 @@ procesora (można to zmienić przez `--jobs`).
   `VK_KHR_fragment_shader_barycentric`), `--texel-offset-fallback` (wlicza przesunięcia `image_sample*_o` do
   współrzędnej, dla urządzeń bez `VK_KHR_maintenance8`) i `--mesh-compute` (shadery mesh jako compute, dla urządzeń
   bez `VK_EXT_mesh_shader`). Każda jest opisana w [`docs/design.md`](../../design.md).
-- **`--work`**: najlepiej wskazać dysk z co najmniej 350 GB wolnego miejsca; do samego uruchomienia wystarczy około
+- **`--work`**: najlepiej wskazać dysk z co najmniej 400 GB wolnego miejsca; do samego uruchomienia wystarczy około
   30 GB (zobacz „Mało miejsca na dysku” powyżej).
 - **`--wav`**: domyślnie wyłączone, bo 16-bitowy PCM WAV jest kilkakrotnie większy od Ogg Opus. Dekoduje przepakowane
   strumienie Ogg Opus do `work\assets\audio\wav` po etapie banków audio; istniejące pliki WAV są pomijane przy

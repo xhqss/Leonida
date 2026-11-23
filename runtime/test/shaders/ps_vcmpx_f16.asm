@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; 16-bit float v_cmpx, e32 form: v_cmpx_{f,lt,eq,le,gt,lg,ge,o,u,nge,nlg,ngt,nle,neq,nlt,tru}_f16 on the seven operand
 ; pairs of ps_vcmp_f16 (see that header for the case list and the ISA rules of the 16 predicates: bits 15:0 of the
 ; operands only, ordered compares false for a NaN, +0 == -0, denormals kept). A v_cmpx writes the result to EXEC

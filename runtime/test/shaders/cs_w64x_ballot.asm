@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Wave64 ballot + v_mbcnt prefix-count stream compaction across both halves. Selected lanes: (lane & 7) == 5, that
 ; is lanes 5, 13, 21, 29 (low half) and 37, 45, 53, 61 (upper half). The ballot is v_cmp_*_e64 into s[4:5]; s_bcnt1
 ; of it = 8 (a 32-wide subgroup sees one half: 4). The slot of a selected lane = v_mbcnt_lo(s4) + v_mbcnt_hi(s5) =

@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; SCC from s_min_i32/s_max_i32 (signed) and s_min_u32/s_max_u32: 1 only when S0 is strictly smaller (min) or larger
 ; (max), since D = S0 < S1 ? S0 : S1 picks S1 on a tie. Per word: byte 0 = the op's result on equal operands,
 ; byte 1 = s_cselect 1/2 after that tie (2: SCC 0), byte 2 = s_cselect 3/4 after a pair that -1 vs 1 decides by

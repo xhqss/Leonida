@@ -493,6 +493,7 @@ const char* result_name(ReplayResult r) {
         case ReplayResult::invalid_predication: return "invalid_predication";
         case ReplayResult::invalid_query: return "invalid_query";
         case ReplayResult::invalid_indirect_arguments: return "invalid_indirect_arguments";
+        case ReplayResult::invalid_draw: return "invalid_draw";
         case ReplayResult::unsupported: return "unsupported";
     }
     return "?";

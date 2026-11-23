@@ -80,6 +80,10 @@ with `scale = (scaleXY, scaleXY, scaleZ)`, the same transform `world_build.py --
 ([world.md](world.md)). Directions are rotated without the translation. Entity lights are placed through
 their own entity.
 
+When an archetype is defined more than once, placement uses its first light list. The summary counts that
+archetype once in `archetype_light_definitions_differ` if any other list differs in length, order or decoded
+light fields, including the effect offset.
+
 | Measure | Count |
 |---|---:|
 | Map entities read (`world_index.py --entities-out`) | 1,670,435 |

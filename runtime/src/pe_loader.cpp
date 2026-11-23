@@ -13,6 +13,7 @@
 #include <fstream>
 #include <mutex>
 #include <stdexcept>
+#include <system_error>
 #include <vector>
 
 #include "../shims/shims.h"
@@ -28,9 +29,54 @@ std::string lower(std::string s) {
 
 namespace {
 
+std::filesystem::path::string_type module_key(const std::filesystem::path& path) {
+    // Keep identity in the platform's native path representation. Only the existing ASCII case folding is
+    // applied here; representable names also retain their old narrow-byte alias below.
+    auto key = path.filename().native();
+    for (auto& c : key)
+        if (c >= 'A' && c <= 'Z') c = static_cast<std::filesystem::path::value_type>(c + ('a' - 'A'));
+    return key;
+}
+
+std::string narrow_module_key(const std::filesystem::path& path) {
+    const auto filename = path.filename();
+    try {
+        const auto narrow = filename.string();
+        // A lossy/default-character alias must not collapse two distinct Unicode basenames.
+        if (std::filesystem::path(narrow).native() == filename.native()) return lower(narrow);
+    } catch (const std::system_error&) {
+        // Some Windows standard libraries throw when a basename is outside the current narrow code page.
+        // It still has a native identity; it simply has no alias in the existing narrow lookup API.
+    }
+    return {};
+}
+
+// Windows matches module names case-insensitively with its own upcase table (RtlEqualUnicodeString); the
+// ordinal ignore-case compare is that table.
+bool same_module_name(const wchar_t* a, const wchar_t* b) {
+    return CompareStringOrdinal(a, -1, b, -1, TRUE) == CSTR_EQUAL;
+}
+
+// A narrow (ANSI code page) module name widened for a case-insensitive compare; empty when it is not valid in the
+// code page.
+std::wstring acp_to_wide(const std::string& narrow) {
+    if (narrow.empty()) return {};
+    const int n = MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, narrow.data(), static_cast<int>(narrow.size()),
+                                      nullptr, 0);
+    if (n <= 0) return {};
+    std::wstring wide(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, narrow.data(), static_cast<int>(narrow.size()), wide.data(), n);
+    return wide;
+}
+
+std::string path_utf8(const std::filesystem::path& path) {
+    const auto bytes = path.u8string();
+    return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+}
+
 std::vector<uint8_t> read_file(const std::filesystem::path& p) {
     std::ifstream f(p, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open " + p.string());
+    if (!f) throw std::runtime_error("cannot open " + path_utf8(p));
     return {std::istreambuf_iterator<char>(f), {}};
 }
 
@@ -983,11 +1029,30 @@ bool bundled_owns_handle(void* ctx, void* module) {
     return static_cast<Loader*>(ctx)->owns_module_handle(module);
 }
 
+void* bundled_find_loaded_w(void* ctx, const std::wstring& basename) {
+    return static_cast<Loader*>(ctx)->find_loaded_module_w(basename);
+}
+
+void* bundled_load_w(void* ctx, const std::wstring& basename, uint32_t flags, bool& handled) {
+    return static_cast<Loader*>(ctx)->load_runtime_module_w(basename, flags, handled);
+}
+
 const shims::BundledModuleOps kBundledOps{
     &bundled_find_loaded,
     &bundled_load,
     &bundled_get_proc,
     &bundled_owns_handle,
+    &bundled_find_loaded_w,
+    &bundled_load_w,
+};
+
+// Marks what a run-time load maps as a dynamic load for as long as it is in scope (the caller holds the mutex).
+struct RuntimeLoadScope {
+    explicit RuntimeLoadScope(int& depth) : depth_(depth) { ++depth_; }
+    ~RuntimeLoadScope() { --depth_; }
+    RuntimeLoadScope(const RuntimeLoadScope&) = delete;
+    RuntimeLoadScope& operator=(const RuntimeLoadScope&) = delete;
+    int& depth_;
 };
 }  // namespace
 
@@ -1047,11 +1112,14 @@ Loader::~Loader() {
 
 Module& Loader::load(const std::filesystem::path& image) {
     std::lock_guard lock(mutex_);
-    std::string key = lower(image.filename().string());
+    const auto key = module_key(image);
     if (auto it = by_name_.find(key); it != by_name_.end()) return *it->second;
+    const auto narrow_key = narrow_module_key(image);
+    if (Module* existing = find_narrow_module(narrow_key)) return *existing;
     Module* mapped = nullptr;
     try {
-        mapped = &map_image(image);
+        mapped = &map_image(image, narrow_key);
+        mapped->dynamic_load = runtime_loads_ > 0;  // before bind_imports: its dependencies are marked the same way
         bind_imports(*mapped);  // loads every bundled module m imports first, so they land in init_order_ before m
         protect_sections(*mapped);
         register_unwind(*mapped);
@@ -1071,10 +1139,41 @@ Module& Loader::load(const std::filesystem::path& image) {
     return m;
 }
 
+Module* Loader::find_narrow_module(const std::string& dll_lower) const {
+    if (dll_lower.empty()) return nullptr;
+    // library_loader and PE import names keep their existing narrow-byte contract: the exact compare below is
+    // bytewise, and the key is never reinterpreted as UTF-8.
+    for (const auto& entry : by_name_)
+        if (entry.second->narrow_key == dll_lower) return entry.second;
+    // The key is ASCII case-folded only. A name with letters outside ASCII (Cyrillic in code page 1251, say)
+    // compares case-insensitively through the code page, as GetModuleHandleA does: GUEST_ДА.EXE finds guest_да.exe.
+    // Widening the folded key is safe here: rt::lower() folds ASCII letters only, and no ANSI code page's multibyte
+    // sequences contain ASCII letter bytes, so both sides widen to the same characters they were spelt with.
+    if (const std::wstring wide = acp_to_wide(dll_lower); !wide.empty())
+        for (const auto& entry : by_name_)
+            if (!entry.second->narrow_key.empty() &&
+                same_module_name(acp_to_wide(entry.second->narrow_key).c_str(), wide.c_str()))
+                return entry.second;
+    return nullptr;
+}
+
+Module* Loader::find_wide_module(const std::wstring& basename) const {
+    if (basename.empty()) return nullptr;
+    for (const auto& entry : by_name_)
+        if (same_module_name(entry.first.c_str(), basename.c_str())) return entry.second;
+    return nullptr;
+}
+
+void* Loader::find_loaded_module_w(const std::wstring& basename) const {
+    std::lock_guard lock(mutex_);
+    Module* m = find_wide_module(basename);
+    return m ? static_cast<void*>(m->base) : nullptr;
+}
+
 void* Loader::find_loaded_module(const std::string& dll_lower) const {
     std::lock_guard lock(mutex_);
-    auto it = by_name_.find(dll_lower);
-    return it == by_name_.end() ? nullptr : static_cast<void*>(it->second->base);
+    Module* m = find_narrow_module(dll_lower);
+    return m ? static_cast<void*>(m->base) : nullptr;
 }
 
 void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, bool& handled) {
@@ -1082,44 +1181,69 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
     if (dll_lower.empty() || prefer_host_copy(dll_lower)) return nullptr;
 
     std::lock_guard lock(mutex_);
-    const auto existing = by_name_.find(dll_lower);
+    const RuntimeLoadScope dynamic(runtime_loads_);
+    Module* existing = find_narrow_module(dll_lower);
     const std::filesystem::path candidate = game_dir_ / dll_lower;
     std::error_code ec;
-    const bool is_bundled = existing != by_name_.end() || std::filesystem::is_regular_file(candidate, ec);
+    const bool is_bundled = existing || std::filesystem::is_regular_file(candidate, ec);
     if (!is_bundled) return nullptr;
 
     handled = true;
+    return load_runtime_candidate(existing, candidate, flags, dll_lower);
+}
+
+void* Loader::load_runtime_module_w(const std::wstring& basename, uint32_t flags, bool& handled) {
+    handled = false;
+    if (basename.empty()) return nullptr;
+    // A name the code page can spell takes the narrow path's host-copy rule as well.
+    if (const std::string narrow = narrow_module_key(std::filesystem::path(basename)); !narrow.empty())
+        if (prefer_host_copy(narrow)) return nullptr;
+
+    std::lock_guard lock(mutex_);
+    Module* existing = find_wide_module(basename);
+    const std::filesystem::path candidate = game_dir_ / basename;
+    std::error_code ec;
+    if (!existing && !std::filesystem::is_regular_file(candidate, ec)) return nullptr;
+
+    handled = true;
+    return load_runtime_candidate(existing, candidate, flags, path_utf8(basename));
+}
+
+void* Loader::load_runtime_candidate(Module* existing, const std::filesystem::path& candidate, uint32_t flags,
+                                     const std::string& display) {
     // Win32 DONT_RESOLVE_DLL_REFERENCES (0x1) forbids resolving dependencies or running TLS/DllMain; refuse it
     // explicitly instead of silently performing a normal resolving + initialising load.
     if ((flags & DONT_RESOLVE_DLL_REFERENCES) != 0) {
         std::fprintf(stderr,
                      "[rt] loader: LoadLibraryEx(%s, DONT_RESOLVE_DLL_REFERENCES) is not supported for bundled DLLs\n",
-                     dll_lower.c_str());
+                     display.c_str());
         SetLastError(ERROR_NOT_SUPPORTED);
         return nullptr;
     }
 
-    if (existing != by_name_.end()) {
+    if (existing) {
         try {
             initialise();
-            return static_cast<void*>(existing->second->base);
+            return static_cast<void*>(existing->base);
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "[rt] loader: run-time initialise of %s failed: %s\n", dll_lower.c_str(), e.what());
+            std::fprintf(stderr, "[rt] loader: run-time initialise of %s failed: %s\n", display.c_str(), e.what());
             SetLastError(ERROR_DLL_INIT_FAILED);
             return nullptr;
         }
     }
 
+    Module* mapped = nullptr;
     try {
         Module& m = load(candidate);
+        mapped = &m;
         initialise();
         std::fprintf(stderr, "[rt] loader: %s mapped from game_dir (run-time load)\n", m.name.c_str());
         return static_cast<void*>(m.base);
     } catch (const std::exception& e) {
         // load() drops a module that failed to map or bind (dependencies included); this also drops one whose
         // initialise() failed, so later GetModuleHandle/LoadLibrary calls don't see it. ~Loader frees it via order_.
-        by_name_.erase(dll_lower);
-        std::fprintf(stderr, "[rt] loader: run-time load of %s failed: %s\n", dll_lower.c_str(), e.what());
+        by_name_.erase(module_key(mapped ? mapped->path : candidate));
+        std::fprintf(stderr, "[rt] loader: run-time load of %s failed: %s\n", display.c_str(), e.what());
         SetLastError(ERROR_DLL_INIT_FAILED);
         return nullptr;
     }
@@ -1141,6 +1265,7 @@ void* Loader::resolve_module_export(void* module_handle, const std::string& sym,
     if (auto it = target->exports.find(sym); it != target->exports.end()) return it->second;
     if (auto it = target->forwarders.find(sym); it != target->forwarders.end()) {
         try {
+            const RuntimeLoadScope dynamic(runtime_loads_);
             Binding binding = Binding::Unimplemented;
             void* fn = resolve_forwarder(it->second, binding, 0);
             if (binding == Binding::Module) initialise();
@@ -1227,7 +1352,11 @@ void Loader::initialise(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
     if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
         auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
-        const BOOL ok = entry(m.base, DLL_PROCESS_ATTACH, nullptr);
+        // lpvReserved "is NULL for dynamic loads and non-NULL for static loads" (DllMain docs). What Windows points
+        // it at is its own; a static load gets a CONTEXT captured here, so a DLL that reads through it reads memory.
+        CONTEXT context{};
+        if (!m.dynamic_load) RtlCaptureContext(&context);
+        const BOOL ok = entry(m.base, DLL_PROCESS_ATTACH, m.dynamic_load ? nullptr : &context);
         if (startup_trace::enabled())
             startup_trace::event("dllmain", "\"module\":" + startup_trace::quote(m.name) +
                                                 ",\"result\":" + std::to_string(ok));
@@ -1246,12 +1375,12 @@ void Loader::set_initialised(Module& m, bool value) {
     m.initialised = value;
 }
 
-Module& Loader::map_image(const std::filesystem::path& path) {
+Module& Loader::map_image(const std::filesystem::path& path, const std::string& narrow_key) {
     auto file = read_file(path);
-    const std::string name = path.filename().string();
+    const std::string name = path_utf8(path.filename());
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(file.data());
     if (file.size() < sizeof(IMAGE_DOS_HEADER) || dos->e_magic != IMAGE_DOS_SIGNATURE)
-        throw std::runtime_error(path.string() + ": not an MZ image");
+        throw std::runtime_error(path_utf8(path) + ": not an MZ image");
     if (dos->e_lfanew < 0 || static_cast<uint64_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > file.size())
         throw std::runtime_error(name + ": the NT headers are outside the file");
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(file.data() + dos->e_lfanew);
@@ -1275,11 +1404,12 @@ Module& Loader::map_image(const std::filesystem::path& path) {
 
     auto* m = new Module;
     m->name = name;
+    m->narrow_key = narrow_key;
     m->path = path;
     m->preferred_base = oh.ImageBase;
     m->size = oh.SizeOfImage;
     m->entry_rva = oh.AddressOfEntryPoint;
-    by_name_[lower(m->name)] = m;
+    by_name_[module_key(path)] = m;
     order_.push_back(m);
 
     // Inside the range gta6rt reserved for this image before the process started (base_reservation.h), else as usual.

@@ -6,7 +6,7 @@ import struct
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -80,6 +80,33 @@ class MaskChannelTests(unittest.TestCase):
                         sys.stderr = saved_err
                 self.assertEqual(cm.exception.code, 2)
 
+    def test_json_folder_is_created(self):
+        """--json under a folder that does not exist yet gets the report, not a traceback, and nothing else."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "m.dds")
+            with open(path, "wb") as fh:
+                fh.write(rgba8_dds(W, H, image()))
+            reports = os.path.join(tmp, "reports")
+            out = os.path.join(reports, "m.json")
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(mc.main([path, "--json", out]), 0)
+            with open(out, encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["width"], W)
+            self.assertEqual(os.listdir(reports), ["m.json"])                # no staging file left behind
+
+    def test_json_write_error_is_one_line(self):
+        """A --json path the tool cannot write is one ERROR line and exit 2, as the other report tools do."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "m.dds")
+            with open(path, "wb") as fh:
+                fh.write(rgba8_dds(W, H, image()))
+            out = os.path.join(path, "r.json")                              # its folder is the input file
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                self.assertEqual(mc.main([path, "--json", out]), 2)
+            self.assertEqual(err.getvalue().count("\n"), 1)
+            self.assertTrue(err.getvalue().startswith(f"ERROR: {out}: "), err.getvalue())
+
     def test_json_cannot_replace_the_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "m.dds")
@@ -104,6 +131,37 @@ class MaskChannelTests(unittest.TestCase):
                 self.assertEqual(cm.exception.code, 2)
                 with open(path, "rb") as fh:
                     self.assertEqual(fh.read(), original)
+
+    def test_an_unreadable_input_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "fake.dds")
+            with open(fake, "wb") as fh:
+                fh.write(b"garbage")
+            stderr, stdout = io.StringIO(), io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                self.assertEqual(mc.main([fake]), 2)
+            self.assertIn("error: cannot read", stderr.getvalue())
+            self.assertIn("DDS header", stderr.getvalue())
+            self.assertEqual(stdout.getvalue(), "")
+            stderr = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
+                self.assertEqual(mc.main([os.path.join(tmp, "no_such.dds")]), 2)
+            self.assertIn("No such file or directory", stderr.getvalue())
+
+    def test_the_json_guard_runs_before_the_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "m.dds")
+            with open(path, "wb") as fh:
+                fh.write(rgba8_dds(W, H, image()))
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                self.assertEqual(mc.main([path, "--json", tmp]), 2)               # tmp is a directory
+            self.assertIn("is a directory", stderr.getvalue())
+            self.assertEqual(stdout.getvalue(), "")            # refused before any channel work
+            out = os.path.join(tmp, "new", "folder", "m.json")
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(mc.main([path, "--json", out]), 0)
+            self.assertTrue(os.path.isfile(out))
 
 
 if __name__ == "__main__":

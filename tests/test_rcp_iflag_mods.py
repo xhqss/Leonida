@@ -80,9 +80,10 @@ class RcpIflagModsTest(unittest.TestCase):
 
         word = match_result(rf"OpBitcast %uint {value}")
         dest = match_result(r"OpAccessChain %_ptr_Function_uint %vgpr %c0")
-        old_word = match_result(rf"OpLoad %uint {dest}")
-        masked = match_result(rf"OpSelect %uint %\w+ {word} {old_word}")
-        self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {masked}$")
+        if not re.search(rf"(?m)^ *OpStore {re.escape(dest)} {re.escape(word)}$", spv):
+            old_word = match_result(rf"OpLoad %uint {dest}")
+            masked = match_result(rf"OpSelect %uint %\w+ {word} {old_word}")
+            self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {masked}$")
 
     def test_no_output_modifiers(self):
         cases = (

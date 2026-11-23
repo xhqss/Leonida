@@ -32,7 +32,10 @@ binary glTF 2.0 (`.glb`):
    a strict binary glTF 2.0 container.
 
 Supports JSON mesh/manifest specs, Wavefront OBJ (via ``tools/glb_writer.py``),
-and binary glTF 2.0 (``.glb``) inputs. Standard library only; no game files.
+and binary glTF 2.0 (``.glb``) inputs, including sparse mesh attributes and indices.
+A GLB may expand up to 1,000,000 implicit zero-initialized accessor rows across its
+imported mesh instances. For larger parts, supply a dense base bufferView.
+Standard library only; no game files.
 """
 from __future__ import annotations
 
@@ -56,6 +59,7 @@ import glb_writer  # noqa: E402
 
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
+MAX_IMPLICIT_ACCESSOR_ROWS = 1_000_000
 CHUNK_TYPE_JSON = 0x4E4F534A
 CHUNK_TYPE_BIN = 0x004E4942
 TARGET_ARRAY_BUFFER = 34962
@@ -796,9 +800,11 @@ def analyze_edge_topology(
     Returns counts of total unique welded edges, boundary edges (incident to
     1 triangle), manifold interior edges (incident to 2 triangles), and
     non-manifold edges (incident to >2 triangles — typically caused by
-    double-drawn coplanar overlap bands).
+    double-drawn coplanar overlap bands). Triangles with fewer than three
+    distinct welded corners are counted separately; they no longer form faces.
     """
     edge_counts: dict[tuple[tuple[int, int, int], tuple[int, int, int]], int] = defaultdict(int)
+    collapsed = 0
     for part in parts:
         ox, oy, oz = part.translation
         qpts = [
@@ -807,9 +813,10 @@ def analyze_edge_topology(
         ]
         for a, b, c in part.triangles:
             qa, qb, qc = qpts[a], qpts[b], qpts[c]
+            if qa == qb or qb == qc or qc == qa:
+                collapsed += 1
+                continue
             for u, v in ((qa, qb), (qb, qc), (qc, qa)):
-                if u == v:
-                    continue
                 edge = (u, v) if u < v else (v, u)
                 edge_counts[edge] += 1
 
@@ -829,6 +836,7 @@ def analyze_edge_topology(
         "boundary_edges": boundary,
         "manifold_edges": manifold,
         "non_manifold_edges": non_manifold,
+        "collapsed_triangles": collapsed,
     }
 
 
@@ -1065,21 +1073,228 @@ def part_to_dict(part: MeshPart) -> dict:
         }
         if part.material.alpha_cutoff is not None:
             mat["alpha_cutoff"] = part.material.alpha_cutoff
+        for slot in ("base_color_png", "normal_png", "metallic_roughness_png"):
+            payload = getattr(part.material, slot)
+            if payload is not None:
+                mat[slot] = "base64:" + base64.b64encode(payload).decode("ascii")
         out["material"] = mat
     return out
 
 
+_GLB_ATTRIBUTE_TYPES = {
+    "POSITION": ("VEC3",),
+    "NORMAL": ("VEC3",),
+    "TEXCOORD_0": ("VEC2",),
+    "COLOR_0": ("VEC3", "VEC4"),
+    "JOINTS_0": ("VEC4",),
+    "WEIGHTS_0": ("VEC4",),
+    "JOINTS_1": ("VEC4",),
+    "WEIGHTS_1": ("VEC4",),
+}
+
+
+def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
+    """Refuse a GLB document `read_glb_parts` cannot walk, with one message instead of a traceback.
+
+    Checks only what the reader dereferences: the tables it indexes, the accessors its primitives name (their
+    type, and that their bytes are inside the BIN chunk) and the material fields it converts.
+    """
+    def bad(detail: str) -> PedAssembleError:
+        return PedAssembleError(f"{path}: malformed GLB: {detail}")
+
+    def is_index(value: object) -> bool:
+        return type(value) is int and value >= 0
+
+    def is_whole(value: object) -> bool:
+        """A count, offset or stride: the reader takes these through int(), so 3.0 reads as 3."""
+        return is_index(value) or (type(value) is float and value.is_integer() and value >= 0)
+
+    def check_name(value: object, what: str) -> None:
+        """The part name is the node's name, else the mesh's; a value that is not text cannot be classified."""
+        if value and not isinstance(value, str):
+            raise bad(f"{what} must be a string, got {value!r}")
+
+    def number(value: object, what: str) -> None:
+        try:
+            float(value)
+        except (TypeError, ValueError):
+            raise bad(f"{what} must be a number, got {value!r}") from None
+
+    if not isinstance(doc, dict):
+        raise bad("the JSON chunk must be an object")
+    tables = {}
+    for name in ("nodes", "meshes", "materials", "skins", "accessors", "bufferViews"):
+        table = doc.get(name, [])
+        if not isinstance(table, list):
+            raise bad(f"{name} must be a list")
+        tables[name] = table
+    nodes, meshes, materials = tables["nodes"], tables["meshes"], tables["materials"]
+    accessors, views = tables["accessors"], tables["bufferViews"]
+
+    def check_accessor(index: object, what: str, allowed: tuple[str, ...]) -> None:
+        if not is_index(index) or index >= len(accessors):
+            raise bad(f"{what} names accessor {index!r} (GLB has {len(accessors)})")
+        acc = accessors[index]
+        if not isinstance(acc, dict):
+            raise bad(f"accessors[{index}] must be an object")
+        ctype, atype, count = acc.get("componentType"), acc.get("type"), acc.get("count")
+        if type(ctype) is not int or ctype not in COMPONENT_STRUCT:
+            raise bad(f"accessors[{index}] has unsupported componentType {ctype!r}")
+        if not isinstance(atype, str) or atype not in TYPE_COMPONENTS:
+            raise bad(f"accessors[{index}] has unsupported type {atype!r}")
+        if atype not in allowed:
+            raise bad(f"{what} is accessor {index} of type {atype}, expected {' or '.join(allowed)}")
+        if not is_whole(count):
+            raise bad(f"accessors[{index}] has invalid count {count!r}")
+        count = int(count)
+        component_size = COMPONENT_STRUCT[ctype][1]
+        elem_bytes = component_size * TYPE_COMPONENTS[atype]
+        label = f"accessors[{index}]"
+        has_sparse = "sparse" in acc
+
+        def check_region(section, name, rows, size, alignment, *, packed=False):
+            """Validate the rows before unpacking them; sparse indices/values always use tight packing."""
+            view_index = section.get("bufferView")
+            if packed and is_whole(view_index):
+                view_index = int(view_index)
+            if not is_index(view_index) or view_index >= len(views):
+                raise bad(f"{name} names bufferView {view_index!r} (GLB has {len(views)})")
+            view = views[view_index]
+            if not isinstance(view, dict):
+                raise bad(f"bufferViews[{view_index}] must be an object")
+            offsets = (view.get("byteOffset", 0), section.get("byteOffset", 0))
+            stride = view.get("byteStride")
+            if not all(is_whole(v) for v in offsets) or not (stride is None or is_whole(stride)):
+                raise bad(f"{name} has an invalid byteOffset or byteStride")
+            start, offset = map(int, offsets)
+            step = int(stride or size)
+            end = offset + ((rows - 1) * step + size if rows else 0)
+            if rows and start + end > len(bin_chunk):
+                raise bad(f"{name} ({what}) runs past the BIN chunk ({len(bin_chunk)} bytes)")
+            if has_sparse:
+                if packed and ("byteStride" in view or "target" in view):
+                    raise bad(f"{name} must use a bufferView without byteStride or target")
+                if offset % alignment or (start + offset) % alignment or step < size or step % alignment:
+                    raise bad(f"{name} has an invalid offset alignment or stride")
+                buffers = doc.get("buffers")
+                if (not is_whole(view.get("buffer")) or view["buffer"] != 0
+                        or not isinstance(buffers, list) or not buffers or not isinstance(buffers[0], dict)
+                        or "uri" in buffers[0]):
+                    raise bad(f"{name} must use the embedded GLB buffer")
+                length = view.get("byteLength")
+                limit = buffers[0].get("byteLength")
+                if (not is_whole(length) or not is_whole(limit) or end > length
+                        or start + length > limit or limit > len(bin_chunk)):
+                    raise bad(f"{name} exceeds its bufferView or embedded buffer")
+            return start + offset
+
+        if "bufferView" in acc:
+            check_region(acc, label, count, elem_bytes, component_size)
+        elif "byteOffset" in acc:
+            raise bad(f"{label} cannot specify byteOffset without a base bufferView")
+        elif not has_sparse:
+            required = doc.get("extensionsRequired", [])
+            if not isinstance(required, list):
+                raise bad("extensionsRequired must be a list")
+            if "KHR_draco_mesh_compression" in required:
+                raise PedAssembleError(f"{path}: required KHR_draco_mesh_compression is unsupported")
+        if not has_sparse:
+            return
+
+        sparse = acc["sparse"]
+        if not isinstance(sparse, dict):
+            raise bad(f"{label}.sparse must be an object")
+        n = sparse.get("count")
+        if not is_whole(n) or not 1 <= n <= count:
+            raise bad(f"{label}.sparse.count must be between 1 and {count}")
+        n = int(n)
+        indices, values = sparse.get("indices"), sparse.get("values")
+        if not isinstance(indices, dict) or not isinstance(values, dict):
+            raise bad(f"{label}.sparse needs indices and values objects")
+        index_type = indices.get("componentType")
+        if not is_whole(index_type) or index_type not in (COMPONENT_UNSIGNED_BYTE, COMPONENT_UNSIGNED_SHORT,
+                                                           COMPONENT_UNSIGNED_INT):
+            raise bad(f"{label}.sparse.indices must use unsigned byte, short or int components")
+        fmt, width = COMPONENT_STRUCT[int(index_type)]
+        start = check_region(indices, f"{label}.sparse.indices", n, width, width, packed=True)
+        check_region(values, f"{label}.sparse.values", n, elem_bytes, component_size, packed=True)
+        previous = -1
+        for (dest,) in struct.iter_unpack("<" + fmt, memoryview(bin_chunk)[start:start + n * width]):
+            if not previous < dest < count:
+                raise bad(f"{label}.sparse.indices must be strictly increasing and below {count}")
+            previous = dest
+
+    for i, mesh in enumerate(meshes):
+        if not isinstance(mesh, dict):
+            raise bad(f"meshes[{i}] must be an object")
+        primitives = mesh.get("primitives", [])
+        if not isinstance(primitives, list):
+            raise bad(f"meshes[{i}].primitives must be a list")
+        for pi, prim in enumerate(primitives):
+            where = f"meshes[{i}].primitives[{pi}]"
+            if not isinstance(prim, dict):
+                raise bad(f"{where} must be an object")
+            attrs = prim.get("attributes", {})
+            if not isinstance(attrs, dict):
+                raise bad(f"{where}.attributes must be an object")
+            if "POSITION" not in attrs:
+                continue
+            for name, allowed in _GLB_ATTRIBUTE_TYPES.items():
+                if name in attrs:
+                    check_accessor(attrs[name], f"{where}.{name}", allowed)
+            if "indices" in prim:
+                check_accessor(prim["indices"], f"{where}.indices", ("SCALAR",))
+            if "material" not in prim:
+                continue
+            material_index = prim["material"]
+            if type(material_index) is not int:
+                raise bad(f"{where}.material must be an index, got {material_index!r}")
+            if not 0 <= material_index < len(materials):
+                continue                                    # the reader leaves such a part without a material
+            material = materials[material_index]
+            if not isinstance(material, dict):
+                raise bad(f"materials[{material_index}] must be an object")
+            pbr = material.get("pbrMetallicRoughness", {})
+            if not isinstance(pbr, dict):
+                raise bad(f"materials[{material_index}].pbrMetallicRoughness must be an object")
+            factor = pbr.get("baseColorFactor", [0.8, 0.8, 0.8, 1.0])
+            if not isinstance(factor, list) or len(factor) < 4:
+                raise bad(f"materials[{material_index}] baseColorFactor must be a list of 4 numbers")
+            for value in factor[:4]:
+                number(value, f"materials[{material_index}] baseColorFactor")
+            for owner, key in ((pbr, "metallicFactor"), (pbr, "roughnessFactor"), (material, "alphaCutoff")):
+                if key in owner:
+                    number(owner[key], f"materials[{material_index}] {key}")
+
+    for i, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            raise bad(f"nodes[{i}] must be an object")
+    if not any("mesh" in node for node in nodes):
+        for i, mesh in enumerate(meshes):                   # the reader then makes one part per mesh
+            check_name(mesh.get("name"), f"meshes[{i}].name")
+    for i, node in enumerate(nodes):
+        if "mesh" not in node:
+            continue
+        if not is_index(node["mesh"]) or node["mesh"] >= len(meshes):
+            raise bad(f"nodes[{i}] names mesh {node['mesh']!r} (GLB has {len(meshes)})")
+        check_name(node.get("name"), f"nodes[{i}].name")
+        if not node.get("name"):
+            check_name(meshes[node["mesh"]].get("name"), f"meshes[{node['mesh']}].name")
+        translation = node.get("translation", (0.0, 0.0, 0.0))
+        if not isinstance(translation, (list, tuple)) or len(translation) != 3:
+            raise bad(f"nodes[{i}].translation must be a list of 3 numbers")
+        for value in translation:
+            number(value, f"nodes[{i}].translation")
+
+
 def _read_glb_accessor(doc: dict, bin_chunk: bytes, acc_idx: int) -> list:
     acc = doc["accessors"][acc_idx]
-    bv = doc["bufferViews"][acc["bufferView"]]
     ctype = acc["componentType"]
     atype = acc["type"]
     count = int(acc["count"])
     fmt_char, comp_size = COMPONENT_STRUCT[ctype]
     n_comp = TYPE_COMPONENTS[atype]
     elem_bytes = comp_size * n_comp
-    stride = int(bv.get("byteStride") or elem_bytes)
-    base = int(bv.get("byteOffset", 0)) + int(acc.get("byteOffset", 0))
     normalized = bool(acc.get("normalized", False))
     denom = None
     if normalized:
@@ -1092,14 +1307,39 @@ def _read_glb_accessor(doc: dict, bin_chunk: bytes, acc_idx: int) -> list:
         elif ctype == COMPONENT_SHORT:
             denom = 32767.0
 
-    unpack_fmt = f"<{n_comp}{fmt_char}"
-    out = []
-    for i in range(count):
-        off = base + i * stride
-        vals = struct.unpack_from(unpack_fmt, bin_chunk, off)
+    unpack = struct.Struct(f"<{n_comp}{fmt_char}").unpack_from
+
+    def read_row(offset):
+        vals = unpack(bin_chunk, offset)
         if denom is not None:
-            vals = tuple(v / denom for v in vals)
-        out.append(vals[0] if n_comp == 1 else vals)
+            if ctype in (COMPONENT_BYTE, COMPONENT_SHORT):
+                # Both signed minimum encodings represent -1 in glTF's normalized range.
+                vals = tuple(max(v, -denom) / denom for v in vals)
+            else:
+                vals = tuple(v / denom for v in vals)
+        return vals[0] if n_comp == 1 else vals
+
+    def start_of(section):
+        view = doc["bufferViews"][int(section["bufferView"])]
+        return int(view.get("byteOffset", 0)) + int(section.get("byteOffset", 0))
+
+    if "bufferView" in acc:
+        base = start_of(acc)
+        stride = int(doc["bufferViews"][acc["bufferView"]].get("byteStride") or elem_bytes)
+        out = [read_row(base + i * stride) for i in range(count)]
+    else:
+        zero = 0 if n_comp == 1 else (0,) * n_comp
+        out = [zero] * count
+
+    if "sparse" in acc:
+        sparse = acc["sparse"]
+        indices = sparse["indices"]
+        fmt, width = COMPONENT_STRUCT[int(indices["componentType"])]
+        start = start_of(indices)
+        packed_indices = memoryview(bin_chunk)[start:start + int(sparse["count"]) * width]
+        values_start = start_of(sparse["values"])
+        for i, (dest,) in enumerate(struct.iter_unpack("<" + fmt, packed_indices)):
+            out[dest] = read_row(values_start + i * elem_bytes)
     return out
 
 
@@ -1169,11 +1409,15 @@ def read_glb_parts(path: str) -> list[MeshPart]:
         payload = data[pos:pos + chunk_len]
         pos += chunk_len
         if chunk_type == CHUNK_TYPE_JSON:
-            doc = json.loads(payload.decode("utf-8"))
+            try:
+                doc = json.loads(payload.decode("utf-8"))
+            except ValueError as exc:                       # UnicodeDecodeError and JSONDecodeError
+                raise PedAssembleError(f"{path}: malformed GLB: the JSON chunk does not parse ({exc})") from None
         elif chunk_type == CHUNK_TYPE_BIN:
             bin_chunk = payload
     if doc is None:
         raise PedAssembleError(f"{path}: GLB has no JSON chunk")
+    _check_glb_document(doc, bin_chunk, path)
 
     stem = os.path.splitext(os.path.basename(path))[0]
     nodes = doc.get("nodes", [])
@@ -1181,6 +1425,21 @@ def read_glb_parts(path: str) -> list[MeshPart]:
     materials = doc.get("materials", [])
     skins = doc.get("skins", [])
     parts: list[MeshPart] = []
+
+    # Unlike dense rows, a zero base has no corresponding bytes in the file to bound the
+    # Python lists built for each visible attribute and each instance of the mesh.
+    remaining_implicit_rows = MAX_IMPLICIT_ACCESSOR_ROWS
+
+    def read_accessor(index):
+        nonlocal remaining_implicit_rows
+        acc = doc["accessors"][index]
+        if "bufferView" not in acc:
+            rows = int(acc["count"])
+            if rows > remaining_implicit_rows:
+                raise PedAssembleError(f"{path}: accessors[{index}] would exceed the per-file limit of "
+                                       f"{MAX_IMPLICIT_ACCESSOR_ROWS:,} implicit accessor rows")
+            remaining_implicit_rows -= rows
+        return _read_glb_accessor(doc, bin_chunk, index)
 
     mesh_nodes = [(n, n["mesh"]) for n in nodes if "mesh" in n]
     if not mesh_nodes:
@@ -1200,41 +1459,41 @@ def read_glb_parts(path: str) -> list[MeshPart]:
             attrs = prim.get("attributes", {})
             if "POSITION" not in attrs:
                 continue
-            positions = [tuple(float(x) for x in p) for p in _read_glb_accessor(doc, bin_chunk, attrs["POSITION"])]
+            positions = [tuple(float(x) for x in p) for p in read_accessor(attrs["POSITION"])]
             if "indices" in prim:
-                raw_idx = [int(i) for i in _read_glb_accessor(doc, bin_chunk, prim["indices"])]
+                raw_idx = [int(i) for i in read_accessor(prim["indices"])]
             else:
                 raw_idx = list(range(len(positions)))
             triangles = _normalize_triangles(raw_idx)
             normals = (
-                [tuple(float(x) for x in n) for n in _read_glb_accessor(doc, bin_chunk, attrs["NORMAL"])]
+                [tuple(float(x) for x in n) for n in read_accessor(attrs["NORMAL"])]
                 if "NORMAL" in attrs else None
             )
             uvs = (
-                [tuple(float(x) for x in u) for u in _read_glb_accessor(doc, bin_chunk, attrs["TEXCOORD_0"])]
+                [tuple(float(x) for x in u) for u in read_accessor(attrs["TEXCOORD_0"])]
                 if "TEXCOORD_0" in attrs else None
             )
             colors = None
             if "COLOR_0" in attrs:
-                raw_c = _read_glb_accessor(doc, bin_chunk, attrs["COLOR_0"])
+                raw_c = read_accessor(attrs["COLOR_0"])
                 colors = [
                     (float(c[0]), float(c[1]), float(c[2]), float(c[3]) if len(c) > 3 else 1.0)
                     for c in raw_c
                 ]
             joints_0 = (
-                [tuple(int(x) for x in j) for j in _read_glb_accessor(doc, bin_chunk, attrs["JOINTS_0"])]
+                [tuple(int(x) for x in j) for j in read_accessor(attrs["JOINTS_0"])]
                 if "JOINTS_0" in attrs else None
             )
             weights_0 = (
-                [tuple(float(x) for x in w) for w in _read_glb_accessor(doc, bin_chunk, attrs["WEIGHTS_0"])]
+                [tuple(float(x) for x in w) for w in read_accessor(attrs["WEIGHTS_0"])]
                 if "WEIGHTS_0" in attrs else None
             )
             joints_1 = (
-                [tuple(int(x) for x in j) for j in _read_glb_accessor(doc, bin_chunk, attrs["JOINTS_1"])]
+                [tuple(int(x) for x in j) for j in read_accessor(attrs["JOINTS_1"])]
                 if "JOINTS_1" in attrs else None
             )
             weights_1 = (
-                [tuple(float(x) for x in w) for w in _read_glb_accessor(doc, bin_chunk, attrs["WEIGHTS_1"])]
+                [tuple(float(x) for x in w) for w in read_accessor(attrs["WEIGHTS_1"])]
                 if "WEIGHTS_1" in attrs else None
             )
             pname = node_name if len(mesh.get("primitives", [])) == 1 else f"{node_name}_p{pi}"
@@ -1260,15 +1519,16 @@ def read_glb_parts(path: str) -> list[MeshPart]:
                 part_joint_names = None
 
             mat_spec = None
-            if "material" in prim and 0 <= prim["material"] < len(materials):
-                gm = materials[prim["material"]]
+            if "material" not in prim or 0 <= prim["material"] < len(materials):
+                gm = materials[prim["material"]] if "material" in prim else {"name": f"{pname}_mat"}
                 pbr = gm.get("pbrMetallicRoughness", {})
-                bcf = pbr.get("baseColorFactor", [0.8, 0.8, 0.8, 1.0])
+                # glTF defaults also apply to primitives with no material; other input formats keep their clay defaults.
+                bcf = pbr.get("baseColorFactor", [1.0, 1.0, 1.0, 1.0])
                 mat_spec = MaterialSpec(
                     name=str(gm.get("name", f"{node_name}_mat")),
                     base_color_factor=(float(bcf[0]), float(bcf[1]), float(bcf[2]), float(bcf[3])),
-                    metallic_factor=float(pbr.get("metallicFactor", 0.0)),
-                    roughness_factor=float(pbr.get("roughnessFactor", 0.85)),
+                    metallic_factor=float(pbr.get("metallicFactor", 1.0)),
+                    roughness_factor=float(pbr.get("roughnessFactor", 1.0)),
                     alpha_mode=str(gm.get("alphaMode", "OPAQUE")),
                     alpha_cutoff=float(gm["alphaCutoff"]) if "alphaCutoff" in gm else None,
                     double_sided=bool(gm.get("doubleSided", False)),
@@ -1322,7 +1582,7 @@ def load_parts_from_path(
         return parts, None
 
     if ext == ".json":
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             data = json.load(f)
         if isinstance(data, dict) and "parts" in data:
             skel = _skeleton_from_dict(data.get("skeleton"), default_space=data.get("coord_space", source_space))
@@ -2030,6 +2290,7 @@ def _cmd_inspect_seams(args: argparse.Namespace) -> int:
         f"inspect-seams: {report['part_count']} part(s), "
         f"edges={topo['unique_edges']} (manifold={topo['manifold_edges']}, "
         f"boundary={topo['boundary_edges']}, non_manifold={topo['non_manifold_edges']}), "
+        f"collapsed_triangles={topo['collapsed_triangles']}, "
         f"overlapping_pairs={len(report['pairwise_overlaps'])}"
     )
     for p in report["parts"]:

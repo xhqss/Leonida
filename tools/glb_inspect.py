@@ -6,6 +6,8 @@ Usage:
 Reads the GLB container (12-byte header, JSON chunk, optional BIN chunk and
 chunk padding), then reports what the JSON actually contains. Missing fields are
 reported as missing; nothing is inferred from the binary buffers.
+For base-color textures without a core source, the inspector checks the declared
+KHR_texture_basisu and EXT_texture_webp image sources without loading either format.
 
 All geometry, names and paths come from the inspected file. No game data is
 needed or bundled.
@@ -13,15 +15,18 @@ needed or bundled.
 from __future__ import annotations
 
 import argparse
+from contextlib import suppress
 import json
 import os
 import struct
 import sys
+import tempfile
 
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 GLB_MAGIC = b"glTF"
@@ -390,6 +395,13 @@ def _texture_name(gltf: dict, texture_index: object) -> str | None:
     if texture is None:
         return None
     image = _entry(gltf, "images", texture.get("source"))
+    if "source" not in texture:
+        extensions = _object(texture.get("extensions"))
+        for extension in ("KHR_texture_basisu", "EXT_texture_webp"):
+            source = _object(extensions.get(extension)).get("source")
+            image = _entry(gltf, "images", source)
+            if image is not None:
+                break
     if image is not None:
         name = _text(image.get("name"))
         if name is not None:
@@ -676,12 +688,24 @@ def main(argv: list[str] | None = None) -> int:
         except (TypeError, ValueError) as exc:
             print(f"error: cannot write {args.json_path}: {exc}", file=sys.stderr)
             return 2
+        staged = None
         try:
-            with open(args.json_path, "w", encoding="utf-8", newline="\n") as handle:
+            directory = os.path.dirname(os.path.abspath(args.json_path))
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=directory,
+                                             prefix=".glb_inspect-", delete=False) as handle:
+                staged = handle.name
                 handle.write(text)
+            os.chmod(staged, published_mode(args.json_path))
+            os.replace(staged, args.json_path)
+            staged = None
         except OSError as exc:
             print(f"error: cannot write {args.json_path}: {getattr(exc, 'strerror', None) or exc}", file=sys.stderr)
             return 2
+        finally:
+            if staged is not None:
+                with suppress(OSError):
+                    os.chmod(staged, 0o600)
+                    os.unlink(staged)
     print(format_report(report))
     if args.json_path:
         print(f"wrote: {args.json_path}")

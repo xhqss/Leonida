@@ -10,8 +10,11 @@ openings match. Reads tracked Markdown only; no game files.
 """
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ITEM = re.compile(r"^(\s*)(?:[-*+]|\d+[.)])\s+(\S.*)$")
@@ -41,8 +44,8 @@ def repeated_items(text):
 
 def markdown_files():
     try:
-        out = subprocess.run(["git", "ls-files", "*.md"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
-        files = out.split()
+        out = subprocess.run(["git", "ls-files", "-z", "--", "*.md"], cwd=ROOT, capture_output=True, check=True).stdout
+        files = [os.fsdecode(name) for name in out.split(b"\0") if name]
     except (OSError, subprocess.CalledProcessError):
         files = [os.path.relpath(os.path.join(r, f), ROOT).replace(os.sep, "/")
                  for r, d, fs in os.walk(ROOT) if ".git" not in r for f in fs if f.endswith(".md")]
@@ -50,6 +53,19 @@ def markdown_files():
 
 
 class RepeatedListItems(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("git"), "requires Git")
+    def test_reads_tracked_markdown_with_spaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+            subprocess.run(["git", "config", "core.quotePath", "true"], cwd=tmp, check=True)
+            page = "space name.md"
+            with open(os.path.join(tmp, page), "w", encoding="utf-8", newline="\n") as f:
+                f.write("# Example\n")
+            subprocess.run(["git", "add", "--", page], cwd=tmp, check=True)
+            with patch(__name__ + ".ROOT", tmp):
+                self.test_docs_have_no_repeated_list_items()
+                self.assertEqual(markdown_files(), [page])
+
     def test_checker_flags_a_repeated_item_only(self):
         current = "- **Wave64.** A native wave64 shader needs a 64-wide subgroup in its stage: AMD can require it"
         old = "- **Wave64.** A native wave64 shader needs a 64-wide subgroup in its stage: AMD (old wording)"

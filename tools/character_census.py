@@ -18,6 +18,8 @@ manifest. The decoded ``model.json`` layout written by the local pack exporter i
 The local exporter does not write an index count, so the index column and total normally stay
 unknown. An input that supplies ``index_count`` (or ``indices``/``IndexCount``) is counted; the
 field is optional, not part of the decoded layout above.
+When a model total is absent, every mesh must supply its contribution for that total to be known.
+A mesh without a triangle count can contribute its own index count divided by three.
 
 An ``rpf9dump models`` manifest (``Items[]`` with ``Verts``, ``Tris``, ``IsFragment``,
 ``HasBoneBindings`` and ``Materials[]``) and a simple ``models[]`` list of model paths or inline
@@ -143,7 +145,8 @@ def model_json_files(directory: str):
 
 
 def _read_json(path: str):
-    with open(path, encoding="utf-8") as handle:
+    # utf-8-sig: a model.json or manifest saved by a Windows editor starts with a BOM, which json.load refuses.
+    with open(path, encoding="utf-8-sig") as handle:
         return json.load(handle)
 
 
@@ -264,16 +267,22 @@ def _count_field(obj, keys, label: str, issues: list, *, list_len: bool = False)
 
 def _mesh_count(meshes: list, keys, label: str, issues: list, *, list_len: bool = False):
     total = 0
-    found = False
+    complete = True
     for index, mesh in enumerate(meshes):
         if not isinstance(mesh, dict):
             issues.append(f"mesh {index} is not an object")
+            complete = False
             continue
         value = _count_field(mesh, keys, f"mesh {index} {label}", issues, list_len=list_len)
-        if value is not None:
+        if value is None and keys == TRIANGLE_KEYS:
+            indices = _count_field(mesh, INDEX_KEYS, f"mesh {index} index count", issues, list_len=True)
+            if indices is not None:
+                value = indices // 3
+        if value is None:
+            complete = False
+        else:
             total += value
-            found = True
-    return total if found else None
+    return total if complete else None
 
 
 def _kind(model: dict, row: dict, issues: list) -> str:
@@ -550,10 +559,6 @@ def model_row(model: dict, source: str, issues: list | None = None) -> dict:
     triangles = _count_field(model, TRIANGLE_KEYS, "triangle count", issues)
     if triangles is None and meshes:
         triangles = _mesh_count(meshes, TRIANGLE_KEYS, "triangle count", issues)
-        if triangles is None:
-            indices = _mesh_count(meshes, INDEX_KEYS, "index count", issues, list_len=True)
-            if indices is not None:
-                triangles = indices // 3
     indices = _count_field(model, INDEX_KEYS, "index count", issues, list_len=True)
     if indices is None and meshes:
         indices = _mesh_count(meshes, INDEX_KEYS, "index count", issues, list_len=True)

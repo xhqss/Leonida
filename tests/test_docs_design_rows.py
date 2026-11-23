@@ -118,6 +118,24 @@ class DesignTableRows(unittest.TestCase):
                 self.assertEqual(repeated, [], f"rows to merge into one in docs/{page} (topic, lines): " +
                                  "; ".join(f"{k[:60]!r} at {v}" for k, v in repeated))
 
+    def test_deduplicating_a_row_keeps_its_unique_border_mode_facts(self):
+        """Removing a duplicated sentence must not take unique measured facts with it.
+
+        The "Other additions" row once held two copies of the border-mode and GPU-check paragraphs. A cleanup that
+        removed the whole block instead of the duplicates lost the BORDER_COLOR_TYPE / SHADER-348 description while
+        the tests above stayed green, and left a ``". ."`` artifact where the join had been.
+        """
+        with open(os.path.join(ROOT, "docs", "design.md"), encoding="utf-8") as f:
+            rows = [line for line in f.read().split("\n") if line.startswith("| Other additions |")]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        for fact in ("BORDER_COLOR_TYPE", "SHADER-348", "FORCE_UNNORMALIZED",
+                     "Modes 6 (clamp border) and 7 (mirror once border)", "remaining approximations",
+                     "ps_gather_wrap.asm"):
+            with self.subTest(fact=fact):
+                self.assertIn(fact, row)
+        self.assertNotIn(". .", row)
+
 
 if __name__ == "__main__":
     unittest.main()

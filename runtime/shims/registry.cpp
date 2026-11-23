@@ -435,6 +435,27 @@ void* load_bundled_module(const std::string& dll_lower, uint32_t flags, bool& ha
     return nullptr;
 }
 
+void* find_loaded_bundled_module_w(const std::wstring& basename) {
+    for (const auto& entry : snapshot_bundled_loaders())
+        if (entry.ops->find_loaded_w)
+            if (void* h = entry.ops->find_loaded_w(entry.ctx, basename)) return h;
+    return nullptr;
+}
+
+void* load_bundled_module_w(const std::wstring& basename, uint32_t flags, bool& handled) {
+    handled = false;
+    for (const auto& entry : snapshot_bundled_loaders()) {
+        if (!entry.ops->load_bundled_w) continue;
+        bool loader_handled = false;
+        void* h = entry.ops->load_bundled_w(entry.ctx, basename, flags, loader_handled);
+        if (loader_handled) {
+            handled = true;
+            return h;
+        }
+    }
+    return nullptr;
+}
+
 void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_handle) {
     owns_handle = false;
     for (const auto& entry : snapshot_bundled_loaders()) {

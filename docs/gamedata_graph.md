@@ -8,7 +8,8 @@ name or target path is committed.
 
 `tools/gamedata_graph.py` rebuilds the documents with `gamedata_index.py` and
 `gamedata_xml.load_documents`, then keeps the reference strings long enough to join them. It is
-standard-library only and reads the same carve as the index and catalog.
+standard-library only and reads the same carve as the index and catalog. XML with an unsupported
+encoding counts as an unparsed payload; it supplies no edges and does not stop the other documents.
 
 ## Graph model
 

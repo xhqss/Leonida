@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; SHADER-52: wave32 v_readlane_b32 / v_writelane_b32 mask the lane select with 31 (S1[4:0]), not 63.
 ; v0 = LocalInvocationId.x (0..31). v2 = 3 * lane + 1.
 ; readlane(v2, 40) must equal lane (40 & 31) = 8 -> 3*8+1 = 25. With & 63 the shuffle asks for lane 40

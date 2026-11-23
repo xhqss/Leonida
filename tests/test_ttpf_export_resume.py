@@ -31,6 +31,22 @@ def textures(folder):
 
 @unittest.skipUnless(os.environ.get("RPF9DUMP_DLL"), "requires a built rpf9dump")
 class TtpfExportResumeTest(unittest.TestCase):
+    def test_manifest_preserves_volume_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool = root / "volume.ttpf"
+            record = pack_etpf_record(8, 8, 1, 0, 10, 8, 3, 2, 4096)
+            write_rds5_pool(pool, [record], [bytes(4096)])
+            result = export(pool, root / "out")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            folder = root / "out" / pool.stem
+            row, = textures(folder)
+            self.assertEqual((row["Dimension"], row["Depth"], row["SourceMips"]), (3, 8, 1))
+            self.assertIsNotNone(row["File"], row["Limitation"])
+            header = (folder / row["File"]).read_bytes()
+            self.assertEqual(struct.unpack_from("<II", header, 24), (row["Depth"], row["Mips"]))
+            self.assertEqual(struct.unpack_from("<I", header, 132)[0], 4)  # D3D10_RESOURCE_DIMENSION_TEXTURE3D
+
     def test_manifest_is_published_only_after_all_extractable_outputs_exist(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -486,6 +486,73 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(g1.seed(0), 0x111)
         self.assertEqual(g2.seed(1), 0x444)
 
+    def test_scan_offsets_boundaries_alignment_and_memoryview(self):
+        sys1, gpu1 = build_synthetic_groom_buffers(flags=0x440, seeds=(0x111, 0x222))
+        sys2, gpu2 = build_synthetic_groom_buffers(flags=0x460, seeds=(0x333, 0x444))
+        res1 = pack_native_resource(sys1, gpu1)
+        res2 = pack_native_resource(sys2, gpu2)
+
+        blob = bytearray(b"9FPR" + b"\xAB" * 0x3C)
+        off1 = len(blob)
+        blob.extend(res1)
+        blob.extend(b"\x55" * 0x20)
+        off2 = len(blob)
+        blob.extend(res2)
+        raw = bytes(blob)
+
+        # Unaligned start rounds up to the next 16-byte boundary and never yields offsets < start.
+        self.assertEqual(list(smh_groom.scan_offsets(raw, start=off1 + 1)), [off2])
+        self.assertEqual(list(smh_groom.scan_offsets(raw, start=off1 + 15)), [off2])
+        self.assertEqual(list(smh_groom.scan_offsets(raw, start=off1)), [off1, off2])
+        self.assertEqual(list(smh_groom.scan_offsets(raw, start=-32)), [off1, off2])
+
+        # Non-16-aligned chunk sizes must still check global 16-byte alignment and find every resource.
+        for chunk in (1, 17, 73, 100):
+            with self.subTest(chunk=chunk):
+                self.assertEqual(list(smh_groom.scan_offsets(raw, chunk=chunk)), [off1, off2])
+
+        # Adjacent [0, split) / [split, size) shards partition offsets without losing a straddling prefix.
+        for split in (off1, off1 + 1, off1 + 16, off1 + 17, off2, off2 + 1, off2 + 16):
+            with self.subTest(split=split):
+                left = list(smh_groom.scan_offsets(raw, start=0, stop=split, chunk=73))
+                right = list(smh_groom.scan_offsets(raw, start=split, stop=len(raw), chunk=73))
+                self.assertTrue(all(o < split for o in left))
+                self.assertTrue(all(o >= split for o in right))
+                self.assertEqual(left + right, [off1, off2])
+
+        # memoryview inputs work identically to bytes/bytearray (contiguous byte, typed, 2D, empty, and strided).
+        self.assertEqual(list(smh_groom.scan_offsets(memoryview(raw), chunk=73)), [off1, off2])
+
+        padded = raw + bytes((-len(raw)) % 4)
+        for fmt in ("B", "h", "I"):
+            with self.subTest(memoryview_fmt=fmt):
+                self.assertEqual(list(smh_groom.scan_offsets(memoryview(padded).cast(fmt), chunk=73)), [off1, off2])
+        self.assertEqual(
+            list(smh_groom.scan_offsets(memoryview(padded).cast("B", shape=(2, len(padded) // 2)), chunk=73)),
+            [off1, off2],
+        )
+        self.assertEqual(list(smh_groom.scan_offsets(memoryview(b"").cast("I"))), [])
+
+        strided_buf = bytearray(2 * len(raw))
+        strided_buf[::2] = raw
+        strided_view = memoryview(strided_buf)[::2]
+        self.assertEqual(list(smh_groom.scan_offsets(strided_view, chunk=73)), [off1, off2])
+
+        strided_u32_buf = bytearray(2 * len(padded))
+        mv_u32 = memoryview(strided_u32_buf).cast("I")
+        mv_u32[::2] = memoryview(padded).cast("I")
+        self.assertEqual(list(smh_groom.scan_offsets(mv_u32[::2], chunk=73)), [off1, off2])
+
+        # A resource at a misaligned offset is never yielded, even when chunk alignment places it at block offset 0.
+        misaligned = b"9FPR" + b"\xAB" * 0x40 + res1
+        self.assertEqual(list(smh_groom.scan_offsets(misaligned, chunk=0x44)), [])
+
+        # Non-positive chunk sizes are rejected with GroomError.
+        for bad_chunk in (0, -16, False):
+            with self.subTest(bad_chunk=bad_chunk):
+                with self.assertRaises(smh_groom.GroomError):
+                    list(smh_groom.scan_offsets(raw, chunk=bad_chunk))
+
     def test_load_groom_all_file_formats(self):
         sysd, gpu = build_synthetic_groom_buffers()
         native = pack_native_resource(sysd, gpu)

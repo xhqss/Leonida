@@ -41,7 +41,7 @@ class BuildDestinationTest(unittest.TestCase):
 
     def run_build(self, game, out, work, rejected):
         argv = ["make_game.py", "--game", game, "--out", out, "--work", work,
-                "--stages", "runtime"]
+                "--stages", "runtime", "--no-tui"]
         with ExitStack() as stack:
             stack.enter_context(patch.object(sys, "argv", argv))
             stack.enter_context(patch("make_game.below_normal"))

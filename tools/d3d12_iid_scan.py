@@ -78,13 +78,16 @@ def d3d12_xs_imports(data: bytes) -> list[str] | None:
             for i in range(sections):
                 s = table + 40 * i
                 vsize, va, rsize, raw = struct.unpack_from("<IIII", data, s + 8)
-                if va <= rva < va + max(vsize, rsize):
-                    return raw + rva - va
+                span = min(vsize, rsize) if vsize else rsize
+                if va <= rva < va + span:
+                    pos_in_file = raw + rva - va
+                    return pos_in_file if pos_in_file < len(data) else None
             return None
 
         def cstr(at: int) -> bytes:
             return data[at:data.index(b"\0", at)]
 
+        names: list[str] | None = None
         pos = offset(imp_rva) if imp_rva else None
         while pos is not None and pos + 20 <= len(data):
             lookup_rva, _, _, name_rva, iat_rva = struct.unpack_from("<IIIII", data, pos)
@@ -92,7 +95,8 @@ def d3d12_xs_imports(data: bytes) -> list[str] | None:
                 break
             at = offset(name_rva)
             if at is not None and cstr(at).lower() == b"d3d12_xs.dll":
-                names: list[str] = []
+                if names is None:
+                    names = []
                 thunk = offset(lookup_rva or iat_rva)
                 width, flag = (8, 1 << 63) if pe32plus else (4, 1 << 31)
                 while thunk is not None:
@@ -105,11 +109,10 @@ def d3d12_xs_imports(data: bytes) -> list[str] | None:
                         hint = offset(value & 0x7FFFFFFF)
                         names.append(cstr(hint + 2).decode("ascii", "replace") if hint is not None else "?")
                     thunk += width
-                return names
             pos += 20
+        return names
     except (struct.error, ValueError):
         return None
-    return None
 
 
 def possible_iid_imports(names: list[str] | None) -> list[str]:

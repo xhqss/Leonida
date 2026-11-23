@@ -96,16 +96,17 @@ struct VulkanDeviceFunctions {
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
     X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements)   \
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                                                        \
-    X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents)                     \
+    X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
 
-    // The Vulkan 1.3 entry points may be null on older devices, the extension ones (conditional rendering) when the
-    // extension is not enabled, and the query functions are optional (a list that uses queries without them is
-    // unsupported). The compute and descriptor functions are needed for normalized or summed occlusion results.
+    // The Vulkan 1.3 entry points may be null on older devices, the extension ones (conditional rendering, mesh
+    // shaders) when the extension is not enabled, and the query functions are optional (a list that uses queries
+    // without them is unsupported). The compute and descriptor functions are needed for normalized or summed
+    // occlusion results.
     bool load(PFN_vkGetDeviceProcAddr get, VkDevice device) {
 #define LEONIDA_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(leonida::device_proc_or_khr(get, device, #name));
         LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_LOAD)
@@ -211,7 +212,8 @@ public:
         write.pBufferInfo = &storage;
         vk_.vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
 
-        const VkPushConstantRange count{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(std::uint32_t)};
+        // The count, and for statistics_sum.comp whether the segments are mesh-pool results.
+        const VkPushConstantRange count{VK_SHADER_STAGE_COMPUTE_BIT, 0, 2 * sizeof(std::uint32_t)};
         VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout.setLayoutCount = 1;
         layout.pSetLayouts = &set_layout_;
@@ -231,21 +233,28 @@ public:
                 create_pipeline(statistics_sum_spirv, statistics_pipeline_));
     }
 
-    // Adds `count` pipeline-statistics results (11 counters each) into one D3D12_QUERY_DATA_PIPELINE_STATISTICS at
-    // dst + offset: the segments of a statistics query that was split around helper dispatches (D3D-162).
-    void sum_statistics(VkCommandBuffer cb, VkQueryPool queries, std::uint32_t first, std::uint32_t count,
-                        VkBuffer dst, VkDeviceSize offset) const {
+    // Adds `count` pipeline-statistics results into one D3D12_QUERY_DATA_PIPELINE_STATISTICS at dst + offset: the
+    // segments of a statistics query that was split around helper dispatches (D3D-162) or mesh draws (D3D-291).
+    // Segment i is in `mesh_queries` when mesh[i] is set (four counters: clipping, fragment and compute; see
+    // statistics_sum.comp), otherwise in `queries` (all eleven).
+    void sum_statistics(VkCommandBuffer cb, VkQueryPool queries, VkQueryPool mesh_queries, const std::uint8_t* mesh,
+                        std::uint32_t first, std::uint32_t count, VkBuffer dst, VkDeviceSize offset) const {
         constexpr VkDeviceSize result = statistics_counters * word_size;
+        constexpr VkDeviceSize mesh_slot = 5 * word_size;  // CInvocations, where the mesh pool's first counter goes
         begin_scratch_write(cb);
         vk_.vkCmdFillBuffer(cb, scratch_, 0, result, 0);
         bind(cb, statistics_pipeline_);
         while (count) {
-            const auto chunk = std::min(count, statistics_capacity);
-            vk_.vkCmdCopyQueryPoolResults(cb, queries, first, chunk, scratch_, result, result,
+            const bool in_mesh = mesh && mesh[first];
+            std::uint32_t chunk = 1;
+            while (chunk < std::min(count, statistics_capacity) && bool(mesh && mesh[first + chunk]) == in_mesh)
+                ++chunk;
+            vk_.vkCmdCopyQueryPoolResults(cb, in_mesh ? mesh_queries : queries, first, chunk, scratch_,
+                                          result + (in_mesh ? mesh_slot : 0), result,
                                           VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
             barrier(cb, transfer | compute, compute, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                     shader_access);
-            dispatch(cb, chunk, 1);
+            dispatch(cb, chunk, 1, in_mesh);
             first += chunk;
             count -= chunk;
             if (count) barrier(cb, compute, transfer, shader_access, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -339,8 +348,9 @@ private:
         vk_.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, &set_, 0, nullptr);
     }
 
-    void dispatch(VkCommandBuffer cb, std::uint32_t chunk, std::uint32_t groups) const {
-        vk_.vkCmdPushConstants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(chunk), &chunk);
+    void dispatch(VkCommandBuffer cb, std::uint32_t chunk, std::uint32_t groups, bool mesh = false) const {
+        const std::uint32_t range[2] = {chunk, mesh ? 1u : 0u};
+        vk_.vkCmdPushConstants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(range), range);
         vk_.vkCmdDispatch(cb, groups, 1, 1);
     }
 
@@ -956,6 +966,7 @@ public:
         replay_.set_stencil_reference = vk.vkCmdSetStencilReference;
         replay_.set_blend_constants = vk.vkCmdSetBlendConstants;
         replay_.draw = vk.vkCmdDraw;
+        replay_.draw_mesh_tasks = vk.vkCmdDrawMeshTasksEXT;  // null unless VK_EXT_mesh_shader is enabled
         replay_.draw_indexed = vk.vkCmdDrawIndexed;
         replay_.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
             const auto it = graphics_pipelines_.find(id);
@@ -2281,9 +2292,10 @@ private:
                                                       std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
                 occlusion_resolve_->normalize(cb, pool, first, count, dst, offset);
             };
-            replay.sum_statistics = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
-                                           std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
-                occlusion_resolve_->sum_statistics(cb, pool, first, count, dst, offset);
+            replay.sum_statistics = [this](VkCommandBuffer cb, VkQueryPool pool, VkQueryPool mesh_pool,
+                                           const std::uint8_t* mesh, std::uint32_t first, std::uint32_t count,
+                                           VkBuffer dst, VkDeviceSize offset) {
+                occlusion_resolve_->sum_statistics(cb, pool, mesh_pool, mesh, first, count, dst, offset);
             };
             replay.sum_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
                                                  std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
@@ -2319,10 +2331,31 @@ private:
         };
         std::shared_ptr<OcclusionSegmentPool> physical, statistics;
         if (segments && !segment_pool(VK_QUERY_TYPE_OCCLUSION, segments, physical)) return ReplayResult::unsupported;
-        // Without the compute helper a split query could not be summed: leave statistics queries whole, as before.
-        if (statistics_segments && can_resolve_occlusion &&
-            !segment_pool(VK_QUERY_TYPE_PIPELINE_STATISTICS, statistics_segments, statistics))
-            return ReplayResult::unsupported;
+        // Without the compute helper a split query could not be summed: leave statistics queries whole, as before
+        // (QueryReplay::plan refuses a list whose statistics query holds a mesh draw then).
+        if (statistics_segments && can_resolve_occlusion) {
+            if (!segment_pool(VK_QUERY_TYPE_PIPELINE_STATISTICS, statistics_segments, statistics))
+                return ReplayResult::unsupported;
+            for (const auto& list : prepared)
+                statistics->mesh.insert(statistics->mesh.end(), list.statistics_mesh.begin(),
+                                        list.statistics_mesh.end());
+            if (std::find(statistics->mesh.begin(), statistics->mesh.end(), 1) == statistics->mesh.end()) {
+                statistics->mesh.clear();
+            } else {
+                // The counters a mesh draw allows (VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076): clipping
+                // invocations and primitives, fragment and compute invocations (D3D-291).
+                VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+                info.queryCount = statistics_segments;
+                info.pipelineStatistics = VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT |
+                                          VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT |
+                                          VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT |
+                                          VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT;
+                if (context_.vk.vkCreateQueryPool(statistics->device, &info, nullptr, &statistics->mesh_pool) !=
+                    VK_SUCCESS)
+                    return ReplayResult::unsupported;
+            }
+        }
         // QueryReplay::plan() reads QueryPool::ended / occlusion and QueryReplay::commit() writes them after
         // resource_lock is unlocked. Hold tracker_mutex_ across plan -> emit -> submit -> commit so concurrent queues
         // see submission-order query state and remove_query_pool() waits until commit finishes.

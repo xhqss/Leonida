@@ -16,6 +16,7 @@ Usage:
 
 `--rigs` additionally joins the RBF0 stream with its 64 KiB continuation blocks and writes the rig-set/rig entries
 and plain `SKEL_` bone names to its own JSON. It stops at the next known container signature or a gap.
+Usage: `python -I tools/anim_index.py --help` lists the options.
 """
 import argparse
 import bisect

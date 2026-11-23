@@ -7,6 +7,7 @@ resources") with `RIG` + a version byte at +0x70 instead of the pack array. Its 
 path. Each value points at +0x20 to a `RIG` block, which holds tables of 8-byte `(hash, word)` items. `--rigs`
 takes the JSON `anim_index.py --rigs` writes and resolves every rig-set entry (source = rig dictionary name,
 rig = key). The output holds counts and one row per rig dictionary, no item values.
+Usage: `python -I tools/anim_rigs.py --help` lists the options.
 """
 import argparse
 import collections
@@ -165,7 +166,7 @@ def main():
         sys.exit(f"{e.filename or a.archive}: {e.strerror or e}")
     if a.rigs:
         try:
-            with open(a.rigs, encoding="utf-8") as f:
+            with open(a.rigs, encoding="utf-8-sig") as f:
                 summary["rbf0_join"] = join_rbf0(dicts, json.load(f))
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
             print(f"ERROR: {a.rigs}: invalid rig report ({getattr(e, 'strerror', None) or e})", file=sys.stderr)

@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; VOP3 FP source modifiers on constants (docs/design.md "VOP3 FP modifiers on constants"): on an inline constant or a
 ; literal, abs clears the sign bit first and neg flips it second; neg on a literal is not an integer negation.
 ;   x: v_add_f32_e64 0 + -|-2.0| = -2.0 (folding - into the constant first gave +2.0)

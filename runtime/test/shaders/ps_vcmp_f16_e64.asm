@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; 16-bit float VOPC compares, e64 form (SGPR destination) with swapped operands: v_cmp_{f,lt,eq,le,gt,lg,ge,o,u,nge,nlg,
 ; ngt,nle,neq,nlt,tru}_f16_e64 s4, B, A. Same seven operand pairs as ps_vcmp_f16 (see its header for the ISA rules and
 ; the case list), but src0 is the VGPR B and src1 is A (the inline constant for k0..k2, the VGPR otherwise), so each

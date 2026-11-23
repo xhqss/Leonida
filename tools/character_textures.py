@@ -26,8 +26,10 @@ lowercase equivalents accepted for hand-written files:
         {"Param": "1E77BF4C", "Name": "face_bumptex"}]}]}
 
 A top-level ``Items``/``Models`` list is also accepted, so a model manifest can
-be passed directly. The texture column keeps its display name or hash. A separate
-``asset_key`` column carries the 16-digit resource identity from ``Id64`` or ``AssetKey``.
+be passed directly. When the model has no name, the ``File`` stem accepts either
+slash convention regardless of the reporting host. The texture column keeps its
+display name or hash. A separate ``asset_key`` column carries the 16-digit
+resource identity from ``Id64`` or ``AssetKey``.
 
     python -I tools/character_textures.py <model.json|dir> [...] [--json FILE] [--csv FILE]
 
@@ -37,6 +39,7 @@ binding; neither may overwrite an input. Standard library only.
 import argparse
 import csv
 import json
+import ntpath
 import os
 import sys
 
@@ -124,7 +127,7 @@ def model_name(model: dict, path: str) -> str:
         return _one_line(explicit)
     file_name = _first(model, MODEL_FILE_KEYS)
     if isinstance(file_name, str) and file_name.strip():
-        return _one_line(os.path.splitext(os.path.basename(file_name.strip()))[0])
+        return _one_line(ntpath.splitext(ntpath.basename(file_name.strip()))[0])
     stem = os.path.splitext(os.path.basename(path))[0]
     if stem.lower() == "model":
         parent = os.path.basename(os.path.dirname(os.path.abspath(path)))
@@ -202,7 +205,7 @@ def classify_material(material: dict, index: int) -> dict:
 def classify_file(path: str) -> dict:
     """Read one model file and classify every material in it."""
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             document = json.load(f)
     except json.JSONDecodeError as exc:
         raise ValueError(f"{path}: {exc.msg} at line {exc.lineno} column {exc.colno}") from None

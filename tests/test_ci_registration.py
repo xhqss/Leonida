@@ -68,7 +68,9 @@ def ci_rules(root):
     # The check loop and the translator list share this one find expression.
     pruned, loop_glob = find(r"-path\s+'([^']+)'\s+-prune\s+-o\s+-type\s+f\s+-name\s+'([^']+)'",
                              "the tests/test_*.py scan")
-    (semantic,) = find(r"python\s+-m\s+unittest\s+discover\s+-s\s+(\S+)", "unittest discover -s")
+    # scripts/run_semantic_tests.py runs the files unittest discover would find, one process each
+    (semantic,) = find(r"(?:python\s+-m\s+unittest\s+discover\s+-s|python\s+-I\s+scripts/run_semantic_tests\.py)\s+(\S+)",
+                       "the semantic suite's folder")
     (viewer,) = find(r"node\s+--test\s+(\S+)", "node --test")
     if re.search(r"unittest\s+discover[^\n]*-p\s", text):
         raise AssertionError("unittest discover now passes -p; this test assumes its default 'test*.py' pattern")

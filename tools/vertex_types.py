@@ -46,6 +46,7 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from meshlet_page import PageError, parse_group  # noqa: E402  (same group validation as the 63 30 pages)
+from report_paths import path_key  # noqa: E402
 
 MAGIC = 0x4042
 HEADER = 0x80
@@ -695,7 +696,7 @@ def _walk_error(exc: OSError):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("inputs", nargs="+", help=".rpf archives or folders of them")
+    ap.add_argument("inputs", nargs="+", help=".rpf archives or folders; overlapping paths are counted once")
     ap.add_argument("--limit", type=int, default=0, help="stop after this many 42 40 00 00 streams per archive")
     ap.add_argument("--json", help="write the totals here")
     ap.add_argument("--seed", type=int, default=1)
@@ -703,7 +704,7 @@ def main(argv=None):
     if args.limit < 0:
         print("error: --limit must be >= 0", file=sys.stderr)
         return 2
-    archives = []
+    archives = {}  # Resolved path -> first spelling, in discovery order.
     for p in args.inputs:
         if not os.path.exists(p):
             print(f"error: {p} does not exist", file=sys.stderr)
@@ -712,26 +713,29 @@ def main(argv=None):
             try:
                 for root, directories, files in os.walk(p, onerror=_walk_error):
                     directories.sort()
-                    archives += [os.path.join(root, f) for f in sorted(files) if f.lower().endswith(".rpf")]
+                    for name in sorted(files):
+                        if name.lower().endswith(".rpf"):
+                            path = os.path.join(root, name)
+                            archives.setdefault(path_key(path), path)
             except OSError as exc:
                 print(f"error: {exc.filename or p}: {exc.strerror or exc}", file=sys.stderr)
                 return 2
         else:
-            archives.append(p)
+            archives.setdefault(path_key(p), p)
     # The report is written after the whole scan, so check its path first: an archive given as --json used to be
     # replaced by the report (exit 0), and a directory ended the run in a traceback.
     if args.json:
         if os.path.isdir(args.json):
             print(f"error: --json {args.json} is a directory", file=sys.stderr)
             return 2
-        for path in archives:
+        for path in archives.values():
             if same_output_path(args.json, path):
                 print(f"error: --json would overwrite the input {path}", file=sys.stderr)
                 return 2
     rng = random.Random(args.seed)
     T = {"streams": 0}
     errors = {}
-    for path in archives:
+    for path in archives.values():
         try:
             for _, _, data in iter_blocks(path, args.limit):
                 T["streams"] += 1

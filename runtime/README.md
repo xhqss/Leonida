@@ -104,7 +104,20 @@ imports by name or ordinal, parses the export table, sets section protections, a
 image's x64 unwind table (`.pdata`) with `RtlAddFunctionTable`, so exceptions raised in or passing
 through a mapped image are dispatched and stack walks can step over its frames. The table is validated
 first (entries in bounds, sorted and non-overlapping) and removed when the loader is destroyed. Modules
-are deduped by lower-case file name, so an import graph that reaches the same DLL twice maps it once.
+are deduped by basename, so an import graph that reaches the same DLL twice maps it once. The identity
+key uses the filesystem's native path representation with ASCII case folded; it does not require a
+Windows filename to fit the ANSI code page. A lossless legacy narrow filename alias retains the existing
+bytewise case behavior for narrow API and import-name lookups. `Module::name`, mapped address labels,
+and path diagnostics use UTF-8. The `LoadLibrary*`/`GetModuleHandle*` shims look a wide name up by its native
+basename when it has a character outside ASCII (`Loader::find_loaded_module_w`, `load_runtime_module_w`), and
+module names compare case-insensitively with the system's own table (`CompareStringOrdinal`), as Windows
+compares them; a narrow name outside ASCII compares the same way through the ANSI code page.
+
+`module_names` checks native and mapped renamed DLLs, distinct Unicode identities, basename cache
+reuse, existing ACP aliases, the wide and case-insensitive lookups, export execution, and path errors. On native Windows with Python available,
+`run_module_names` compares original renamed EXEs through native execution and `--dry-run`, `--init`,
+and `--run`, including a Unicode parent directory and an ACP-named imported DLL. It checks strict UTF-8
+trace names and unchanged fixture bytes. Both tests use only locally built synthetic images.
 
 MSVC C++ exceptions need one more piece. `_CxxThrowException` stores the throwing image's base in the
 exception record, from `RtlPcToFileHeader`, and the catch side adds the throw's RVAs to it; Windows' own
@@ -150,7 +163,12 @@ Current limits, by design:
   measured three-argument
   `XMemVirtualQuery(process, address, out)`. Allocations are 64-byte aligned; the working-set and
   virtual-query outputs fill the observed 64-byte structures and return `FALSE`/`0` on a null or bad
-  address.
+  address. `XMemAllocDefault`/`XMemFreeDefault` share that heap. `XMemVirtualAlloc` accepts the attribute word,
+  drops the console's `PAGE_GRAPHICS_*` protection bits, commits 2 MiB guest pages 2 MiB-aligned,
+  and passes `MEM_RESERVE_PLACEHOLDER`/`MEM_REPLACE_PLACEHOLDER` through. Physical pages
+  (`XMemAllocatePhysicalPages`, `XMemFreePhysicalPages`, `XMemMapPhysicalPages`, `XMemMapPhysicalPagesScatter`) are
+  64 KiB pages of pagefile-backed sections, mapped one view per page into the placeholder that a reserve-only
+  64 KiB-page `XMemVirtualAlloc` becomes, with that reservation's protection. `XMemIsToolsMemAvailable` is `FALSE`.
 - The `kernel32.dll` file API — `CreateFileA/W`, `FindFirstFileA/W`/`FindNextFileA/W`/`FindClose`,
   `GetFileAttributesA/W`, `GetFileAttributesExA/W` and `DeleteFileA/W`: a `GAME:` path maps under `--game-dir`, an
   open that can write and a delete go to `--overlay DIR` (default `<game-dir>\overlay`), which reads prefer, and a path
@@ -223,7 +241,8 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
   and found by FSSM hash; three draws into a float target, compared bit for bit. Needs `llvm-mc` (`LLVM_MC`) and the
   Vulkan SDK's `spirv-as` and `spirv-val` at build time.
 - `d3d12_compute_test` — the compute path: root signature, a compute PSO found by its FSSM hash in a
-  translator-style index, root arguments through the GPU address arena, and two dispatches.
+  translator-style index, root arguments through the GPU address arena, and two dispatches. A second program is
+  found the same way in `<shaders>/bvh/index.json`, where the BVH builder's programs go (`docs/embedded_shaders.md`).
 - `d3d12_fspx_compute_test` — compute PSOs from synthetic FSPX programs (`docs/fspx.md`): an `ACCC` container
   through slot 62 and a bare kind-6 program, found by `fspx_code_sha256` in `<shaders>/fspx/index.json`, one
   dispatch each that reads its kind-6 program as the code base; malformed directories and untranslated programs
@@ -340,14 +359,18 @@ from the ANSI code page.
 | `tls_callback` | before each TLS callback the Loader runs (process attach and detach; thread events run under the Windows loader lock and are not traced) | `module`, `at` (module+RVA), `reason` |
 | `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |
 | `unimplemented_call` | first call of each unimplemented import | `import` (`dll!name`), `caller` (module+RVA) |
-| `xmem_attributes` | the first `XMemAlloc` and the first `XMemFree` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (`XMemAlloc` only), `caller` (module+RVA) |
+| `xmem_attributes` | the first `XMemAlloc`, `XMemFree`, `XMemAllocDefault`, `XMemFreeDefault` and `XMemVirtualAlloc` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (not for the frees), `caller` (module+RVA) |
+| `xmem_physical_pages` | the first `XMemAllocatePhysicalPages` for each distinct attribute word | `api`, `attributes`, `pages`, `caller` |
+| `file_open_failed` | a guest `CreateFileW`/`CreateFile2` that fails (at most 256 events) | `api`, `path` (as the title passed it), `error` (Win32), `caller` (module+RVA) |
+| `int3_skipped` | with `LEONIDA_SKIP_INT3` set: first int3 at each address, which is then stepped over | `at` (module+RVA) |
 | `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |
 | `exception` | any exception, before handlers run | `code`, `at`, `access`/`address` for access violations, `cpp` for C++ throws, `stack` (up to 16 frames) |
 | `exit` / `error` | `--run` returns, or the loader throws | `code` / `what` |
 
 Every line also has `seq` and `t` (seconds since the trace opened). Addresses are `module+0xRVA` for mapped images,
 `host:name.dll+0xRVA` for host modules. The exception handler only records: it returns `EXCEPTION_CONTINUE_SEARCH`,
-so the process behaves the same with or without the trace. It works with any `LEONIDA_UNIMPLEMENTED` policy.
+so the process behaves the same with or without the trace (except under the diagnostic `LEONIDA_SKIP_INT3`, which
+steps over int3). It works with any `LEONIDA_UNIMPLEMENTED` policy.
 
 The file can quote what the game prints, so it stays on your machine. In issues and pull requests, share counts or
 lines from synthetic fixtures only.

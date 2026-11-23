@@ -26,9 +26,12 @@ and the descriptor's `samples` counts interleaved samples across those packet ch
 Output: <out>/<bank>/<stream id>.ogg (or .wav). Directory input preserves each bank's relative path.
 
 For 16-bit PCM copies of the Ogg Opus files, run tools/audio_wav.py on the output (make_game.py does it with --wav).
+Usage: `python -I tools/awc_opus.py --help` lists the options.
 """
 import argparse
 import functools
+import json
+from collections import Counter
 import os
 import struct
 import sys
@@ -38,6 +41,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import new_file_mode, published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
+from rsc8_audio import decode_marker_records, marker_records, pair_marker_regions, parse_adat_header_bytes
 from report_paths import path_key  # noqa: E402
 
 # ---- Ogg ----
@@ -64,6 +68,8 @@ def ogg_page(serial: int, seq: int, granule: int, packets: list, flags: int) -> 
             lacing.append(255)
             n -= 255
         lacing.append(n)
+    if len(lacing) > 255:
+        raise ValueError("packet needs more than 255 Ogg segments")
     hdr = struct.pack("<4sBBqIIIB", b"OggS", 0, flags, granule, serial, seq, 0, len(lacing)) + bytes(lacing)
     body = b"".join(packets)
     page = bytearray(hdr + body)
@@ -147,6 +153,11 @@ def folder_file_mode(directory: str) -> int:
 
 
 def write_file(path: str, data: bytes) -> None:
+    """Publish one buffer using the same staged writer as multipart WAV output."""
+    _write_file_parts(path, (data,))
+
+
+def _write_file_parts(path: str, parts: tuple[bytes | memoryview, ...]) -> None:
     """Write under a private temporary name and rename into place: a stopped run or a full disk never leaves a
     short file under the final name, where a later run would keep it. The staging file is created in the
     destination directory (the same volume), so concurrent writers each publish a complete file (last wins)
@@ -157,7 +168,8 @@ def write_file(path: str, data: bytes) -> None:
     try:
         with tempfile.NamedTemporaryFile(mode="wb", dir=parent, prefix=".awc-", suffix=".tmp", delete=False) as f:
             tmp_path = f.name
-            f.write(data)
+            for part in parts:
+                f.write(part)
         # NamedTemporaryFile creates 0600; give the staged file the mode of the file it replaces, or a new file's.
         os.chmod(tmp_path, published_mode(out_path) if os.path.exists(out_path) else folder_file_mode(parent))
         os.replace(tmp_path, out_path)
@@ -174,7 +186,10 @@ def write_file(path: str, data: bytes) -> None:
         raise
 
 
-def write_wav(path: str, pcm: bytes, rate: int, channels: int, float32: bool = False) -> None:
+def write_wav(path: str, pcm: bytes | memoryview, rate: int, channels: int, float32: bool = False) -> None:
+    # A typed or multidimensional view's len() counts elements, not bytes. Flatten the contiguous buffer
+    # without copying before sizing the RIFF/data chunks and the float sample count.
+    pcm = memoryview(pcm).cast("B")
     bits = 32 if float32 else 16
     block_align = channels * (bits // 8)
     fmt = struct.pack("<HHIIHH", 3 if float32 else 1, channels, rate, rate * block_align, block_align, bits)
@@ -183,7 +198,8 @@ def write_wav(path: str, pcm: bytes, rate: int, channels: int, float32: bool = F
         fmt += struct.pack("<H", 0)  # WAVEFORMATEX.cbSize
         fact = struct.pack("<4sII", b"fact", 4, len(pcm) // block_align)
     header = b"WAVEfmt " + struct.pack("<I", len(fmt)) + fmt + fact + b"data" + struct.pack("<I", len(pcm))
-    write_file(path, b"RIFF" + struct.pack("<I", len(header) + len(pcm)) + header + pcm)
+    header = b"RIFF" + struct.pack("<I", len(header) + len(pcm)) + header
+    _write_file_parts(path, (header, pcm))
 
 
 # ---- AWC ----
@@ -341,19 +357,61 @@ def bank_output_dir(path, out_dir):
     return os.path.join(out_dir, name)
 
 
-def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
+def music_cue_regions(data, frame_limits):
+    """Join a unique marker stream-table entry to a unique exported music channel in this bank."""
+    if not frame_limits:
+        return []
+    bank = parse_adat_header_bytes(data, 0, len(data))
+    if bank is None:
+        return []
+    entries = bank["entries"]
+    occurrences = Counter(sid for sid, _ in entries)
+    rows = []
+    for sid, tags in entries:
+        if sid not in frame_limits or occurrences[sid] != 1:
+            continue
+        for kind, offset, size in tags:
+            if kind != 0xBD:
+                continue
+            blob = data[offset:offset + size]
+            if not decode_marker_records(blob)["offsets_ascending"]:
+                continue
+            for region in pair_marker_regions(marker_records(blob))["regions"]:
+                if region["end"] <= frame_limits[sid]:
+                    rows.append({"file": f"{sid:08X}.ogg", "name_hash": f"{region['name']:08X}",
+                                 "start_sample": region["start"], "end_sample": region["end"]})
+    return rows
+
+
+def write_cue_sheet(sheet, rows):
+    payload = {"sample_rate": 48000, "regions": rows}
+    write_file(sheet, (json.dumps(payload, indent=2) + "\n").encode("utf-8"))
+
+
+def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP, cue_sheet: bool = False):
+    od = bank_output_dir(path, out_dir)
+    if cue_sheet:
+        sheet = os.path.join(od, "cue_regions.json")
+        if os.path.exists(sheet):
+            # A skipped bank or interrupted channel write must not leave last run's regions current.
+            write_cue_sheet(sheet, [])
     with open(path, "rb") as f:
         d = f.read()
     streams, music = parse_awc(d)
-    od = bank_output_dir(path, out_dir)
     os.makedirs(od, exist_ok=True)
     counts = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
+    channel_counts = Counter()
+    frame_limits = {}
     for mus, data in music:
         for cid, samples, rate, codec, pk, packet_channels in music_channels(d, mus, data):
+            if cue_sheet:
+                channel_counts[cid] += 1
             if pk:
                 n48 = samples * 48000 // rate if rate else 0
-                write_ogg_opus(os.path.join(od, f"{cid:08X}.ogg"), pk, packet_channels, cid, n48,
-                               pre_skip=pre_skip)
+                granule = write_ogg_opus(os.path.join(od, f"{cid:08X}.ogg"), pk, packet_channels, cid, n48,
+                                         pre_skip=pre_skip)
+                if cue_sheet and rate == 48000 and samples > 0:
+                    frame_limits[cid] = min(samples, max(0, granule - pre_skip))
                 counts["music"] += 1
     for s, stem in zip(streams, export_stems([s["id"] for s in streams])):
         at, size = s["data"]
@@ -373,14 +431,21 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
                 continue
         if s["codec"] == 2 and s["channels"] in (1, 2) and size == s["samples"] * s["channels"] * 4:
             # codec 2: 32-bit float PCM (4 bytes per sample; values can exceed +-1, e.g. impulse responses)
-            write_wav(os.path.join(od, stem + ".wav"), d[at:at + size], s["rate"], s["channels"], True)
+            write_wav(os.path.join(od, stem + ".wav"), memoryview(d)[at:at + size], s["rate"], s["channels"], True)
             counts["pcm"] += 1
             continue
         if s["codec"] == 0 and s["channels"] in (1, 2) and size == s["samples"] * s["channels"] * 2:
-            write_wav(os.path.join(od, stem + ".wav"), d[at:at + size], s["rate"], s["channels"])
+            write_wav(os.path.join(od, stem + ".wav"), memoryview(d)[at:at + size], s["rate"], s["channels"])
             counts["pcm"] += 1
             continue
         counts["other"] += 1
+    if cue_sheet:
+        for stream in streams:
+            frame_limits.pop(stream["id"], None)
+        verified = {cid: limit for cid, limit in frame_limits.items() if channel_counts[cid] == 1}
+        rows = music_cue_regions(d, verified)
+        if rows:
+            write_cue_sheet(sheet, rows)
     return counts
 
 
@@ -388,6 +453,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
     ap.add_argument("out")
+    ap.add_argument("--cue-sheet", action="store_true", help="write paired music cues beside their Ogg files")
     ap.add_argument("--limit", type=int, help="maximum number of banks to export (default: all)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
                     help="banks to export at once (default: half the CPU count)")
@@ -451,7 +517,7 @@ def main(argv=None) -> int:
     if jobs == 1:
         for i, (b, output_parent) in enumerate(banks):
             try:
-                add(export_bank(b, output_parent, a.pre_skip))
+                add(export_bank(b, output_parent, a.pre_skip, a.cue_sheet))
             except (ValueError, struct.error, IndexError, OSError) as e:
                 skipped(b, e)
                 continue
@@ -459,7 +525,7 @@ def main(argv=None) -> int:
                 print(f"  {i + 1}/{len(banks)} banks: {tot}", flush=True)
     else:
         with ProcessPoolExecutor(max_workers=process_workers(jobs)) as ex:
-            futures = {ex.submit(export_bank, b, output_parent, a.pre_skip): b for b, output_parent in banks}
+            futures = {ex.submit(export_bank, b, output_parent, a.pre_skip, a.cue_sheet): b for b, output_parent in banks}
             for i, fut in enumerate(as_completed(futures), 1):
                 b = futures[fut]
                 try:

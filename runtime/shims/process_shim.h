@@ -6,9 +6,9 @@
 
 namespace rt::process {
 
-// What the game sees as argv[0..] and GetCommandLine: `program` then `args`, quoted where needed. The wide forms
-// (__wargv, GetCommandLineW) hold the arguments exactly; the narrow ones are their ANSI code page text, with a
-// character the code page can't represent replaced as the CRT does (RT-84).
+// Set GetCommandLine to `program` then `args`, quoted where needed, before process-attach callbacks. The wide text
+// holds the arguments exactly; the narrow text uses the ANSI code page (RT-84). Reset CRT argv to argc=0/null:
+// its startup configuration selects no arguments, the original arguments, or wildcard expansion for each width.
 void set_command_line(const std::wstring& program, const std::vector<std::wstring>& args);
 
 // Runs a mapped EXE's entry point on a new thread with `stack_bytes` of reserved stack and returns the game's

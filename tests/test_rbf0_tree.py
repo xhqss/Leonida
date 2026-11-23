@@ -4,7 +4,9 @@
 
 Every byte here is built by the test. No game file, game asset path or game name is used.
 """
+import contextlib
 import csv
+import io
 import json
 import os
 import struct
@@ -384,6 +386,23 @@ class OutputTest(unittest.TestCase):
         rbf0_tree.write_xml(xml_dir, doc["resources"])  # a rerun overwrites, it does not add -0000 duplicates
         self.assertEqual(len(os.listdir(xml_dir)), 1)
 
+    def test_csv_distinguishes_trees_with_the_same_offset_and_root(self):
+        names = ["00000100-left.bin", "00000100-right.bin"]
+        for name in names:
+            with open(os.path.join(self.root, name), "wb") as f:
+                f.write(wide_blob())
+        out = os.path.join(self.root, "tree.json")
+        table = os.path.join(self.root, "nodes.csv")
+        self.assertEqual(rbf0_tree.main([self.root, out, "--csv", table, "--quiet"]), 0)
+        with open(table, encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual({row["resource"] for row in rows}, {"0x100"})
+        self.assertEqual({row["source"] for row in rows}, set(names))
+        for name in names:
+            nodes = [row for row in rows if row["source"] == name]
+            self.assertEqual(len(nodes), 8)
+            self.assertEqual({node["kind"] for node in nodes}, {"element", "value", "text"})
+
     def test_duplicate_offsets_keep_each_source(self):
         names = ["000000000100-left.bin", "000000000100-right.bin"]
         roots = ["RootA", "RootB"]
@@ -418,6 +437,25 @@ class OutputTest(unittest.TestCase):
         self.assertIn(os.path.basename(out), result.stderr)
         self.assertIn("depth", result.stderr)
         self.assertCountEqual(os.listdir(self.root), ["deep.bin", "tree.json"])
+
+    def test_error_lines_name_the_path_as_typed(self):
+        """repr() doubled every Windows backslash in the one line an error printed; a POSIX path stays the same."""
+        source = os.path.join(self.root, "deep.bin")
+        with open(source, "wb") as f:
+            f.write(WIDE + _open(0, b"TestRoot") + CLOSE)
+        out = os.path.join(self.root, "tree.json")
+        cases = (
+            ("decode_source", RecursionError(), source, "tree exceeds the export depth limit"),
+            ("write_json", OSError(28, "No space left on device"), out, "No space left on device"),
+        )
+        for failure_in, failure, path, text in cases:
+            with self.subTest(failure_in):
+                stderr = io.StringIO()
+                with patch.object(rbf0_tree, failure_in, side_effect=failure), \
+                        contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(rbf0_tree.main([source, out, "--quiet"]), 1)
+                self.assertEqual(stderr.getvalue(), f"{path}: {text}\n")
+        self.assertEqual(os.listdir(self.root), ["deep.bin"])
 
     @unittest.skipIf(os.name == "nt", "POSIX permission bits")
     def test_report_keeps_the_usual_permission_bits(self):

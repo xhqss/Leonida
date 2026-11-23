@@ -14,6 +14,12 @@ Architecture:
   - Modifiers:
       * Input modifiers on S0: abs (|S0|), neg (-S0).
       * Output modifiers: clamp (clamps result to [0.0, 1.0]), omod (mul:2, mul:4, div:2).
+
+Translator-backed cases (SHADER-1039): a hand-written pixel-shader listing goes through
+tools/rdna2spirv.py and is executed with tests/semantic/spirv_mini_interp.py. The lowering is pure 32-bit
+integer work, so that interpreter can run it and the module carries no OpCapability Float64. The expected
+words there are written by hand from the rules above, never taken from the oracle below, so a rule the
+translator and the oracle share cannot hide a mistake.
 """
 
 from fractions import Fraction
@@ -25,6 +31,17 @@ import sys
 import unittest
 from dataclasses import dataclass
 from enum import Enum, auto
+
+sys.dont_write_bytecode = True
+HERE = os.path.dirname(os.path.abspath(__file__))
+TESTS_DIR = os.path.dirname(HERE)
+for _p in (HERE, TESTS_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+# The translator-backed cases at the end run a hand-written listing through tools/rdna2spirv.py, so the
+# file is a translator regression test and not only a private oracle (SHADER-1039).
+from support import mrt0_words, translate_lines  # noqa: E402  (tests/semantic is sys.path, see above)
+import rdna2spirv  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
@@ -1535,6 +1552,92 @@ class TestValuLdexpF64Oracle(unittest.TestCase):
         self.assertEqual(bits_to_f64(ref_ldexp_f64(ONE_F64, 0, omod="mul:2")), 2.0)
         self.assertEqual(bits_to_f64(ref_ldexp_f64(ONE_F64, 0, omod="mul:4")), 4.0)
         self.assertEqual(bits_to_f64(ref_ldexp_f64(ONE_F64, 0, omod="div:2")), 0.5)
+
+
+# --- translator-backed cases (SHADER-1039) -------------------------------------------------------
+# Each case translates a hand-written pixel shader with tools/rdna2spirv.py and runs it through
+# tests/semantic/spirv_mini_interp.py; the expected word is the rule above applied by hand.
+
+
+def run_ldexp(src_bits, exp_bits, src_text="v[0:1]", tail="", setup=()):
+    """Translate and run `v_ldexp_f64 v[4:5], <src_text>, v2<tail>`; return (bits, SPIR-V text)."""
+    lines = list(setup) + [
+        "v_mov_b32 v0, %#010x" % (src_bits & MASK32),
+        "v_mov_b32 v1, %#010x" % ((src_bits >> 32) & MASK32),
+        "v_mov_b32 v2, %#010x" % (exp_bits & MASK32),
+        "v_ldexp_f64 v[4:5], %s, v2%s" % (src_text, tail),
+        "exp mrt0 v4, v5, v4, v5 done vm",
+        "s_endpgm",
+    ]
+    spv = translate_lines("ps_ldexp_f64", lines)
+    words = mrt0_words(spv)
+    return (words[0] | words[1] << 32), spv
+
+
+class TranslatedLdexpF64(unittest.TestCase):
+    """The translated instruction against words written by hand from the rules above (SHADER-1039)."""
+
+    CASES = [
+        # (source bits, exponent, expected bits, what it pins)
+        (ONE_F64, 5, 0x4040000000000000, "1.0 * 2^5 = 32.0"),
+        (0x3FF8000000000000, -1, 0x3FE8000000000000, "1.5 * 2^-1 = 0.75"),
+        (0xBFF8000000000000, 2, 0xC018000000000000, "-1.5 * 2^2 = -6.0"),
+        (ONE_F64, -1074, MIN_SUBNORMAL_F64, "1.0 * 2^-1074 is the smallest subnormal"),
+        (MIN_SUBNORMAL_F64, 1, 0x0000000000000002, "a subnormal input is normalised before scaling"),
+        (ONE_F64, -1075, POS_ZERO_F64, "half an ulp ties to even"),
+        (0x3FF8000000000000, -1075, MIN_SUBNORMAL_F64, "three quarters of an ulp rounds up"),
+        (POS_ZERO_F64, 900, POS_ZERO_F64, "+0 passes through"),
+        (NEG_ZERO_F64, 900, NEG_ZERO_F64, "-0 keeps its sign"),
+        (POS_INF_F64, 900, POS_INF_F64, "+inf passes through"),
+        (NEG_INF_F64, -900, NEG_INF_F64, "-inf passes through"),
+        (QNAN_F64, 7, QNAN_F64, "qNaN passes through unchanged"),
+        (MAX_FINITE_F64, 2, POS_INF_F64, "overflow gives +inf"),
+    ]
+
+    def test_scaling_specials_and_subnormals(self):
+        for src_bits, exponent, want, why in self.CASES:
+            with self.subTest(why=why):
+                got, spv = run_ldexp(src_bits, exponent)
+                self.assertEqual(got, want, why)
+                self.assertNotIn("OpCapability Float64", spv, "the lowering is 32-bit integer only")
+
+    def test_source_modifiers(self):
+        got, _ = run_ldexp(0xC008000000000000, 3, src_text="|v[0:1]|")      # |-3.0| * 8
+        self.assertEqual(got, 0x4038000000000000)
+        got, _ = run_ldexp(0x3FF8000000000000, 1, src_text="-v[0:1]")      # -(1.5 * 2)
+        self.assertEqual(got, 0xC008000000000000)
+
+    def test_clamp(self):
+        # dx10_clamp: NaN, -0 and negatives give +0.0; anything above 1.0 gives 1.0.
+        for src_bits, exponent, want in ((ONE_F64, 2000, ONE_F64),
+                                         (0xBFF0000000000000, 3, POS_ZERO_F64),
+                                         (QNAN_F64, 3, POS_ZERO_F64),
+                                         (0x3FE0000000000000, 1, ONE_F64)):
+            with self.subTest(src=hex(src_bits), exponent=exponent):
+                got, _ = run_ldexp(src_bits, exponent, tail=" clamp")
+                self.assertEqual(got, want)
+
+    def test_32_bit_literal_lands_in_the_high_word(self):
+        # RDNA2 places a 32-bit literal constant in bits [63:32] of an f64 operand (measured on gfx1036).
+        got, _ = run_ldexp(0, 3, src_text="0x3ff00000")
+        self.assertEqual(got, 0x4020000000000000)                          # 1.0 * 2^3
+
+    def test_sgpr_pair_source(self):
+        setup = ("s_mov_b32 s0, 0x00000000", "s_mov_b32 s1, 0xc0000000")   # -2.0
+        got, _ = run_ldexp(0, 2, src_text="s[0:1]", setup=setup)
+        self.assertEqual(got, 0xC020000000000000)                          # -2.0 * 4
+
+    def test_mode_dependent_omod_is_refused(self):
+        # Hardware ignores mul:2/mul:4/div:2 with denorm16_64 = 3 and applies them with 0, so the
+        # translator refuses them rather than guessing.
+        with self.assertRaisesRegex(rdna2spirv.Unsupported, "output modifier"):
+            run_ldexp(ONE_F64, 5, tail=" mul:2")
+
+    def test_single_register_destination_is_refused(self):
+        lines = ["v_mov_b32 v0, 0", "v_mov_b32 v1, 0x3ff00000", "v_mov_b32 v2, 3",
+                 "v_ldexp_f64 v4, v[0:1], v2", "exp mrt0 v4, v4, v4, v4 done vm", "s_endpgm"]
+        with self.assertRaisesRegex(rdna2spirv.Unsupported, "destination"):
+            translate_lines("ps_ldexp_bad_dst", lines)
 
 
 if __name__ == "__main__":

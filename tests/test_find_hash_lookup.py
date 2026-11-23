@@ -104,6 +104,30 @@ class FindHashLookupTest(unittest.TestCase):
             self.assertEqual(r.returncode, 2)
             self.assertIn("ERROR", r.stderr)
 
+    def test_json_writes_nothing_over_the_image_and_never_crashes(self):
+        """--json naming the scanned image must be refused before it truncates the image (the game executable),
+        and an unwritable path is one error line, not a traceback."""
+        data, _, _ = image()
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "image.exe")
+            with open(exe, "wb") as f:
+                f.write(data)
+            r = subprocess.run([sys.executable, "-I", TOOL, exe, "--json", exe], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            with open(exe, "rb") as f:
+                self.assertEqual(f.read(), data, "the scanned image must be untouched")
+            r = subprocess.run([sys.executable, "-I", TOOL, exe, "--json", tmp], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("is a folder", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            missing = os.path.join(tmp, "no-such-folder", "report.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, exe, "--json", missing], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("ERROR: cannot write", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

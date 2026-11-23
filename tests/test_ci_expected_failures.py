@@ -38,6 +38,14 @@ class Judge(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("::error::the test runner exited with 2 without naming a failed test", lines)
 
+    def test_interrupted_run_cannot_pass_on_a_partial_failure_list(self):
+        for status in (-15, 143):
+            with self.subTest(status=status):
+                code, lines = cef.judge(["known"], status, ["known", "not_run"])
+                self.assertEqual(code, 1)
+                self.assertTrue(any(str(status) in line and line.startswith("::error::") for line in lines))
+                self.assertFalse(any("not_run passed" in line for line in lines))
+
     def test_expected_failure_that_passes_gets_a_notice(self):
         code, lines = cef.judge([], 0, ["xdxr_build_check"])
         self.assertEqual(code, 0)
@@ -64,6 +72,31 @@ class Main(unittest.TestCase):
     def test_missing_arguments_is_a_usage_error(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(cef.main([]), 2)
+
+    def test_help_prints_the_usage_and_succeeds(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cef.main(["--help"]), 0)
+        self.assertIn("FAILED_LIST EXIT_STATUS", out.getvalue())
+
+    def test_a_list_that_cannot_be_read_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "absent.txt"
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(cef.main([str(missing), "8"]), 2)
+        self.assertEqual(err.getvalue().count("\n"), 1)
+        self.assertIn(str(missing), err.getvalue())
+
+    def test_a_non_integer_status_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "failed.txt"
+            path.write_text("a\n", encoding="utf-8")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(cef.main([str(path), "x"]), 2)
+        self.assertEqual(err.getvalue().count("\n"), 1)
+        self.assertIn("'x'", err.getvalue())
 
 
 if __name__ == "__main__":

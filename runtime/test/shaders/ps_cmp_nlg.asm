@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; v_cmp_nlg / v_cmpx_nlg (docs/design.md "Constant and ordered VOPC"): nlg ("not less or greater") is true when
 ; x == y or either source is NaN (unordered equal). Each case ORs its bit into a mask; channels are mask | 0x40000000.
 ;   x, f32 cases: bit0 1.0 vs 1.0 (1), bit1 +0 vs -0 (1), bit2 quiet NaN vs 1.0 (1), bit3 1.0 vs 2.5 (0),

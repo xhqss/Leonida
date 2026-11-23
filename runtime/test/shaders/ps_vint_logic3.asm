@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Three-operand integer logic (VOP3): v_add_lshl_u32, v_and_or_b32, v_xor3_b32, v_bfi_b32. vN holds hN.
 ; Inputs come from memory at run time (not inline constants, which the driver could fold). The V# in s[0:3]
 ; points at 0x1000 (num_records 32); the test seeds 0x1000..0x101c with h0..h7 =

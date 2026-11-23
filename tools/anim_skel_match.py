@@ -20,6 +20,7 @@ Usage:
 
 The default streams are the four offsets in docs/animation.md (1.0.2.1 package). Exit 0 when the report was
 written, 2 on a read error. Nothing here decrypts anything.
+Usage: `python -I tools/anim_skel_match.py --help` lists the options.
 """
 import argparse
 import collections

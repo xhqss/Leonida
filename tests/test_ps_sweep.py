@@ -92,6 +92,41 @@ class VertexShader(unittest.TestCase):
         self.assertNotIn("out vec4", glsl)
         self.assertIn("gl_Position", glsl)
 
+    def test_f16_halves_are_decoded_from_the_params_own_words(self):
+        # --f16-interp-fallback: the PS reads param 1's halves at locations 26 and 27 and the raw param itself is not an
+        # input, so a default translation would read param 1's words per vertex at location 1.
+        glsl = ps_sweep.vs_glsl([3, 26, 27], set(), {"1": [26, 27]})
+        raw1 = ps_sweep._raw_glsl(1)
+        self.assertIn(f"vec4 r = {raw1};", glsl)
+        self.assertIn("o26 = vec4(unpackHalf2x16(w.x)[0], unpackHalf2x16(w.y)[0], unpackHalf2x16(w.z)[0], "
+                      "unpackHalf2x16(w.w)[0]);", glsl)
+        self.assertIn("o27 = vec4(unpackHalf2x16(w.x)[1],", glsl)
+        self.assertIn(f"o3 = {ps_sweep._raw_glsl(3)};", glsl)
+        self.assertNotIn(f"o26 = {ps_sweep._raw_glsl(26)}", glsl)
+        self.assertNotIn("o1 =", glsl)
+
+    def test_without_halves_the_text_is_unchanged(self):
+        self.assertEqual(ps_sweep.vs_glsl([0, 2], {2}), ps_sweep.vs_glsl([0, 2], {2}, {}))
+        self.assertNotIn("unpackHalf2x16", ps_sweep.vs_glsl([0, 2], {2}, None))
+
+
+class GeometryShaderLookup(unittest.TestCase):
+    def test_job_env_drops_inherited_per_job_variables(self):
+        base = {"PATH": "p", "VKS_GS": "stale.spv", "VKS_TEX": "1", "VKS_NEED_MAINTENANCE8": "1"}
+        env = ps_sweep.job_env(base, 9, "z", {}, None)
+        for k in ps_sweep.JOB_VARS:
+            self.assertNotIn(k, env)
+        self.assertEqual((env["PATH"], env["VKS_TIMEOUT_S"]), ("p", "9"))
+        env = ps_sweep.job_env(base, 9, "t", {"needs_maintenance8": True}, "g.spv")
+        self.assertEqual((env["VKS_GS"], env["VKS_TEX"], env["VKS_NEED_MAINTENANCE8"]), ("g.spv", "1", "1"))
+
+    def test_gs_is_the_bary_gs_file_beside_the_pixel_shader(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(ps_sweep.gs_for(d, "x1"))
+            open(os.path.join(d, "x1.bary_gs.spv"), "wb").close()
+            self.assertEqual(ps_sweep.gs_for(d, "x1"), os.path.join(d, "x1.bary_gs.spv"))
+            self.assertIsNone(ps_sweep.gs_for(d, "x2"))
+
 
 class Classification(unittest.TestCase):
     def setUp(self):
@@ -136,6 +171,12 @@ class Classification(unittest.TestCase):
         # the same non-finite value at the same component matches
         self.assertEqual(self.classify([inf, nan, 1.0], [inf, nan, 1.0]), ("OK on both", ""))
 
+    def test_not_translated_is_its_own_class(self):
+        rec = {"code": ps_sweep.NOT_TRANSLATED, "reason": "not translated"}
+        ok = {"code": 0, "reason": ""}
+        self.assertEqual(ps_sweep.classify_pair(rec, ok, "x", "y"), ("not translated", ""))
+        self.assertEqual(ps_sweep.classify_pair(ok, rec, "x", "y"), ("not translated", ""))
+
     def test_failures_and_timeouts(self):
         self.assertEqual(self.classify([0.5], [0.5], 0, 77), ("fails on one GPU", "b: missing device feature"))
         self.assertEqual(self.classify([0.5], [0.5], 4, 0), ("fails on one GPU", "a: exit 4"))
@@ -172,6 +213,194 @@ class CompareCommand(unittest.TestCase):
                 ps_sweep.main(["compare", "--out", out, "--tags", "a", "b"])
             self.assertIn("OK on both: 2", buf.getvalue())
             self.assertNotIn("timeout", buf.getvalue())
+
+    def test_exact_readbacks_and_rerun(self):
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            clear = struct.pack("<f", -1) * (ps_sweep.W * ps_sweep.H * 4)
+            zero = bytes(len(clear))
+            neg_zero = zero[:-4] + struct.pack("<f", -0.0)
+            # Entries are (declared targets, payload). None means no result record.
+            pairs = [
+                ((2, clear + zero), (2, clear + zero)),
+                ((1, clear), (1, clear)),
+                ((1, zero), (1, neg_zero)),
+                ((1, zero), (1, None)),
+                ((1, zero[:-1]), (1, zero[:-1])),
+                ((1, zero), (2, zero)),
+                ((1, clear), None),
+                ((1, zero + b"x"), (1, zero + b"x")),
+                ((1, clear), (1, zero)),
+            ]
+            (out / "sample.json").write_text(json.dumps([{}] * len(pairs)), encoding="utf-8", newline="\n")
+            for side, tag in enumerate(("a", "b")):
+                folder = out / f"{tag}_z"
+                folder.mkdir()
+                with (folder / "results_0.jsonl").open("w", encoding="utf-8", newline="\n") as log:
+                    for i, pair in enumerate(pairs):
+                        if pair[side] is None:
+                            continue
+                        n, data = pair[side]
+                        rec = {"i": i, "code": 0, "targets": n}
+                        if side == 1:
+                            rec["samples_passed"] = 0
+                        print(json.dumps(rec), file=log)
+                        if data is not None:
+                            (folder / f"{i}.raw").write_bytes(data)
+            rerun = out / "a_z_re"
+            rerun.mkdir()
+            (rerun / "8.raw").write_bytes(zero)
+            (rerun / "results_8.jsonl").write_text('{"i":8,"code":3,"targets":1}\n', encoding="utf-8", newline="\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                ps_sweep.main(["compare", "--exact", "--out", tmp])
+            report = json.loads((out / "exact_z.json").read_text(encoding="utf-8"))
+            self.assertEqual([r["class"] for r in report["rows"]], [
+                "non-clear exact", "clear-only exact", "mismatch", "missing", "incompatible",
+                "incompatible", "missing", "incompatible", "missing",
+            ])
+            self.assertEqual(report["rows"][0]["targets"], ["clear-only exact", "non-clear exact"])
+            self.assertEqual(report["targets"], {"non-clear exact": 1, "clear-only exact": 2, "mismatch": 1})
+            self.assertEqual(report["rows"][-1]["codes"], [3, 0])
+            self.assertEqual(report["rows"][0]["samples_passed"], [None, 0])
+            self.assertEqual(report["rows"][-1]["samples_passed"], [None, 0])
+            self.assertNotIn("samples_passed", report["rows"][6])
+
+    def test_incomplete_depth_measurements(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = {"depth": True, "code": 0, "dir": tmp, "samples_passed": 0}
+            self.assertEqual(ps_sweep.depth_measurements(0, rec, rec), {"depth_class": "missing"})
+            with open(os.path.join(tmp, "0.raw.depth"), "wb") as plane:
+                plane.write(b"short")
+            self.assertEqual(ps_sweep.depth_measurements(0, rec, rec), {"depth_class": "incompatible"})
+            with open(os.path.join(tmp, "0.raw.depth"), "wb") as plane:
+                plane.write(bytes(ps_sweep.W * ps_sweep.H * 4))
+            self.assertEqual(ps_sweep.depth_measurements(0, rec, rec), {"depth_class": "incompatible"})
+            self.assertEqual(ps_sweep.depth_measurements(0, {"code": 0}, rec), {"depth_class": "missing"})
+
+    @unittest.skipUnless(os.environ.get("PS_SWEEP_TEST_EXE"), "requires a Vulkan worker")
+    def test_integer_texture_fetch(self):
+        from pathlib import Path
+        import subprocess
+
+        worker = os.environ["PS_SWEEP_TEST_EXE"]
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            vs = ps_sweep.make_vs("glslangValidator", {}, tmp)
+            src = folder / "fetch.frag"
+            fs = folder / "fetch.spv"
+            raw = folder / "draw.raw"
+            draw = [worker, vs, str(fs), str(raw), "32", "32", "1"]
+            def compile_shader(text):
+                src.write_text(text, encoding="utf-8", newline="\n")
+                subprocess.run(["glslangValidator", "-V", str(src), "-o", str(fs)], check=True)
+
+            for mode, prefix, expected in (("sint", "i", (-126, 34, -8, 77)), ("uint", "u", (130, 34, 248, 77))):
+                source = ("#version 450\n#extension GL_EXT_samplerless_texture_functions : require\n"
+                          f"layout(set=0,binding=0) uniform {prefix}texture2D tex[1];\n"
+                          "layout(location=0) out vec4 color;\n"
+                          "void main() {color = vec4(texelFetch(tex[0], ivec2(2,3), 0));}\n")
+                compile_shader(source)
+                env = ps_sweep.job_env(os.environ, 20, mode, {}, None)
+                subprocess.run(draw, env=env, check=True)
+                self.assertEqual(raw.read_bytes(), struct.pack("<4f", *expected) * 1024)
+                raw.unlink()
+                env["VKS_TEX"] = "uint" if mode == "sint" else "sint"
+                self.assertEqual(subprocess.run(draw, env=env).returncode, 77)
+                self.assertFalse(raw.exists())
+                for other in (source.replace("tex[1];", "tex[2];").replace("tex[0],", "tex[1],"),
+                              source.replace("2,3", "8,3"), source.replace("), 0)", "), 1)"),
+                              source.replace("binding=0", "binding=3"),
+                              source.replace("ivec2(2,3)", "ivec2(gl_FragCoord.xy)"),
+                              source.replace("layout(location=0)", "layout(set=0,binding=0) uniform texture2D other;\n"
+                                             "layout(location=0)").replace(";}"," + texelFetch(other, ivec2(0), 0);}")):
+                    compile_shader(other)
+                    self.assertEqual(subprocess.run([worker, "--screen-integer", str(fs)]).returncode, 77)
+
+            compile_shader(source.replace("utexture2D", "texture2D"))
+            env = ps_sweep.job_env(os.environ, 20, "t", {}, None)
+            subprocess.run(draw, env=env, check=True)
+            for rgba in struct.iter_unpack("<4f", raw.read_bytes()):
+                for component, byte in zip(rgba, (64, 96, 64, 255)):
+                    self.assertAlmostEqual(component, byte / 255, places=6)
+            self.assertEqual(raw.stat().st_size, 1024 * 16)
+
+    @unittest.skipUnless(os.environ.get("PS_SWEEP_TEST_EXE"), "requires a precise-query Vulkan worker")
+    def test_clear_draws_with_opposite_coverage(self):
+        from pathlib import Path
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            for tag, statement in (("covered", "color = vec4(-1);"), ("discarded", "discard;")):
+                folder = out / tag
+                folder.mkdir()
+                src = folder / "control.frag"
+                src.write_text("#version 450\nlayout(location=0) out vec4 color;\nvoid main() {" + statement + "}\n",
+                               encoding="utf-8", newline="\n")
+                subprocess.run(["glslangValidator", "-V", str(src), "-o", str(folder / "control.spv")], check=True)
+                (folder / "index.json").write_text('{"control":{"stage":"ps"}}', encoding="utf-8", newline="\n")
+                if tag == "covered":
+                    ps_sweep.main(["sample", "--spirv", str(folder), "--out", tmp])
+                ps_sweep.main(["run", "--spirv", str(folder), "--out", tmp, "--tag", tag, "--occlusion",
+                               "--exe", os.environ["PS_SWEEP_TEST_EXE"]])
+            compare = ["compare", "--out", tmp, "--tags", "covered", "discarded"]
+            ps_sweep.main(compare)
+            ps_sweep.main(compare + ["--exact"])
+            exact = json.loads((out / "exact_z.json").read_text())["rows"][0]
+            ordinary = json.loads((out / "classes_z.json").read_text())[0]
+            self.assertEqual(exact["class"], "clear-only exact")
+            self.assertEqual(exact["samples_passed"], [ps_sweep.W * ps_sweep.H, 0])
+            self.assertEqual(ordinary["samples_passed"], exact["samples_passed"])
+
+    @unittest.skipUnless(os.environ.get("PS_SWEEP_TEST_EXE"), "requires a Vulkan worker with D32 readback")
+    def test_equal_color_different_depth(self):
+        from pathlib import Path
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            for tag, code in (("clear", "gl_FragDepth = 1.0;"), ("near", "gl_FragDepth = 0.25;"),
+                              ("discarded", "discard;")):
+                folder = out / tag
+                folder.mkdir()
+                src = folder / "control.frag"
+                src.write_text("#version 450\nlayout(location=0) out vec4 color;\nvoid main(){color=vec4(-1);"
+                               + code + "}\n", encoding="utf-8", newline="\n")
+                subprocess.run(["glslangValidator", "-V", str(src), "-o", str(folder / "control.spv")], check=True)
+                (folder / "index.json").write_text('{"control":{"stage":"ps"}}', encoding="utf-8", newline="\n")
+                if tag == "clear":
+                    ps_sweep.main(["sample", "--spirv", str(folder), "--out", tmp])
+                ps_sweep.main(["run", "--spirv", str(folder), "--out", tmp, "--tag", tag, "--two-clear",
+                               "--exe", os.environ["PS_SWEEP_TEST_EXE"]])
+            pixels = ps_sweep.W * ps_sweep.H
+            for tag, differing, written in (("near", pixels, pixels), ("discarded", 0, 0)):
+                args = ["compare", "--out", tmp, "--tags", "clear", tag]
+                ps_sweep.main(args)
+                ps_sweep.main(args + ["--exact"])
+                ordinary = json.loads((out / "classes_z.json").read_text())[0]
+                exact = json.loads((out / "exact_z.json").read_text())["rows"][0]
+                self.assertEqual(exact["targets"], ["clear-only exact"])
+                for row in (ordinary, exact):
+                    self.assertEqual(row["depth_different_pixels"], differing)
+                    self.assertEqual(row["depth_nonclear_pixels"], [0, differing])
+                    self.assertEqual(row["samples_passed"], [pixels, written])
+                    self.assertEqual(row["depth_clears"], [1, 0])
+                    self.assertEqual(row["zero_depth_different_pixels"], pixels)
+                    self.assertEqual(row["depth_control"], [
+                        {"identical": pixels, "follow_clear": 0, "other": 0},
+                        {"identical": written, "follow_clear": pixels - written, "other": 0},
+                    ])
+                self.assertEqual(ordinary["class"], "depth mismatch")
+                self.assertEqual(exact["class"], "mismatch")
+
+    def test_help_warns_about_nvidia_resets(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit):
+            ps_sweep.main(["--help"])
+        self.assertIn("TDR", buf.getvalue())
+        self.assertIn("display", buf.getvalue())
 
 
 if __name__ == "__main__":

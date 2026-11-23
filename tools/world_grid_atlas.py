@@ -31,6 +31,7 @@ cell of every placed tile: that is data derived from your own copy of the game, 
 Unlike most tools here this one imports numpy and Pillow (Pillow decodes BC6H); it is one of the texture-tool
 exceptions in AGENTS.md. The placement, ordering and fitting logic is plain Python, and its tests run on the
 standard library alone.
+Usage: `python -I tools/world_grid_atlas.py --help` lists the options.
 """
 import argparse
 import json

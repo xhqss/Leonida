@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; buffer_load, then a ballot + s_bcnt1, then a second buffer_load, then a store, all in one basic block (this
 ; sequence once produced invalid SPIR-V under --wave64-emulate), with a checked result. The loads read the other
 ; half's stores of the same wave (out[lane] = 10 + lane, then the stores are waited for).

@@ -274,40 +274,15 @@ class LocalDecoder:
         if faces > 1 and d["mode"] == 1:
             # Mode-1 arrays group source slices by mip. DDS groups mips by slice.
             layout = ttpf.array_surface_layout(width, height, faces, levels, bs, 4, tile)
+            bw, bh = layout["block_w"], layout["block_h"]
             offsets = {
                 mip["index"]: (mip["offset"], mip["tile_x"], mip["tile_y"], mip["slice_stride"])
                 for mip in layout["mips"]
             }
         else:
-            layout = ttpf.surface_layout(width, height, fmt, levels, tile)
-            bw, bh = layout["block_w"], layout["block_h"]
-            capacity = 12 if tile == 65536 else 8
-            tail = next(
-                (
-                    i
-                    for i, (w, h) in enumerate(grids)
-                    if w <= bw // 2 and h <= bh and levels - i <= capacity
-                ),
-                levels,
-            )
-            offsets = {}
-            stride = tile if tail < levels else 0
-            for i in reversed(range(tail)):
-                w, h = grids[i]
-                offsets[i] = (stride, 0, 0)
-                stride += ((w + bw - 1) // bw) * ((h + bh - 1) // bh) * tile
-            for i in range(tail, levels):
-                bits = capacity - 1 - (i - tail)
-                packed = 16 << bits if bits > 6 else bits << 8
-                x = sum(((packed >> (9 + 2 * j)) & 1) << j for j in range(6)) * (
-                    4 if bs == 16 else 8
-                )
-                y = sum(((packed >> (8 + 2 * j)) & 1) << j for j in range(6)) * 4
-                offsets[i] = (0, x, y)
-            if levels == 1:
-                offsets[0] = (0, 0, 0)
-            offsets = {i: (offset, x, y, stride) for i, (offset, x, y) in offsets.items()}
-        bw, bh = layout["block_w"], layout["block_h"]
+            # ASSET-568: the compact mip chain is computed in tools/tex_headers.py. Re-deriving
+            # first_tail here got NPOT chains and single-mip sub-tiles wrong; consume the layout.
+            bw, bh, grids, offsets = compact_dds_layout(width, height, fmt, levels, tile)
         profile = (
             self.cal.get("entries", {})
             .get(Path(self.pool.path).name, {})
@@ -332,6 +307,27 @@ class LocalDecoder:
         return ttpf.dds_bytes(
             width, height, fmt, count, linear, bytes(payload), array_size=faces
         )
+
+
+def compact_dds_layout(width, height, fmt, levels, tile):
+    """Block dimensions and per-mip (offset, x, y, slice_stride) from the measured compact layout.
+
+    ASSET-568: the packed-tail boundary and standalone subresource offsets belong to
+    ``tools/tex_headers.py``; callers that re-derived them used the wrong grid on NPOT
+    chains and treated a single mip as a packed tail.
+    """
+    layout = ttpf.surface_layout(width, height, fmt, levels, tile)
+    first_tail = layout["first_tail"]
+    stride = tile if first_tail < levels else 0
+    offsets, dims = {}, []
+    for mip in layout["mips"]:
+        i = mip["index"]
+        dims.append((mip["blocks_w"], mip["blocks_h"]))
+        if i < first_tail:
+            offsets[i] = (mip["offset"], 0, 0, stride)
+        else:
+            offsets[i] = (0, mip["tile_x"], mip["tile_y"], stride)
+    return layout["block_w"], layout["block_h"], dims, offsets
 
 
 @lru_cache(maxsize=64)

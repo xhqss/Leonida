@@ -5,10 +5,13 @@
 Nothing here starts XCL or gta6rt, and no game files are read. The run tests start a small Python script that
 prints the test title's line format in place of a title.
 """
+import argparse
 import os
+from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 import xcl_compare as xc  # noqa: E402
@@ -107,6 +110,31 @@ class Sink:
         pass
 
 
+class OutputEOF(unittest.TestCase):
+    def run_closed_pipe(self, after_close):
+        script = ("import os, time\n"
+                  "print('[RUN] probe', flush=True)\n"
+                  "os.close(1)\n"
+                  "os.close(2)\n" + after_close)
+        run = xc.Run("synthetic")
+        with tempfile.TemporaryDirectory() as tmp:
+            hung = xc.run_title([sys.executable, "-I", "-c", script], os.environ, tmp, run,
+                                ["probe"], 1, None, Sink(), [])
+        return hung, run
+
+    def test_live_title_after_eof_returns_hung_check_for_restart(self):
+        hung, run = self.run_closed_pipe("time.sleep(3)")
+        self.assertEqual(hung, "probe")
+        self.assertEqual(run.checks["probe"]["status"], "HANG")
+        self.assertEqual(run.checks["probe"]["reason"], "no output for 1 s")
+
+    def test_exit_after_eof_keeps_exit_code(self):
+        hung, run = self.run_closed_pipe("raise SystemExit(7)")
+        self.assertIsNone(hung)
+        self.assertEqual(run.exit_code, 7)
+        self.assertEqual(run.checks["probe"]["status"], "FAIL")
+
+
 # A stand-in title: checks a, b and c; b hangs unless XCL_TESTTITLE_SKIP names it (or HONOUR_SKIP is 0).
 FAKE_TITLE = """
 import os, sys, time
@@ -155,6 +183,84 @@ class Restart(unittest.TestCase):
         self.assertEqual(attempts, [0, 1])
         self.assertEqual(run.checks["b"]["status"], "HANG")
         self.assertNotIn("c", run.checks)  # run_all marks it NOT RUN
+
+
+class RestartTraces(unittest.TestCase):
+    """Hang restarts reset game/ and overlay/, while preserving earlier trace_N.jsonl files."""
+
+    def test_hang_restart_preserves_previous_trace_and_resets_game_and_overlay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            xcl_dir = root / "xcl"
+            rel = xcl_dir / "target" / "release"
+            rel.mkdir(parents=True)
+            for name in ("xcl.exe", "xcl_testtitle.exe", "testgame_mw.dll"):
+                (rel / name).write_bytes(b"stub")
+            testgame = xcl_dir / "tests" / "data" / "testgame"
+            testgame.mkdir(parents=True)
+            (testgame / "marker.txt").write_text("clean", encoding="utf-8", newline="\n")
+
+            gta6rt = root / "gta6rt.exe"
+            gta6rt.write_bytes(b"stub")
+
+            work = root / "work"
+            stale_dir = work / "leonida"
+            stale_dir.mkdir(parents=True)
+            stale_trace = stale_dir / "trace_stale.jsonl"
+            stale_trace.write_text("old\n", encoding="utf-8", newline="\n")
+
+            seen = []
+
+            def fake_run_title(cmd, env, cwd, run, known, timeout, cdb, events, skip, transcript=None):
+                if run.label == "XCL":
+                    for name in ("a", "b", "c"):
+                        run.set(name, status="PASS")
+                    return None
+                trace_path = Path(cmd[cmd.index("--trace") + 1])
+                overlay_path = Path(cmd[cmd.index("--overlay") + 1])
+                game_path = Path(cmd[cmd.index("--game-dir") + 1])
+                attempt = len(seen)
+                seen.append({
+                    "attempt": attempt,
+                    "trace": trace_path,
+                    "overlay_existed": overlay_path.exists(),
+                    "marker": (game_path / "marker.txt").read_text(encoding="utf-8"),
+                })
+                overlay_path.mkdir(parents=True, exist_ok=True)
+                (overlay_path / "dirty.txt").write_text(f"attempt {attempt}\n", encoding="utf-8", newline="\n")
+                (game_path / "marker.txt").write_text(f"dirty {attempt}", encoding="utf-8", newline="\n")
+                trace_path.write_text(f'{{"attempt": {attempt}}}\n', encoding="utf-8", newline="\n")
+                if attempt == 0:
+                    run.set("a", status="PASS")
+                    run.set("b", status="HANG", reason="no output for 15 s")
+                    return "b"
+                run.set("c", status="PASS")
+                return None
+
+            args = argparse.Namespace(
+                xcl=str(xcl_dir),
+                gta6rt=str(gta6rt),
+                work=str(work),
+                timeout=15.0,
+                max_restarts=3,
+                skip=[],
+                cdb=None,
+                out=None,
+            )
+            with mock.patch.object(xc, "run_title", side_effect=fake_run_title):
+                xc.run_all(args, Sink())
+
+            self.assertEqual(len(seen), 2)
+            self.assertFalse(stale_trace.exists())
+            self.assertFalse(seen[1]["overlay_existed"])
+            self.assertEqual(seen[1]["marker"], "clean")
+
+            trace0 = work / "leonida" / "trace_0.jsonl"
+            trace1 = work / "leonida" / "trace_1.jsonl"
+            self.assertTrue(trace0.is_file(), "attempt 0 trace was deleted by attempt 1 restart")
+            self.assertTrue(trace1.is_file())
+            self.assertEqual(trace0.read_text(encoding="utf-8"), '{"attempt": 0}\n')
+            self.assertEqual(trace1.read_text(encoding="utf-8"), '{"attempt": 1}\n')
 
 
 if __name__ == "__main__":

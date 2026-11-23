@@ -187,5 +187,28 @@ class GuidSites(unittest.TestCase):
             data = json.load(f)
 
         self.assertEqual({c["value"] for c in data["images"][0]["guid_candidates"]}, {str(QUEUE), str(UNKNOWN)})
+
+    def test_cli_cannot_overwrite_an_input_with_its_json_report(self):
+        image, _ = pe32plus(b"\x90", QUEUE.bytes_le)
+        script = os.path.join(ROOT, "tools", "d3d12_guid_sites.py")
+        header_text = b"// Synthetic IID header\n"
+        for input_name in ("second.dll", "d3d12.h"):
+            with self.subTest(input=input_name):
+                first = self.write("first.dll", image)
+                second = self.write("second.dll", image)
+                header = self.write("d3d12.h", header_text)
+                output = os.path.join(self.tmp.name, input_name)
+                result = subprocess.run(
+                    [sys.executable, "-I", script, first, second, "--header", header, "--json", output],
+                    capture_output=True, text=True, cwd=ROOT,
+                )
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("would overwrite", result.stderr)
+                with open(second, "rb") as f:
+                    self.assertEqual(f.read(), image)
+                with open(header, "rb") as f:
+                    self.assertEqual(f.read(), header_text)
+
+
 if __name__ == "__main__":
     unittest.main()

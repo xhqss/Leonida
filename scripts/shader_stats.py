@@ -8,6 +8,7 @@ the driver's instruction count with the original one (code growth) and its VGPRs
 code uses, and it flags scratch memory and spills: a register file that didn't fit in registers and went to memory,
 which is the expensive case (relative VGPR indexing, v_movrels/v_movreld, forces it). It prints a summary per stage and,
 with --details, one line per shader.
+Growth is unavailable when the original listing has no parsed instructions; its driver counters are still shown.
 
 Metrics are read only where the driver emits these exact RADV/ACO statistic names with a numeric value: Instructions,
 VGPRs, SGPRs, Scratch size, Spilled VGPRs, Spilled SGPRs, Subgroups per SIMD. No equivalence is claimed for other
@@ -98,7 +99,7 @@ def shader_row(name, stage, st, src):
     r = {"name": name, "stage": stage, "orig": n_orig, "v_orig": v_orig}
     for key, stat in METRICS:
         r[key] = number(st.get(stat))
-    r["growth"] = None if r["aco"] is None else r["aco"] / max(n_orig, 1)
+    r["growth"] = r["aco"] / n_orig if n_orig and r["aco"] is not None else None
 
     spill_counts = [number(st.get(stat)) for stat in SPILLS]
     known_spills = [v for v in spill_counts if v is not None]

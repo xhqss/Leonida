@@ -32,6 +32,10 @@ import os
 import struct
 import sys
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import path_key, same_report_path  # noqa: E402
+
 MAGIC = b"FSPX"
 DXBC = b"DXBC"
 ENDPGM = struct.pack("<I", 0xBF810000)
@@ -43,6 +47,15 @@ KINDS = (0, 1, 6, 7)
 PROLOGUE_WORDS = (0, 3, 6)
 PROLOGUE_SIZE = 36
 STAGE_COMPUTE = 5  # PSVRuntimeInfo1 ShaderStage (DirectX): 5 = compute
+
+
+def inside_folder(path: str, folder: str) -> bool:
+    """True when path is folder or below it, by the resolved and normcased name report_paths compares."""
+    key, root = path_key(path), path_key(folder)
+    try:
+        return os.path.commonpath((key, root)) == root
+    except ValueError:  # different drives
+        return False
 
 
 def parse_fspx(data: bytes):
@@ -171,6 +184,15 @@ def main(argv=None) -> int:
                     help="llvm-mc CPU for --disasm (default gfx1030: the programs use v_dot4 instructions, which "
                          "gfx1010 and gfx1013 do not decode)")
     a = ap.parse_args(argv)
+    # An output in the input folder can replace a .dxbc input and, when the input is the folder itself,
+    # os.makedirs writes there before open() tries to read the folder as a file. Refuse before either.
+    for path in a.files:
+        folder = path if os.path.isdir(path) else os.path.dirname(os.path.abspath(path))
+        if (same_report_path(a.out, path) or same_report_path(a.out, folder)
+                or (os.path.isdir(path) and inside_folder(a.out, folder))):
+            print(f"ERROR: --out {a.out} collides with the input folder {folder}; give another output folder",
+                  file=sys.stderr)
+            return 2
     fspx_dir = os.path.join(a.out, "fspx")
     try:
         os.makedirs(fspx_dir, exist_ok=True)

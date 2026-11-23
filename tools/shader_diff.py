@@ -11,6 +11,7 @@ interpreter and is never modified here.
 
 Usage:
     python -I tools/shader_diff.py [--programs N] [--seed S] [--max-ops N]
+    python -I tools/shader_diff.py --program-index I --seed S --max-ops N
     python -I tools/shader_diff.py --self-test     # harness canaries (must fail loudly if broken)
     python -I tools/shader_diff.py --list-ops
 
@@ -162,7 +163,14 @@ def generate_program(rng, n_ops):
         name, emit = rng.choice(vec_ops)
         dst = rng.choice(SCRATCH)
         clean = [v for v in SCRATCH if v not in tainted]
-        pool = SCRATCH if name in _FLOAT_OPS or not clean else clean
+        if name not in _FLOAT_OPS and not clean:
+            # All float results may carry oracle-specific NaN payloads. Restore one
+            # known bit pattern before choosing integer operands, even when dst is read.
+            lines.append(f"v_mov_b32 v{dst}, 0")
+            writers[dst] = ("v_mov_b32/seed", len(lines))
+            tainted.discard(dst)
+            clean = [dst]
+        pool = SCRATCH if name in _FLOAT_OPS else clean
         srcs = [rng.choice(pool) for _ in range(4)]
         lines.append(emit(rng, dst, srcs))
         writers[dst] = (name, len(lines))
@@ -255,28 +263,32 @@ def run_one(name, lines, writers):
         return ("mismatch", mismatch)
 
 
-def run_suite(programs, seed, max_ops, limit=None):
-    """Run N seeded programs. Returns (counts, first_failure)."""
+def run_suite(programs, seed, max_ops, limit=None, *, start=0):
+    """Generate the seeded sequence, executing cases from index start. Return (counts, first_failure)."""
     counts = {"pass": 0, "mismatch": 0, "skip": {}, "harness-error": 0}
     first_failure = None
     rng = random.Random(seed)
     total = programs if limit is None else min(programs, limit)
     for i in range(total):
-        name = f"ps_diff_{i:04d}"
         lines, writers = generate_program(rng, rng.randrange(1, max_ops + 1))
+        if i < start:  # advance the original RNG stream, but skip both oracles
+            continue
+        name = f"ps_diff_{i:04d}"
         try:
             status, detail = run_one(name, lines, writers)
         except Exception as e:  # noqa: BLE001 - harness bugs must be loud
             counts["harness-error"] += 1
             if first_failure is None:
-                first_failure = f"{name}: harness error {type(e).__name__}: {e}"
+                first_failure = (f"{name}: harness error {type(e).__name__}: {e}\n"
+                                 f"Replay: --seed {seed} --max-ops {max_ops} --program-index {i}")
             continue
         if status == "match":
             counts["pass"] += 1
         elif status == "mismatch":
             counts["mismatch"] += 1
             if first_failure is None:
-                first_failure = (f"{name} (seed {seed} program {i}): {detail}\n" +
+                first_failure = (f"{name} (seed {seed} program {i}): {detail}\n"
+                                 f"Replay: --seed {seed} --max-ops {max_ops} --program-index {i}\n" +
                                  "\n".join("\t" + line for line in lines))
         else:
             counts["skip"][detail] = counts["skip"].get(detail, 0) + 1
@@ -325,7 +337,10 @@ def _at_least_one(value):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Differential oracle: cpu_ref vs translated SPIR-V.")
-    ap.add_argument("--programs", type=_at_least_one, default=200, help="number of programs to run (default: 200)")
+    selection = ap.add_mutually_exclusive_group()
+    selection.add_argument("--programs", type=_at_least_one, help="number of programs to run (default: 200)")
+    selection.add_argument("--program-index", type=int, metavar="I",
+                           help="replay only zero-based program I using the original --seed and --max-ops")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--max-ops", type=_at_least_one, default=8,
                     help="maximum ops per generated program (default: 8)")
@@ -340,7 +355,15 @@ def main(argv=None):
         return 0
     if a.self_test:
         return 0 if self_test() else 1
-    counts, first_failure = run_suite(a.programs, a.seed, a.max_ops, a.limit)
+    if a.program_index is None:
+        counts, first_failure = run_suite(a.programs or 200, a.seed, a.max_ops, a.limit)
+    else:
+        if a.program_index < 0:
+            ap.error("--program-index must be nonnegative")
+        if a.limit is not None:
+            ap.error("--program-index cannot be combined with --limit")
+        print(f"replaying program {a.program_index} (seed {a.seed}, max ops {a.max_ops})")
+        counts, first_failure = run_suite(a.program_index + 1, a.seed, a.max_ops, start=a.program_index)
     total_skips = sum(counts["skip"].values())
     total_run = counts["pass"] + counts["mismatch"] + total_skips + counts["harness-error"]
     print(f"{total_run} programs (seed {a.seed}): "

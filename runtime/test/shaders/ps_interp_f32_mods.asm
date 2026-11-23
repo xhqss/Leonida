@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; VOP3 output modifiers on v_interp_p2_f32_e64 (docs/design.md "v_fmac_f16, v_interp_p2/mov_f32 output modifiers"),
 ; omod before clamp. Drawn with vs_interp_consts: attr0 = (1.5, -0.25, 0.375, 0.625) at every pixel.
 ;   x: clamp(1.5) = 1.0; y: clamp(-0.25) = 0.0; z: 0.375 mul:2 = 0.75; w: 0.625 mul:2 = 1.25, clamp: 1.0

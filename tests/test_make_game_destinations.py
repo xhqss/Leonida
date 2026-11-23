@@ -76,5 +76,50 @@ class DestinationTests(unittest.TestCase):
             self.assertEqual(make_game.main(), 0)
 
 
+class DriveRootGameTests(unittest.TestCase):
+    """--game at a drive root: the game folder is the dump's own top-level manifest names, so an unrelated --out on
+    the same drive is allowed and the rerun that resumes a build is not rejected."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.game = self.tmp   # the drive root itself: every top-level folder here is "on the drive"
+        os.makedirs(os.path.join(self.game, "Content"))
+        self.version = {"title": "test", "version": "1.0", "expected_exe": "Game.exe",
+                        "files": {"Content/a.bin": {}, "Game.exe": {}}}
+
+    def main_at_drive_root(self, out, err):
+        """main() with the game folder reported as a drive root. Returns nothing; it stops at preflight."""
+        real_splitdrive = os.path.splitdrive
+        real_game = os.path.normcase(os.path.realpath(self.game))
+
+        def fake_splitdrive(path):
+            return ("X:", "\\") if os.path.normcase(path) == real_game else real_splitdrive(path)
+
+        with patch.object(sys, "argv", ["make_game.py", "--game", self.game, "--out", out,
+                                        "--work", os.path.join(self.tmp, "work")]), \
+             patch.object(make_game, "below_normal"), patch.object(make_game, "log"), \
+             patch.object(make_game, "check", return_value=self.version), \
+             patch.object(make_game.os.path, "splitdrive", fake_splitdrive), \
+             patch.object(make_game, "preflight", side_effect=AssertionError("preflight was reached")), \
+             contextlib.redirect_stderr(err):
+            make_game.main()
+
+    def test_out_on_the_same_drive_is_accepted_on_resume(self):
+        # The folder is already there, as after a first run: listing the drive would count it as the game's own.
+        out = os.path.join(self.tmp, "Leonida_Port")
+        os.makedirs(out)
+        with self.assertRaisesRegex(AssertionError, "preflight was reached"):
+            self.main_at_drive_root(out, io.StringIO())
+
+    def test_out_inside_a_top_level_manifest_folder_is_rejected(self):
+        err = io.StringIO()
+        with self.assertRaises(SystemExit) as raised:
+            self.main_at_drive_root(os.path.join(self.game, "Content", "out"), err)
+        self.assertEqual(raised.exception.code, 1, err.getvalue())
+        self.assertIn("--out and --work must be outside the game folder.", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

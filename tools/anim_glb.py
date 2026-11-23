@@ -39,6 +39,7 @@ Usage:
 Offsets are the resources' zlib stream offsets in the archive (the `0x...` offsets rpf9dump and skin_streams
 report). `--part` takes a drawable, a fragment or a drawable dictionary; `:<child>` picks a dictionary child.
 `--coverage` writes counts only: how many clip-dictionary bone tracks name a joint of the skeleton.
+Usage: `python -I tools/anim_glb.py --help` lists the options.
 """
 import argparse
 import collections
@@ -729,16 +730,19 @@ def main(argv=None):
     ap.add_argument("--skeleton", type=parse_offset, required=True, help="resource with the skeleton, <offset>[:<child>]")
     ap.add_argument("--part", type=parse_offset, action="append", default=[], help="part drawable, <offset>[:<child>]")
     ap.add_argument("--anim", help="anim.rpf")
-    ap.add_argument("--dictionary", type=lambda t: parse_offset(t)[0], help="clip dictionary offset in --anim")
-    ap.add_argument("--clip", action="append", default=[], help="clip name (without pack:/ and .clip) or 0xhash")
+    ap.add_argument("--dictionary", type=lambda t: parse_offset(t)[0], help="export: clip dictionary offset in --anim")
+    ap.add_argument("--clip", action="append", default=[],
+                    help="export: name (without pack:/ and .clip) or 0xhash in the selected --anim dictionary")
     ap.add_argument("--lod", type=int, default=0, help="LOD level of the parts (0 = highest)")
     ap.add_argument("--max-influences", type=int, choices=(4, 8), default=8,
                     help="bone influences per vertex; 4 keeps the largest four, renormalised (three.js reads four)")
     ap.add_argument("--no-root-motion", action="store_true", help="leave out the mover (bone hash 0) tracks")
     ap.add_argument("--coverage", action="store_true", help="count clip bone tracks that name a skeleton joint")
-    ap.add_argument("--jobs", type=int, default=1, help="worker processes for --coverage")
+    ap.add_argument("--jobs", type=int, default=1, help="worker processes for --coverage (at least 1)")
     ap.add_argument("--report", help="write a JSON report (counts only)")
     args = ap.parse_args(argv)
+    if args.jobs < 1:
+        ap.error("--jobs must be at least 1")
     inputs = [args.archive] + ([args.anim] if args.anim else [])
     outputs = [p for p in (args.out, args.report) if p]
     for o in outputs:
@@ -749,6 +753,11 @@ def main(argv=None):
         ap.error(f"--report is a directory: {args.report}")
     if args.out and args.report and same_path(args.out, args.report):
         ap.error("the GLB and the report are the same path")
+    if args.clip or args.dictionary is not None:
+        if args.coverage:
+            ap.error("--clip and --dictionary select clips for export, not --coverage")
+        if not args.anim:
+            ap.error("--clip and --dictionary require --anim")
     if args.coverage:
         if not args.anim or not args.report:
             ap.error("--coverage needs --anim and --report")
@@ -761,7 +770,10 @@ def main(argv=None):
             ap.error("--anim needs --dictionary")
     try:
         report = coverage(args) if args.coverage else export(args)
-    except (ExportError, anim_clips.DecodeError, struct.error, OSError, ValueError) as e:
+    except OSError as e:
+        print(f"ERROR: {e.filename or args.archive}: {e.strerror or e}", file=sys.stderr)
+        return 2
+    except (ExportError, anim_clips.DecodeError, struct.error, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     if args.report:

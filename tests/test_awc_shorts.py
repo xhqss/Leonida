@@ -136,6 +136,25 @@ class ShortsTest(unittest.TestCase):
         self.assertEqual(rows[0]["channels"], "2")
         self.assertTrue(rows[0]["file"].endswith("00001234.ogg"))
 
+    def test_bank_extensions_cannot_collapse_two_banks_into_one_export(self):
+        first = self.write("clip.awc", 0x78, 480000)
+        second = os.path.join(self.tmp.name, "clip.AWC")
+        if os.path.exists(second):
+            self.skipTest("input volume does not support case-distinct files")
+        self.write("clip.AWC", 0xFC, 480000)
+        os.makedirs(self.out)
+        catalog = os.path.join(self.out, "shorts.csv")
+        with open(catalog, "wb") as f:
+            f.write(b"previous catalog\n")
+        for jobs in ("1", "2"):
+            with self.subTest(jobs=jobs), contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(shorts.main([self.tmp.name, self.out, "--jobs", jobs]), 2)
+            self.assertIn(first, err.getvalue())
+            self.assertIn(second, err.getvalue())
+            self.assertEqual(os.listdir(self.out), ["shorts.csv"])
+            with open(catalog, "rb") as f:
+                self.assertEqual(f.read(), b"previous catalog\n")
+
     def test_rejects_nonpositive_job_counts(self):
         for jobs in ("0", "-1"):
             with self.subTest(jobs=jobs):
@@ -166,6 +185,14 @@ class ShortsTest(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertIn("missing.awc", err.getvalue())
         self.assertEqual(len(err.getvalue().splitlines()), 1)
+
+    def test_missing_source_names_the_path_as_typed(self):
+        """The path is printed as typed: repr() doubles every Windows backslash, so `C:\\a\\b` came out `C:\\\\a\\\\b`."""
+        missing = os.path.join(self.tmp.name, "missing.awc")
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+            self.assertEqual(shorts.main([missing, self.out]), 2)
+        self.assertIn(missing, stderr.getvalue())
 
     def test_clip_write_error_preserves_catalog_in_both_worker_modes(self):
         path = self.write("blocked.awc", 0xFC, 480000)

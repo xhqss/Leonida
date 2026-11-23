@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Packed f16 FMA, integer min3/max3 and signed bitfield extract. Expected mrt0 bits: 0x48804300, 5, 7, 0xbffffffc
 ; XOR bit 30 before export to encode the integer result as a finite RGBA32F value.
 v_mov_b32 v0, 0x40003c00

@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; 24-bit multiplies: v_mad_i32_i24 (VOP3, no clamp), v_mul_hi_u32_u24 (VOP2). vN holds hN.
 ; Inputs come from memory at run time (not inline constants, which the driver could fold). The V# in s[0:3]
 ; points at 0x1000 (num_records 32); the test seeds 0x1000..0x101c with h0..h7 =

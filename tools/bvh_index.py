@@ -555,7 +555,9 @@ def main(argv=None):
         try:
             rows, summaries = scan_rpf(a.target, a.start, a.limit, a.max_inflate)
         except (OSError, ValueError) as e:
-            print(f"{a.target}: {e}", file=sys.stderr)
+            # An OSError repeats the target we already print, and reprs it: name the reason once.
+            reason = e.strerror if isinstance(e, OSError) and e.filename and e.strerror else e
+            print(f"{a.target}: {reason}", file=sys.stderr)
             return 2
     for s in summaries:
         print(json.dumps(s, indent=1))

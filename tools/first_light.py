@@ -239,9 +239,12 @@ def read_obj(
                 if len(p) < 4:
                     raise SystemExit(f"{path}: short vertex line: {line.strip()!r}")
                 try:
-                    positions.append(tuple(float(x) for x in p[1:4]))
+                    position = tuple(float(x) for x in p[1:4])
                 except ValueError:
                     raise SystemExit(f"{path}: invalid vertex coordinates: {line.strip()!r}") from None
+                if not all(math.isfinite(value) for value in position):
+                    raise SystemExit(f"{path}: non-finite vertex coordinates: {line.strip()!r}")
+                positions.append(position)
             elif p[0] == "vt":
                 if len(p) < 3:
                     raise SystemExit(f"{path}: short texture-coordinate line: {line.strip()!r}")
@@ -897,7 +900,7 @@ def main(argv=None) -> int:
         description="Draw an exported model with translated game shaders. Display its UVs or supply a texture with --dds."
     )
     ap.add_argument("--game", help="the package folder")
-    ap.add_argument("--obj", help="an OBJ exported by rpf9dump models")
+    ap.add_argument("--obj", help="an OBJ exported by rpf9dump models, with finite vertex positions and UVs")
     ap.add_argument(
         "--work",
         default=os.path.expanduser("~/leonida-work"),
@@ -958,6 +961,8 @@ def main(argv=None) -> int:
     )
     a = ap.parse_args(argv)
     if a.camera:
+        if not math.isfinite(a.yaw):
+            ap.error("--yaw must be finite")
         if a.vs not in (None, CAMERA_VS):
             ap.error(f"--camera writes the constant layout of {CAMERA_VS} only")
         if a.no_fit or a.keep_z:

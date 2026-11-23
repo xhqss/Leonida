@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; 64-bit integer VOPC compares: v_cmp_{lt,le,gt,ge}_{u64,i64}, v_cmp_ne_u64, v_cmp_{eq,ne}_i64 (e32 VCC and e64
 ; SGPR destination) and v_cmpx_{lt,ge,ne}_i64 / v_cmpx_{gt,le}_u64 (EXEC copied out and put back after each one).
 ; Only v_cmp_eq_u64 / v_cmpx_eq_u64 had a test. Inputs read from memory at run time: the V# in s[0:3] points at

@@ -63,6 +63,9 @@ def parse_startup(path: str, limit: int = 10) -> dict:
         "unimplemented": [],
         "unimplemented_by_dll": {},
         "debug_strings": 0,
+        "file_open_failed": [],
+        "file_open_failed_count": 0,
+        "int3_skipped": [],
         "exceptions": [],
         "exception_count": 0,
         "exit": None,
@@ -129,6 +132,18 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                     )
             elif kind == "debug_string":
                 trace["debug_strings"] += 1
+            elif kind == "file_open_failed":
+                trace["file_open_failed_count"] += 1
+                if len(trace["file_open_failed"]) < limit:
+                    trace["file_open_failed"].append(
+                        {
+                            "path": event.get("path"),
+                            "error": event.get("error"),
+                            "caller": event.get("caller"),
+                        }
+                    )
+            elif kind == "int3_skipped":
+                trace["int3_skipped"].append(event.get("at"))
             elif kind == "exception":
                 trace["exception_count"] += 1
                 if limit <= 0:
@@ -247,6 +262,14 @@ def format_text(summary: dict, limit: int) -> str:
             out.append("  unimplemented: none")
         if startup["debug_strings"]:
             out.append(f"  debug strings: {startup['debug_strings']} (text not shown)")
+        if startup["file_open_failed_count"]:
+            out.append(f"  failed file opens: {startup['file_open_failed_count']}")
+            for item in startup["file_open_failed"][:limit]:
+                out.append(f"    {item['path']} error {item['error']} from {item['caller']}")
+            if startup["file_open_failed_count"] > limit:
+                out.append(f"    ... {startup['file_open_failed_count'] - limit} more")
+        if startup["int3_skipped"]:
+            out.append(f"  int3 skipped (LEONIDA_SKIP_INT3, one per address): {_tail(startup['int3_skipped'], limit)}")
         if startup["exception_count"]:
             out.append(f"  exceptions: {startup['exception_count']}")
             for exc in startup["exceptions"][:limit]:

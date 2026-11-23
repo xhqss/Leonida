@@ -3,18 +3,74 @@ using RpfPreview.Core;
 
 public static class Util
 {
-    // Every output is written to <path>.partial and renamed into place. The exporters skip any file that already
-    // exists, and make_game.py takes manifest.json / audio_manifest.json as proof a step finished, so a file cut
-    // short by a stopped run or a full disk must never appear under its final name.
+    // Every output is written to a unique <path>.*.partial and renamed into place. The exporters skip any file that
+    // already exists, and make_game.py takes manifest.json / audio_manifest.json as proof a step finished, so a
+    // file cut short by a stopped run or a full disk must never appear under its final name.
+    // Unique names matter on parallel export (two models with the same stem) and when a stale exclusive
+    // lock on the classic ".partial" name would throw IOException: "being used by another process".
     public static void WriteAtomic(string path, Action<string> write)
     {
-        string tmp = path + ".partial";
-        if (File.Exists(tmp)) File.Delete(tmp);   // left by a stopped run; some writers open with CreateNew
-        try { write(tmp); File.Move(tmp, path, true); }
-        finally { if (File.Exists(tmp)) File.Delete(tmp); }
+        TryDelete(path + ".partial");   // leftover from older builds / stopped runs
+        string tmp = PartialName(path);
+        try
+        {
+            write(tmp);
+            MoveReplace(tmp, path);
+        }
+        finally { TryDelete(tmp); }
     }
     public static void WriteAllBytes(string path, byte[] data) => WriteAtomic(path, t => File.WriteAllBytes(t, data));
     public static void WriteAllText(string path, string text) => WriteAtomic(path, t => File.WriteAllText(t, text));
+
+    public static string PartialName(string path) =>
+        path + $".{Environment.ProcessId}.{Environment.CurrentManagedThreadId}.{Guid.NewGuid():N}.partial";
+
+    public static void TryDelete(string path)
+    {
+        try { if (File.Exists(path)) File.Delete(path); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    /// <summary>Create/truncate for exclusive write, retrying through brief file locks.</summary>
+    public static FileStream OpenExclusiveCreate(string path, int bufferSize = 1 << 20)
+    {
+        IOException? last = null;
+        for (int i = 0; i < 20; i++)
+        {
+            try
+            {
+                return new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize);
+            }
+            catch (IOException ex)
+            {
+                last = ex;
+                TryDelete(path);
+                Thread.Sleep(50 * (i + 1));
+            }
+        }
+        throw last!;
+    }
+
+    /// <summary>Atomic publish with retries (File.Move onto a briefly locked target can fail).</summary>
+    public static void MoveReplace(string src, string dst)
+    {
+        IOException? last = null;
+        for (int i = 0; i < 20; i++)
+        {
+            try
+            {
+                File.Move(src, dst, overwrite: true);
+                return;
+            }
+            catch (IOException ex)
+            {
+                last = ex;
+                Thread.Sleep(50 * (i + 1));
+            }
+        }
+        throw last!;
+    }
 
     // The decoder names every geometry mesh `model_{mi}_geometry_{gi}`, where mi is the position of the model in the
     // drawable's primary-LOD model list and gi the position of the geometry in that model - the pair a dehydrated

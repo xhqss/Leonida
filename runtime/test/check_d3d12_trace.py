@@ -58,7 +58,7 @@ def main():
             "ID3D12GraphicsCommandList::Close ok",
             "ID3D12GraphicsCommandList::Close failed",
             "ID3D12GraphicsCommandList::Reset ok",
-            "ID3D12GraphicsCommandList::SetDescriptorHeaps ignored",
+            "ID3D12GraphicsCommandList::SetDescriptorHeaps called",
             "ID3D12GraphicsCommandList::SetGraphicsRootDescriptorTable called",
             "ID3D12GraphicsCommandList::SetComputeRootSignature called",
             "ID3D12GraphicsCommandList::Dispatch called",

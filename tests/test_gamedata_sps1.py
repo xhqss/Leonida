@@ -255,6 +255,22 @@ class GamedataSps1Test(unittest.TestCase):
         self.assertEqual(m["preset_stem_hash"], f"{joaat('beta_only_alias'):08X}")
         self.assertEqual(m["effect_hash"], f"{joaat('beta_fx'):08X}")
 
+    def test_missing_input_path_is_a_usage_error_naming_it(self):
+        """BUILD-1046: a path that does not exist is exit 2 and one ERROR line, not a failed run."""
+        missing = os.path.join(self.root, "no-such-input")
+        self.assertFalse(os.path.exists(missing))
+        for cmd in ([sys.executable, "-I", TOOL, missing],
+                    [sys.executable, "-I", TOOL, self.carve, "--shaders", missing]):
+            with self.subTest(cmd=cmd[3:]):
+                p = subprocess.run(cmd, cwd=self.root, capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace")
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                lines = p.stderr.strip().splitlines()
+                self.assertEqual(len(lines), 1, p.stderr)
+                self.assertTrue(lines[0].startswith("ERROR:"), p.stderr)
+                self.assertIn(missing, lines[0])
+
     def test_refuses_json_colliding_with_inputs_and_rejects_bad_archive(self):
         self.add(sps1_payload([("a.sps", "a", 0)]))
         self.finish()

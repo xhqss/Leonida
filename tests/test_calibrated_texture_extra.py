@@ -2018,6 +2018,28 @@ class TestLocalDecoder(unittest.TestCase):
         dds = dec.dds(0)
         self.assertEqual(dds[148:], lin0 + lin1)
 
+    def test_compact_dds_layout_uses_tex_headers_tail_and_mips(self):
+        # ASSET-568: NPOT chains and a single-mip sub-tile must use the measured compact
+        # layout's first_tail/mips, not locally re-derived grids (the latter packed a
+        # lone mip into the tail and misplaced the NPOT standalone subresources).
+        for width, height, fmt, levels, tile in ((65, 65, 98, 7, 4096), (32, 32, 71, 1, 4096)):
+            with self.subTest(size=(width, height, fmt, levels, tile)):
+                lay = ttpf.surface_layout(width, height, fmt, levels, tile)
+                bw, bh, grids, offsets = ct.compact_dds_layout(width, height, fmt, levels, tile)
+                self.assertEqual((bw, bh), (lay["block_w"], lay["block_h"]))
+                self.assertEqual(grids, [(m["blocks_w"], m["blocks_h"]) for m in lay["mips"]])
+                stride = tile if lay["first_tail"] < levels else 0
+                for m in lay["mips"]:
+                    i = m["index"]
+                    if i < lay["first_tail"]:
+                        want = (m["offset"], 0, 0, stride)
+                    else:
+                        want = (0, m["tile_x"], m["tile_y"], stride)
+                    self.assertEqual(offsets[i], want)
+                if levels == 1:
+                    self.assertEqual(lay["first_tail"], 1)
+                    self.assertEqual(offsets[0], (0, 0, 0, 0))
+
     def test_all_supported_formats_and_entries_fallback(self):
         self.assertEqual(ct.LocalDecoder.formats, frozenset((71, 72, 77, 78, 80, 83, 95, 96, 98, 99)))
         base0 = ttpf.align(16 + 10 * 24 + 10 * 32, 4096)

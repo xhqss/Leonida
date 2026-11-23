@@ -764,11 +764,11 @@ class MainTest(unittest.TestCase):
                 self.assertEqual(out, "")
         self.assertFalse(os.path.exists(self.out))
 
-    def test_same_output_path_identity(self):
+    def test_same_report_path_identity(self):
         a = os.path.join(self.dir, "test.rpf")
-        self.assertTrue(WC.same_output_path(a, a))
+        self.assertTrue(WC.same_report_path(a, a))
         b = os.path.join(self.dir, "other.rpf")
-        self.assertFalse(WC.same_output_path(a, b))
+        self.assertFalse(WC.same_report_path(a, b))
 
     def test_out_matching_archive_or_reports_is_rejected(self):
         code, _, err = self.run_main(self.arc, "--out", self.arc)

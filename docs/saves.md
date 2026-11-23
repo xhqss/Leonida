@@ -123,8 +123,10 @@ to it holds the same save. The wrapper's header is the only place the autosave's
 The runtime's offline `XGameSaveImpl` (`runtime/shims/xgameruntime_gamesave.cpp`,
 [runtime_imports.md](runtime_imports.md)) keeps `XGameSave` data in
 `LEONIDA_SAVE_DIR\local-user\<container>\<blob>`, defaulting to `%LOCALAPPDATA%\Leonida\saves`, with names
-%-encoded. `python -I tools/saves.py import <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB]` writes payloads
-in that layout with the same encoding, plus `import-manifest.json` (source, size, SHA-256).
+%-encoded. `python -I tools/saves.py import <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB] [--with-packed]`
+writes payloads in that layout with the same encoding, plus `import-manifest.json` (source, size, SHA-256).
+`--with-packed` also imports `chives.dat`, the packed `SLAYER1` copy of the same save (below), as a blob of its own;
+without it only the plain payload is imported.
 
 Checked earlier with the shim of the open #279, which used the same layout: four imported blobs (2 KB to 1.2 MB)
 read back byte-identical through its `XGameSaveReadBlobData`.
@@ -160,13 +162,16 @@ resolve most of them. The resolved names are game data and stay local; only coun
 
 ## Tool
 
+`verify` reports on every supplied file. Its exit status is 2 if any file could not be read or parsed,
+otherwise 1 if any rebuild differed, otherwise 0.
+
 ```powershell
 python -I tools/saves.py info    <file or folder>...
-python -I tools/saves.py verify  <JSAV>                 # parse every block, rebuild, compare byte for byte
+python -I tools/saves.py verify  <JSAV>...              # parse every block, rebuild, compare byte for byte
 python -I tools/saves.py extract <JSAV|ASAV> <outdir>   # blocks/*.json, index.json, save.pretty.json
 python -I tools/saves.py pack    <outdir> <JSAV>        # after editing blocks/*.json
 python -I tools/saves.py diff    <JSAV a> <JSAV b>
-python -I tools/saves.py import  <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB] [--dry-run] [--force]
+python -I tools/saves.py import  <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB] [--with-packed] [--dry-run] [--force]
 python -I tools/save_keys.py collect <save file or extract folder>...           # distinct $0x… keys
 python -I tools/save_keys.py resolve <saves>... --dict <files>... [--compose N] [--out FILE]
 ```

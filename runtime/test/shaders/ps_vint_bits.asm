@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Bit-field mask and bit reverse: v_bfm_b32 (VOP3), v_bfrev_b32. vN holds hN.
 ; Inputs come from memory at run time (not inline constants, which the driver could fold). The V# in s[0:3]
 ; points at 0x1000 (num_records 32); the test seeds 0x1000..0x101c with h0..h7 =

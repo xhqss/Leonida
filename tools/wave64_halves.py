@@ -33,6 +33,7 @@ candidate cross-half opcodes and decides nothing. This module decides per shader
 the tiers the translator wrote into an index.json. They answer different questions.
 
 Standard library only.
+Usage: `python -I tools/wave64_halves.py --help` lists the options.
 """
 import argparse
 import json
@@ -1718,7 +1719,7 @@ def main(argv=None):
     # JSON document that is not the index object used to end in a traceback (FileNotFoundError, PermissionError,
     # JSONDecodeError, AttributeError).
     try:
-        with open(args.census, encoding="utf-8") as f:
+        with open(args.census, encoding="utf-8-sig") as f:
             index = json.load(f)
     except OSError as exc:
         print(f"ERROR: cannot read {args.census}: {exc.strerror or exc}", file=sys.stderr)

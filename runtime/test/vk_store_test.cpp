@@ -20,6 +20,7 @@
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
+#include "spirv_capability.h"
 #include "../src/gfx10_descriptors.h"
 
 #include <cmath>
@@ -100,9 +101,8 @@ int main(int argc, char** argv) {
     // as vk_compute_test does) instead of failing vkCreateDevice. Typed loads need no storage image feature.
     VkPhysicalDeviceFeatures have{};
     vkGetPhysicalDeviceFeatures(pd, &have);
-    if (!have.shaderStorageImageWriteWithoutFormat || !have.shaderInt64) {
-        std::printf("unsupported: shaderStorageImageWriteWithoutFormat=%u shaderInt64=%u\n",
-                    have.shaderStorageImageWriteWithoutFormat, have.shaderInt64);
+    if (!have.shaderStorageImageWriteWithoutFormat) {
+        std::printf("unsupported: shaderStorageImageWriteWithoutFormat=0\n");
         return 77;
     }
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
@@ -132,6 +132,12 @@ int main(int argc, char** argv) {
     std::ifstream f(argv[1], std::ios::binary);
     std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
     if (code.size() < 20 || code.size() % 4) { std::fprintf(stderr, "%s: not a SPIR-V module\n", argv[1]); return 1; }
+    // shaderInt64 only for a module with 64-bit integers: SHADER-423's address pairs need none (TEST-468).
+    const bool int64 = leonida::vk_test::needs_shader_int64(code.data(), code.size());
+    if (int64 && !have.shaderInt64) {
+        std::printf("unsupported: %s declares Int64 and the device has no shaderInt64\n", argv[1]);
+        return 77;
+    }
     using leonida::vk_test::spirv_declares_capability;
     const bool dynamic_sampled = spirv_declares_capability(code.data(), code.size(),
         leonida::vk_test::spv_sampled_image_array_dynamic_indexing);
@@ -152,7 +158,7 @@ int main(int argc, char** argv) {
         std::printf("FAILED: the module declares StorageImageReadWithoutFormat\n");
         return 1;
     }
-    f2.features.shaderInt64 = VK_TRUE;
+    f2.features.shaderInt64 = int64 ? VK_TRUE : VK_FALSE;
     f2.pNext = &f12;
     leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr)
     fma.query(gipa, inst, pd);

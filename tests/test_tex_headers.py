@@ -745,6 +745,24 @@ class TestTextureDescriptorParsing(unittest.TestCase):
         self.assertEqual(t["packed"], 0xCAFEBABE00000001)
         self.assertEqual(t["q_index"], k)
 
+    def test_scan_archive_utf8_bom_index(self):
+        cpu_off, gpu_off, k = self._make_synthetic_texture_blobs(w=64, h=64, depth=1, fmt=71, data_off=0x1000, mips=4)
+        index_path = os.path.join(self.arch_dir, "index.json")
+        with open(index_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        with open(index_path, "w", encoding="utf-8-sig") as f:
+            f.write(raw)
+
+        results = tex_headers.scan_archive(self.carve, self.arch)
+        self.assertEqual(len(results), 1)
+        t = results[0]
+        self.assertEqual(t["cpu"], cpu_off)
+        self.assertEqual(t["gpu"], gpu_off)
+        self.assertEqual(t["w"], 64)
+        self.assertEqual(t["h"], 64)
+        self.assertEqual(t["fmt"], 71)
+        self.assertEqual(t["q_index"], k)
+
     def test_scan_archive_unaligned_pointer_rejected(self):
         # Texture data pointer must be 256-byte aligned (int(q[k]) & 0xFF == 0)
         self._make_synthetic_texture_blobs(data_off=0x1001)

@@ -18,16 +18,22 @@ import make_game  # noqa: E402
 
 class FakeProc:
     def __init__(
-        self, *, running=True, wait_side_effect=None, timeout_on_terminate=False
+        self, *, running=True, wait_side_effect=None, poll_side_effect=None,
+        timeout_on_terminate=False
     ):
         self.running = running
         self.wait_side_effect = wait_side_effect
+        self.poll_side_effect = poll_side_effect
         self.timeout_on_terminate = timeout_on_terminate
         self.terminated = False
         self.killed = False
         self.waits = 0
 
     def poll(self):
+        if self.poll_side_effect is not None:
+            exc = self.poll_side_effect
+            self.poll_side_effect = None
+            raise exc
         return None if self.running else 0
 
     def terminate(self):
@@ -52,12 +58,13 @@ class TranslateCleanupTests(unittest.TestCase):
     def test_keyboard_interrupt_during_wait_terminates_and_reaps_all_running_shards(
         self,
     ):
+        # translate() polls shards and sleeps; Ctrl+C must arrive from poll() (or sleep), not wait().
         with tempfile.TemporaryDirectory() as tmp:
             disasm = os.path.join(tmp, "disasm")
             spirv = os.path.join(tmp, "spirv")
             os.makedirs(disasm)
             p0 = FakeProc(running=False)
-            p1 = FakeProc(running=True, wait_side_effect=KeyboardInterrupt)
+            p1 = FakeProc(running=True, poll_side_effect=KeyboardInterrupt())
             p2 = FakeProc(running=True)
             procs = [p0, p1, p2]
             spawned = iter(procs)
@@ -69,15 +76,15 @@ class TranslateCleanupTests(unittest.TestCase):
                     side_effect=lambda *a, **kw: next(spawned),
                 ),
                 patch("make_game.py") as merge_call,
+                patch("make_game.time.sleep"),
             ):
                 with self.assertRaises(KeyboardInterrupt):
                     make_game.translate(disasm, spirv, jobs=3)
 
-            self.assertFalse(p0.terminated)
+            self.assertFalse(p0.terminated)  # already finished before the interrupt
             self.assertTrue(p1.terminated)
             self.assertTrue(p2.terminated)
-            self.assertGreaterEqual(p0.waits, 1)
-            self.assertGreaterEqual(p1.waits, 2)
+            self.assertGreaterEqual(p1.waits, 1)
             self.assertGreaterEqual(p2.waits, 1)
             merge_call.assert_not_called()
 

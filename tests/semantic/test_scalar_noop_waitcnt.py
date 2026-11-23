@@ -331,6 +331,15 @@ class ScalarNoopWaitcntParsingTests(unittest.TestCase):
                 [{"k": "special", "t": "depctr_vm_vsrc(0)"}, {"k": "special", "t": "depctr_va_sdst(0)"}],
             ),
             (
+                "s_waitcnt_depctr depctr_hold_cnt(0) depctr_sa_sdst(0) depctr_va_vdst(0)",
+                "s_waitcnt_depctr",
+                [
+                    {"k": "special", "t": "depctr_hold_cnt(0)"},
+                    {"k": "special", "t": "depctr_sa_sdst(0)"},
+                    {"k": "special", "t": "depctr_va_vdst(0)"},
+                ],
+            ),
+            (
                 "s_waitcnt_expcnt null, 0x0",
                 "s_waitcnt_expcnt",
                 [{"k": "special", "t": "null", "neg": False, "abs": False}, {"k": "imm", "v": 0}],
@@ -361,9 +370,21 @@ class ScalarNoopWaitcntParsingTests(unittest.TestCase):
             (
                 "s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)",
                 "s_waitcnt",
-                [{"k": "special", "t": "vmcnt(0) expcnt(0) lgkmcnt(0)"}],
+                [
+                    {"k": "special", "t": "vmcnt(0)"},
+                    {"k": "special", "t": "expcnt(0)"},
+                    {"k": "special", "t": "lgkmcnt(0)"},
+                ],
             ),
             ("s_waitcnt 0", "s_waitcnt", [{"k": "imm", "v": 0}]),
+            (
+                "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s0",
+                "s_setreg_b32",
+                [
+                    {"k": "special", "t": "hwreg(HW_REG_MODE, 2, 2)"},
+                    {"k": "sgpr", "r": 0, "n": 1, "neg": False, "abs": False},
+                ],
+            ),
             (
                 "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3",
                 "s_setreg_imm32_b32",

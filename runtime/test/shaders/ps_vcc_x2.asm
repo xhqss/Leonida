@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; s_buffer_load_dwordx2 into VCC: the low dword lands in vcc_lo, the high dword in vcc_hi.
 ; The V# in s[0:3] points at 0x1000; the test seeds memory with 0x11223344 and 0x55667788 there.
 ; Expected mrt0 bits: 0x11223344, 0x55667788, 0, 0

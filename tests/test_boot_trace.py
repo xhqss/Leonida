@@ -404,6 +404,23 @@ class BootTraceTests(unittest.TestCase):
         ):
             self.assertIn(needle, text)
 
+    def test_failed_file_opens_and_skipped_int3_are_listed(self):
+        self.write(
+            self.startup,
+            [
+                {"seq": 1, "kind": "trace_open", "pid": 1},
+                {"seq": 2, "kind": "file_open_failed", "api": "CreateFileW", "path": "GAME:/probe/missing.bin", "error": 2, "caller": "game.exe+0x20"},
+                {"seq": 3, "kind": "int3_skipped", "at": "game.exe+0x1330"},
+            ],
+        )
+        trace = bt.parse_startup(self.startup)
+        self.assertEqual(trace["file_open_failed"], [{"path": "GAME:/probe/missing.bin", "error": 2, "caller": "game.exe+0x20"}])
+        self.assertEqual(trace["int3_skipped"], ["game.exe+0x1330"])
+        text = bt.format_text(bt.summarize(trace, None), 10)
+        self.assertIn("failed file opens: 1", text)
+        self.assertIn("GAME:/probe/missing.bin error 2 from game.exe+0x20", text)
+        self.assertIn("game.exe+0x1330", text)
+
     def test_last_observed_tls_callback_in_incomplete_startup(self):
         first = {"kind": "tls_callback", "module": "first.dll", "at": "first.dll+0x1100", "reason": 1}
         for fields, reason, phase in (

@@ -16,13 +16,41 @@ from file_mode import published_mode
 import ttpf_mips as ttpf
 
 
+# The modules that decode a full chain, next to this file. Both pass stamps hash them, so a pool completed by an
+# older decoder is done again, as one completed with another calibration is.
+DECODER_SOURCES = ("bcpack.py", "bcpack_tables.py", "bcpack_tables_bptc.py", "calibrated_texture.py",
+                   "tex_headers.py", "ttpf_mips.py")
+
+
+def decoder_digest():
+    h = hashlib.sha256()
+    for name in DECODER_SOURCES:
+        data = Path(__file__).with_name(name).read_bytes()   # a missing source is an error, not an empty hash
+        h.update(f"{name}\0{len(data)}\0".encode())
+        h.update(data)
+    return h.hexdigest()
+
+
+def strict_stamp():
+    # Ends in "-strict" (candidate() keeps such rows without a profile); its first 19 characters name the DDS.
+    return f"v1-{decoder_digest()[:16]}-strict"
+
+
 def load_profile(work):
     path = Path(work, "bcpack-calibration.json")
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
-        return "v1-strict", None
-    profile = json.loads(raw)
+        return strict_stamp(), None
+    except OSError as exc:
+        raise ValueError(f"{path}: cannot read the calibration profile: {exc.strerror or exc}") from None
+    try:
+        # json.loads() on the bytes also detects a UTF-16 profile or one saved with a BOM.
+        profile = json.loads(raw)
+    except ValueError as exc:   # JSONDecodeError, or an encoding json cannot detect
+        # The profile is hand-written (make_game says where it goes), so a typo names the file, not a bare
+        # 'Expecting property name enclosed in double quotes'.
+        raise ValueError(f"{path}: not a JSON calibration profile: {exc}") from None
     if not isinstance(profile, dict) or profile.get("version") != 1:
         raise ValueError(f"Unsupported calibration version in {path}")
     try:
@@ -31,7 +59,7 @@ def load_profile(work):
     except (OSError, ImportError) as exc:
         raise RuntimeError("Calibrated texture export requires NumPy and the release build of "
                            "tools/bcpack_calibration (see its README.md)") from exc
-    return "v1-" + hashlib.sha256(raw).hexdigest(), profile
+    return "v1-" + hashlib.sha256(decoder_digest().encode() + raw).hexdigest(), profile
 
 
 def publish(path, data):
@@ -130,7 +158,7 @@ def complete_pool(source, directory, manifest, settings):
     written = blocked = 0
     superseded = set()   # the files the rows named before they were switched to a full chain
     with closing(ttpf.Pool(source)) as pool:
-        decoder = None
+        decoder = strict = None
         if profile is not None:
             from calibrated_texture import LocalDecoder
             decoder = LocalDecoder(pool, profile)
@@ -151,7 +179,9 @@ def complete_pool(source, directory, manifest, settings):
                         method = stamp
                         blob = decoder.dds(index)
                     else:
-                        method = "v1-strict"
+                        if profile is not None and strict is None:
+                            strict = strict_stamp()   # once per pass: it reads and hashes six sources
+                        method = strict or stamp
                         analysis = ttpf.analyze(pool, index)
                         blob = ttpf.texture_dds(pool, analysis)
                 except (ValueError, KeyError, IndexError, ttpf.BcpackRequired,

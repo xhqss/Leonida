@@ -6,12 +6,14 @@ synthetic RDS5/ETPF pool round trip. No game data is used.
 import importlib.util
 import io
 import json
+import math
 import os
 import random
 import struct
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 import zlib
 from contextlib import ExitStack, closing, redirect_stderr, redirect_stdout
@@ -2558,6 +2560,392 @@ class UnmappedSentinelSpanTest(unittest.TestCase):
                     total = json.load(f)["total"]
                 self.assertEqual(total["chunk_metadata_fail"], 0)
                 self.assertEqual(total["chunk_metadata_ok"], len(mapped_indices))
+
+
+class DetileFastPathTest(unittest.TestCase):
+    def test_coalesce_x_runs_merges_contiguous_blocks(self):
+        self.assertEqual(ttpf._coalesce_x_runs([], 16), [])
+        self.assertEqual(ttpf._coalesce_x_runs([0, 16, 32, 128, 144, 64], 16),
+                         [(0, 48), (128, 32), (64, 16)])
+
+    def test_detile_matches_reference_formula_across_all_element_sizes_and_tiles(self):
+        def ref_detile(layout, mip, tiled):
+            pat = (ttpf.PATTERNS_4K if layout["tile"] == 4096 else ttpf.PATTERNS_64K)[
+                {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[layout["element_bytes"]]]
+            bw, bh = layout["block_w"], layout["block_h"]
+            eb = layout["element_bytes"]
+            out = bytearray(mip["blocks_w"] * mip["blocks_h"] * eb)
+            for y in range(mip["blocks_h"]):
+                for x in range(mip["blocks_w"]):
+                    off = ((y // bh) * (mip["padded_w"] // bw) + x // bw) * layout["tile"]
+                    for bit, s in enumerate(pat):
+                        if s > 0:
+                            off |= (((x + mip["tile_x"]) >> (s - 1)) & 1) << bit
+                        elif s < 0:
+                            off |= (((y + mip["tile_y"]) >> (-s - 1)) & 1) << bit
+                    at = (y * mip["blocks_w"] + x) * eb
+                    out[at:at + eb] = tiled[off:off + eb]
+            return bytes(out)
+
+        for fmt, eb in ((61, 1), (49, 2), (28, 4), (71, 8), (98, 16)):
+            for tile in (4096, 65536):
+                layout = ttpf.surface_layout(60, 44, fmt, 4, tile=tile)
+                for idx, mip in enumerate(layout["mips"]):
+                    nbytes = max(mip["padded_w"] * mip["padded_h"] * eb, tile)
+                    tiled = bytes((i * 131 + 17) & 255 for i in range(nbytes))
+                    with self.subTest(fmt=fmt, tile=tile, level=idx):
+                        self.assertEqual(ttpf.detile(layout, mip, tiled), ref_detile(layout, mip, tiled))
+
+        # Truncated input falls back to the exact slice behavior without raising ValueError.
+        layout_t = ttpf.surface_layout(64, 64, 98, 1, tile=4096)
+        mip_t = layout_t["mips"][0]
+        short_tiled = bytes(range(200))
+        self.assertEqual(ttpf.detile(layout_t, mip_t, short_tiled), ref_detile(layout_t, mip_t, short_tiled))
+
+
+    @staticmethod
+    def _ref_detile(layout, mip, tiled):
+        pat = (ttpf.PATTERNS_4K if layout["tile"] == 4096 else ttpf.PATTERNS_64K)[
+            {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[layout["element_bytes"]]]
+        bw, bh, eb = layout["block_w"], layout["block_h"], layout["element_bytes"]
+        out = bytearray(mip["blocks_w"] * mip["blocks_h"] * eb)
+        for y in range(mip["blocks_h"]):
+            for x in range(mip["blocks_w"]):
+                off = ((y // bh) * (mip["padded_w"] // bw) + x // bw) * layout["tile"]
+                for bit, s in enumerate(pat):
+                    if s > 0:
+                        off |= (((x + mip["tile_x"]) >> (s - 1)) & 1) << bit
+                    elif s < 0:
+                        off |= (((y + mip["tile_y"]) >> (-s - 1)) & 1) << bit
+                at = (y * mip["blocks_w"] + x) * eb
+                out[at:at + eb] = tiled[off:off + eb]
+        return bytes(out)
+
+    def test_narrow_shapes_stream_and_match_reference(self):
+        for w, h in ((16384, 1), (1, 16384), (1, 1), (3, 1), (1, 3)):
+            for tile in (4096, 65536):
+                layout = ttpf.surface_layout(w, h, 28, 1, tile=tile)
+                mip = layout["mips"][0]
+                nbytes = max(mip["padded_w"] * mip["padded_h"] * 4, tile)
+                full = bytes((i * 131 + 17) & 255 for i in range(nbytes))
+                for tiled in (full, full[:nbytes // 3 + 5]):  # complete and truncated input
+                    with self.subTest(w=w, h=h, tile=tile, size=len(tiled)):
+                        self.assertEqual(ttpf.detile(layout, mip, tiled),
+                                         self._ref_detile(layout, mip, tiled))
+
+    def test_volume_slice_nonzero_z_truncated_matches_reference(self):
+        layout = ttpf.volume_surface_layout(16, 8, 8, 1, 2)
+        w, h, d = (layout["mips"][0][k] for k in ("blocks_w", "blocks_h", "blocks_d"))
+        linear = bytes((i * 7 + 3) & 255 for i in range(w * h * d * 2))
+        tiled = retile_volume(layout, linear)
+        for z in (0, 3, 7):
+            self.assertEqual(ttpf.detile_volume_slice(layout, tiled, z),
+                             linear[z * w * h * 2:(z + 1) * w * h * 2])
+        # Truncated allocation: the exact slice-copy fallback must match a per-element reference.
+        eb = layout["element_bytes"]
+        pat = ttpf.VOLUME_PATTERNS_4K[{1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[eb]]
+        bw, bh, bd = layout["block_w"], layout["block_h"], layout["block_d"]
+        tiles_x = layout["mips"][0]["padded_w"] // bw
+        cut = tiled[:len(tiled) // 2 + 3]
+        for z in (1, 5):
+            ref = bytearray(w * h * eb)
+            for y in range(h):
+                for x in range(w):
+                    off = (z // bd) * layout["z_tile_stride"] + ((y // bh) * tiles_x + x // bw) * layout["tile"]
+                    for bit, s in enumerate(pat):
+                        if s >= 101:
+                            off |= ((z >> (s - 101)) & 1) << bit
+                        elif s < 0:
+                            off |= ((y >> (-s - 1)) & 1) << bit
+                        elif 0 < s < 100:
+                            off |= ((x >> (s - 1)) & 1) << bit
+                    at = (y * w + x) * eb
+                    ref[at:at + eb] = cut[off:off + eb]
+            self.assertEqual(ttpf.detile_volume_slice(layout, cut, z), bytes(ref))
+        self.assertEqual(ttpf.detile_volume_slice(layout, tiled, 0), linear[:w * h * 2])
+
+
+# --- The BC1/BC4 decode and block_means as they were before the table-driven rewrite -------
+# Kept verbatim as the reference the fast paths must reproduce float for float.
+
+def _ref_rgb565(c):
+    return ((c >> 11) & 31) * 255.0 / 31, ((c >> 5) & 63) * 255.0 / 63, (c & 31) * 255.0 / 31
+
+
+def _ref_bc1_block(data, at, four_color=False):
+    c0, c1, idx = struct.unpack_from("<HHI", data, at)
+    p0, p1 = _ref_rgb565(c0), _ref_rgb565(c1)
+    if four_color or c0 > c1:
+        pal = [p0, p1, tuple((2 * a + b) / 3 for a, b in zip(p0, p1)),
+               tuple((a + 2 * b) / 3 for a, b in zip(p0, p1))]
+    else:
+        pal = [p0, p1, tuple((a + b) / 2 for a, b in zip(p0, p1)), (0.0, 0.0, 0.0)]
+    return [pal[(idx >> (2 * (y * 4 + x))) & 3] for y in range(4) for x in range(4)]
+
+
+def _ref_bc4_block(data, at):
+    e0, e1 = data[at], data[at + 1]
+    bits = int.from_bytes(data[at + 2:at + 8], "little")
+    if e0 > e1:
+        pal = [e0, e1] + [((7 - i) * e0 + i * e1) // 7 for i in range(1, 7)]
+    else:
+        pal = [e0, e1] + [((5 - i) * e0 + i * e1) // 5 for i in range(1, 5)] + [0, 255]
+    vals = [pal[(bits >> (3 * (y * 4 + x))) & 7] for y in range(4) for x in range(4)]
+    return [(float(v),) * 3 for v in vals]
+
+
+def _ref_decode_pixels(fmt, data, blocks_w, blocks_h):
+    px = []
+    for by in range(blocks_h):
+        rows = [[None] * (blocks_w * 4) for _ in range(4)]
+        for bx in range(blocks_w):
+            at = (by * blocks_w + bx) * 16
+            if fmt in (71, 72):
+                blk = _ref_bc1_block(data, (by * blocks_w + bx) * 8)
+            elif fmt in (74, 75, 77, 78):
+                blk = _ref_bc1_block(data, at + 8, four_color=True)
+            elif fmt in (80,):
+                blk = _ref_bc4_block(data, (by * blocks_w + bx) * 8)
+            elif fmt in (83,):
+                a = _ref_bc4_block(data, at)
+                b = _ref_bc4_block(data, at + 8)
+                blk = [(p[0], q[0], 0.0) for p, q in zip(a, b)]
+            else:
+                return None
+            for y in range(4):
+                for x in range(4):
+                    rows[y][bx * 4 + x] = blk[y * 4 + x]
+        px.extend(rows)
+    return [p for row in px for p in row]
+
+
+def _ref_block_means(pixels, blocks_w, blocks_h, pixels_w=None, pixels_h=None, block=4):
+    if block == 1:
+        return list(pixels)
+    pw = blocks_w * block if pixels_w is None else pixels_w
+    ph = blocks_h * block if pixels_h is None else pixels_h
+    out = []
+    for by in range(blocks_h):
+        for bx in range(blocks_w):
+            acc = [0.0, 0.0, 0.0]
+            n = 0
+            for y in range(block):
+                if by * block + y >= ph:
+                    continue
+                for x in range(block):
+                    if bx * block + x >= pw:
+                        continue
+                    q = pixels[(by * block + y) * (blocks_w * block) + bx * block + x]
+                    for k in range(3):
+                        acc[k] += q[k]
+                    n += 1
+            out.append((acc[0] / n, acc[1] / n, acc[2] / n) if n else (0.0, 0.0, 0.0))
+    return out
+
+
+def _float_bits(pixels):
+    """Every channel's IEEE bits (so -0.0 counts); each channel must be a float. All NaNs map
+    to one: which NaN comes out of `NaN + NaN` follows the operand order the interpreter's
+    float add happens to use (it differs between a cold and a specialized `+`), in the scalar
+    loop as much as here, and no consumer of the means reads it (`_hdr_tonemap` maps NaN to 0)."""
+    flat = [c for p in pixels for c in p]
+    assert all(type(c) is float for c in flat), "a channel is not a float"
+    return struct.pack(f"<{len(flat)}d", *[float("nan") if c != c else c for c in flat])
+
+
+class BcFastDecodeParityTest(unittest.TestCase):
+    """decode_bc1_block / decode_bc4_block / decode_pixels / block_means against the scalar
+    code they replaced, plus hand-derived values that need no reference."""
+
+    def assert_same_pixels(self, got, want):
+        self.assertEqual(len(got), len(want))
+        self.assertEqual(_float_bits(got), _float_bits(want))
+
+    def test_bc1_hand_derived_palette_and_pixel_order(self):
+        red, blue = 0xF800, 0x001F
+        # c0 > c1: four colors; index = row number, so row y is all pal[y].
+        blk = struct.pack("<HHI", red, blue, 0xFFAA5500)
+        pal = [(255.0, 0.0, 0.0), (0.0, 0.0, 255.0), (170.0, 0.0, 85.0), (85.0, 0.0, 170.0)]
+        px = ttpf.decode_pixels(71, blk, 1, 1)
+        self.assertEqual(px, [pal[y] for y in range(4) for _ in range(4)])
+        self.assertEqual(ttpf.decode_bc1_block(blk, 0), px)
+        # index = column number: every row is pal[0..3]
+        blk = struct.pack("<HHI", red, blue, 0xE4E4E4E4)
+        self.assertEqual(ttpf.decode_pixels(72, blk, 1, 1), pal * 4)
+        # c0 <= c1: three colors and black; index 3 is (0, 0, 0), index 2 the midpoint.
+        blk = struct.pack("<HHI", blue, red, 0xE4E4E4E4)
+        pal3 = [(0.0, 0.0, 255.0), (255.0, 0.0, 0.0), (127.5, 0.0, 127.5), (0.0, 0.0, 0.0)]
+        self.assertEqual(ttpf.decode_pixels(71, blk, 1, 1), pal3 * 4)
+        # BC3 reads the same color block four-color even when c0 <= c1 (alpha bytes first).
+        self.assertEqual(ttpf.decode_pixels(77, b"\xAA" * 8 + blk, 1, 1),
+                         [(0.0, 0.0, 255.0), (255.0, 0.0, 0.0), (85.0, 0.0, 170.0),
+                          (170.0, 0.0, 85.0)] * 4)
+        # RGB565 channel levels: the 5/6/5-bit value scaled to 255 in float, not rounded.
+        self.assertEqual(ttpf._rgb565(0x7BEF), (15 * 255.0 / 31, 31 * 255.0 / 63, 15 * 255.0 / 31))
+        self.assertEqual(ttpf._rgb565(0xFFFF), (255.0, 255.0, 255.0))
+        self.assertEqual(ttpf._rgb565(0), (0.0, 0.0, 0.0))
+
+    def test_bc4_hand_derived_pixel_order(self):
+        # 8-value mode, pixel (y, x) takes index (4 * y + x) % 8; palette is e0, e1, then
+        # (6e0 + e1)//7 ... (e0 + 6e1)//7.
+        e0, e1 = 200, 11
+        bits = sum(((4 * y + x) % 8) << (3 * (4 * y + x)) for y in range(4) for x in range(4))
+        blk = bytes([e0, e1]) + bits.to_bytes(6, "little")
+        pal = [200, 11, 173, 146, 119, 92, 65, 38]
+        want = [(float(pal[(4 * y + x) % 8]),) * 3 for y in range(4) for x in range(4)]
+        self.assertEqual(ttpf.decode_pixels(80, blk, 1, 1), want)
+        self.assertEqual(ttpf.decode_bc4_block(blk, 0), want)
+        # 6-value mode: the last two indices are the constants 0 and 255.
+        blk = bytes([20, 220]) + bits.to_bytes(6, "little")
+        pal = [20, 220, 60, 100, 140, 180, 0, 255]
+        self.assertEqual(ttpf.decode_bc4_block(blk, 0),
+                         [(float(pal[(4 * y + x) % 8]),) * 3 for y in range(4) for x in range(4)])
+
+    def test_decode_pixels_matches_reference_on_random_blocks(self):
+        rng = random.Random(0xBC14)
+        for fmt, size in ((71, 8), (72, 8), (74, 16), (75, 16), (77, 16), (78, 16),
+                          (80, 8), (83, 16)):
+            for bw, bh in ((1, 1), (7, 5), (16, 3)):
+                data = rng.randbytes(bw * bh * size)
+                self.assert_same_pixels(ttpf.decode_pixels(fmt, data, bw, bh),
+                                        _ref_decode_pixels(fmt, data, bw, bh))
+
+    def test_decode_pixels_matches_reference_on_edge_endpoints(self):
+        # Both endpoint orders, equal endpoints, the extremes and the 6-value/8-value BC4 split.
+        ends = [0, 1, 0x001F, 0x07E0, 0xF800, 0x7BEF, 0xFFFF, 0xFFFE]
+        rng = random.Random(7)
+        bc1 = b"".join(struct.pack("<HHI", a, b, rng.getrandbits(32)) for a in ends for b in ends)
+        n = len(ends) ** 2
+        self.assert_same_pixels(ttpf.decode_pixels(71, bc1, 8, n // 8),
+                                _ref_decode_pixels(71, bc1, 8, n // 8))
+        vals = [0, 1, 7, 127, 128, 254, 255]
+        bc4 = b"".join(bytes([a, b]) + rng.randbytes(6) for a in vals for b in vals)
+        self.assert_same_pixels(ttpf.decode_pixels(80, bc4, 7, 7), _ref_decode_pixels(80, bc4, 7, 7))
+        for at in range(0, len(bc1) - 7, 8):
+            for four in (False, True):
+                self.assert_same_pixels(ttpf.decode_bc1_block(bc1, at, four),
+                                        _ref_bc1_block(bc1, at, four))
+        for at in range(0, len(bc4), 8):
+            self.assert_same_pixels(ttpf.decode_bc4_block(bc4, at), _ref_bc4_block(bc4, at))
+
+    def test_palette_cache_reset_does_not_change_pixels(self):
+        rng = random.Random(99)
+        bc1, bc4 = rng.randbytes(20 * 20 * 8), rng.randbytes(20 * 20 * 8)
+        with mock.patch.object(ttpf, "_ROW_MAX_CACHE", 3):
+            self.assert_same_pixels(ttpf.decode_pixels(71, bc1, 20, 20),
+                                    _ref_decode_pixels(71, bc1, 20, 20))
+            self.assert_same_pixels(ttpf.decode_pixels(80, bc4, 20, 20),
+                                    _ref_decode_pixels(80, bc4, 20, 20))
+
+    def test_decode_pixels_accepts_any_buffer_and_keeps_its_failures(self):
+        rng = random.Random(3)
+        data = rng.randbytes(6 * 8)
+        want = _ref_decode_pixels(71, data, 3, 2)
+        for buf in (bytearray(data), memoryview(data)):
+            self.assert_same_pixels(ttpf.decode_pixels(71, buf, 3, 2), want)
+        # Truncated input fails the same way as before (and in the reference).
+        for fmt, size in ((71, 8), (74, 16), (80, 8)):
+            short = bytes(size * 4 - (9 if fmt == 80 else 1))
+            with self.assertRaises(IndexError if fmt == 80 else struct.error):
+                _ref_decode_pixels(fmt, short, 2, 2)
+            with self.assertRaises(IndexError if fmt == 80 else struct.error):
+                ttpf.decode_pixels(fmt, short, 2, 2)
+        # A BC format this decoder has no block code for is None, or [] on an empty grid.
+        self.assertIsNone(ttpf.decode_pixels(70, bytes(16), 1, 1))
+        self.assertEqual(ttpf.decode_pixels(70, b"", 0, 4), [])
+        self.assertEqual(ttpf.decode_pixels(71, b"", 3, 0), [])
+        self.assertEqual(ttpf.decode_pixels(80, b"", 0, 0), [])
+
+    def test_bc4_levels_are_shared_and_peak_memory_does_not_grow(self):
+        rng = random.Random(11)
+        bw = bh = 96
+        for fmt in (71, 80):
+            data = rng.randbytes(bw * bh * 8)
+            peaks = []
+            for fn in (ttpf.decode_pixels, _ref_decode_pixels):
+                tracemalloc.start()
+                try:
+                    keep = fn(fmt, data, bw, bh)
+                    peaks.append(tracemalloc.get_traced_memory()[1])
+                finally:
+                    tracemalloc.stop()
+                del keep
+            self.assertLessEqual(peaks[0], peaks[1], f"fmt {fmt} peak {peaks}")
+        px = ttpf.decode_pixels(80, data, bw, bh)
+        self.assertLessEqual(len({id(p) for p in px}), 256)
+
+    def test_block_means_matches_reference_for_every_clip(self):
+        rng = random.Random(0xB10C)
+        for block in (2, 3, 4, 5, 8):
+            for bw, bh in ((1, 1), (2, 3), (5, 2), (7, 7)):
+                w, h = bw * block, bh * block
+                px = [(rng.uniform(-300, 300), rng.random(), float(rng.randrange(256)))
+                      for _ in range(w * h)]
+                clips = [(None, None), (w, h), (w - 1, h - 1), (w - block, h), (w, h - block + 1),
+                         (1, 1), (0, h), (w, 0), (0, 0), (-3, 2), (w + 9, h + 9),
+                         (max(1, w - block - 1), max(1, h - block - 1)), (w - 1, None)]
+                for pw, ph in clips:
+                    got = ttpf.block_means(px, bw, bh, pw, ph, block)
+                    want = _ref_block_means(px, bw, bh, pw, ph, block)
+                    self.assertEqual(_float_bits(got), _float_bits(want),
+                                     f"block {block} grid {bw}x{bh} clip {pw}x{ph}")
+                    self.assertEqual(len(got), bw * bh)
+
+    def test_block_means_keeps_summation_order_and_special_values(self):
+        # Sequential float adds from 0.0: a naive left-to-right sum, not a compensated one.
+        inf, nan = float("inf"), float("nan")
+        values = [1e16, 1.0, -1e16, 1.0, 0.1, 0.2, 0.3, -0.0, -0.0, inf, -inf, nan,
+                  1e308, 1e308, -0.0, 5e-324]
+        px = [(v, -v, v * 0.5) for v in values] * 2
+        for bw, bh in ((1, 2), (2, 1)):
+            for pw, ph in ((None, None), (3, 5), (4, 8)):
+                self.assertEqual(_float_bits(ttpf.block_means(px, bw, bh, pw, ph)),
+                                 _float_bits(_ref_block_means(px, bw, bh, pw, ph)))
+        # Values whose sum depends on the order (1e16 + 1.0 == 1e16 in float).
+        order = [(1e16, 0.0, 0.0), (1.0, 0.0, 0.0)] * 8
+        self.assertEqual(ttpf.block_means(order, 1, 1), _ref_block_means(order, 1, 1))
+        # Each +1.0 is lost against 1e16 (the spacing there is 2); a compensated sum keeps them.
+        self.assertEqual(ttpf.block_means(order, 1, 1)[0][0], 8e16 / 16)
+        # A block of negative zeros stays +0.0 because the sum starts from 0.0.
+        zero = ttpf.block_means([(-0.0, -0.0, -0.0)] * 16, 1, 1)
+        self.assertEqual([math.copysign(1.0, c) for c in zero[0]], [1.0, 1.0, 1.0])
+
+    def test_block_means_integer_pixels_lists_and_block_one(self):
+        px = [[x + 3 * y, 2 * x, y] for y in range(8) for x in range(8)]
+        self.assertEqual(_float_bits(ttpf.block_means(px, 2, 2)),
+                         _float_bits(_ref_block_means(px, 2, 2)))
+        self.assertEqual(ttpf.block_means(px, 8, 8, block=1), px)
+        self.assertEqual(ttpf.block_means(tuple(px), 2, 2), _ref_block_means(px, 2, 2))
+        self.assertEqual(ttpf.block_means([], 0, 0), [])
+        self.assertEqual(ttpf.block_means([], 3, 0), [])
+        self.assertEqual(ttpf.block_means([], 0, 3), [])
+        self.assertEqual(ttpf.block_means(px, 2, 2, block=0), [(0.0, 0.0, 0.0)] * 4)
+
+    def test_block_means_reads_only_the_visible_texels(self):
+        # 5x3 visible texels in a 2x1 block grid: the list needs only the texels the clipped
+        # blocks use (rows are 8 apart), so a list ending at the last visible texel works.
+        full = [(float(i), float(2 * i), 1.0) for i in range(8 * 4)]
+        need = 2 * 8 + 5  # last visible texel is (row 2, column 4)
+        got = ttpf.block_means(full[:need], 2, 1, 5, 3)
+        self.assertEqual(got, _ref_block_means(full, 2, 1, 5, 3))
+        with self.assertRaises(IndexError):
+            ttpf.block_means(full[:need - 1], 2, 1, 5, 3)
+        with self.assertRaises(IndexError):
+            _ref_block_means(full[:need - 1], 2, 1, 5, 3)
+        with self.assertRaises(IndexError):
+            ttpf.block_means([(0.0, 0.0, 0.0)] * 15, 1, 1)
+
+    def test_decode_then_means_on_a_large_surface_matches_reference(self):
+        rng = random.Random(2024)
+        bw, bh = 33, 17
+        for fmt in (71, 80):
+            data = rng.randbytes(bw * bh * 8)
+            got = ttpf.decode_pixels(fmt, data, bw, bh)
+            want = _ref_decode_pixels(fmt, data, bw, bh)
+            self.assert_same_pixels(got, want)
+            for pw, ph in ((None, None), (bw * 4 - 3, bh * 4 - 1)):
+                self.assertEqual(_float_bits(ttpf.block_means(got, bw, bh, pw, ph)),
+                                 _float_bits(_ref_block_means(want, bw, bh, pw, ph)))
 
 
 if __name__ == "__main__":

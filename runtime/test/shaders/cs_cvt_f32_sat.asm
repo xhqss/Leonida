@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; s[0:3] is the output V#, s4 is one binary32 input as a raw word.
 ; RDNA 2 ISA, VOP1 opcodes 7 and 8: truncate toward zero, saturate to
 ; the destination range, and return zero for NaN.

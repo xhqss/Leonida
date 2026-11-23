@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; ds_write_b8 / ds_write_b8_d16_hi / ds_write_b16 / ds_write_b16_d16_hi and ds_read_u8 / ds_read_i8 / ds_read_u16 /
 ; ds_read_i16 (RDNA2 ISA, "Data Share Instructions"). ADDR = vaddr + offset: (bytes).
 ;   ds_write_b8   MEM[ADDR][7:0]  = DATA[7:0]       ds_write_b8_d16_hi   MEM[ADDR][7:0]  = DATA[23:16]

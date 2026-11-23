@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Wave64 ds_bpermute_b32: RDNA2 ISA 10.4.4 - it works on each 32-lane half as two independent wave32s (only index
 ; bits [6:2] are used, a half references its own lanes 0-31) and reads from a disabled lane return 0. So there is NO
 ; cross-half read: src lane = (lane & 32) | ((addr / 4) & 31). Crosses: the upper half must read from ITS OWN half

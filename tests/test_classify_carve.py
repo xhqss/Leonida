@@ -292,6 +292,8 @@ class MainTests(unittest.TestCase):
                                       cwd=self.root)
                 self.assertEqual(proc.returncode, 0)
                 self.assertIn("usage", proc.stdout)
+                # The printed line is meant to be copied from the repository root, so it names the tool's folder.
+                self.assertIn("python -I tools/classify_carve.py", proc.stdout)
                 self.assertEqual(proc.stderr, "")
         self.assertEqual(os.listdir(self.root), [])                            # nothing read or written
 

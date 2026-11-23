@@ -413,11 +413,15 @@ def translated(lines, name="ps_vint"):
     return [w & M32 for w in out["%out_mrt0"]]
 
 
-def hw_kernel(lines):
-    """A raw kernel for tools/hw_oracle: the program on one lane, then v8..v11 stored at the output pointer."""
+def hw_kernel(lines, wave=32):
+    """A raw kernel for tools/hw_oracle: the program on one lane, then v8..v11 stored at the output pointer. wave 64
+    runs it in a wave64 wave with the lane masks as 64-bit pairs."""
     from hw_oracle import asm
+    if wave == 64:
+        import vk_fuzz_run
+        lines = [vk_fuzz_run.wave64_text(ln) for ln in lines]
     return asm.Kernel(list(lines) + ["v_mov_b32 v0, 0", "global_store_b128 v0, v[8:11], s[2:3]", "s_endpgm"],
-                      wave=32, threads=1, words=4, raw=True)
+                      wave=wave, threads=1, words=4, raw=True)
 
 
 # ---- comparison, shrinking, the run --------------------------------------------------------------------------
@@ -482,12 +486,18 @@ def shrink(lines, check_fn=check):
     return seed + body + obs
 
 
-def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=None):
-    counts = {"pass": 0, "mismatch": 0, "skip": {}}
+def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=None, wave=32, build=None, work=None,
+              vk_constants=False):
+    counts = {"pass": 0, "mismatch": 0, "skip": {}, "vk": {}, "vk_failures": []}
     failures = []
     rng = random.Random(seed)
     progs = [generate(rng, rng.randrange(1, max_ops + 1), ops) for _ in range(programs)]
-    hw = oracle.run([hw_kernel(p) for p in progs]) if "hw" in backends else [None] * programs
+    hw = oracle.run([hw_kernel(p, wave) for p in progs]) if "hw" in backends else [None] * programs
+    if "vk" in backends:
+        import vk_fuzz_run
+        counts["vk"], counts["vk_failures"] = vk_fuzz_run.judge(progs, hw, vk_fuzz_run.exact_verdict, wave=wave,
+                                                                  build=build, work_parent=work, opaque=not vk_constants)
+    backends = tuple(b for b in backends if b != "vk")
     for i, lines in enumerate(progs):
         try:
             problem = check(lines, backends, hw[i])
@@ -538,12 +548,22 @@ def main(argv=None):
                     help="comma-separated comparison targets: translator (default), hw (natively on an AMD GPU; see "
                          "tools/hw_oracle/). 'hw' alone compares the hardware with the reference only")
     ap.add_argument("--hw-arch", default=None, help="GPU architecture to assemble for (default: detected)")
+    ap.add_argument("--wave", type=int, choices=(32, 64), default=32,
+                    help="the wave size of the hardware kernels and of the vk programs (64 needs native 64-wide "
+                         "subgroups; lane 0 is judged)")
+    ap.add_argument("--build", default=os.path.join(os.path.dirname(HERE), "runtime", "build"),
+                    help="with vk: the folder with vk_compute_test")
+    ap.add_argument("--vk-constants", action="store_true",
+                    help="with vk: keep the seeds as literal v_mov_b32 constants (the driver may fold them)")
+    ap.add_argument("--work", default=None, help="with vk: a folder for the temporary files (VK_FUZZ_KEEP=1 keeps them)")
     a = ap.parse_args(argv)
     if a.programs < 1 or a.max_ops < 1:
         ap.error("--programs and --max-ops must be at least 1")
     backends = tuple(dict.fromkeys(t.strip() for t in a.oracle.split(",")))
-    if not backends or any(t not in ("translator", "hw") for t in backends):
-        ap.error("--oracle takes translator, hw or translator,hw")
+    if not backends or any(t not in ("translator", "hw", "vk") for t in backends):
+        ap.error("--oracle takes translator, hw, vk (with hw) or a comma-separated mix")
+    if "vk" in backends and "hw" not in backends:
+        ap.error("--oracle vk judges the translated programs against the hardware's words: use --oracle hw,vk")
     global KNOWN, LITERALS
     KNOWN = a.known or backends == ("hw",)
     LITERALS = not a.no_literals
@@ -578,15 +598,26 @@ def main(argv=None):
             return 77
         print(f"hardware oracle: {oracle.device}")
     try:
-        counts, failures = run_suite(a.programs, a.seed, a.max_ops, ops, backends, oracle)
+        counts, failures = run_suite(a.programs, a.seed, a.max_ops, ops, backends, oracle, a.wave, a.build, a.work,
+                                     a.vk_constants)
+        vk_bad = counts.pop("vk_failures")
         skips = sum(counts["skip"].values())
         print(f"{a.programs} programs (seed {a.seed}, {'+'.join(backends)}{', known' if KNOWN else ''}): "
               f"{counts['pass']} pass, {counts['mismatch']} mismatch, {skips} skipped")
         for reason, n in sorted(counts["skip"].items(), key=lambda kv: -kv[1]):
             print(f"  skip x{n}: {reason}")
 
+        want_vk = "vk" in backends
+        if want_vk:
+            print(f"translated on the Vulkan GPU (wave{a.wave}) against the hardware: "
+                  + ", ".join(f"{k} {n}" for k, n in sorted(counts["vk"].items(), key=lambda kv: kv[0].startswith("skip"))))
+            for i, detail, lines in vk_bad[: None if a.all_failures else 3]:
+                print(f"VK MISMATCH program {i}: {detail}")
+                print("\n".join("\t" + line for line in lines))
+        backends = tuple(b for b in backends if b != "vk")
+
         def check_fn(lines):
-            return check(lines, backends, (lambda l: oracle.run([hw_kernel(l)])[0]) if oracle else None)
+            return check(lines, backends, (lambda l: oracle.run([hw_kernel(l, a.wave)])[0]) if oracle else None)
         for i, problem, lines in failures[: None if a.all_failures else 1]:
             small = shrink(lines, check_fn)
             print(f"MISMATCH program {i}: {check_fn(small) or problem}")
@@ -597,11 +628,16 @@ def main(argv=None):
     finally:
         if oracle:
             oracle.close()
-    if failures:
+    if failures or vk_bad:
         return 1
     if not counts["pass"]:   # nothing was compared: every program was skipped
         print("no program ran: every one was skipped")
         return 2
+    if want_vk:
+        import vk_fuzz_run
+        if vk_fuzz_run.all_skipped(counts["vk"]):
+            print("no Vulkan program ran: every one was skipped")
+            return 2
     return 0
 
 

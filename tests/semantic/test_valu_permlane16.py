@@ -796,17 +796,35 @@ class NegativeControls(unittest.TestCase):
         self.assertEqual(n3, 2)   # the data shuffle and, with FI=0 (no op_sel), the source lane's activity shuffle (SHADER-74)
         self.assertNotEqual(self._run(bad_shuf, 32, 32), want)
 
-        # 4. Dropping the destination EXEC OpSelect overwrites inactive destination lanes.
-        # The select is the one dst() emits right before the OpStore of the destination VGPR (not the activity selects
-        # of the FI=0 path, which also follow a shuffle).
-        # It is the first such select after the data shuffle: v1 and v2 before it are written inside one active run
-        # (#3549), which has no per-write select, and v21 comes after it.
-        shuffle = re.search(r"OpGroupNonUniformShuffle %uint %c3 ", spv).start()
-        dst_selects = [m for m in re.finditer(r"(%\w+ = OpSelect %uint %\w+ (%\w+)) %\w+(\n\s*OpStore %\w+ %\w+\n)", spv)
-                       if m.start() > shuffle]
-        self.assertGreaterEqual(len(dst_selects), 1)
-        m = dst_selects[0]
-        bad_exec = spv[:m.start()] + m.group(1) + " " + m.group(2) + m.group(3) + spv[m.end():]
+        # 4. The FI/BOUND_CTRL result is a bitwise merge, not a select (#5895): an active lane whose source is off in
+        #    EXEC keeps the old value. Every even lane selects an odd (off) source, so the unsabotaged run keeps OLD
+        #    everywhere; forcing the ok-mask on makes the active lanes take the off source's value instead — the
+        #    MoltenVK symptom the masks exist to prevent.
+        spv_fi, _ = translate_cs("cs_w32_neg_perm_fi", [
+            "v_add_nc_u32_e32 v1, 200, v0",
+            f"v_or_b32_e32 v2, {OLD_SENTINEL:#x}, v0",
+            f"s_mov_b32 exec_lo, {0x55555555:#x}",
+            "s_mov_b32 s4, 0x11111111",
+            "s_mov_b32 s5, 0x11111111",
+            "v_permlane16_b32 v2, v1, s4, s5",
+            "s_mov_b32 exec_lo, -1",
+            "v_lshlrev_b32_e32 v21, 2, v0",
+            "buffer_store_dword v2, v21, s[0:3], 0 offen",
+        ], 32)
+        want_fi = [OLD_SENTINEL | l for l in range(32)]   # FI=0 with an off source keeps OLD; odd lanes are off in EXEC
+        self.assertEqual(self._run(spv_fi, 32, 32), want_fi)
+        ok_mask = re.search(r"(%\w+) = OpSelect %uint %\w+ (%cffffffff) %c0(\n(?:.*\n){0,2}?\s*%\w+ = OpAccessChain %_ptr_Function_uint %vgpr)", spv_fi)
+        self.assertIsNotNone(ok_mask)
+        bad_ok = spv_fi[:ok_mask.start()] + ok_mask.group(1) + " = OpCopyObject %uint " + ok_mask.group(2) + ok_mask.group(3) + spv_fi[ok_mask.end():]
+        got_bad_ok = self._run(bad_ok, 32, 32)
+        self.assertNotEqual(got_bad_ok, want_fi)
+        self.assertNotEqual(got_bad_ok[0], OLD_SENTINEL)   # the active lane now takes the off source's value
+
+        # 5. Forcing the destination EXEC mask on overwrites inactive destination lanes: dst() combines with the
+        #    same masks, and its exec mask is the select that its own OpNot consumes on the next line.
+        exec_mask = re.search(r"(%\w+) = OpSelect %uint %\w+ (%cffffffff) %c0(?=\n\s*%\w+ = OpNot %uint \1\n)", spv)
+        self.assertIsNotNone(exec_mask)
+        bad_exec = spv[:exec_mask.start()] + exec_mask.group(1) + " = OpCopyObject %uint " + exec_mask.group(2) + spv[exec_mask.end():]
         got_bad_exec = self._run(bad_exec, 32, 32)
         self.assertNotEqual(got_bad_exec, want)
         self.assertNotEqual(got_bad_exec[1], OLD_SENTINEL | 1)

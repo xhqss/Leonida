@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Wave64 compute: instructions that read a lane mask as a whole, on a partly active wave. EXEC = lanes 16-47
 ; (exec_lo = 0xffff0000, exec_hi = 0xffff), saved in s[6:7]. s_bcnt1 of EXEC and of the saved pair = 32 each,
 ; s_ff1 of EXEC = 16, s_bcnt1 of a compare result (lane < 24: lanes 16-23, VCC is clear outside EXEC) = 8,

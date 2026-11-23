@@ -155,10 +155,13 @@ def parse(b: bytes) -> dict:
         graphics.append(rec)
     for i in range(h["compute"]):
         hsh, state, blob1, p, blob2 = struct.unpack_from("<QIIII", b, lay["compute"] + i * CS_SIZE)
+        prog_i, layout_i = ref(p, "program"), ref(blob2, "blob")
         compute.append({"hash": f"{hsh:016x}", "state": ref(state, "blob"), "blob": ref(blob1, "blob"),
-                        "program": ref(p, "program"), "layout": ref(blob2, "blob")})
-        stage.setdefault(p, set()).add("cs")
-        links.append((p, blob2))
+                        "program": prog_i, "layout": layout_i})
+        if prog_i is not None:
+            stage.setdefault(prog_i, set()).add("cs")
+            if layout_i is not None:
+                links.append((prog_i, layout_i))
     digest = {}
     for p, i in links:
         o, size = blobs[i]
@@ -351,7 +354,8 @@ def main(argv=None) -> int:
         "layout": lib["layout"],
         "graphics": [{"hash": g["hash"], "state": g["state"], "input_layout": g["input_layout"],
                       "stages": named(g["stages"])} for g in lib["graphics"]],
-        "compute": [{"hash": c["hash"], "state": c["state"], "program": names[c["program"]]} for c in lib["compute"]],
+        "compute": [{"hash": c["hash"], "state": c["state"], "program": names.get(c["program"])}
+                    for c in lib["compute"]],
     }
     with open(os.path.join(a.out, "library.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(summary, f, indent=1)

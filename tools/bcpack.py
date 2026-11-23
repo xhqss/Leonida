@@ -305,11 +305,130 @@ def _decode_lanes_raw(raw, widths, nsym):
                 held[i] = False
 
 
+_NATIVE = []
+
+
+def _native_unpack():
+    """`(unpack_model, tables)` of the optional Rust lane decoder, or None.
+
+    `tools/bcpack_calibration` (built with Cargo, see its README.md) exports
+    `unpack_model`, a port of `_decode_lanes_raw` that is fed this module's
+    probability tables, so it accepts the same streams and gives the same
+    symbols. Set `LEONIDA_BCPACK_NATIVE=0` to use Python only.
+    """
+    if not _NATIVE:
+        found = None
+        if os.environ.get("LEONIDA_BCPACK_NATIVE", "1") != "0":
+            import ctypes
+            name = {"win32": "bcpack_calibration.dll",
+                    "darwin": "libbcpack_calibration.dylib"}.get(sys.platform, "libbcpack_calibration.so")
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "bcpack_calibration", "target", "release", name)
+            if os.path.isfile(path):
+                try:
+                    lib = ctypes.CDLL(path)
+                    fn = lib.unpack_model
+                    blocks = lib.decode_blocks
+                except (OSError, AttributeError):
+                    fn = None
+                if fn is not None:
+                    fn.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t,
+                                   ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+                    fn.restype = ctypes.c_ssize_t
+                    side = MAX_WIDTH + 1
+                    flat = [-1] * (side * 16 * side)
+                    for (w, q), freq in _tables.PROB_TABLES.items():
+                        if 0 <= w <= MAX_WIDTH and 0 <= q < 16 and len(freq) == w + 1:
+                            flat[(w * 16 + q) * side:(w * 16 + q) * side + w + 1] = freq
+                    blocks.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_char_p,
+                                       ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t,
+                                       ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t,
+                                       ctypes.c_void_p, ctypes.c_size_t]
+                    blocks.restype = ctypes.c_ssize_t
+                    found = fn, (ctypes.c_int32 * len(flat))(*flat), blocks
+        _NATIVE.append(found)
+    return _NATIVE[0]
+
+
+def _decode_lanes_native(raw, widths, nsym):
+    """`(lanes, bytes_used)` from the Rust port of `_decode_lanes_raw`, or None.
+
+    None means the library is not built or the stream is refused (or is one
+    the port leaves to Python); `decode_lanes` then runs the Python model,
+    which raises its usual error. `tests/test_bcpack_native.py` checks that the
+    two agree.
+    """
+    native = _native_unpack()
+    if native is None or nsym <= 0:
+        return None
+    import ctypes
+    fn, tables, _ = native
+    nl = len(widths)
+    data = bytes(raw)
+    out = (ctypes.c_uint16 * (nsym * nl))()
+    used = fn(data, len(data), bytes(widths), nl, nsym, tables, len(tables), out)
+    if used < 0:
+        return None
+    flat = memoryview(out).cast("B").cast("H")
+    return [flat[i * nsym:(i + 1) * nsym].tolist() for i in range(nl)], used
+
+
+_NATIVE_BLOCKS = {
+    # codec: (lookup table bytes, confirmed defaults, provisional defaults, values per entry)
+    1: (lambda: bytes(_tables.BC1_QUADRANT), "BC1_HISTORY_CONFIRMED", "BC1_HISTORY_PROVISIONAL", 6),
+    3: (lambda: bytes(v for pair in _tables.BC3_ALPHA_PAIR for v in pair) + bytes(_tables.BC3_COLOUR_QUADRANT),
+        "BC3_HISTORY_CONFIRMED", "BC3_HISTORY_PROVISIONAL", 8),
+    4: (lambda: bytes(v for pair in _tables.BC4_PAIR for v in pair), "BC4_HISTORY_CONFIRMED",
+        "BC4_HISTORY_PROVISIONAL", 2),
+    5: (lambda: bytes(v for pair in _tables.BC5_PAIR for v in pair), "BC5_HISTORY_CONFIRMED",
+        "BC5_HISTORY_PROVISIONAL", 4),
+}
+_NATIVE_BUILTIN = {}
+
+
+def _decode_blocks_native(raw, codec, out_size, history):
+    """BC1/BC3/BC4/BC5 bytes from the Rust lanes + strict rebuild, or None to decode in Python.
+
+    Rust only takes the strict path: a stream it refuses, a non-zero lane 1 or
+    a history entry that is not confirmed returns None, and Python decodes the
+    chunk itself, so its errors and provisional entries are unchanged.
+    """
+    native = _native_unpack()
+    spec = _NATIVE_BLOCKS.get(codec)
+    if native is None or spec is None or out_size <= 0 or out_size % BLOCK_BYTES[codec]:
+        return None
+    import ctypes
+    _, tables, blocks = native
+    lut, conf_name, prov_name, k = spec
+    cached = _NATIVE_BUILTIN.get(codec) if history is None else None
+    if cached is None:
+        try:
+            confirmed, _ = _resolve_bc_history(
+                codec, getattr(_tables, conf_name), getattr(_tables, prov_name), history)
+        except (ValueError, TypeError, OSError):
+            return None  # Python reads the same history after the lanes, so its error order is unchanged
+        flat = [-1] * (256 * k)
+        for entry, values in confirmed.items():
+            if 0 <= entry < 256 and len(values) == k:
+                flat[entry * k:entry * k + k] = values
+        cached = lut(), (ctypes.c_int32 * len(flat))(*flat)
+        if history is None:
+            _NATIVE_BUILTIN[codec] = cached
+    table, builtin = cached
+    widths = LANE_WIDTHS[codec]
+    data = bytes(raw)
+    out = ctypes.create_string_buffer(out_size)
+    used = blocks(data, len(data), codec, bytes(widths), len(widths), out_size // ELEMENT_BYTES,
+                  tables, len(tables), table, len(table), builtin, len(builtin), out, out_size)
+    return out.raw if used >= 0 else None
+
+
 def decode_lanes(raw, codec, out_size):
     """Entropy layer: decode `raw` into per-lane symbol lists and bytes consumed.
 
     Works for all six active codecs (`1, 3, 4, 5, 6, 7`). Trailing non-zero
-    bytes after the last lane finishes are rejected.
+    bytes after the last lane finishes are rejected. Uses the Rust decoder when
+    it is built (`_native_unpack`) and Python for the streams it refuses.
     """
     if codec not in LANE_WIDTHS:
         raise BcpackError(f"unsupported BCPack codec id: {codec}")
@@ -318,6 +437,9 @@ def decode_lanes(raw, codec, out_size):
             f"decoded size {out_size} is not a whole number of {CODEC_NAMES[codec]} blocks"
         )
     nsym = out_size // ELEMENT_BYTES
+    fast = _decode_lanes_native(raw, LANE_WIDTHS[codec], nsym)
+    if fast is not None:
+        return fast
     data = memoryview(raw)
     lanes, used = _decode_lanes_raw(data, LANE_WIDTHS[codec], nsym)
     if any(data[used:]):
@@ -1336,6 +1458,9 @@ def decode_with_info(raw, codec, out_size, *, allow_provisional=False, history=N
     if rebuilder is None:
         name = CODEC_NAMES.get(codec, str(codec))
         raise BcpackUnsupportedCodec(f"BCPack block rebuilder for codec {codec} ({name}) is not implemented yet")
+    fast = _decode_blocks_native(raw, codec, out_size, history)
+    if fast is not None:
+        return fast, set()
     lanes, _ = decode_lanes(raw, codec, out_size)
     nblocks = out_size // BLOCK_BYTES[codec]
     prov = set() if allow_provisional else None

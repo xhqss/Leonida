@@ -25,12 +25,17 @@ Usage:
 
 `--curves` also decodes every clip's keyframes (the blocks are the sequence layout of
 tools/anim_clips.py) and counts the outcome; it reports counts only, never a value.
+
+Every scan also reads the `0xbd` cue records of each stream; the summary's `marker_regions` block
+matches the records whose value is joaat("start") or joaat("end") into region pairs, name by name
+(pair_marker_regions(), docs/rsc8_audio.md).
 """
 import argparse
 import csv
 import json
 import math
 import os
+import statistics
 import struct
 import sys
 import tempfile
@@ -68,6 +73,11 @@ MARKER_NAME_COMMON = 0xE5C74063
 MARKER_MAGIC = MARKER_NAME_COMMON
 MARKER_RECORD_BYTES = 16
 MAX_MARKER_BYTES = 16 * 1024 * 1024
+# A region cue stores a second name hash in its `value` word (pair_marker_regions()).
+MARKER_VALUE_START = 0x84DC271F  # joaat("start")
+MARKER_VALUE_END = 0xB0C485D7  # joaat("end")
+_REGION_VALUES = {MARKER_VALUE_START: "start", MARKER_VALUE_END: "end"}
+MAX_REGION_EXCEPTIONS_LISTED = 64
 
 ATTR_FLOAT = 0xFFFF0001
 ATTR_INT = 0xFFFF0002
@@ -85,6 +95,7 @@ MAX_ANIM_BLOCKS = 256
 MAX_TRACK_ENTRIES = 4096
 MAX_PROP_ENTRIES = 256
 SCAN_CHUNK_BYTES = 32 * 1024 * 1024
+PROGRESS_BYTES = 2 * 1024 * 1024 * 1024
 
 CSV_COLUMNS = [
     "bank_offset",
@@ -1035,6 +1046,251 @@ def decode_marker_records(blob, sample_count=None):
     return out
 
 
+def marker_records(blob):
+    """The ``(name, value, offset, extra)`` u32 words of every whole 16-byte record of a ``0xbd`` tag."""
+    raw = bytes(blob)
+    return list(struct.iter_unpack("<IIII", raw[: len(raw) - len(raw) % MARKER_RECORD_BYTES]))
+
+
+def pair_marker_regions(records):
+    """Match the region cues of one ``0xbd`` tag into start/end pairs, record by record (ASSET-320).
+
+    `records` is `marker_records()` output. A region record is one whose ``value`` word is
+    `MARKER_VALUE_START` or `MARKER_VALUE_END`, and a name with at least one of them is a region name of
+    this tag. Each region name's records are walked in stored order, and a pair is a ``start`` whose
+    next record of the same name is an ``end`` at the same or a later offset. Every other record of a
+    region name is one exception:
+
+    - ``start_without_end``: the next record of the name is not an ``end``, or there is none;
+    - ``end_without_start``: the record of the name before it is not a ``start``, or there is none;
+    - ``end_before_start``: an ``end`` right after a ``start`` but at a smaller offset (the pair is refused
+      and the ``start`` is counted here, not as ``start_without_end``);
+    - ``other_value``: the name also has a record whose value is neither word; it opens and closes nothing.
+
+    So per name ``starts == pairs + start_without_end + end_before_start`` and
+    ``ends == pairs + end_without_start + end_before_start``. Two regions of one name therefore never
+    nest or overlap by construction; what would be a nested region shows up as a ``start_without_end``
+    followed by a ``start`` and an ``end_without_start`` preceded by an ``end``.
+
+    Returns ``{"regions": [...], "exceptions": [...], "names": {name: counts}}`` with a region as
+    ``{"name", "start", "end", "start_index", "end_index", "extra_differs"}`` (offsets in samples,
+    indices into `records`) and an exception as ``{"kind", "name", "value", "index", "offset",
+    "before", "before_offset", "after", "after_offset"}``, where ``before`` and ``after`` say what the
+    neighbouring records of the same name are (``"start"``, ``"end"``, ``"other"``, or ``None`` when
+    the record is the name's first or last of the tag) and the two offsets are theirs.
+    """
+    out = {"regions": [], "exceptions": [], "names": {}}
+    if not any(value in _REGION_VALUES for _name, value, _offset, _extra in records):
+        return out
+    by_name = {}
+    for index, (name, value, offset, extra) in enumerate(records):
+        by_name.setdefault(name, []).append((index, value, offset, extra))
+    for name, rows in by_name.items():
+        kinds = [_REGION_VALUES.get(value, "other") for _index, value, _offset, _extra in rows]
+        if "start" not in kinds and "end" not in kinds:
+            continue
+        counts = {"starts": 0, "ends": 0, "other_value": 0, "pairs": 0,
+                  "start_without_end": 0, "end_without_start": 0, "end_before_start": 0}
+
+        def refuse(kind, k):
+            index, value, offset, _extra = rows[k]
+            counts[kind] += 1
+            out["exceptions"].append({
+                "kind": kind, "name": name, "value": value, "index": index, "offset": offset,
+                "before": kinds[k - 1] if k else None,
+                "before_offset": rows[k - 1][2] if k else None,
+                "after": kinds[k + 1] if k + 1 < len(kinds) else None,
+                "after_offset": rows[k + 1][2] if k + 1 < len(kinds) else None,
+            })
+
+        opened = None  # position in `rows` of a start that no record has followed yet
+        for k, (index, _value, offset, extra) in enumerate(rows):
+            kind = kinds[k]
+            if kind != "end" and opened is not None:
+                refuse("start_without_end", opened)
+                opened = None
+            if kind == "start":
+                counts["starts"] += 1
+                opened = k
+            elif kind == "end":
+                counts["ends"] += 1
+                if opened is None:
+                    refuse("end_without_start", k)
+                elif offset < rows[opened][2]:
+                    refuse("end_before_start", k)
+                else:
+                    start_index, _v, start, start_extra = rows[opened]
+                    counts["pairs"] += 1
+                    out["regions"].append({
+                        "name": name, "start": start, "end": offset, "start_index": start_index,
+                        "end_index": index, "extra_differs": extra != start_extra,
+                    })
+                opened = None
+            else:
+                refuse("other_value", k)
+        if opened is not None:
+            refuse("start_without_end", opened)
+        out["names"][name] = counts
+    out["regions"].sort(key=lambda r: r["start_index"])
+    out["exceptions"].sort(key=lambda e: e["index"])
+    return out
+
+
+def marker_region_overlaps(regions):
+    """How the paired regions of different names in one tag lie against each other.
+
+    Returns ``{(name, other name): [nested, crossing]}`` with the smaller hash first, counting pairs of
+    regions that share at least one sample (``[start, end)``, so a zero-length region and two regions
+    that only touch share none). ``nested`` is one region inside the other (equal bounds included),
+    ``crossing`` is each one starting or ending inside the other. `regions` come from one
+    `pair_marker_regions()` call on a tag whose offsets never decrease, where regions of one name
+    cannot overlap, so at most one region per name is open at a time.
+    """
+    out = {}
+    active = []
+    for region in sorted(regions, key=lambda r: (r["start"], r["start_index"])):
+        if region["end"] <= region["start"]:
+            continue
+        active = [a for a in active if a["end"] > region["start"]]
+        for a in active:
+            if a["name"] == region["name"]:
+                continue
+            counts = out.setdefault((min(a["name"], region["name"]), max(a["name"], region["name"])), [0, 0])
+            nested = region["end"] <= a["end"] or region["start"] == a["start"]
+            counts[0 if nested else 1] += 1
+        active.append(region)
+    return out
+
+
+def _new_region_tally():
+    """Running totals of pair_marker_regions() over the tags of a scan; marker_region_report() finishes them."""
+    return {
+        "tags": 0,  # tags with at least one start/end record
+        "tags_all_paired": 0,  # ... and no exception
+        "tags_with_sample_count": 0,  # ... on a stream that has a 0x76 sample count
+        "pairs_per_tag": [],
+        "pairs_extra_differs": 0,
+        "overlaps": {},  # marker_region_overlaps(), added up
+        "names": {},  # name -> the counts of pair_marker_regions(), "tags" and the "lengths" of its pairs
+        "exceptions_total": 0,
+        "exceptions": [],  # the first MAX_REGION_EXCEPTIONS_LISTED in scan order
+    }
+
+
+def _tally_marker_regions(tally, records, *, bank_offset=0, stream_id=None, sample_count=None):
+    """Add one valid ``0xbd`` tag's region pairing to a `_new_region_tally()`."""
+    paired = pair_marker_regions(records)
+    if not paired["names"]:
+        return
+    tally["tags"] += 1
+    tally["tags_all_paired"] += not paired["exceptions"]
+    tally["tags_with_sample_count"] += sample_count is not None
+    tally["pairs_per_tag"].append(len(paired["regions"]))
+    for name, counts in paired["names"].items():
+        into = tally["names"].setdefault(name, {"tags": 0, "lengths": []})
+        into["tags"] += 1
+        for key, count in counts.items():
+            into[key] = into.get(key, 0) + count
+    for region in paired["regions"]:
+        tally["names"][region["name"]]["lengths"].append(region["end"] - region["start"])
+        tally["pairs_extra_differs"] += region["extra_differs"]
+    _add_region_overlaps(tally["overlaps"], marker_region_overlaps(paired["regions"]))
+    tally["exceptions_total"] += len(paired["exceptions"])
+    for exc in paired["exceptions"]:
+        if len(tally["exceptions"]) >= MAX_REGION_EXCEPTIONS_LISTED:
+            break
+        tally["exceptions"].append({
+            "kind": exc["kind"],
+            "name": f"0x{exc['name']:08x}",
+            "value": f"0x{exc['value']:08x}",
+            "before": exc["before"],
+            "before_offset": exc["before_offset"],
+            "after": exc["after"],
+            "after_offset": exc["after_offset"],
+            "record": exc["index"],
+            "tag_records": len(records),
+            "offset": exc["offset"],
+            "tag_last_offset": records[-1][2],
+            "stream_samples": sample_count,
+            "bank_offset": bank_offset,
+            "stream_id": None if stream_id is None else f"0x{stream_id:08x}",
+        })
+
+
+def _add_region_overlaps(dst, src):
+    for names, (nested, crossing) in src.items():
+        into = dst.setdefault(names, [0, 0])
+        into[0] += nested
+        into[1] += crossing
+
+
+def _merge_region_tally(dst, src):
+    for key, value in src.items():
+        if key == "overlaps":
+            _add_region_overlaps(dst[key], value)
+        elif key == "names":
+            for name, counts in value.items():
+                into = dst["names"].setdefault(name, {"tags": 0, "lengths": []})
+                for field, count in counts.items():
+                    if field == "lengths":
+                        into["lengths"].extend(count)
+                    else:
+                        into[field] = into.get(field, 0) + count
+        elif key == "exceptions":
+            dst[key].extend(value[: MAX_REGION_EXCEPTIONS_LISTED - len(dst[key])])
+        elif isinstance(value, list):
+            dst[key].extend(value)
+        else:
+            dst[key] += value
+
+
+def _min_median_max(values):
+    if not values:
+        return None
+    return {"min": min(values), "median": statistics.median(values), "max": max(values)}
+
+
+def marker_region_report(tally):
+    """The `marker_regions` block of a scan summary, from a `_new_region_tally()`: counts, sample
+    offsets and 32-bit hashes only.
+
+    ``names`` maps each region name (hex) to its ``starts``, ``ends``, ``pairs``, the four exception
+    counts of pair_marker_regions() and the ``length_samples`` (min/median/max) of its pairs.
+    ``overlaps_between_names`` counts pairs of paired regions of different names in one tag that share a
+    sample (marker_region_overlaps()), in all and per pair of names. ``exceptions`` lists the first
+    `MAX_REGION_EXCEPTIONS_LISTED` in scan order with where each one sits: its record index among the
+    tag's ``tag_records``, its offset, the tag's last offset, the stream's ``0x76`` sample count when it
+    has one, and what and where the neighbouring records of the same name are (``None``: it is the
+    name's first or last record of the tag). ``exceptions_total`` counts them all.
+    """
+    names = {}
+    for name, counts in sorted(tally["names"].items(), key=lambda kv: (-kv[1]["starts"] - kv[1]["ends"], kv[0])):
+        row = {key: value for key, value in counts.items() if key != "lengths"}
+        row["length_samples"] = _min_median_max(counts["lengths"])
+        names[f"0x{name:08x}"] = row
+    return {
+        "tags": tally["tags"],
+        "tags_all_paired": tally["tags_all_paired"],
+        "tags_with_sample_count": tally["tags_with_sample_count"],
+        "starts": sum(c["starts"] for c in tally["names"].values()),
+        "ends": sum(c["ends"] for c in tally["names"].values()),
+        "pairs": sum(c["pairs"] for c in tally["names"].values()),
+        "pairs_per_tag": _min_median_max(tally["pairs_per_tag"]),
+        "pairs_extra_differs": tally["pairs_extra_differs"],
+        "overlaps_between_names": {
+            "nested": sum(n for n, _c in tally["overlaps"].values()),
+            "crossing": sum(c for _n, c in tally["overlaps"].values()),
+            "by_names": {
+                f"0x{a:08x}+0x{b:08x}": {"nested": n, "crossing": c}
+                for (a, b), (n, c) in sorted(tally["overlaps"].items())
+            },
+        },
+        "names": names,
+        "exceptions_total": tally["exceptions_total"],
+        "exceptions": list(tally["exceptions"]),
+    }
+
+
 def _decode_companion_tags(read_slice, bank_offset, tag_map):
     """Decode companion speech tags (`0x76`, `0x55`, `0x36`, `0x5a`, `0xa3`, `0xb2`, `0xbd`, `0xd9`) on a stream."""
     comp = {
@@ -1135,24 +1391,31 @@ def _new_grid_tally():
         "marker_records": 0,
         "marker_invalid": 0,
         "marker_first_names": {},
+        # Region cues matched into start/end pairs (ASSET-320). A running `_new_region_tally()` while banks are
+        # read and in decode_awc_bank()'s result; a scan's summary carries marker_region_report() of it.
+        "marker_regions": _new_region_tally(),
     }
 
 
 def _merge_grid_tally(dst, src):
     """Add one bank's companion-table tally to a running summary (counts add, per-name maps merge)."""
     for key, start in _new_grid_tally().items():
-        if isinstance(start, dict):
+        if key == "marker_regions":
+            _merge_region_tally(dst[key], src[key])
+        elif isinstance(start, dict):
             for name, count in src[key].items():
                 dst[key][name] = dst[key].get(name, 0) + count
         else:
             dst[key] += src[key]
 
 
-def _tally_undocumented_tables(read_slice, bank_base, tmap, tally):
+def _tally_undocumented_tables(read_slice, bank_base, tmap, tally, stream_id=None):
     """Decode the ``0x5a``/``0xd9`` tables and the ``0xbd`` cue list on one stream into a running tally.
 
     A stream counts as invalid when one of the layout invariants measured over the whole ``audio.rpf``
-    population fails, so the tally doubles as a package-wide validator.
+    population fails, so the tally doubles as a package-wide validator. The region cues of a valid
+    ``0xbd`` tag are matched into start/end pairs (`marker_regions`); `stream_id` only labels the
+    exceptions listed there.
     """
     grid = None
     if TAG_GRID20 in tmap:
@@ -1197,9 +1460,10 @@ def _tally_undocumented_tables(read_slice, bank_base, tmap, tally):
                 tally["indexrun_index_overruns"] += 1
     if TAG_MARKER in tmap:
         mo, ms = tmap[TAG_MARKER][0]
-        marks = None
+        marks = blob = None
         if 0 < ms <= MAX_MARKER_BYTES:
-            marks = decode_marker_records(read_slice(bank_base + mo, ms))
+            blob = read_slice(bank_base + mo, ms)
+            marks = decode_marker_records(blob)
         tally["marker_streams"] += 1
         if marks is None or not (marks["size_ok"] and marks["offsets_ascending"]):
             tally["marker_invalid"] += 1
@@ -1208,6 +1472,15 @@ def _tally_undocumented_tables(read_slice, bank_base, tmap, tally):
             key = f"0x{marks['first_name']:08x}"
             firsts = tally["marker_first_names"]
             firsts[key] = firsts.get(key, 0) + 1
+            records = marker_records(blob)
+            if any(value in _REGION_VALUES for _name, value, _offset, _extra in records):
+                samples = None
+                if TAG_FORMAT in tmap:
+                    fo, fs = tmap[TAG_FORMAT][0]
+                    fb = read_slice(bank_base + fo, 4) if fs >= 4 else b""
+                    samples = _u32(fb, 0) if len(fb) == 4 else None
+                _tally_marker_regions(tally["marker_regions"], records, bank_offset=bank_base,
+                                      stream_id=stream_id, sample_count=samples)
 
 
 def decode_awc_bank(data, bank_offset=0, *, deep=True, curves=False):
@@ -1229,7 +1502,7 @@ def decode_awc_bank(data, bank_offset=0, *, deep=True, curves=False):
             key = f"0x{tt:02x}"
             tag_counts[key] = tag_counts.get(key, 0) + 1
             tmap.setdefault(tt, []).append((toff, tsz))
-        _tally_undocumented_tables(read_slice, 0, tmap, tally)
+        _tally_undocumented_tables(read_slice, 0, tmap, tally, sid)
         for tt, toff, tsz in tags:
             if tt == TAG_RSC8_CLIP:
                 if tsz < 4 or tsz > MAX_RSC8_BYTES:
@@ -1304,6 +1577,12 @@ def _new_summary(mode, source):
         "curve_delta2_boundaries": 0,
         "curve_delta2_boundaries_closed": 0,
     }
+
+
+def _finish_summary(summary, t0):
+    """Close a scan's summary: the running region tally becomes its report, and the clock stops."""
+    summary["marker_regions"] = marker_region_report(summary["marker_regions"])
+    summary["elapsed_seconds"] = round(time.time() - t0, 3)
 
 
 def _accumulate_record(summary, rec, *, in_adat=True, has_audio=None):
@@ -1443,7 +1722,7 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
                 adat_ranges.append((earlier["offset"], earlier["end"]))
 
         pos = start
-        next_prog = start + 2 * 1024 * 1024 * 1024
+        next_prog = start + PROGRESS_BYTES
         while pos < scan_end:
             f.seek(pos)
             buf = f.read(min(SCAN_CHUNK_BYTES + 16, scan_end - pos))
@@ -1498,7 +1777,7 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
                         tk = f"0x{tt:02x}"
                         summary["adat_tag_counts"][tk] = summary["adat_tag_counts"].get(tk, 0) + 1
                         tmap.setdefault(tt, []).append((toff, tsz))
-                    _tally_undocumented_tables(bank_read_slice, aoff, tmap, summary)
+                    _tally_undocumented_tables(bank_read_slice, aoff, tmap, summary, sid)
                     if not has_5c:
                         continue
                     for tt, toff, tsz in tags:
@@ -1555,9 +1834,9 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
                 break
             if progress and pos >= next_prog:
                 progress(pos, scan_end, summary)
-                next_prog += 2 * 1024 * 1024 * 1024
+                next_prog += PROGRESS_BYTES
 
-    summary["elapsed_seconds"] = round(time.time() - t0, 3)
+    _finish_summary(summary, t0)
     return records, summary
 
 
@@ -1617,7 +1896,7 @@ def scan_dir(path, *, max_banks=None, deep=True, collect_records=True, curves=Fa
             summary["invalid_files"] += 1
             print(f"{fp}: {e}", file=sys.stderr)
 
-    summary["elapsed_seconds"] = round(time.time() - t0, 3)
+    _finish_summary(summary, t0)
     return records, summary
 
 
@@ -1637,7 +1916,7 @@ def scan_single_file(path, *, start=0, limit=None, max_banks=None, deep=True, co
         rec = _make_record(0, 0, None, dec, None)
         summary = _new_summary("rsc8", path)
         _accumulate_record(summary, rec, in_adat=False, has_audio=None)
-        summary["elapsed_seconds"] = round(time.time() - t0, 3)
+        _finish_summary(summary, t0)
         return ([rec] if collect_records else []), summary
     if head == ADAT_MAGIC and start == 0 and limit is None and fsize <= MAX_AWC_FILE_BYTES:
         t0 = time.time()
@@ -1653,7 +1932,7 @@ def scan_single_file(path, *, start=0, limit=None, max_banks=None, deep=True, co
         summary["rsc8_non_rsc8_0x5c"] = bank_res["non_rsc8_0x5c"]
         for rec in bank_res["records"]:
             _accumulate_record(summary, rec, in_adat=True, has_audio=rec.get("has_audio_data"))
-        summary["elapsed_seconds"] = round(time.time() - t0, 3)
+        _finish_summary(summary, t0)
         return (bank_res["records"] if collect_records else []), summary
     return scan_rpf(
         path,
@@ -1753,7 +2032,7 @@ def main(argv=None):
     ap.add_argument("--curves", action="store_true",
                     help="also decode every clip's keyframes and count the outcome (slower; counts only)")
     ap.add_argument("--summary-only", action="store_true", help="do not store per-clip records in memory/JSON")
-    ap.add_argument("--quiet", action="store_true", help="suppress progress output")
+    ap.add_argument("--quiet", action="store_true", help="suppress progress on stderr; stdout contains the JSON summary")
     args = ap.parse_args(argv)
 
     if not os.path.exists(args.source):
@@ -1789,7 +2068,7 @@ def main(argv=None):
                 print(
                     f"[{min(pos, end) / max(1, end):6.1%}] banks={s['adat_banks']} "
                     f"rsc8={s['rsc8_in_adat']} valid={s['rsc8_valid']} outside={s['rsc8_outside_adat']}",
-                    flush=True,
+                    file=sys.stderr, flush=True,
                 )
         try:
             records, summary = scan_single_file(

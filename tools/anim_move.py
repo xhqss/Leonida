@@ -4,10 +4,10 @@
 
 Each MoVE resource has a fixed 32-byte header (`MoVE`, u32 version = 19, three zero u32s, u32 network hash at
 +0x14, u32 body_size at +0x18, one zero u32 at +0x1C), followed at +0x20 by a variable preamble:
-  - u32 N_req + N_req Ã— u32 request hashes
-  - u32 N_flag + N_flag Ã— u32 flag hashes
+  - u32 N_req + N_req × u32 request hashes
+  - u32 N_flag + N_flag × u32 flag hashes
   - u32 preamble_mode (0, 1 or 2)
-  - u32 N_desc + N_desc Ã— 5-byte `{u32 hash; u8 kind}` descriptors
+  - u32 N_desc + N_desc × 5-byte `{u32 hash; u8 kind}` descriptors
   - 10-byte tail `{u16 sub_flag; u32 ref_hash_0; u32 ref_hash_1}` (zero when preamble_mode is 0 or 1)
 
 `body_size` at +0x18 excludes the 46 fixed/count/tail preamble bytes outside it and the `5 * N_desc` descriptor
@@ -19,6 +19,7 @@ One resource in anim.rpf (at 0x105a7d000, 71,099 bytes) exceeds RPF9's 64 KiB st
 consecutive 16-byte-aligned zlib streams (65,536 + 5,563 bytes). After the 10-byte preamble tail sits the root
 state container (`Type 1` = StateMachine, `Type 3` = InlinedStateMachine, `Type 22` = MotionTree), whose child
 states, transitions and length-prefixed parameter blocks recurse through signed 32-bit self-relative offsets.
+Usage: `python -I tools/anim_move.py --help` lists the options.
 """
 import argparse
 import collections
@@ -32,6 +33,7 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import anim_index  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 MAGIC = b"MoVE"
 VERSION = 19
@@ -422,12 +424,18 @@ def _collect_move_streams_rpf(path, start=None, limit=None):
     return items, walk["files"]
 
 
-def _collect_move_streams_dir(path):
-    entries = []
+def _iter_dir_stream_paths(path):
+    """Yield (name, full_path) for every candidate stream file in a carved-streams directory."""
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
         if name.lower().endswith((".json", ".csv")) or os.path.islink(full) or not os.path.isfile(full):
             continue
+        yield name, full
+
+
+def _collect_move_streams_dir(path):
+    entries = []
+    for name, full in _iter_dir_stream_paths(path):
         size = os.path.getsize(full)
         if size == 0 or size > MAX_STANDALONE_FILE_BYTES:
             continue
@@ -589,7 +597,8 @@ def main(argv=None):
         ap.error("--start and --limit cannot be used when the input is a directory")
     if os.path.isdir(a.out):
         sys.exit(f"{a.out}: cannot write: Is a directory")
-    if os.path.exists(a.out) and os.path.samefile(a.archive, a.out):
+    inputs = [full for _name, full in _iter_dir_stream_paths(a.archive)] if os.path.isdir(a.archive) else [a.archive]
+    if any(same_report_path(path, a.out) for path in inputs):
         sys.exit(f"{a.out}: refuses to overwrite the input archive")
     try:
         resources, summary = scan(a.archive, a.start, a.limit)

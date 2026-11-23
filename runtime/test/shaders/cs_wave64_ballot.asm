@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Wave64 ballot: s_bcnt1_i32_b64 and s_ff1_i32_b64 on 64-lane comparison masks and EXEC.
 ; mattr: +wavefrontsize64,-wavefrontsize32
 ; Case 1: lanes 16..47 -> s[4:5] -> bcnt=32, ff1=16

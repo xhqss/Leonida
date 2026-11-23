@@ -77,6 +77,67 @@ class TranslateEmptyIndexTest(unittest.TestCase):
             self.assertEqual(json.load(f), {"shader_0": {"stage": "ps"}})
 
 
+class TranslateLockedIndexTest(unittest.TestCase):
+    """translate(): an index that cannot be read or removed (on Windows, a file an antivirus scan or the indexer
+    holds) ends the stage with its own message naming the file once, not with a PermissionError traceback."""
+
+    setUp = TranslateEmptyIndexTest.setUp
+    translate_with_index = TranslateEmptyIndexTest.translate_with_index
+
+    def locked(self, path):
+        return PermissionError(13, "Permission denied", path)
+
+    def failure(self, text, open_locked=False, shard_code=0):
+        index = os.path.join(self.spirv, "index.json")
+        real_remove, real_open = os.remove, open
+
+        def remove(path, *a, **k):
+            if os.path.abspath(path) == os.path.abspath(index):
+                raise self.locked(path)
+            return real_remove(path, *a, **k)
+
+        def opener(path, mode="r", *a, **k):
+            if open_locked and mode == "r" and os.path.abspath(path) == os.path.abspath(index):
+                raise self.locked(path)
+            return real_open(path, mode, *a, **k)
+
+        class Exited(Done):
+            def wait(self):
+                return shard_code
+
+        err = io.StringIO()
+        with mock.patch.object(make_game.os, "remove", remove), \
+                mock.patch("builtins.open", opener), \
+                mock.patch.object(make_game.subprocess, "Popen", lambda *a, **k: Exited()), \
+                mock.patch("sys.stderr", err), \
+                self.assertRaises(SystemExit) as cm:
+            if shard_code:
+                write(index, text)
+                with mock.patch.object(make_game, "log", lambda *a: None):
+                    make_game.translate(self.disasm, self.spirv, 1)
+            else:
+                self.translate_with_index(text)
+        self.assertEqual(cm.exception.code, 1)
+        message = err.getvalue()
+        self.assertIn(f"{index} could not be removed (Permission denied): delete it before running", message)
+        self.assertNotIn(repr(index), message)
+        return message
+
+    def test_an_unopenable_index_that_cannot_be_removed(self):
+        message = self.failure('{"shader_0": {}}', open_locked=True)
+        index = os.path.join(self.spirv, "index.json")
+        self.assertIn(f"--merge wrote an unreadable {index}: Permission denied.", message)
+
+    def test_an_unparsable_index_that_cannot_be_removed(self):
+        self.assertIn("--merge wrote an unreadable", self.failure("not json"))
+
+    def test_an_empty_index_that_cannot_be_removed(self):
+        self.assertIn("translated 0 shaders", self.failure("{}"))
+
+    def test_a_stale_index_after_a_failed_shard_that_cannot_be_removed(self):
+        self.assertIn("rdna2spirv.py: shard 0 exited with 1.", self.failure('{"old": {}}', shard_code=1))
+
+
 class RequireTranslatedShadersTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()

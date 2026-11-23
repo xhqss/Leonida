@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Wave64 cross-half v_writelane_b32 (writes lane S1 % 64 of the VGPR, EXEC ignored). Crosses: writes into lanes
 ; >= 32 (a 32-wide subgroup never matches lane select >= 32, so those writes are lost), the dynamic lane select
 ; 96 % 64 = 32 (first lane of the upper half), and a readlane of the written upper lanes from the low half.

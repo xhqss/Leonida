@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; v_mad_u32_u16 / v_mad_i32_i16 (VOP3-only on GFX10): D = S0.half * S1.half + S2, wrapping at 32 bits. The halves
 ; are zero-extended (u16) or sign-extended (i16); op_sel bit 0 / 1 picks the high half of S0 / S1. S2 and D are whole
 ; dwords, so D is written in full: the destinations start as 0xaaaa5555 and none of that may survive. The source

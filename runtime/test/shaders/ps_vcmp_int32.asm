@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; 32-bit integer VOPC compares: v_cmp_{eq,ne,lt,le,gt,ge,f,t}_{u32,i32}, in the e32 form (VCC) and the e64 form
 ; (SGPR destination), with inline constants and literals as operands, on values where signed and unsigned disagree.
 ; The cmpx forms are in ps_vcmpx_forms; 64-bit and 16-bit compares are not covered here.

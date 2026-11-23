@@ -4,9 +4,10 @@
 registry or the host, and prints a report. It does **not** call `DllMain`, TLS callbacks or the entry point, so
 this page measures mapping and binding only; it does not claim the modules work.
 
-The game executable is still missing from the package available here. Every other PE that the package ships is
-present, and all of them are Xbox Series builds. Running the dry-run over those images is the closest thing to a
-loader test that does not need the executable.
+The game executable is not in the package. Every other PE that the package ships is present, and all of them are
+Xbox Series builds. Running the dry-run over those images is the closest thing to a loader test that does not need
+the executable; [The retail executable](#the-retail-executable-rt-5) below is the dry-run over the executable
+itself, supplied separately.
 
 ## Reproduce
 
@@ -63,6 +64,19 @@ The process shim (`runtime/shims/process.cpp`) serves `ExitProcess` and `GetComm
 
 The shims added since account for the rest of the difference from the first version of the table. The UCRT's `_configure_narrow_argv`, `_configure_wide_argv`, `__p___argc`, `__p___wargv` and `abort` are served by `runtime/shims/process.cpp`, which is why almost every DLL gained one or two. The file-system calls listed in *Console paths and the write overlay* below (`CreateFile2`, `CopyFile2`, `CreateDirectoryW`, `FindFirstFileExW`, `SetFileAttributesW` and the rest) account for `msvcp140.dll`, `vcomp140.dll`, `Bink2Scarlett.dll`'s `CreateFile2` and part of the two HTTP clients. `winhttp.dll` is a module the shims own (*WinHTTP offline* below), so every `WinHttp*` import binds to it: 15 in `libHttpClient.GDK.dll` (all 16 but `WinHttpCrackUrl`) and 15 in `XCurl.dll` (all but `WinHttpQueryOption`). That is why the two HTTP clients moved the most: 11 to 26 and 9 to 24 shim imports.
 
+The UCRT argv configuration imports honor the executable's startup mode. Each run starts with `argc == 0` and
+null narrow/wide argument tables, while `GetCommandLineA/W` is already available to TLS and process-attach
+callbacks. Default startup publishes unexpanded arguments for its chosen width. `setargv.obj` / `wsetargv.obj`
+startup expands wildcard arguments against the host working directory, including quoted patterns; an unmatched
+pattern stays literal. Narrow expansion searches the ACP-converted pattern and converts matching names back to
+ACP, so its matches can differ from wide startup. The two widths retain independent tables, and the most recently
+configured width sets the shared `argc`. `noarg.obj` leaves the initial tables null; later no-argument
+configuration is a no-op that preserves existing pointers and counts. These are guest-owned tables, without
+changing the host CRT's argument globals. This does not add console-path wildcard routing or change the legacy
+`msvcrt!__getmainargs` wildcard policy. `run_argv_modes` compares the same six linker-selected MSVC fixtures
+natively and through the loader; `run_startup_cmdline` also checks native preconfiguration and command-line
+identity through attach and entry.
+
 The six unique Xbox-specific imports (eight consumer/import pairs) are exactly the set recorded in
 [`d3d12_vulkan.md` §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi):
 
@@ -79,6 +93,92 @@ The six unique Xbox-specific imports (eight consumer/import pairs) are exactly t
 
 The video path (`Bink2Scarlett.dll`), the BVH builder and the FidelityFX upscaler therefore all go through the
 two shim DLLs that already exist. `libHttpClient.GDK.dll` and `XCurl.dll` import only desktop APIs.
+
+`xmem.dll!XMemTransferMemory` is not imported by any of these DLLs, but a Series executable calls it during startup
+(reported in [#5934](https://github.com/ItsNotRexed/Leonida/issues/5934#issuecomment-7101779516)). Its GDK reference
+page is an NDA topic, but Microsoft's public [NetRumble](https://github.com/microsoft/XBOX-MonoGame-NetRumble/blob/203255e785f2ab2671a9d83b724eaa14d5b07414/console/NetRumble.Bootstrap/Main.cpp#L135-L145)
+sample and FNA's [NativeAOT-Xbox](https://github.com/FNA-XNA/NativeAOT-Xbox/blob/b9dc547afd0e05f45764d670ec49e0ac7997a301/Bootstrap/Main.cpp#L117-L124)
+bootstrap call it as `if (!XMemTransferMemory(XMemTransferTitleToSystem, size))` with a `size_t` in multiples of
+2 MiB, to move budget from the title's memory partition to the system's. A PC has no such partition, so the shim
+returns `TRUE` for every direction and size and allocates nothing; with `--trace` it records each distinct direction
+and size as an `xmem_transfer` event, because the enum values are not public. `xmem_test` covers it.
+
+Seven more `xmem.dll` imports follow argument shapes measured locally at a title's call sites (the comments in
+`runtime/shims/xmem.cpp` give each shape):
+
+- `XMemAllocDefault` and `XMemFreeDefault` take `XMemAlloc`'s and `XMemFree`'s arguments and share their heap.
+- `XMemAllocatePhysicalPages(attributes, UINT64* count, UINT64* pages)` returns a `BOOL` and the count it allocated.
+  Each call is one pagefile-backed section of `count` 64 KiB pages. A page number is a 4 KiB frame number: a
+  non-zero multiple of 16 below 2^25, which is what the measured title assumes when it packs them. `0` means "unmap".
+- `XMemMapPhysicalPages(address, UINT64 count, pages)` returns the address. A null page array unmaps.
+  `XMemMapPhysicalPagesScatter(addresses, UINT32 count, pages)` returns a `BOOL`, and a `0` entry unmaps.
+  `XMemFreePhysicalPages(UINT64 count, pages)` returns a `BOOL`. Every page is its own view, mapped with
+  `MapViewOfFile3` into a 64 KiB placeholder, so a page keeps its contents across remaps and can be mapped twice.
+- The windows are reserve-only 64 KiB-page `XMemVirtualAlloc` regions. The shim reserves them as placeholders and
+  keeps their protection, which mapped pages get (AWE's rule). The measured title also reserves a placeholder with
+  `MEM_RESERVE_PLACEHOLDER` and carves windows out of it with `MEM_REPLACE_PLACEHOLDER`, and the shim passes both
+  through. **ASSUMPTION:** nothing commits into a window with `kernel32!VirtualAlloc`, which a placeholder refuses.
+- `XMemVirtualAlloc` used to refuse 2 MiB pages, and five of the 23 measured calls commit them. They are now
+  committed 2 MiB-aligned through `VirtualAlloc2`. The attribute word is recorded (`xmem_attributes`) and the
+  console's `PAGE_GRAPHICS_*` bits are dropped from the protection, as before.
+- `XMemIsToolsMemAvailable()` is `FALSE`: a PC has no development-kit tools memory. The measured title asks only
+  on an out-of-memory path, after an allocation has already failed.
+
+## The retail executable (RT-5)
+
+`game_scarlett_master.exe` (120,181,760 bytes on disk, SHA-256
+`e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`) is a PE32+ x86-64 image with no resource
+section. `gta6rt --dry-run` maps it at its preferred base together with the four package DLLs it imports, and
+exits 0 with nothing on stderr:
+
+```powershell
+$game = "D:\path\to\your\package"
+$scratch = Join-Path $env:TEMP 'leonida-overlay'
+runtime\build\gta6rt.exe --dry-run "D:\path\to\game_scarlett_master.exe" --game-dir $game --overlay $scratch
+```
+
+`--overlay` points the write overlay away from `<game-dir>\overlay`, so a dry run writes nothing into the package.
+Measured at `1cc6e3c1`, Windows 11, MSVC 14.44:
+
+| Image | Base | Size of image | Entry RVA | Shim | Host | Module | Unimplemented |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `game_scarlett_master.exe` | `0x140000000` | 184,995,840 | `0x56a1ec8` | 53 | 432 | 72 | **30** |
+| `XboxBvhBuilder.dll` | `0x180000000` | 909,312 | `0x227cc` | 5 | 52 | 0 | 0 |
+| `amd_fidelityfx_loader_xbox.dll` | relocated | 32,768 | `0x18d0` | 6 | 16 | 0 | 0 |
+| `libHttpClient.GDK.dll` | relocated | 999,424 | `0x11f0` | 28 | 170 | 0 | 0 |
+| `Bink2Scarlett.dll` | relocated | 278,528 | `0x2ac1c` | 5 | 55 | 0 | 0 |
+
+The 72 module imports are served by those four DLLs. The 30 unimplemented imports all fall under the dry-run's
+policy "other" (none is counted as returning an `HRESULT`), and they come from seven Xbox-only DLLs:
+
+| DLL | Unimplemented imports | What the names suggest (not measured) |
+|---|---:|---|
+| `xmem.dll` | 7: `XMemAllocDefault`, `XMemAllocatePhysicalPages`, `XMemFreeDefault`, `XMemFreePhysicalPages`, `XMemIsToolsMemAvailable`, `XMemMapPhysicalPages`, `XMemMapPhysicalPagesScatter` | the console's physical page and default allocation routines; `XMemAlloc`, `XMemFree`, `XMemVirtualQuery`, `XMemGetWorkingSetStatistics` and `XMemTransferMemory` already bind |
+| `d3d12_xs.dll` | 1: `D3D12ConfigureVirtualMemoryX` | GPU virtual memory setup |
+| `xg_xs.dll` | 2: `XGCreateTextureComputer`, `XGSuggestSwizzleMode` | texture layout computation |
+| `XCRDAPI.dll` | 1: `DStorageGetFactory` | DirectStorage |
+| `chad.dll` | 5: `XDspActivate`, `XDspConnectWithMaximumStreamLimit`, `XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand` | the audio DSP |
+| `xapu.dll` | 5: `XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`, `XApuEnqueueCommand`, `XApuGetResultCount` | the audio processing unit |
+| `AcpHal.dll` | 9: `AcpHalAllocateShapeContexts`, `AcpHalCreate`, `AcpHalReleaseShapeContexts`, `ApuAlloc`, `ApuCreateHeap`, `ApuFree`, `ApuIsVirtualAddressValid`, `ApuMapApuAddress`, `ApuMapVirtualAddress` | the audio hardware layer |
+
+Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), and they are not complete:
+they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
+`xapu.dll`, `AcpHal.dll`) with no shim at all.
+
+The seven `xmem.dll` imports are served now (see the `xmem.dll` notes above), so the same dry run lists 23.
+
+`--init` on the same files also exits 0 with nothing on stderr. Its `--trace` file has 15 lines: the four package DLLs'
+`DllMain(DLL_PROCESS_ATTACH)` each return 1, the executable's two TLS callbacks run at process attach (reason 1) and
+again at detach (reason 0), and there is no `exception`, `error` or `unimplemented_call` event. So none of the 30
+unimplemented imports is reached by the TLS callbacks or the `DllMain`s.
+
+What this does not show: `--run` has not been run, so the entry point has not been called and no import is known to be
+reached on the way to the first frame. A bound import is not a working one (the binding only says a function with
+that name exists), and an unimplemented import stops the run only if the title calls it
+([When an unimplemented import is called](#when-an-unimplemented-import-is-called)). The executable imports 25
+functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo`) and the loader binds them to the
+host's, so a `--run` can open real sockets: run it with the network off. `winhttp.dll` is served by the offline shim,
+which opens none.
 
 ## Console paths and the write overlay
 
@@ -105,6 +205,10 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   or two threads opening the same file never leave a truncated copy under its name; a delete of a
   package file leaves an empty marker under `<overlay>\.gta6rt-deleted`, which reads and listings treat as gone. The
   package is never written.
+- `DeleteFileA/W` checks the visible file's `FILE_ATTRIBUTE_READONLY`: a read-only package file with no overlay is
+  refused with `ERROR_ACCESS_DENIED` before writing a deletion marker. An overlay copy supplies its own attributes,
+  so a writable overlay can still be deleted when the package file underneath is read-only. The native A/W controls
+  in `file_system_test` cover these cases and mixed hidden, system and archive attributes.
 - Reads prefer the overlay copy and then the package. `FindFirstFile` merges the two folders, the overlay winning on a
   name, and hides deleted names, the marker folder and the copy folder.
 - A path that climbs above `GAME:` with `..`, or names another drive, fails with `ERROR_INVALID_NAME`, so a title
@@ -130,7 +234,8 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   are dropped, and a `COPYFILE2` progress routine is not called. A call it can't run as asked (`SKIP_ALTERNATE_STREAMS`,
   `DIRECTORY`, `OPEN_AND_COPY_REPARSE_POINT`, `IGNORE_SOURCE_ENCRYPTION`, an unknown flag, or a longer V2 block) is
   `ERROR_NOT_SUPPORTED` and writes nothing. `rt::fs::force_copy_file2_fallback` makes the test take this path on
-  Windows too.
+  Windows too. A cancel flag that is already set is answered before the host's `CopyFile2` is called as well, since
+  Wine 10 and 11 export `CopyFile2` but ignore the flag; clearing it lets the same call be retried.
 - `SetFileAttributes*` sets the attributes on the overlay copy, copying a package file up (or mirroring a package
   folder) first, so the package keeps its own.
 - A folder has to exist in the title's view before it is used. An open that writes fails with `ERROR_PATH_NOT_FOUND`
@@ -186,12 +291,13 @@ pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name 
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`,
-`XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`, `XDisplayImpl` and `XUserDeviceImpl` from xgameruntime-docs'
-layout (below); for any other class it logs
+version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`, `XSystemImpl`,
+`XPersistentLocalStorageImpl`, `XPackageImpl`, `XGameImpl`, `XGameRuntimeFeatureImpl` and `XSystemAnalyticsImpl`
+(below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`, `XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`,
+`XDisplayImpl`, `XUserDeviceImpl`, `XAccessibilityImpl` and `XLauncherImpl` from xgameruntime-docs' layout (below); for any other class it logs
 the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
 the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
-the api-set binding `XCurl.dll` uses, and calls the two classes slot by slot.
+the api-set binding `XCurl.dll` uses, and calls the classes `xgameruntime.cpp` serves slot by slot.
 
 `XCurl.dll` has a second way in. One of its functions reads `HKLM\Microsoft\GamingServices` value
 `ServiceRetryTimeout`, then `LoadLibraryExW(L"gameplatformservices.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)` and
@@ -244,8 +350,10 @@ documents (on the queue's completion port, the process queue when none is given:
 none after, and the three `IXNetworkingImpl2` additions are `E_NOTIMPL`.
 
 `XUserImpl` (`runtime/shims/xgameruntime_user.cpp`) is served from xgameruntime-docs' layout alone. No package DLL
-calls an `XUser*` slot (`libHttpClient.GDK.dll` only holds the GUID table), so its slots are **not measured** yet.
-The executable's first boot confirms them, or names the slots that differ.
+calls an `XUser*` slot (`libHttpClient.GDK.dll` only holds the GUID table). The executable links thunks for
+`IXUserImpl` slots 3-5, 7-14, 19-25 and 33-34 and `IXUserGamertagImpl` slot 3 (`tools/gdk_runtime_calls.py`, from the
+file alone): none of the slots logged on first use below, and of the offline failures only the token-and-signature
+trio (23-25). What the slots must answer is still **not measured**; that is the executable's first boot.
 - **Interfaces:** the class id doubles as `IXUserImpl`'s; `IXUserImpl2`-`6` answer with the same 50-slot vtable;
   `IXUserGamertagImpl` (`XUserGetGamertag`) is a second interface.
 - **The user:** one offline local user, always signed in. `XUserAddAsync` adds it with or without
@@ -287,7 +395,8 @@ The executable's first boot confirms them, or names the slots that differ.
 
 `xgameruntime_gamesave_test` drives every slot against a temporary `LEONIDA_SAVE_DIR`.
 
-`XStoreImpl` (`runtime/shims/xgameruntime_store.cpp`), from the same layout, also **not measured**:
+`XStoreImpl` (`runtime/shims/xgameruntime_store.cpp`), from the same layout; the game-license struct is measured
+on the executable, the rest is not:
 - **Interfaces:** the class id doubles as `IXStoreImpl`'s; `IXStoreImpl2`-`6` answer with the same 84-slot vtable.
 - **Offline answers:** the game license is active and not a trial; a package's license is acquirable and valid;
   there are no add-on licenses, no products in any query and no package updates. License-changed and license-lost
@@ -295,14 +404,19 @@ The executable's first boot confirms them, or names the slots that differ.
 - **Not available offline:** purchases, consumables, license tokens, collections and purchase ids, downloads and
   every store UI fail before starting (`E_FAIL`, logged once). The docs' three unnamed slots and
   `XStoreIsAvailabilityPurchasable` (no documented signature) answer `E_NOTIMPL`.
-- **UNVERIFIED:** `STORE_SKU_ID_SIZE` = 18, `SKU_ID_SIZE` = 5 and `TRIAL_UNIQUE_ID_MAX_SIZE` = 64, which fix
-  `XStoreGameLicense` (104 bytes) and `XStoreCanAcquireLicenseResult` (12 bytes). The public pages give no values;
-  confirm them from the buffer the executable passes to `XStoreQueryGameLicenseResult` before a boot relies on it.
+- **Measured on the executable:** `XStoreGameLicense` is 104 bytes. The title's `XStoreQueryGameLicenseResult`
+  call passes a 104-byte stack buffer and reads the SKU id as a C string at +0x00, the three booleans at
+  +0x13..+0x15, the trial id as a C string at +0x1C and the expiration time at +0x60. That fixes
+  `STORE_SKU_ID_SIZE` = 18 and the 104-byte total.
+- **UNVERIFIED:** `SKU_ID_SIZE` = 5 and the exact `TRIAL_UNIQUE_ID_MAX_SIZE` = 64. The executable bounds the
+  trial id to at most 68 bytes (the expiration time is at +0x60) but reads it as a C string, so it does not name
+  the bound; 64 is the public source's value. It does not call either can-acquire slot (24-27), so
+  `XStoreCanAcquireLicenseResult` (12 bytes) is unmeasured.
 
 `xgameruntime_store_test` drives the license check, add-ons, updates, package licenses and product queries.
 
-`XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`, `XDisplayImpl` and `XUserDeviceImpl`
-(`runtime/shims/xgameruntime_offline.cpp`), from the same layout, also **not measured**:
+`XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`, `XDisplayImpl`, `XUserDeviceImpl`, `XAccessibilityImpl` and
+`XLauncherImpl` (`runtime/shims/xgameruntime_offline.cpp`), from the same layout, also **not measured**:
 - **`XGameEventWrite`** succeeds; the events are dropped. The first one's name is logged, and
   `LEONIDA_LOG_GAME_EVENTS=1` logs each with its dimensions and measurements.
 - **Dialogs:** a message dialog's title, text and buttons go to the log (`[rt] game dialog:`), and it completes at
@@ -314,18 +428,47 @@ The executable's first boot confirms them, or names the slots that differ.
   are no clients, and the connection-state registration hands out a token that never fires. Every per-client slot
   answers `E_GAMESTREAMING_NOT_INITIALIZED` (0x89245400), which a caller reading a bool sees as false (low byte
   0).
-- **ASSUMPTION:** the parameter lists of `XGameUiShowMessageDialogAsync` and
-  `XGameStreamingRegisterConnectionStateChanged`, from the GDK reference, not re-checked against the executable.
+- **Not reached by the executable:** the parameter lists of `XGameUiShowMessageDialogAsync` and
+  `XGameStreamingRegisterConnectionStateChanged` are the GDK reference's, and the executable has no caller to check
+  them against. `tools/gdk_runtime_calls.py` finds no thunk for the message dialog and none for any
+  `XGameStreamingImpl` or `XUserDeviceImpl` slot. Of `XGameUiImpl` it links slots 7-8 and 17-19 only: the profile
+  card and text entry, which fail before starting.
 
+- **Accessibility and speech** (`IXAccessibilityImpl2`, slots 3-21): `XHighContrastGetMode` (5) answers Off and
+  `XClosedCaptionSetEnabled` (4) is accepted. No voice is installed: `XSpeechSynthesizerEnumerateInstalledVoices`
+  (8) calls back zero times and returns `S_OK`, `XSpeechSynthesizerCreate` (9) fails (`E_FAIL`) with a null handle,
+  and the handle calls (10-16, 21: close, default and custom voice, streams from text and SSML, stream size and
+  data) refuse the handle they were never given (`E_INVALIDARG`, outputs zeroed). The closed-caption properties (3)
+  and the speech-to-text display calls (6, 7, 17-20) fail with `E_FAIL`, writing nothing: their parameter lists
+  are not in the docs' layout.
+- **`XLauncherImpl`** (`IXLauncherImpl`, slots 3-5): `XLaunchUri`, `XDisplayAcquireTimeoutDeferral` (null handle)
+  and `XDisplayCloseTimeoutDeferralHandle` fail with `E_FAIL`; nothing is launched.
+- **ASSUMPTION:** the parameter lists of the speech calls and `XHighContrastGetMode` (Off is 0), from the GDK
+  reference; only the argument counts were measured, from `tools/gdk_runtime_calls.py` on the executable.
 - **HDR:** `XDisplayTryEnableHdrMode` answers Disabled, because the host output is SDR. With `LEONIDA_HDR=1` it
   answers Enabled with the documented default tone-map luminances (0.01, 1000, 1000 nits).
 - **Devices:** every device belongs to the offline user (`XUserFindForDevice` hands out an `XUserHandle` the title
   closes). Association and audio-endpoint registrations hand out tokens that never fire. The user has no audio
   endpoint of its own (`ERROR_NOT_FOUND`). Finding a controller shows no UI and gives an all-zero device id, as
-  documented for desktop. **ASSUMPTION:** `APP_LOCAL_DEVICE_ID` is 32 bytes.
+  documented for desktop. `APP_LOCAL_DEVICE_ID` is taken to be 32 bytes; no caller in the executable confirms it.
 
 `xgameruntime_offline_test` drives the five classes; `xgameruntime_offline_hdr` runs it again with
 `LEONIDA_HDR=1`.
+
+Two more classes are served from `tools/gdk_runtime_calls.py`'s measurement of `libHttpClient.GDK.dll` (it finds the
+thunks in the code without running it and prints, per class, the interface id asked for, the slots called and the
+argument count each passes after `this`). Their thunks are in the DLL but nothing in it calls them; a title linked with
+the same `xgameruntime.lib` gets the same thunks. Every slot is the function at that position of xgameruntime-docs'
+layout with the documented argument count, and each behaves as Microsoft's reference page for that function says
+(`runtime/shims/xgameruntime.cpp` cites both):
+
+| Class | Interface asked for | Slots (args after `this`) | Offline behaviour |
+|---|---|---|---|
+| `XGameRuntimeFeatureImpl` | its class id | 3 `XGameRuntimeIsFeatureAvailable` (1, returns `bool`) | True when `QueryApiImpl` serves the class the feature's functions go through (whichever `xgameruntime*.cpp` serves it) and the feature is documented for Windows: today XAccessibility, XSpeechSynthesizer, XLauncher, XAsync, XAsyncProvider, XTaskQueue, XThread, XError, XGame, XGameSave, XGameUI, XNetworking, XPackage, XPersistentLocalStorage, XStore, XSystem, XUser, XGameEvent, XGameStreaming. False for XDisplay (served, but documented for the consoles only), for the classes not served (XAppCapture, XGameInvite) and for values past the enum |
+| `XSystemAnalyticsImpl` | its class id | 3 `XSystemGetAnalyticsInfo` (1: the result's address, as MSVC passes a returned struct to a member function) | The named export's `XSystemAnalyticsInfo` |
+
+Not served yet, though `libHttpClient.GDK.dll` has thunks for them: `XAppCaptureImpl` and `XGameInviteImpl`,
+among others.
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
@@ -338,8 +481,48 @@ xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; co
 
 So `XCurl.dll` needs threading, error reporting and networking from the runtime, and the interface versions in
 `libHttpClient.GDK.dll` date the GDK the package was built with: newer than the first `IXUserImpl5`, older than
-`IXUserImpl6`. The executable's own set is still unmeasured. `tools/gdk_runtime_calls.py` gives it from the file
-(below), and `QueryApiImpl`'s log on the first boot.
+`IXUserImpl6`.
+
+### The retail executable's runtime classes (RT-5)
+
+`python -I tools/gdk_runtime_calls.py game_scarlett_master.exe` (from the file alone, nothing executed; `main`
+`1cc6e3c1`) finds one `QueryApiImpl` helper at RVA `0x55de048` and **161** `xgameruntime.lib` thunks that reach **17**
+runtime classes. 158 of the thunks are referenced from the image; three are present and unreferenced (one each in
+`XPackageImpl`, `XThreadingImpl` and `XAccessibilityImpl`).
+
+The executable does not import `xgameruntime.dll`. Its import table has no such module, so the thunks are linked into
+the image like `libHttpClient.GDK.dll`'s. The name occurs in the image as a UTF-16 string, which
+`tools/pe_inspect.py` lists among the run-time load candidates (a string is where to look, not proof of a
+`LoadLibrary`). The registry
+therefore needs no module name beyond the `xgameruntime.dll` it already has, which settles the assumption at the top of
+`runtime/shims/xgameruntime.cpp`.
+
+| Class | Thunks | Referenced | Served |
+|---|---:|---:|---|
+| `XAccessibilityImpl` | 10 | 9 | no |
+| `XAppCaptureImpl` | 1 | 1 | no |
+| `XLauncherImpl` | 3 | 3 | no |
+| `XDisplayImpl` | 1 | 1 | yes |
+| `XGameEventImpl` | 1 | 1 | yes |
+| `XGameImpl` | 2 | 2 | yes |
+| `XGameRuntimeFeatureImpl` | 1 | 1 | yes |
+| `XGameSaveImpl` | 20 | 20 | yes |
+| `XGameUiImpl` | 5 | 5 | yes |
+| `XNetworkingImpl` | 10 | 10 | yes |
+| `XPackageImpl` | 18 | 17 | yes |
+| `XPersistentLocalStorageImpl` | 2 | 2 | yes |
+| `XStoreImpl` | 44 | 44 | yes |
+| `XSystemAnalyticsImpl` | 1 | 1 | yes |
+| `XSystemImpl` | 3 | 3 | yes |
+| `XThreadingImpl` | 18 | 17 | yes |
+| `XUserImpl` | 21 | 21 | yes |
+
+"Served" is the tool's answer for the runtime sources at that commit. The three that are not: `XAccessibilityImpl`
+(the speech-synthesizer slots 8-13, 15, 16 and 21 are referenced; slot 14 is not), `XAppCaptureImpl` (slot 5,
+`XAppCaptureTakeScreenshot`) and `XLauncherImpl` (slots 3-5: `XLaunchUri` and the two display timeout-deferral calls).
+Open pull requests serve them: #4235, #4307 and #4248. The slots of `XUserImpl`, `XStoreImpl` and `XGameSaveImpl` the
+executable calls, and the argument counts the tool estimates from the registers, are in the report the tool writes.
+`XErrorImpl`, which `XCurl.dll` and `libHttpClient.GDK.dll` call, is not among the executable's classes.
 
 ### Measuring which runtime classes a binary calls
 

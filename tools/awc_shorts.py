@@ -11,6 +11,7 @@ per-channel frame count is `samples / packet_channels`. The output is
 
 This tool never re-encodes: the selected Opus packets are repacked into Ogg Opus exactly as stored.
 It does not transcribe or classify the clips; that is a separate analysis step.
+Usage: `python -I tools/awc_shorts.py --help` lists the options.
 """
 import argparse
 import csv
@@ -25,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import awc_opus as awc  # noqa: E402
 from file_mode import published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
+from report_paths import path_key  # noqa: E402
 
 FIELDS = ("bank", "stream", "duration_s", "channels", "packets", "file")
 
@@ -82,7 +84,11 @@ def export_bank(path: str, out_dir: str, min_seconds: float, max_seconds: float,
 def _banks(src: str):
     if os.path.isdir(src):
         found = []
-        for root, _dirs, files in os.walk(src):
+
+        def scan_failed(error):
+            raise error
+
+        for root, _dirs, files in os.walk(src, onerror=scan_failed):
             found += [os.path.join(root, name) for name in files if name.lower().endswith(".awc")]
         return [(path, os.path.splitext(os.path.relpath(path, src))[0].replace(os.sep, "/"))
                 for path in sorted(found)]
@@ -104,14 +110,26 @@ def main(argv=None) -> int:
         print("awc_shorts: error: require 0 <= --min-seconds <= --max-seconds", file=sys.stderr)
         return 2
     if not os.path.exists(a.src):
-        print(f"awc_shorts: error: source does not exist: {a.src!r}", file=sys.stderr)
+        print(f"awc_shorts: error: source does not exist: {a.src}", file=sys.stderr)
         return 2
-    banks = _banks(a.src)
+    try:
+        banks = _banks(a.src)
+    except OSError as e:
+        print(f"awc_shorts: cannot list {e.filename or a.src}: {e.strerror or e}", file=sys.stderr)
+        return 2
     try:
         os.makedirs(a.out, exist_ok=True)
     except OSError as e:
         print(f"awc_shorts: cannot create {a.out}: {e}", file=sys.stderr)
         return 1
+    destinations = {}
+    for path, bank in banks:
+        target = os.path.join(a.out, bank)
+        key = path_key(target)
+        if key in destinations:
+            print(f"awc_shorts: error: {destinations[key]} and {path} would both export to {target}", file=sys.stderr)
+            return 2
+        destinations[key] = path
     rows = []
     io_failed = False
 

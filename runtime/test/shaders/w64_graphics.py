@@ -230,12 +230,19 @@ def _wave_size(tools, spirv, stage, size, tmp):
     probe is 32..63 in a wave64 and below 32 in a wave32. Size 32 also needs size 64 to work, so the draws differ."""
     if (stage, size) not in _applied:
         def top(s):
-            words = _draw_heap(tools, spirv, PROBES[stage], s, tmp)[0]
-            return None if words is None else max(w[0] for w in words)
-        lane64, lane32 = top(64), top(32)
+            words, problem = _draw_heap(tools, spirv, PROBES[stage], s, tmp)
+            if words is None and not problem.startswith("unsupported"):
+                return None, f"{s}-wide {stage} subgroup probe: {problem}"
+            return (None if words is None else max(w[0] for w in words)), None
+        lane64, problem = top(64)
+        if problem:
+            return False, problem
+        lane32, problem = top(32)
+        if problem:
+            return False, problem
         _applied[stage, 64] = lane64 is not None and 32 <= lane64 < 64
         _applied[stage, 32] = _applied[stage, 64] and lane32 is not None and lane32 < 32
-    return _applied[stage, size]
+    return _applied[stage, size], None
 
 
 def _draw_heap(tools, spirv, name, size, tmp):
@@ -294,7 +301,12 @@ def draw(tools, spirv, name, size, tmp):
         words, heap = _draw_heap(tools, spirv, name, size, tmp)
         if words is None:
             return None, heap, None
-        return words, heap, _wave_size(tools, spirv, name[:2], size, tmp) if size else None
+        if size:
+            applied, problem = _wave_size(tools, spirv, name[:2], size, tmp)
+            if problem:
+                return None, problem, None
+            return words, heap, applied
+        return words, heap, None
     env = dict(os.environ, **extra)
     env.pop("VKH_SUBGROUP_SIZE", None)
     if size:

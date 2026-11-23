@@ -43,7 +43,7 @@ class PipelinesJobsTest(unittest.TestCase):
 
     def main_with(self, *extra):
         argv = ["make_game.py", "--game", self.game, "--work", self.work, "--out", self.out,
-                "--stages", "pipelines", *extra]
+                "--stages", "pipelines", "--no-tui", *extra]
         with mock.patch.object(sys, "argv", argv), mock.patch.object(make_game, "below_normal"), \
                 mock.patch.object(make_game, "check", return_value={"expected_exe": "g.exe"}), \
                 mock.patch.object(make_game, "preflight"):

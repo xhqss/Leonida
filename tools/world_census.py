@@ -36,6 +36,7 @@ _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
+from report_paths import same_report_path  # noqa: E402
 import world_index as WI
 
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
@@ -785,16 +786,6 @@ def job_count(text):
     return value
 
 
-def same_output_path(first, second):
-    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("archive")
@@ -825,14 +816,14 @@ def main(argv=None):
     if start < data_start or start >= end:
         print("bad scan range", file=sys.stderr)
         return 2
-    if same_output_path(a.archive, a.out):
+    if same_report_path(a.archive, a.out):
         print("error: --out must not overwrite the input archive", file=sys.stderr)
         return 2
     if os.path.isfile(a.out):
         print(f"error: --out {a.out} is a file, not a directory", file=sys.stderr)
         return 2
     for report in ("summary.json", "maps.json"):
-        if same_output_path(a.archive, os.path.join(a.out, report)):
+        if same_report_path(a.archive, os.path.join(a.out, report)):
             print(f"error: --out reports would overwrite input archive: {a.archive}", file=sys.stderr)
             return 2
     try:

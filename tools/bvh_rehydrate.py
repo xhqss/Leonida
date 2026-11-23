@@ -170,6 +170,14 @@ class Header:
         unit = ((node_offset - self.offset_to_elements) & M32) >> 6
         return (self.offset_to_parents + 4 * unit) & M32
 
+    def stored_parent_entry(self, node_offset, size):
+        """The entry's address when the structure stores it, else None: only the entries from the header end to
+        offsetToElements are kept (docs/bvh.md §3.1), so a console structure's low units have none."""
+        entry = self.parent_entry(node_offset)
+        if 64 <= entry and entry + 4 <= min(self.offset_to_elements, size):
+            return entry
+        return None
+
 
 def rotation(index):
     """Rotation index -> 3x3 matrix Rz * Ry * Rx, each angle a multiple of pi/8, products rounded to float32."""
@@ -395,8 +403,8 @@ def write_box_groups(src, dst, hdr, start, count, wide):
             me = (at >> 6) << 3 | (BOX32 if wide else BOX16)
             for child in children:
                 if (child & 6) == 4 or ((child & 7) == TRI0 and hdr.flags & FLAG_UPDATABLE):
-                    entry = hdr.parent_entry(((child >> 3) << 6) & M32)
-                    if entry + 4 <= len(dst):
+                    entry = hdr.stored_parent_entry(((child >> 3) << 6) & M32, len(dst))
+                    if entry is not None:
                         struct.pack_into("<I", dst, entry, me)
 
 
@@ -414,8 +422,8 @@ def rehydrate(dehydrated, geometries, header_offset=0):
         raise ValueError("the kept header bytes (%d) run past the input" % kept)
     dst[:kept] = src[:kept]
     struct.pack_into("<I", dst, 0, hdr.flags & ~FLAG_DEHYDRATED & M32)
-    root_entry = hdr.parent_entry(((hdr.root >> 3) << 6) & M32)
-    if root_entry + 4 <= len(dst):
+    root_entry = hdr.stored_parent_entry(((hdr.root >> 3) << 6) & M32, len(dst))
+    if root_entry is not None:
         struct.pack_into("<I", dst, root_entry, INVALID)
     write_leaves(src, dst, hdr, list(geometries), LeafFrame(hdr))
     if hdr.root & 7 in (BOX16, BOX32):

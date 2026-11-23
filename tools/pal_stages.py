@@ -199,14 +199,15 @@ def tally(rows):
     }
 
 
-def non_negative(text):
-    """--limit: a count of files; a negative one would slice from the end."""
+def positive_count(text):
+    """--limit: a count of files, at least 1. 0 used to select no file at all and report an empty run as
+    a clean one; a negative one sliced from the end of the folder listing."""
     try:
         value = int(text, 0)
     except ValueError:
         raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
-    if value < 0:
-        raise argparse.ArgumentTypeError("must be 0 or more")
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
     return value
 
 
@@ -214,7 +215,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Read the PAL stage descriptors in FSSM headers.")
     ap.add_argument("path", help="an .fssm file, a DXBC container, or a folder of either")
     ap.add_argument("--json", action="store_true", help="print one JSON document instead of lines")
-    ap.add_argument("--limit", type=non_negative, help="stop after this many files")
+    ap.add_argument("--limit", type=positive_count, help="stop after this many files (at least 1)")
     args = ap.parse_args(argv)
 
     if not os.path.exists(args.path):

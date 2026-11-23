@@ -45,6 +45,7 @@ Wave size and stage are found as in wave64_graphics_scan.py: the FSSM header's w
 blocks are split as rdna2spirv.translate does (at branch targets and after branches) for the lane-mask analysis.
 
 Standard library only. Nothing from the game is printed or written: counts only.
+Usage: `python -I tools/wave32_pixel_scan.py --help` lists the options.
 """
 import argparse
 import json

@@ -10,7 +10,10 @@
 #include <algorithm>
 #include <clocale>
 #include <cstdio>
+#include <exception>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <initializer_list>
 #include <string>
 #include <thread>
@@ -18,6 +21,7 @@
 
 #include "file_system.h"
 #include "shims.h"
+#include "startup_trace.h"
 
 namespace {
 
@@ -113,12 +117,100 @@ int count(const std::vector<std::wstring>& names, const wchar_t* name) {
 
 bool contains(const std::vector<std::wstring>& names, const wchar_t* name) { return count(names, name) != 0; }
 
+// Denies the current user `rights` on a folder while it lives and puts the folder's old DACL back when it goes, on
+// every way out of the check. Both changes go through one handle opened before the deny. Under Wine the DACL is the
+// folder's unix mode: a deny of FILE_LIST_DIRECTORY clears its owner and group read bits (server/file.c, sd_to_mode),
+// and Wine opens a folder with open(O_RDONLY) (server/fd.c, open_fd), which then fails with EACCES. A restore through
+// the folder's name (SetNamedSecurityInfoW) could not open it again, so the folder stayed unlistable and the closing
+// remove_all threw. Windows checks access when a handle is opened, so the handle keeps WRITE_DAC there as well.
+class FolderDeny {
+public:
+    FolderDeny(const std::wstring& folder, DWORD rights) {
+        handle_ = ::CreateFileW(folder.c_str(), READ_CONTROL | WRITE_DAC,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) return;
+        if (GetSecurityInfo(handle_, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &old_dacl_,
+                            nullptr, &sd_) != ERROR_SUCCESS)
+            return;
+        EXPLICIT_ACCESS_W deny{};
+        deny.grfAccessPermissions = rights;
+        deny.grfAccessMode = DENY_ACCESS;
+        deny.grfInheritance = NO_INHERITANCE;
+        BuildTrusteeWithNameW(&deny.Trustee, const_cast<LPWSTR>(L"CURRENT_USER"));
+        PACL new_dacl = nullptr;
+        if (SetEntriesInAclW(1, &deny, old_dacl_, &new_dacl) != ERROR_SUCCESS) return;
+        denied_ = SetSecurityInfo(handle_, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, new_dacl,
+                                  nullptr) == ERROR_SUCCESS;
+        LocalFree(new_dacl);
+    }
+    FolderDeny(const FolderDeny&) = delete;
+    FolderDeny& operator=(const FolderDeny&) = delete;
+    ~FolderDeny() {
+        restore();
+        if (sd_) LocalFree(sd_);
+        if (handle_ != INVALID_HANDLE_VALUE) ::CloseHandle(handle_);
+    }
+
+    bool denied() const { return denied_; }
+
+    // Puts the old DACL back; true when it is back (or was never changed).
+    bool restore() {
+        if (denied_ && SetSecurityInfo(handle_, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr,
+                                       old_dacl_, nullptr) == ERROR_SUCCESS)
+            denied_ = false;
+        return !denied_;
+    }
+
+private:
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+    PACL old_dacl_ = nullptr;  // points into sd_
+    PSECURITY_DESCRIPTOR sd_ = nullptr;
+    bool denied_ = false;
+};
+
+// Whether the host's own MoveFileW changes a file's name to the same name in another case. Windows does. Wine 11.20
+// looks the new name up without case, finds the file itself and returns success without renaming it (server/fd.c,
+// set_fd_name: "if (!stat( name, &st ))" with the same inode returns early), so a listing keeps the old spelling.
+bool host_renames_case(const std::filesystem::path& folder) {
+    write_path(folder / "case_probe.tmp", "probe");
+    const BOOL moved = ::MoveFileW((folder / "case_probe.tmp").c_str(), (folder / "CASE_PROBE.TMP").c_str());
+    const std::vector<std::wstring> names =
+        list(::FindFirstFileW, ::FindNextFileW, ::FindClose, (folder / "*").c_str());
+    ::DeleteFileW((folder / "CASE_PROBE.TMP").c_str());
+    return moved && std::find(names.begin(), names.end(), std::wstring(L"CASE_PROBE.TMP")) != names.end();
+}
+
+void run_checks(const std::filesystem::path& root);
+
 }  // namespace
 
 int main() {
+    // A folder of this run's own: Wine hands each fresh prefix the same small process ids, so a folder named after
+    // the process id alone can be one an earlier run left behind.
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
     const std::filesystem::path root =
-        std::filesystem::temp_directory_path() / ("leonida_file_system_" + std::to_string(GetCurrentProcessId()));
-    std::filesystem::remove_all(root);
+        std::filesystem::temp_directory_path() / ("leonida_file_system_" + std::to_string(GetCurrentProcessId()) +
+                                                  "_" + std::to_string(now.QuadPart));
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    // An exception from one check (std::filesystem throws on a host error) ends the checks, not the run: it is a
+    // failure, the folder is still removed and the summary is still printed.
+    try {
+        run_checks(root);
+    } catch (const std::exception& e) {
+        check(false, (std::string("the checks run to the end (stopped by: ") + e.what() + ")").c_str());
+    }
+    std::filesystem::remove_all(root, ec);
+    if (ec) std::printf("NOTE could not remove %s: %s\n", root.string().c_str(), ec.message().c_str());
+    std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
+    return g_failures == 0 ? 0 : 1;
+}
+
+namespace {
+
+void run_checks(const std::filesystem::path& root) {
     const std::filesystem::path package = root / "package";
     const std::filesystem::path overlay = root / "overlay";
     write_path(package / "data" / "hello.txt", "package");
@@ -158,6 +250,40 @@ int main() {
         h = create_a("GAME:\\data\\hello.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
         check(h != INVALID_HANDLE_VALUE, "CreateFileA takes the same path");
         if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+    }
+
+    // --trace: a failed open of a guest path is a "file_open_failed" event, a successful one is not, and with the
+    // trace off nothing is written.
+    {
+        const std::wstring trace = (root / "open_trace.jsonl").wstring();
+        const auto events = [&] {
+            std::ifstream in(std::filesystem::path(trace), std::ios::binary);
+            std::stringstream text;
+            text << in.rdbuf();
+            return text.str();
+        };
+        const auto count = [](const std::string& hay, const std::string& needle) {
+            int n = 0;
+            for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1)) ++n;
+            return n;
+        };
+        HANDLE h = create_w(L"GAME:\\data\\absent_off.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND, "a missing open fails with the trace off");
+        check(rt::startup_trace::open(trace.c_str()), "open the startup trace file");
+        h = create_w(L"GAME:\\data\\hello.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "an open that succeeds");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(count(events(), "file_open_failed") == 0, "a successful open writes no file_open_failed event");
+        h = create_w(L"GAME:\\data\\absent_on.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND,
+              "a missing open still fails the same way with the trace on");
+        rt::startup_trace::close();
+        const std::string log = events();
+        check(count(log, "\"kind\":\"file_open_failed\"") == 1, "one file_open_failed event");
+        check(log.find("\"path\":\"GAME:\\\\data\\\\absent_on.txt\"") != std::string::npos, "the event names the path");
+        check(log.find("\"error\":2,") != std::string::npos, "the event carries error 2");
+        check(log.find("\"caller\":\"host:") != std::string::npos, "the event names a caller");
+        check(count(log, "absent_off") == 0, "nothing was traced before the trace was opened");
     }
 
     // Attributes, wide and narrow.
@@ -296,24 +422,8 @@ int main() {
         write_path(package / "acl" / "b.txt", "package");
         check(delete_w(L"GAME:\\acl\\a.txt") != FALSE, "DeleteFileW hides a.txt");
         const std::wstring marks = (overlay / ".gta6rt-deleted" / "acl").wstring();
-        PACL old_dacl = nullptr;
-        PSECURITY_DESCRIPTOR sd = nullptr;
-        bool denied = false;
-        if (GetNamedSecurityInfoW(marks.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr,
-                                  &old_dacl, nullptr, &sd) == ERROR_SUCCESS) {
-            EXPLICIT_ACCESS_W deny{};
-            deny.grfAccessPermissions = FILE_LIST_DIRECTORY;
-            deny.grfAccessMode = DENY_ACCESS;
-            deny.grfInheritance = NO_INHERITANCE;
-            BuildTrusteeWithNameW(&deny.Trustee, const_cast<LPWSTR>(L"CURRENT_USER"));
-            PACL new_dacl = nullptr;
-            if (SetEntriesInAclW(1, &deny, old_dacl, &new_dacl) == ERROR_SUCCESS) {
-                denied = SetNamedSecurityInfoW(const_cast<LPWSTR>(marks.c_str()), SE_FILE_OBJECT,
-                                               DACL_SECURITY_INFORMATION, nullptr, nullptr, new_dacl,
-                                               nullptr) == ERROR_SUCCESS;
-                LocalFree(new_dacl);
-            }
-        }
+        FolderDeny deny(marks, FILE_LIST_DIRECTORY);
+        const bool denied = deny.denied();
         WIN32_FIND_DATAW probe{};
         const HANDLE ph = ::FindFirstFileW((marks + L"\\*").c_str(), &probe);
         const bool listing_denied = ph == INVALID_HANDLE_VALUE && GetLastError() == ERROR_ACCESS_DENIED;
@@ -326,10 +436,13 @@ int main() {
         } else {
             std::printf("SKIP could not deny listing the marker folder\n");
         }
-        if (denied)
-            SetNamedSecurityInfoW(const_cast<LPWSTR>(marks.c_str()), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
-                                  nullptr, nullptr, old_dacl, nullptr);
-        if (sd) LocalFree(sd);
+        if (denied) {
+            const bool restored = deny.restore();
+            const HANDLE again = ::FindFirstFileW((marks + L"\\*").c_str(), &probe);
+            check(restored && again != INVALID_HANDLE_VALUE,
+                  "the marker folder lists again once its old DACL is back");
+            if (again != INVALID_HANDLE_VALUE) ::FindClose(again);
+        }
     }
 
     // A delete hides the package file without removing it.
@@ -390,6 +503,107 @@ int main() {
               "deleting a nested package file does not hide its parent folder");
         check(contains(list(first_w, next_w, find_close, L"GAME:\\data\\*"), L"sub"),
               "the parent folder stays listed after deleting a nested package file");
+    }
+
+    // DeleteFile checks the visible file's read-only bit. A package file is hidden by a marker instead of being
+    // passed to the host DeleteFile, but that must not bypass the same refusal. Compare each API with a real host
+    // file and keep the package and overlay attributes independent.
+    {
+        struct DeleteCase {
+            const char* name;
+            DWORD package_attributes;
+            DWORD overlay_attributes;  // zero means there is no overlay copy
+        };
+        constexpr DWORD mixed = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE;
+        const DeleteCase cases[] = {
+            {"package-readonly", FILE_ATTRIBUTE_READONLY, 0},
+            {"package-normal", FILE_ATTRIBUTE_NORMAL, 0},
+            {"package-mixed-readonly", FILE_ATTRIBUTE_READONLY | mixed, 0},
+            {"package-mixed-writable", mixed, 0},
+            {"readonly-package-normal-overlay", FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_NORMAL},
+            {"normal-package-readonly-overlay", FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY},
+            {"readonly-package-readonly-overlay", FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_READONLY},
+            {"readonly-package-mixed-overlay", FILE_ATTRIBUTE_READONLY, mixed},
+            {"normal-package-mixed-readonly-overlay", FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY | mixed},
+        };
+        for (const bool narrow : {false, true}) {
+            for (const auto& item : cases) {
+                const std::string leaf = std::string(narrow ? "a-" : "w-") + item.name + ".bin";
+                const std::filesystem::path relative = std::filesystem::path("delete-attributes") / leaf;
+                const auto package_file = package / relative, overlay_file = overlay / relative;
+                const auto native_file = root / "native-delete" / leaf;
+                const auto deletion_marker = overlay / ".gta6rt-deleted" / relative;
+                const bool has_overlay = item.overlay_attributes != 0;
+                const DWORD visible_attributes = has_overlay ? item.overlay_attributes : item.package_attributes;
+                const char* visible_bytes = has_overlay ? "overlay bytes" : "package bytes";
+                std::printf("DeleteFile%c case: %s\n", narrow ? 'A' : 'W', item.name);
+                write_path(package_file, "package bytes");
+                check(::SetFileAttributesW(package_file.c_str(), item.package_attributes) != FALSE,
+                      "set the synthetic package attributes");
+                const DWORD package_before = ::GetFileAttributesW(package_file.c_str());
+                if (has_overlay) {
+                    write_path(overlay_file, visible_bytes);
+                    check(::SetFileAttributesW(overlay_file.c_str(), item.overlay_attributes) != FALSE,
+                          "set the visible overlay attributes");
+                }
+                write_path(native_file, visible_bytes);
+                check(::SetFileAttributesW(native_file.c_str(), visible_attributes) != FALSE,
+                      "set the independent native file attributes");
+                std::string native_a;
+                if (narrow) {
+                    const UINT code_page = ::AreFileApisANSI() ? CP_ACP : CP_OEMCP;
+                    const int size = ::WideCharToMultiByte(code_page, 0, native_file.c_str(), -1, nullptr, 0,
+                                                           nullptr, nullptr);
+                    native_a.resize(size > 0 ? static_cast<size_t>(size) : 1);
+                    check(size > 0 && ::WideCharToMultiByte(code_page, 0, native_file.c_str(), -1, native_a.data(),
+                                                           size, nullptr, nullptr) == size,
+                          "encode the native DeleteFileA control path");
+                }
+                SetLastError(0);
+                const BOOL native_ok = narrow ? ::DeleteFileA(native_a.c_str()) : ::DeleteFileW(native_file.c_str());
+                const DWORD native_error = native_ok ? 0 : GetLastError();
+                const bool readonly = (visible_attributes & FILE_ATTRIBUTE_READONLY) != 0;
+                check((native_ok != FALSE) == !readonly && (native_ok || native_error == ERROR_ACCESS_DENIED),
+                      "native deletion rejects read-only and accepts other attribute combinations");
+                const std::wstring logical = L"GAME:\\" + relative.wstring();
+                const std::string logical_a = "GAME:\\delete-attributes\\" + leaf;
+                SetLastError(0);
+                const BOOL mapped_ok = narrow ? delete_a(logical_a.c_str()) : delete_w(logical.c_str());
+                const DWORD mapped_error = mapped_ok ? 0 : GetLastError();
+                check((mapped_ok != FALSE) == (native_ok != FALSE) && mapped_error == native_error,
+                      "shim deletion matches its native API's result and failure error");
+                check(read_path(package_file) == "package bytes" &&
+                          ::GetFileAttributesW(package_file.c_str()) == package_before,
+                      "deletion leaves package bytes and attributes unchanged");
+                check(std::filesystem::exists(deletion_marker) == !readonly,
+                      "only an accepted delete publishes a marker");
+                check(std::filesystem::exists(overlay_file) == (has_overlay && readonly),
+                      "a refused delete keeps its overlay and never copies the package up");
+                if (readonly) {
+                    // The host's answer for a real file given the same attributes, which survived its refused
+                    // delete: Windows reads back exactly what was set, while Wine 9 adds ARCHIVE and keeps neither
+                    // HIDDEN nor SYSTEM without its xattr support (0x21 for every read-only case here).
+                    const DWORD native_attributes = ::GetFileAttributesW(native_file.c_str());
+                    check(native_attributes != INVALID_FILE_ATTRIBUTES &&
+                              attributes_w(logical.c_str()) == native_attributes,
+                          "a refused delete retains the visible attributes");
+                    const HANDLE retained = create_w(logical.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                                     OPEN_EXISTING, 0, nullptr);
+                    check(retained != INVALID_HANDLE_VALUE && read_handle(retained) == visible_bytes,
+                          "a refused delete leaves the same logical bytes readable");
+                    if (retained != INVALID_HANDLE_VALUE) ::CloseHandle(retained);
+                } else {
+                    SetLastError(0);
+                    check(attributes_w(logical.c_str()) == INVALID_FILE_ATTRIBUTES &&
+                              GetLastError() == ERROR_FILE_NOT_FOUND,
+                          "an accepted delete hides the logical file");
+                }
+                // Restore only these synthetic files, including on a failed assertion, for remove_all below.
+                ::SetFileAttributesW(package_file.c_str(), FILE_ATTRIBUTE_NORMAL);
+                if (std::filesystem::exists(overlay_file)) ::SetFileAttributesW(overlay_file.c_str(), FILE_ATTRIBUTE_NORMAL);
+                if (std::filesystem::exists(native_file)) ::SetFileAttributesW(native_file.c_str(), FILE_ATTRIBUTE_NORMAL);
+            }
+        }
     }
 
     // Deleting one package file must not hide its folder. The overlay has never written to GAME:\pkgonly, so the
@@ -622,6 +836,10 @@ int main() {
                           HRESULT_FROM_WIN32(ERROR_REQUEST_ABORTED) &&
                       !std::filesystem::exists(out / "cancelled.txt"),
                   ("a cancel flag set before the copy cancels it" + mode).c_str());
+            cancel = FALSE;
+            check(copy2(L"GAME:\\misc\\keep.txt", to(L"cancelled.txt").c_str(), &block) == S_OK &&
+                      read_path(out / "cancelled.txt") == "keep",
+                  ("clearing the cancel flag allows a retry" + mode).c_str());
             block.pfCancel = nullptr;
             if (fallback) {
                 // A flag that changes what the copy produces, and which CopyFileExW can't do, is refused before
@@ -1130,11 +1348,20 @@ int main() {
         check(r != INVALID_HANDLE_VALUE && read_handle(r) == "package", "it still reads");
         if (r != INVALID_HANDLE_VALUE) ::CloseHandle(r);
 
+        // An overlay entry's case rename is the host's own rename, so the new spelling is only checked where the
+        // host's MoveFileW changes it (not under Wine); the entry is still listed exactly once everywhere.
+        const bool host_case = host_renames_case(root / "case_probe");
+        if (!host_case)
+            std::printf("SKIP the host's MoveFileW keeps the old case on a case-only rename (Wine): the listing's "
+                        "spelling of a renamed overlay entry is not checked\n");
         check(move_w(L"GAME:\\moves\\save.dat", L"GAME:\\moves\\SAVE.DAT") != FALSE,
               "MoveFileW renames an overlay file to the same name in another case");
         std::vector<std::wstring> names = names_in(L"GAME:\\moves\\*");
-        check(has_exact(names, L"SAVE.DAT") && !has_exact(names, L"save.dat") && count(names, L"save.dat") == 1,
-              "the listing shows the new case, once");
+        if (host_case)
+            check(has_exact(names, L"SAVE.DAT") && !has_exact(names, L"save.dat") && count(names, L"save.dat") == 1,
+                  "the listing shows the new case, once");
+        else
+            check(count(names, L"save.dat") == 1, "the listing shows the renamed file once");
         check(read_path(overlay / "moves" / "SAVE.DAT") == "save", "and the bytes are the same");
 
         check(move_w(L"GAME:\\moves\\pkg.dat", L"GAME:\\moves\\PKG.DAT") != FALSE,
@@ -1149,14 +1376,16 @@ int main() {
 
         check(move_w(L"GAME:\\moves\\dir", L"GAME:\\moves\\DIR") != FALSE,
               "MoveFileW renames an overlay folder to the same name in another case");
-        check(has_exact(names_in(L"GAME:\\moves\\*"), L"DIR"), "the listing shows the folder's new case");
+        names = names_in(L"GAME:\\moves\\*");
+        if (host_case)
+            check(has_exact(names, L"DIR"), "the listing shows the folder's new case");
+        else
+            check(count(names, L"dir") == 1, "the listing shows the renamed folder once");
         check(move_w(L"GAME:\\moves", L"GAME:\\moves") != FALSE, "MoveFileW of a package folder onto itself succeeds");
         SetLastError(0);
         check(move_w(L"GAME:\\moves", L"GAME:\\MOVES") == FALSE && GetLastError() == ERROR_ACCESS_DENIED,
               "a case rename of a package folder is refused like any other move of one");
     }
-
-    std::filesystem::remove_all(root);
-    std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
-    return g_failures == 0 ? 0 : 1;
 }
+
+}  // namespace

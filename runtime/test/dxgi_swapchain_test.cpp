@@ -9,6 +9,7 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/dxgi_com.h"
 #include "vulkan_loader.h"
+#include "window_station.h"
 #include "../src/vulkan_device_filter.h"
 
 #include <cmath>
@@ -307,6 +308,11 @@ int compare_swap_chain_arguments(IDXGIFactory4* ours, ID3D12Device* our_device, 
 }
 
 int main() {
+    if (!has_interactive_window_station()) {
+        // The host answers DXGI_ERROR_NOT_CURRENTLY_AVAILABLE to every CreateSwapChainForHwnd there: nothing to compare.
+        std::printf("SKIP: the process has no interactive window station\n");
+        return 77;  // ctest skips
+    }
     const PFN_vkGetInstanceProcAddr gipa = load_vulkan();
     if (!gipa) {
         std::printf("SKIP: vulkan-1.dll not available\n");

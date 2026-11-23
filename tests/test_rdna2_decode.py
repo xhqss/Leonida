@@ -24,6 +24,7 @@ import sys
 import tempfile
 import unittest
 import warnings
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -105,6 +106,48 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(inv, 0)
         self.assertIn("s_cbranch_scc1 -4", text)
         self.assertIn("s_branch -20", text)
+
+    def test_s_ttracedata_imm_keeps_simm16(self):
+        for word, value in ((0xBFA80000, 0x0), (0xBFA80001, 0x1),
+                            (0xBFA80063, 0x63), (0xBFA80064, 0x64),
+                            (0xBFA81234, 0x1234), (0xBFA8FFFF, 0xFFFF)):
+            with self.subTest(word=hex(word)):
+                code = words(word)
+                info = rdna2_decode.decode_bytes(code)
+                self.assertEqual(info["invalid"], 0)
+                self.assertEqual(info["insns"][0]["op"], "s_ttracedata_imm")
+                self.assertEqual(info["insns"][0]["args"],
+                                 [{"k": "imm", "v": value}])
+                text, invalid = rdna2_decode.disasm_bytes(code)
+                self.assertEqual(invalid, 0)
+                self.assertIn(f"s_ttracedata_imm 0x{value:x}", text)
+
+    def test_disasm_formats_each_instruction_before_decoding_the_next(self):
+        code = words(0xBF800000, 0xBF810000)  # s_nop 0; s_endpgm
+        events = []
+        decode_one = rdna2_decode._decode_one
+        format_insn = rdna2_decode.format_insn
+
+        def record_decode(code, offset, *args, **kwargs):
+            events.append(("decode", offset))
+            return decode_one(code, offset, *args, **kwargs)
+
+        def record_format(ins):
+            events.append(("format", ins["pc"]))
+            return format_insn(ins)
+
+        with (
+            patch.object(rdna2_decode, "_decode_one", record_decode),
+            patch.object(rdna2_decode, "format_insn", record_format),
+        ):
+            text, invalid = rdna2_decode.disasm_bytes(code, code_start=0x100, name="synthetic")
+
+        expected_text = (
+            f"\t{'s_nop 0':<40}; encoding: [0x00,0x00,0x80,0xbf]\n"
+            f"\t{'s_endpgm':<40}; encoding: [0x00,0x00,0x81,0xbf]\n"
+        )
+        self.assertEqual((text, invalid), (expected_text, 0))
+        self.assertEqual(events, [("decode", 0), ("format", 0x100), ("decode", 4), ("format", 0x104)])
 
     def test_sop1_sop2_sopc_sopk_with_literals(self):
         # s_mov_b32 s4, 0x12345678 (SOP1: op=3, sdst=4, ssrc0=255 + lit)

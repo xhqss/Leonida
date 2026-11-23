@@ -126,11 +126,20 @@ def load_names(path, source=None):
 
 
 def load_dialogue(path):
-    """{wave: row} from text_tables.py dialogue CSV, and the language codes in column order."""
+    """{wave: row} and language codes; refuse repeated waves whose rendered tags disagree."""
     with open(path, encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
         langs = [f[5:] for f in reader.fieldnames or [] if f.startswith("text_")]
-        return {row["wave"].lower(): row for row in reader}, langs
+        out = {}
+        for row in reader:
+            wave = row["wave"].lower()
+            if wave in out:
+                previous = tags_packet(comments(wave, out[wave], langs))
+                if previous != tags_packet(comments(wave, row, langs)):
+                    raise ValueError(f"{path}:{reader.line_num}: conflicting dialogue rows for wave {wave!r}")
+            else:
+                out[wave] = row
+        return out, langs
 
 
 def comments(name, line, langs):

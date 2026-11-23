@@ -250,7 +250,7 @@ class KeepEmulatedFlagTest(unittest.TestCase):
             game = os.path.join(tmp, "game")
             os.makedirs(game)
             argv = ["make_game.py", "--game", game, "--out", os.path.join(tmp, "o"), "--work", os.path.join(tmp, "w"),
-                    "--stages", "shaders", "--wave64-emulate", mode]
+                    "--stages", "shaders", "--no-tui", "--wave64-emulate", mode]
             if mesh_compute:
                 argv.append("--mesh-compute")
             with mock.patch.object(sys, "argv", argv), mock.patch.object(make_game, "below_normal"), \
@@ -372,6 +372,10 @@ class TranslateFlagTest(unittest.TestCase):
         class FakeProc:
             def __init__(self, args):
                 started.append(args)
+                self.stdout = None
+
+            def poll(self):
+                return 0
 
             def wait(self):
                 return 0

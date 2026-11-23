@@ -91,6 +91,25 @@ def test_reconcile_compatible():
     assert rsc.reconcile(reads, dwords) == []
 
 
+@pytest.mark.parametrize(("base", "model"), [(0, []), (4, ["--model", "console"])])
+def test_cli_checks_explicit_pointer_pairs(tmp_path, base, model):
+    sig_path = tmp_path / "sig.json"
+    sig_path.write_text(json.dumps({"params": [{"type": "cbv"}, {"type": "srv"}]}),
+                        encoding="utf-8", newline="\n")
+    index_path = tmp_path / "index.json"
+    for hi, status in ((base + 1, 0), (base + 3, 1)):
+        pair = [base, hi]
+        reads = [{"sgpr": base, "kind": "ptr64_lo", "pair": pair},
+                 {"sgpr": hi, "kind": "ptr64_hi", "pair": pair}]
+        index_path.write_text(json.dumps({"fixture": {"stage": "cs", "user_sgpr_reads": reads}}),
+                              encoding="utf-8", newline="\n")
+        result = subprocess.run([sys.executable, "-I", TOOL, index_path, "--rootsig", sig_path, *model],
+                                capture_output=True, text=True)
+        assert result.returncode == status, result.stdout + result.stderr
+        if status:
+            assert f"pair {pair} does not name both halves of one root address" in result.stdout
+
+
 @pytest.mark.parametrize(("sgpr", "kind", "needle"), [
     (0, "ptr64_lo", "incompatible"),  # s0 is a constant dword, not a VA
     (31, "const32", "8 dwords"),  # layout ends at s7

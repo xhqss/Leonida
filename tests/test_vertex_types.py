@@ -410,6 +410,18 @@ class ArchiveTests(unittest.TestCase):
             fh.write(data)
         return path, data
 
+    def test_overlapping_targets_count_distinct_archives_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sub = os.path.join(tmp, "nested")
+            os.mkdir(sub)
+            path, _ = self._archive(sub)
+            self._archive(tmp)  # Same basename and bytes, different archive path.
+            r = subprocess.run([sys.executable, "-I", TOOL, path, tmp, sub, os.path.join(sub, ".", "fake.rpf")],
+                               capture_output=True, text=True, errors="replace")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            out = json.loads(r.stdout)
+            self.assertEqual((out["streams"], out["blocks"]), (2, 2))
+
     def test_json_over_an_input_archive_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             path, data = self._archive(tmp)

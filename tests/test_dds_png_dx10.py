@@ -54,6 +54,15 @@ def _dx10(width, height, dxgi, payload, pitch=0):
 
 
 class SingleChannelTests(unittest.TestCase):
+    def test_r32_float_linear_values_with_padding(self):
+        payload = (struct.pack("<4f", -1, 0, 0.5, 0.25) + b"skip"
+                   + struct.pack("<4f", 2, float("inf"), float("-inf"), float("nan")))
+        data = _dx10(4, 2, 41, payload, pitch=20)
+        self.assertEqual(dds.parse_dds_header(data)["format"], "R32_FLOAT")
+        width, height, rgba = dds.decode_dds(data)
+        self.assertEqual((width, height), (4, 2))
+        self.assertEqual(rgba, b"".join(bytes((r, 0, 0, 255)) for r in (0, 0, 128, 64, 255, 255, 0, 0)))
+
     def test_r16_unorm_red_opaque(self):
         px = struct.pack("<HHHH", 0, 65535, 32768, 257)
         _, _, rgba = dds.decode_dds(_dx10(2, 2, 56, px))
@@ -66,7 +75,7 @@ class SingleChannelTests(unittest.TestCase):
         self.assertEqual(set(rgba[0::4]) | set(rgba[1::4]) | set(rgba[2::4]), {0})
 
     def test_truncated_rejected(self):
-        for dxgi, n in ((56, 7), (65, 3)):
+        for dxgi, n in ((56, 7), (65, 3), (41, 15)):
             with self.assertRaises(dds.DdsError):
                 dds.decode_dds(_dx10(2, 2, dxgi, bytes(n)))
 

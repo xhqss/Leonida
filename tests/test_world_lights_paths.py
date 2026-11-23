@@ -374,6 +374,20 @@ class ScanTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_a_truncated_rpf9_header_is_one_error_line(self) -> None:
+        # Before: scan() unpacked the data-start word from an unchecked 8-byte head, so a 5-byte "9FPR" file
+        # died in a struct.error traceback. A truncated header is a usage error: one ERROR line, exit 2.
+        short = os.path.join(self.tmp.name, "short.rpf")
+        with open(short, "wb") as f:
+            f.write(b"9FPR\x01")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = T.main([short])
+        self.assertEqual(rc, 2)
+        self.assertIn(f"ERROR: {short}: the RPF9 header is 5 bytes, the format needs 8", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertNotIn("struct.error", err.getvalue())
+
     def test_summary_write_failure_is_one_error_line(self) -> None:
         # --out naming a directory: IsADirectoryError/PermissionError on most systems. The input half
         # of main already answers with one ERROR line; the write half must too.
@@ -415,6 +429,18 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(summary["lane_graph"]["nodes"], 4)
         self.assertEqual(summary["lane_graph"]["junctions"], 1)
         self.assertEqual(summary["graph_resources"], {"junctions": 1, "links": 1, "nodes": 1})
+
+    def test_duplicate_light_definitions_compare_values_not_just_counts(self):
+        total = T.scan(self.rpf)
+        total["archetype_lights"] = {
+            1: [[{"posn": [0, 1, 0]}], [{"posn": [0, 1, 0]}]],
+            2: [[{"posn": [0, 1, 0]}], [{"posn": [1, 0, 0]}]],
+            3: [[], [{"intensity": 2}]],
+            4: [[{"intensity": 2}]],
+        }
+        summary = T.summarize(total)
+        self.assertEqual(summary["archetypes_defined_more_than_once"], 3)
+        self.assertEqual(summary["archetype_light_definitions_differ"], 2)
 
     def test_jobs_give_the_same_summary(self):
         one = T.summarize(T.scan(self.rpf, jobs=1))
@@ -576,6 +602,82 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(len(lines), 5)
         self.assertEqual(lines[3], "ERROR: --limit must be at least 1")
         self.assertEqual(lines[4], "ERROR: --limit must be at least 1")
+
+
+    def test_cli_refuses_malformed_entities_rows_before_the_scan(self):
+        good = '{"archetype": "a1b2c3d4", "position": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0]}\n'
+        cases = [
+            ("badjson", '{"archetype": "a1b2c3d4", "position": [0,0,0]\n', "not valid JSON"),
+            ("notjson", "garbage line\n", "not valid JSON"),
+            ("nonobject", "[1, 2, 3]\n", "not a JSON object"),
+            ("scalar", "123\n", "not a JSON object"),
+            ("badhex", '{"archetype": "zzz"}\n', "archetype is not a hex hash"),
+            ("unhashable", '{"archetype": {"x": 1}}\n', "archetype is not a hash:"),
+            ("shortrot", good.replace("[0.0, 0.0, 0.0, 1.0]", "[0.0, 0.0]"), "rotation is not 4 numbers"),
+            ("scalarpos", good.replace('"position": [0.0, 0.0, 0.0]', '"position": 5'),
+             "position is not 3 numbers"),
+            ("boolpos", good.replace('"position": [0.0, 0.0, 0.0]', '"position": [true, 0.0, 0.0]'),
+             "position is not 3 numbers"),
+            ("emptypos", good.replace('"position": [0.0, 0.0, 0.0]', '"position": []'),
+             "position is not 3 numbers"),
+            ("strscale", good.replace('1.0]}\n', '1.0], "scale_xy": "2"}\n'), "scale_xy is not a number"),
+        ]
+        for name, line, expected in cases:
+            with self.subTest(case=name):
+                ent = os.path.join(self.tmp.name, name + ".jsonl")
+                with open(ent, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(line)
+                err = io.StringIO()
+                with mock.patch.object(T, "scan",
+                                       side_effect=AssertionError("scan started before refusing the entities")
+                                       ) as scan, contextlib.redirect_stderr(err):
+                    self.assertEqual(T.main([self.rpf, "--entities", ent]), 2)
+                scan.assert_not_called()
+                lines = err.getvalue().strip().splitlines()
+                self.assertEqual(len(lines), 1)
+                self.assertTrue(lines[0].startswith("ERROR: %s:1:" % ent), lines[0])
+                self.assertIn(expected, lines[0])
+
+    def test_cli_refuses_non_utf8_entities_file(self):
+        ent = os.path.join(self.tmp.name, "binary.jsonl")
+        with open(ent, "wb") as f:
+            f.write(b"\xff\xfe binary garbage\n")
+        err = io.StringIO()
+        with mock.patch.object(T, "scan",
+                               side_effect=AssertionError("scan started before refusing the entities")) as scan, \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(T.main([self.rpf, "--entities", ent]), 2)
+        scan.assert_not_called()
+        self.assertEqual(err.getvalue().strip().splitlines(), ["ERROR: %s: not UTF-8 text" % ent])
+
+    def test_malformed_entities_write_no_lights_file_or_summary(self):
+        ent = os.path.join(self.tmp.name, "late-bad.jsonl")
+        with open(ent, "w", encoding="utf-8", newline="\n") as f:
+            f.write('{"archetype": "a1b2c3d4", "position": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0]}\n')
+            f.write('{"archetype": "zzz"}\n')
+        out = os.path.join(self.tmp.name, "never.json")
+        lights = os.path.join(self.tmp.name, "never.jsonl")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(T.main([self.rpf, "--out", out, "--entities", ent, "--lights-out", lights]), 2)
+        self.assertIn("archetype is not a hex hash", err.getvalue())
+        self.assertFalse(os.path.exists(lights))
+        self.assertFalse(os.path.exists(out))
+
+    def test_entities_rows_with_null_fields_and_blank_lines_are_accepted(self):
+        ent = os.path.join(self.tmp.name, "nulls.jsonl")
+        with open(ent, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n")
+            f.write(json.dumps({"archetype": "a1b2c3d4", "position": None, "rotation": None,
+                                "scale_xy": None, "scale_z": None}) + "\n")
+        out = os.path.join(self.tmp.name, "nulls.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(T.main([self.rpf, "--out", out, "--entities", ent]), 0)
+        with open(out, encoding="utf-8") as f:
+            summary = json.load(f)
+        self.assertEqual(summary["placement"]["entities"], 1)
+        self.assertEqual(summary["placement"]["entities_with_lights"], 1)
+        self.assertEqual(summary["placement"]["archetype_lights_placed"], 2)
 
 
 class GraphStatsFirstLinkTest(unittest.TestCase):

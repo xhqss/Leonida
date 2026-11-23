@@ -27,7 +27,8 @@ struct ImportRecord {
 };
 
 struct Module {
-    std::string name;
+    std::string name;        // UTF-8 basename for diagnostics and traces, not a lookup key
+    std::string narrow_key;  // legacy lower-case narrow basename; empty when it cannot round-trip
     std::filesystem::path path;
     uint8_t* base = nullptr;
     uint64_t preferred_base = 0;
@@ -40,6 +41,10 @@ struct Module {
     // dispatch and stack walks can unwind through its frames. Removed when the loader is destroyed.
     void* function_table = nullptr;
     uint32_t function_count = 0;
+
+    // Mapped for a run-time LoadLibrary or a GetProcAddress forwarder (a dynamic load), not by a host load() (the
+    // start-up graph, a static load). DllMain's DLL_PROCESS_ATTACH gets lpvReserved NULL only for a dynamic load.
+    bool dynamic_load = false;
 
     std::vector<ImportRecord> imports;
     std::map<std::string, void*> exports;           // by name, plus "#ordinal"
@@ -121,13 +126,21 @@ public:
     // Run-time module lookup/loading used by the library_loader shim for bundled package DLLs.
     void* find_loaded_module(const std::string& dll_lower) const;
     void* load_runtime_module(const std::string& dll_lower, uint32_t flags, bool& handled);
+    // The same by the module's native basename (any Unicode name, matched case-insensitively as Windows matches
+    // module names), for the W entries of LoadLibrary / GetModuleHandle.
+    void* find_loaded_module_w(const std::wstring& basename) const;
+    void* load_runtime_module_w(const std::wstring& basename, uint32_t flags, bool& handled);
     void* resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle);
     bool owns_module_handle(void* module_handle) const;
 
 private:
     void initialise(Module& m);
     static void set_initialised(Module& m, bool value);
-    Module& map_image(const std::filesystem::path& path);
+    Module* find_narrow_module(const std::string& dll_lower) const;  // caller holds mutex_
+    Module* find_wide_module(const std::wstring& basename) const;    // caller holds mutex_
+    void* load_runtime_candidate(Module* existing, const std::filesystem::path& candidate, uint32_t flags,
+                                 const std::string& display);        // caller holds mutex_
+    Module& map_image(const std::filesystem::path& path, const std::string& narrow_key);
     void initialize_tls(Module& m);
     // LEONIDA_GUEST_TLS_SLOT0=1: moves this executable's own static TLS to a reserved module index, so the first mapped
     // image with a TLS directory can take index 0, which is the index the game's own code hard-codes (see the comment
@@ -144,9 +157,10 @@ private:
 
     mutable std::recursive_mutex mutex_;
     std::filesystem::path game_dir_;
-    std::map<std::string, Module*> by_name_;  // lower-case file name
+    std::map<std::filesystem::path::string_type, Module*> by_name_;  // native basename, ASCII case folded
     std::vector<Module*> order_;       // mapping order; owns the modules
     std::vector<Module*> init_order_;  // dependencies first, see initialisation_order()
+    int runtime_loads_ = 0;  // > 0 while a run-time load or forwarder maps modules (under mutex_): they are dynamic
 
     // What find_address reads: one entry per mapped image, added once its memory exists. Under ranges_mutex_, a leaf
     // lock: mutex_ is held while image code runs and the registry holds its own lock around the lookup, so the

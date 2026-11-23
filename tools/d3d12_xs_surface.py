@@ -616,7 +616,7 @@ def main(argv=None):
         return 1
     if args.check or args.sdk or args.scarab:
         print("PASS: 116 slots (23 functions + 93 GUID data), %d standard + %d console GUIDs, "
-              "%d command-list IIDs not exported"
+              "%d unresolved command-list IIDs absent from local tables"
               % (len(STANDARD_GUIDS), len(CONSOLE_IIDS), len(UNRECOVERED_CONSOLE_IIDS)))
     return 0
 

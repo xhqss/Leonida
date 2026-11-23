@@ -42,6 +42,10 @@ import re
 import sys
 from collections import Counter, defaultdict
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 POINTER_KINDS = ("ptr32_lo", "ptr64_lo")
 
 
@@ -100,9 +104,12 @@ def census(index, base=None):
 
 def load_index(path):
     """The index as {name: entry}. ValueError with a one-line reason when the file cannot be read, is not JSON or
-    is not the shape census() reads; the wording follows tools/root_sig_contract.py, which reads the same file."""
+    is not the shape census() reads; the wording follows tools/root_sig_contract.py, which reads the same file.
+
+    utf-8-sig: a BOM left by a Windows editor is not a JSON error.
+    """
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             index = json.load(f)
     except (OSError, ValueError, RecursionError) as e:   # ValueError: not JSON, or not UTF-8
         reason = getattr(e, "strerror", None) or e
@@ -222,12 +229,8 @@ def main(argv=None):
     ap.add_argument("--pairs", action="store_true",
                     help="compare the VS and PS of one technique (root-parameter visibility, D3D-318)")
     a = ap.parse_args(argv)
-    if a.json:
-        try:
-            if os.path.samefile(a.index, a.json):
-                ap.error("--json must not overwrite the input index")
-        except OSError:
-            pass  # a missing or unreachable --json path is not the index; writing it reports the error
+    if a.json and same_report_path(a.index, a.json):
+        ap.error("--json must not overwrite the input index")
     try:
         index = load_index(a.index)
     except ValueError as e:

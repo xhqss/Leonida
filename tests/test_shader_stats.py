@@ -65,6 +65,19 @@ class ShaderStats(unittest.TestCase):
         self.assertIn("ps: 1 shaders, code growth median 2.00x", r.stdout)
         self.assertIn("scratch in 1, spills in 1", r.stdout)
 
+    def test_empty_listing_has_no_growth_denominator(self):
+        rows = ["ps_empty,ps,Instructions,16"]
+        listings = {"ps_empty": "; no instructions\n"}
+        result = self.run_stats(rows, listings=listings)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.detail(result, "ps_empty")[2:5], ["0", "16", "-"])
+        self.assertIn("code growth n/a", result.stdout)
+
+        result = self.run_stats(rows + ["ps_flat,ps,Instructions,16"], details=False,
+                                listings={**listings, "ps_flat": PS_FLAT})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("code growth median 2.00x (p90 2.00x, max 2.00x) (1 of 2)", result.stdout)
+
     def test_original_vgpr_count_includes_non_contiguous_image_addresses(self) -> None:
         listing = ("\timage_sample v[6:9], [v1, v31, v2], s[0:7], s[8:11] dmask:0xf\n"
                    "\ts_endpgm\n")

@@ -20,8 +20,8 @@ sys.path.insert(0, str(TOOLS))
 import report_paths  # noqa: E402
 
 # Tools that use report_paths and must not define their own copy again.
-SHARED = ("anim_index", "awc_manifest", "gamedata_index", "gamedata_xml", "glb_inspect", "navmesh_index",
-          "rpf_probe", "tile_probe", "world_lights_paths", "world_names")
+SHARED = ("anim_index", "awc_manifest", "gamedata_index", "gamedata_xml", "gen_d3d12_stubs", "glb_inspect",
+          "navmesh_index", "rpf_probe", "tile_probe", "world_lights_paths", "world_names")
 # The one tool that still carries its own copy (an open pull request edits its call site). Do not add to this list:
 # import report_paths instead.
 LEGACY_COPIES = {"navmesh_decode"}
@@ -172,9 +172,18 @@ class FoldingVolumeTests(unittest.TestCase):
 
     def test_same_report_path_asks_the_volume_when_the_name_rules_disagree(self):
         # The name rules say "different"; the volume has the last word on a pair that differs only by case.
-        with mock.patch.object(report_paths, "path_key", side_effect=os.path.realpath),                 mock.patch.object(report_paths, "same_name_on_folding_volume", return_value=True) as probe:
+        with mock.patch.object(report_paths, "_resolved_key", side_effect=os.path.realpath), \
+                mock.patch.object(report_paths, "_same_resolved_name", return_value=True) as probe:
             self.assertTrue(report_paths.same_report_path(self.p("R.json"), self.p("r.json")))
-        probe.assert_called_once()
+        probe.assert_called_once_with(os.path.realpath(self.p("R.json")), os.path.realpath(self.p("r.json")))
+
+    def test_each_path_is_resolved_once_per_call(self):
+        # #6220's review: the key and the volume probe both want the resolved names, so resolving each path
+        # once costs two realpath calls per guard, not four. A guard runs once per input file, so this is the
+        # whole cost: on main the same call resolves four times.
+        with mock.patch.object(report_paths.os.path, "realpath", wraps=os.path.realpath) as resolved:
+            report_paths.same_report_path(self.p("out.json"), self.p("lights.json"))
+        self.assertEqual(resolved.call_count, 2, "each path is resolved once, not once per check")
 
 
 class NoPrivateCopiesTests(unittest.TestCase):

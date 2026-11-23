@@ -157,6 +157,22 @@ class OperandTests(unittest.TestCase):
     def test_unknown_operand_falls_back_to_raw(self):
         self.assertEqual(shader_ir.operand("weirdthing"), {"k": "raw", "t": "weirdthing"})
 
+    def test_llvm23_lit_is_the_constant(self):
+        # LLVM 23 prints lit(V) for a literal it could also show as an inline constant (v_fma_mix* sources).
+        for text, plain in (("lit(0x42200000)", "0x42200000"), ("|lit(0x3f800000)|", "|0x3f800000|"),
+                            ("neg(lit(0x3f800000))", "neg(0x3f800000)"), ("-lit(0x3f800000)", "neg(0x3f800000)")):
+            with self.subTest(text=text):
+                self.assertEqual(shader_ir.operand(text), shader_ir.operand(plain))
+
+    def test_llvm23_lit_of_a_register_is_not_unwrapped(self):
+        # lit() wraps a constant; a register inside it is not a literal and must not parse as the register (or as a
+        # constant): it keeps the lit(...) text, which the translator refuses as before lit() was read.
+        for text in ("lit(v2)", "lit(s4)", "-lit(v2)", "lit(vcc_lo)"):
+            with self.subTest(text=text):
+                op = shader_ir.operand(text)
+                self.assertNotIn(op["k"], ("vgpr", "sgpr", "imm", "fimm"))
+                self.assertIn("lit(", op.get("t", ""))
+
 
 class SplitArgsTests(unittest.TestCase):
     def test_commas_inside_parentheses_stay_together(self):

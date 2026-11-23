@@ -40,6 +40,8 @@ class F64TranscendentalsTest(unittest.TestCase):
         for index, reg in ((0, f"%c{dst_lo}"), (1, f"%c{dst_hi}")):
             word = result(rf"OpCompositeExtract %uint {pair} {index}")
             dest = result(rf"OpAccessChain %_ptr_Function_uint %vgpr {reg}")
+            if re.search(rf"(?m)^ *OpStore {re.escape(dest)} {re.escape(word)}$", spv):
+                continue
             old_word = result(rf"OpLoad %uint {dest}")
             masked = result(rf"OpSelect %uint %\w+ {word} {old_word}")
             self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {masked}$")

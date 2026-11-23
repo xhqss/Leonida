@@ -59,7 +59,8 @@ gesammelt.
     dauert etwa 20-40 Minuten.
   - Schneller, wenn du [conda](https://docs.conda.io/) nutzt: `conda install -c conda-forge llvm-tools` (der
     Windows-Build enthält das AMDGPU-Target), dann `LLVM_MC` auf den vollen Pfad des installierten `llvm-mc.exe`
-    setzen (`where llvm-mc` zeigt ihn bei aktivierter Umgebung).
+    setzen (`where.exe llvm-mc` zeigt ihn bei aktivierter Umgebung; das nackte `where` ist in
+    PowerShell das Cmdlet `Where-Object`).
   - Mit WSL: `llvm-21` in Ubuntu installieren und die Variable in derselben PowerShell-Sitzung setzen, in der du
     `make_game.py` startest:
 

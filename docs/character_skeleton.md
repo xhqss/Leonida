@@ -300,8 +300,8 @@ it does and why:
   the track's bone hash. Bone hash 0 drives a `mover` node above the skeleton (root motion;
   `--no-root-motion` leaves it out). Other track types are counted, not exported. A clip entry
   plays its animation's `[start, end]` window at `rate`, so animation time `t` is clip time
-  `(t − start) / rate`. In 300 sampled dictionaries, `(end − start) / rate` equals the clip's
-  `+0x78` duration for all 4,471 entries.
+  `(t − start) / rate`. `(end − start) / rate` equals the clip's `+0x78` duration for all 785,174
+  entries of all 61,505 dictionaries, to within 2.2e-4 relative (see [animation.md](animation.md#clip-dictionaries-are-rage-resources)).
 - The whole skeleton sits under one node that turns RAGE Z-up into glTF Y-up. Skinned mesh nodes
   sit at the scene root, because glTF ignores a skinned mesh node's own transform.
 
@@ -383,6 +383,20 @@ total). This is a static-export skip: only the components named on the command l
 exported, and no body or other unrequested component is assembled. No game data or generated
 GLB is stored in the repository; `tests/test_skinned_glb.py` builds its own skeleton, skin
 buffer and GLB.
+
+`python -I tools/glb_inspect.py out.glb` reads the written file back with no glTF library and
+prints its mesh, skin (joint count) and animation counts, the POSITION bounding box and any
+field the exporter dropped; [models.md](models.md#skinned-glb-export) lists what the rest of
+the report carries.
+
+`python -I tools/glb_skinning.py out.glb` checks the skin data itself: each skin's joint and
+`inverseBindMatrices` counts, the accessor types and finite values, which primitives carry
+skinning data and which are static, `JOINTS_n`/`WEIGHTS_n` pairing, every vertex's weight sum
+as FLOAT or normalized `UNSIGNED_BYTE`/`UNSIGNED_SHORT`, the joint-index range and the POSITION
+bounds computed from the accessor. A malformed container, a file with no skin, or a skin whose
+`inverseBindMatrices` count differs from its joint count exits nonzero; `--json report.json`
+writes the same report as LF-only JSON. `python -I tests/test_glb_skinning.py` runs its 17
+synthetic tests and needs no game files.
 
 ## Texture parameter split
 

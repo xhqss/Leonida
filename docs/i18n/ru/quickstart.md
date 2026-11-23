@@ -54,7 +54,8 @@ Windows. Процессор консоли x86-64, как у ПК, поэтом�
     переменная подхватилась. Сборка занимает 20-40 минут;
   - быстрее, если вы пользуетесь [conda](https://docs.conda.io/): `conda install -c conda-forge llvm-tools` (в её
     сборке для Windows цель AMDGPU есть), затем укажите в `LLVM_MC` полный путь к установленному `llvm-mc.exe`
-    (`where llvm-mc` покажет его в активированном окружении);
+    (`where.exe llvm-mc` покажет его в активированном окружении; в PowerShell команда `where` без `.exe` — это
+    `Where-Object`);
   - если ставите `llvm-21` в WSL, передайте `LLVM_MC` целой командой в той же сессии PowerShell, откуда
     запускаете `make_game.py`:
 

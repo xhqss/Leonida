@@ -229,6 +229,43 @@ class DivFixupF64Tests(unittest.TestCase):
         self.assertIn("FClamp", spv_mod)
         validate_spirv(spv_mod)
 
+    def test_scaling_modifiers_are_ignored_under_the_games_mode(self):
+        # Measured by @fiestorra on a gfx1036 iGPU (driver 31.0.24002.92) through tools/hw_oracle,
+        # tools/f64_omod_probe.py: on both ops the f16 and the binary64 result ignore mul:/div: while
+        # denorm_mode_16_64 = 3, the MODE these rows assume, and scale only with IEEE=0 and
+        # denorm_mode_16_64 = 0, while clamp applies in every MODE. See docs/design.md,
+        # "v_div_fixup_f16, v_div_fixup_f64".
+        two, onep5, three = 0x4000000000000000, 0x3FF8000000000000, 0x4008000000000000
+        spv = translate_lines([
+            f"v_mov_b32 v2, {two & 0xFFFFFFFF:#x}",
+            f"v_mov_b32 v3, {two >> 32:#x}",
+            f"v_mov_b32 v4, {onep5 & 0xFFFFFFFF:#x}",
+            f"v_mov_b32 v5, {onep5 >> 32:#x}",
+            f"v_mov_b32 v6, {three & 0xFFFFFFFF:#x}",
+            f"v_mov_b32 v7, {three >> 32:#x}",
+            "v_div_fixup_f64 v[0:1], v[2:3], v[4:5], v[6:7] mul:4 div:2",
+        ])
+        self.assertNotIn("OpCapability Float64", spv)
+        self.assertNotRegex(spv, r"OpFMul %double")
+        self.assertNotIn("FClamp", spv)
+        validate_spirv(spv)
+        # 2.0 is the fixup of (2.0, 1.5, 3.0); mul:4 div:2 would have made it 4.0.
+        self.assertEqual(
+            run_f64(two, onep5, three, insn="v_div_fixup_f64 v[0:1], v[2:3], v[4:5], v[6:7] mul:4 div:2"), two)
+
+        # The f16 form keeps the low-half write: no unpack/pack round-trip, no clamp.
+        spv16 = translate_lines([
+            "v_mov_b32 v1, 0x4000",
+            "v_mov_b32 v2, 0x3e00",
+            "v_mov_b32 v3, 0x4200",
+            "v_div_fixup_f16 v0, v1, v2, v3 mul:2",
+        ])
+        self.assertNotRegex(spv16, r"UnpackHalf2x16")
+        self.assertNotIn("FClamp", spv16)
+        validate_spirv(spv16)
+        self.assertEqual(
+            run_f16(0x4000, 0x3E00, 0x4200, insn="v_div_fixup_f16 v0, v1, v2, v3 mul:2") & 0xFFFF, 0x4000)
+
     def test_rejects_non_pair_destination(self):
         with self.assertRaises(rdna2spirv.Unsupported):
             translate_lines(["v_div_fixup_f64 v0, v[2:3], v[4:5], v[6:7]"])

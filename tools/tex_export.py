@@ -13,8 +13,9 @@ For each texture:
   - writes <out>/<archive>/<cpu blob>_<q index>_<WxH>_<format>.dds and records the choice in export_log.json,
     with "heuristic": true whenever two distinct placements fitted (the pick is a score, not a verified layout)
   - with --png, also writes the same path with .png for every texture tools/dds_png.py can decode (BC1-BC5, BC7
-    and 8-bit RGBA/BGRA or R10G10B10A2_UNORM, with no sRGB transfer; BC5 blue is a reconstructed normal Z).
-    The rest (BC6H and other uncompressed formats: R8, R8G8, 16-bit, float, integer) keep their
+    and 8-bit RGBA/BGRA, R10G10B10A2_UNORM or R11G11B10_FLOAT, with no sRGB transfer; BC5 blue is a reconstructed normal Z;
+    R16_FLOAT and R16G16B16A16_FLOAT clamped to [0, 1], NaN as 0).
+    The rest (including BC6H and R32_FLOAT) keep their
     DDS only and are counted as "png unsupported". A PNG that fails to decode or write is counted as
     "png error:<Type>" and its DDS stays; neither changes the exit code
 
@@ -193,7 +194,7 @@ def main():
     ap.add_argument("--png", action="store_true", help="also write a PNG beside each DDS dds_png.py can decode")
     a = ap.parse_args()
     try:
-        with open(a.index, encoding="utf-8") as f:
+        with open(a.index, encoding="utf-8-sig") as f:  # Notepad and PowerShell ">" save a BOM; json would refuse it
             texs = json.load(f)
     except (OSError, ValueError) as e:
         print(f"ERROR: cannot read {a.index}: {e}", file=sys.stderr)

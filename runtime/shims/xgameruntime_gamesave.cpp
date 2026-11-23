@@ -183,10 +183,12 @@ std::recursive_mutex g_mutex;
 struct XGameSaveProvider {
     fs::path user_dir;   // <root>\local-user
     std::string config_id;
+    uint64_t serial = 0;
 };
 struct XGameSaveContainer {
     fs::path user_dir;   // the provider's, copied: a container outlives a closed provider safely
     std::string name;
+    uint64_t serial = 0;
     fs::path dir() const { return user_dir / widen(encode_name(name)); }
 };
 struct Op {
@@ -195,15 +197,33 @@ struct Op {
 };
 struct XGameSaveUpdate {
     XGameSaveContainer* container;
+    uint64_t container_serial;       // the container's serial when the update was made
     std::string display_name;
     bool has_display_name;
     std::map<std::string, Op> ops;   // blob name -> its one write or delete
     uint64_t bytes;
+    uint64_t serial = 0;
 };
 
 std::unordered_set<const void*> g_providers, g_containers, g_updates;
 
 bool live(const std::unordered_set<const void*>& set, const void* h) { return h && set.count(h) != 0; }
+
+// Every handle gets a serial when it is made, and no two get the same one. The heap may hand a closed handle's address
+// to the next handle of its kind, so whatever keeps a handle past the call that gave it (an update its container, an
+// async job its provider, container or update) keeps the serial as well, and the handle counts as the same one only
+// while both match. A reused address is then refused as expired instead of acting on another save. Under g_mutex.
+uint64_t g_next_serial = 1;
+
+template <class T> bool live_as(const std::unordered_set<const void*>& set, const T* h, uint64_t serial) {
+    return live(set, h) && h->serial == serial;
+}
+
+// The serial of a live handle; 0, which no handle has, for one that isn't, so a job made from it fails as expired.
+template <class T> uint64_t serial_of(const std::unordered_set<const void*>& set, const T* h) {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    return live(set, h) ? h->serial : 0;
+}
 
 // ---- Files ----
 
@@ -405,6 +425,7 @@ HRESULT open_provider(XUserHandle user, const char* config_id, XGameSaveProvider
     if (ec) return E_GS_OUT_OF_LOCAL_STORAGE;
     auto* p = new XGameSaveProvider{user_dir, config_id};
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    p->serial = g_next_serial++;
     g_providers.insert(p);
     *out = p;
     static std::atomic<int> s_logged{0};
@@ -433,7 +454,7 @@ HRESULT delete_container(XGameSaveProviderHandle p, const char* name) {
 
 HRESULT submit_update(XGameSaveUpdateHandle u) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
-    if (!live(g_updates, u) || !live(g_containers, u->container)) return E_GS_HANDLE_EXPIRED;
+    if (!live(g_updates, u) || !live_as(g_containers, u->container, u->container_serial)) return E_GS_HANDLE_EXPIRED;
     return commit(u);
 }
 
@@ -446,6 +467,7 @@ struct Job {
     XGameSaveProviderHandle provider = nullptr;
     XGameSaveContainerHandle container = nullptr;
     XGameSaveUpdateHandle update = nullptr;
+    uint64_t serial = 0;   // the serial of the provider, container or update above, when the job was made
     std::vector<std::string> names;
     bool all_blobs = false;
     // results
@@ -473,15 +495,25 @@ HRESULT do_work(Job& job, size_t& size) {
         return S_OK;
     }
     if (job.identity == &kQuotaIdentity) {
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        if (!live_as(g_providers, job.provider, job.serial)) return E_GS_HANDLE_EXPIRED;
         const HRESULT hr = remaining_quota(job.provider, &job.quota);
         if (SUCCEEDED(hr)) size = sizeof(int64_t);
         return hr;
     }
-    if (job.identity == &kDeleteIdentity) return delete_container(job.provider, job.text.c_str());
-    if (job.identity == &kSubmitIdentity) return submit_update(job.update);
+    if (job.identity == &kDeleteIdentity) {
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        if (!live_as(g_providers, job.provider, job.serial)) return E_GS_HANDLE_EXPIRED;
+        return delete_container(job.provider, job.text.c_str());
+    }
+    if (job.identity == &kSubmitIdentity) {
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        if (!live_as(g_updates, job.update, job.serial)) return E_GS_HANDLE_EXPIRED;
+        return submit_update(job.update);
+    }
     if (job.identity == &kReadIdentity) {
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
-        if (!live(g_containers, job.container)) return E_GS_HANDLE_EXPIRED;
+        if (!live_as(g_containers, job.container, job.serial)) return E_GS_HANDLE_EXPIRED;
         std::vector<const char*> names;
         for (const std::string& n : job.names) names.push_back(n.c_str());
         const HRESULT hr = read_blobs(job.container, job.all_blobs ? nullptr : names.data(),
@@ -597,6 +629,7 @@ HRESULT STDMETHODCALLTYPE save_quota(void*, XGameSaveProviderHandle p, int64_t* 
 HRESULT STDMETHODCALLTYPE save_quota_async(void*, XGameSaveProviderHandle p, XAsyncBlock* async) {
     auto* job = new Job{&kQuotaIdentity};
     job->provider = p;
+    job->serial = serial_of(g_providers, p);
     return begin(async, job, "XGameSaveGetRemainingQuotaAsync");
 }
 
@@ -616,6 +649,7 @@ HRESULT STDMETHODCALLTYPE save_delete_async(void*, XGameSaveProviderHandle p, co
     if (!valid_container_name(name)) return E_GS_INVALID_CONTAINER_NAME;
     auto* job = new Job{&kDeleteIdentity};
     job->provider = p;
+    job->serial = serial_of(g_providers, p);
     job->text = name;
     return begin(async, job, "XGameSaveDeleteContainerAsync");
 }
@@ -673,6 +707,7 @@ HRESULT STDMETHODCALLTYPE save_create_container(void*, XGameSaveProviderHandle p
     if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
     if (!valid_container_name(name)) return E_GS_INVALID_CONTAINER_NAME;
     auto* c = new XGameSaveContainer{p->user_dir, name};
+    c->serial = g_next_serial++;
     g_containers.insert(c);
     *out = c;
     return S_OK;
@@ -733,6 +768,7 @@ HRESULT STDMETHODCALLTYPE save_read_async(void*, XGameSaveContainerHandle c, con
                                           XAsyncBlock* async) {
     auto* job = new Job{&kReadIdentity};
     job->container = c;
+    job->serial = serial_of(g_containers, c);
     job->all_blobs = names == nullptr;
     for (uint32_t i = 0; names && i < count; ++i) {
         if (!valid_blob_name(names[i])) {
@@ -764,7 +800,8 @@ HRESULT STDMETHODCALLTYPE save_create_update(void*, XGameSaveContainerHandle c, 
     *out = nullptr;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_containers, c)) return E_GS_HANDLE_EXPIRED;
-    auto* u = new XGameSaveUpdate{c, display_name ? display_name : "", display_name != nullptr, {}, 0};
+    auto* u = new XGameSaveUpdate{c, c->serial, display_name ? display_name : "", display_name != nullptr, {}, 0};
+    u->serial = g_next_serial++;
     g_updates.insert(u);
     *out = u;
     return S_OK;
@@ -809,6 +846,7 @@ HRESULT STDMETHODCALLTYPE save_submit(void*, XGameSaveUpdateHandle u) { return s
 HRESULT STDMETHODCALLTYPE save_submit_async(void*, XGameSaveUpdateHandle u, XAsyncBlock* async) {
     auto* job = new Job{&kSubmitIdentity};
     job->update = u;
+    job->serial = serial_of(g_updates, u);
     return begin(async, job, "XGameSaveSubmitUpdateAsync");
 }
 

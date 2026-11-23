@@ -785,7 +785,7 @@ def _find_gpu_ptr_qwords(buf: bytes):
 
 
 def scan_archive(carve, arch):
-    with open(os.path.join(carve, arch, "index.json"), encoding="utf-8") as f:
+    with open(os.path.join(carve, arch, "index.json"), encoding="utf-8-sig") as f:
         files = sorted(json.load(f)["files"], key=lambda r: r["off"])
     out = []
     for i in range(len(files) - 1):

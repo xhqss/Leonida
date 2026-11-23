@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; v_mad_u32_u16 / v_mad_i32_i16 with op_sel on S2 or D and with clamp, the forms the translator used to refuse.
 ; Measured on an AMD Radeon iGPU (gfx1036, RDNA2, Windows driver 26.10.1) with raw kernels through tools/hw_oracle,
 ; wave32 and wave64 alike (EGEN-HW-MAD-U32-U16):

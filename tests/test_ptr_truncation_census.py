@@ -165,6 +165,24 @@ class SummaryTests(unittest.TestCase):
             with open(idx, encoding="utf-8") as f:
                 self.assertEqual(json.load(f), {"0": {"stage": "ps", "user_sgpr_reads": [{"sgpr": 2, "kind": "ptr32_lo"}]}})
 
+    def test_json_and_index_out_name_two_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.mkdir(disasm)
+            write_listing(tmp, "ps_table32", LISTINGS["ps_table32"])
+            one = os.path.join(tmp, "r.json")
+            stderr = sys.stderr
+            sys.stderr = io.StringIO()
+            try:
+                with self.assertRaises(SystemExit) as cm:
+                    P.main([disasm, "--jobs", "1", "--json", one, "--index-out", one])
+            finally:
+                message = sys.stderr.getvalue()
+                sys.stderr = stderr
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("one file", message)
+            self.assertFalse(os.path.exists(one))
+
     def test_missing_folder(self):
         stderr = sys.stderr
         sys.stderr = io.StringIO()
@@ -172,6 +190,20 @@ class SummaryTests(unittest.TestCase):
             self.assertEqual(P.main([os.path.join(ROOT, "no-such-folder-here")]), 2)
         finally:
             sys.stderr = stderr
+
+    def test_limit_must_be_positive(self):
+        for value in ("0", "-1"):
+            with self.subTest(limit=value):
+                stderr = sys.stderr
+                sys.stderr = io.StringIO()
+                try:
+                    with self.assertRaises(SystemExit) as cm:
+                        P.main([os.path.join(ROOT, "tools"), "--limit", value])
+                finally:
+                    message = sys.stderr.getvalue()
+                    sys.stderr = stderr
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("--limit must be at least 1", message)
 
 
 if __name__ == "__main__":

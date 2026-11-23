@@ -15,9 +15,9 @@ validates each container's chunk table, reads the `ILDN` module name, and report
 Usage:
     python -I pe_shader_containers.py <image> [<image> ...] [--json FILE] [--extract DIR] [--verbose]
 
-`--json` writes the per-container records (offset, size, sha256, chunk list, name, flags). `--extract` writes
-each container as `<module>.dxbc` plus an `index.json` whose entries the translator reads (`stage: "cs"`), so the
-next step can be `fssm_unpack.py <DIR>`: nothing is extracted unless asked for, and extracted shaders are game
+`--json` writes the per-container records (offset, size, sha256, chunk list, name, stage, flags). `--extract` writes
+each container as `<module>.dxbc` plus an `index.json` whose entries the translator reads (with `stage` from
+`PSV0`, defaulting to `"cs"` when absent), so the next step can be `fssm_unpack.py <DIR>`: nothing is extracted unless asked for, and extracted shaders are game
 data that must stay in the user's work folder, never in the repository. Nothing here prints shader bytes.
 
 Standard library only; reads files, never runs them.
@@ -112,6 +112,19 @@ def module_name(ildn: bytes) -> str | None:
     return base[:-4] if base.lower().endswith(".pdb") else base or None
 
 
+PSV0_STAGES = {0: "ps", 1: "vs", 2: "gs", 3: "hs", 4: "ds", 5: "cs", 13: "ms", 14: "as"}
+
+
+def psv0_stage(psv0: bytes) -> str | None:
+    """Return the shader stage from a `PSV0` chunk payload, or None if short/unknown."""
+    if len(psv0) < 29:
+        return None
+    info_size = u32(psv0, 0)
+    if info_size < 25 or 4 + 24 >= len(psv0):
+        return None
+    return PSV0_STAGES.get(psv0[4 + 24])
+
+
 def xdat_tags(dxil: bytes) -> list[dict]:
     """The XDAT entries of a `DXIL` part, as {tag, size, magic} with the first four payload bytes as ASCII."""
     start = dxil.find(XDAT)
@@ -162,6 +175,11 @@ def inspect(data: bytes, image: str) -> tuple[list[dict], list[int]]:
         elif b"ACCC" in parts:
             dialect = chunk_payload(data, i, (b"ACCC",) + parts[b"ACCC"])
         tags = xdat_tags(dialect) if b"DXIL" in parts else []
+        stage = (
+            psv0_stage(chunk_payload(data, i, (b"PSV0",) + parts[b"PSV0"]))
+            if b"PSV0" in parts
+            else None
+        )
         record = {
             "image": image,
             "offset": i,
@@ -170,6 +188,7 @@ def inspect(data: bytes, image: str) -> tuple[list[dict], list[int]]:
             "name": module_name(chunk_payload(data, i, (b"ILDN",) + parts[b"ILDN"]))
             if b"ILDN" in parts
             else None,
+            "stage": stage,
             "chunks": [
                 {"fourcc": fourcc.decode("latin-1"), "size": size}
                 for fourcc, _, size in chunks
@@ -207,7 +226,7 @@ def extract(data: bytes, records: list[dict], directory: str) -> list[dict]:
                 file = f"{stem}_{n:02d}.dxbc"
                 target = os.path.join(directory, file)
                 n += 1
-        index.append({"name": stem, "file": file, "stage": "cs"})
+        index.append({"name": stem, "file": file, "stage": record.get("stage") or "cs"})
     return index
 
 

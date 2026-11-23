@@ -37,6 +37,26 @@ class BadGamedataMapsIndexTest(unittest.TestCase):
         self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
         self.assertTrue(result.stderr.startswith("error:"), result.stderr)
 
+    def assert_missing_source(self, result, target):
+        self.assertNotIn("Traceback", result.stderr, result.stderr)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
+        self.assertTrue(result.stderr.startswith(f"ERROR: {target}:"), result.stderr)
+
+    def test_source_is_a_file(self):
+        # main's version names the index it could not open ('<file>\index.json') and exits 1.
+        with tempfile.TemporaryDirectory() as td:
+            source = pathlib.Path(td) / "not-a-carve.txt"
+            source.write_text("junk", encoding="utf-8")
+            self.assert_missing_source(self.run_tool(source), source)
+
+    def test_folder_without_index(self):
+        # A folder of carved .bin files whose index.json is missing, as main also fails on.
+        with tempfile.TemporaryDirectory() as td:
+            carve = pathlib.Path(td)
+            (carve / "000000000001.bin").write_bytes(b"MHIU" + bytes(40))
+            self.assert_missing_source(self.run_tool(carve), carve)
+
     def test_missing_files_key(self):
         with tempfile.TemporaryDirectory() as td:
             self.assert_one_error(self.run_tool(self.make_carve(td, {})))

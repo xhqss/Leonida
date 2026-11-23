@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Ops merged with CPU-only checks (#1471 #825 #828 #814 #810), run once on a GPU.
 ; Lane 0 of a wave32 group computes one result per op and stores eight dwords:
 ;   out[0] = high word of s_nand_b64(0xF0F0F0F0_12345678, 0xFF00FF00_FFFFFFFF) = 0x0FFF0FFF  (~(S0 & S1))

@@ -6,6 +6,7 @@ Every model, skeleton, skin stream and GLB here is built by the test. No game
 file, value or name is used. The fixture is a three-bone ped skeleton, a
 two-entry drawable palette and a three-vertex 8-influence skin buffer.
 """
+import hashlib
 import json
 import math
 import os
@@ -44,6 +45,11 @@ def _write_glb(path):
     }
     with open(path, "wb") as handle:
         handle.write(glb_writer.build_glb([primitive]))
+
+
+def _read(path):
+    with open(path, "rb") as handle:
+        return handle.read()
 
 
 def _section_word(offset, fmt):
@@ -244,6 +250,56 @@ class SkinnedGlbTest(unittest.TestCase):
         self.assertEqual(stats["source_weight_sum_min"], 255)
         self.assertEqual(stats["source_weight_sum_max"], 255)
 
+    def test_local_child_listed_before_its_parent_keeps_the_own_skeleton_link(self):
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root)
+        model = _read_model(component)
+        model["drawable"]["skeleton"] = [
+            {"name": "HelperParent", "parent_name": "SKEL_Spine",
+             "bind_matrix": _matrix((0.0, 0.0, 2.0))},
+            {"name": "HelperChild", "parent_name": "HelperParent",
+             "bind_matrix": _matrix((0.0, 0.0, 3.0))},
+        ]
+        model["drawable"]["models"][0]["bone_palette"] = [
+            skinned_glb.joaat32("HelperChild"),
+            skinned_glb.joaat32("HelperParent"),
+        ]
+        _write_json(os.path.join(component, "model.json"), model)
+
+        payload, stats = skinned_glb.build_skinned_glb(skeleton, [component])
+        gltf, _binary = skinned_glb.read_glb(self._write(payload))
+        self.assertEqual(stats["component_joints"], 2)
+        by_name = {node.get("name"): index for index, node in enumerate(gltf["nodes"])}
+        parent, child = by_name["HelperParent"], by_name["HelperChild"]
+        self.assertIn(child, gltf["nodes"][parent].get("children", []))
+        self.assertIn(parent, gltf["nodes"][by_name["SKEL_Spine"]].get("children", []))
+
+    def test_local_child_under_a_parent_the_palette_never_lists(self):
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root)
+        model = _read_model(component)
+        model["drawable"]["skeleton"] = [
+            {"name": "HelperParent", "parent_name": "SKEL_Spine",
+             "bind_matrix": _matrix((0.0, 0.0, 2.0))},
+            {"name": "HelperMiddle", "parent": 0, "bind_matrix": _matrix((0.0, 0.0, 3.0))},
+            {"name": "HelperChild", "parent": 1, "bind_matrix": _matrix((0.0, 0.0, 4.0))},
+        ]
+        model["drawable"]["models"][0]["bone_palette"] = [
+            skinned_glb.joaat32("HelperChild"),
+            skinned_glb.joaat32("GM_TEST_L_UpperArm01_O"),
+        ]
+        _write_json(os.path.join(component, "model.json"), model)
+
+        payload, stats = skinned_glb.build_skinned_glb(skeleton, [component])
+        gltf, _binary = skinned_glb.read_glb(self._write(payload))
+        self.assertEqual(stats["component_joints"], 4)
+        by_name = {node.get("name"): index for index, node in enumerate(gltf["nodes"])}
+        parent, middle, child = (by_name["HelperParent"], by_name["HelperMiddle"],
+                                 by_name["HelperChild"])
+        self.assertIn(middle, gltf["nodes"][parent].get("children", []))
+        self.assertIn(child, gltf["nodes"][middle].get("children", []))
+        self.assertIn(parent, gltf["nodes"][by_name["SKEL_Spine"]].get("children", []))
+
     def test_normalized_byte_uvs_have_aligned_output_rows(self) -> None:
         from anim_glb import pack_glb
 
@@ -354,6 +410,24 @@ class SkinnedGlbTest(unittest.TestCase):
         self.assertEqual(with_numpy["sum_min"], without_numpy["sum_min"])
         self.assertEqual(with_numpy["sum_max"], without_numpy["sum_max"])
         self.assertAlmostEqual(struct.unpack_from("<4f", with_numpy["w0"], 0)[0], 64 / 255, delta=1e-6)
+
+    def test_only_weighted_joint_indices_must_fit_unsigned_short(self):
+        backends = [None] if skinned_glb._np is None else [None, skinned_glb._np]
+        palette = [65536, 65535]
+        for backend in backends:
+            with self.subTest(backend=backend), mock.patch.object(skinned_glb, "_np", backend):
+                for second_set in (False, True):
+                    w0, w1 = bytes([255, 0, 0, 0]), bytes(4)
+                    if second_set:
+                        w0, w1 = w1, w0
+                    with self.subTest(second_set=second_set):
+                        with self.assertRaisesRegex(skinned_glb.SkinError, "UNSIGNED_SHORT"):
+                            skinned_glb.normalise_weights(bytes(4), bytes(4), w0, w1, 1, 2, palette, 65537)
+                        joints = bytes([1, 0, 0, 0])
+                        out = skinned_glb.normalise_weights(joints, joints, w0, w1, 1, 2, palette, 65537)
+                        weighted, unused = ("j1", "j0") if second_set else ("j0", "j1")
+                        self.assertEqual(struct.unpack("<4H", out[weighted]), (65535, 0, 0, 0))
+                        self.assertEqual(out[unused], bytes(8))
 
     def test_full_export_without_numpy(self):
         skeleton = _skeleton_dir(self.root)
@@ -691,6 +765,99 @@ class SkinnedGlbTest(unittest.TestCase):
                 with open(path, "wb") as handle:
                     handle.write(data)
                 self._assert_one_line_error(self._run_cli(skeleton, component), path)
+
+    def test_output_must_not_overwrite_a_source(self):
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root)
+        victims = {
+            "component model.json": os.path.join(component, "model.json"),
+            "skeleton model.json (file)": os.path.join(skeleton, "model.json"),
+            "skeleton model.json (dir)": os.path.join(skeleton, "model.json"),
+            "component model.glb": os.path.join(component, "model.glb"),
+            "component buffer": os.path.join(component, "buffers", "01_0.bin"),
+        }
+        originals = {key: _read(path) for key, path in victims.items()}
+        for argv, key in (
+                ([victims["component model.json"], "--skeleton", skeleton,
+                  "--component", component], "component model.json"),
+                ([victims["skeleton model.json (file)"], "--skeleton", victims["skeleton model.json (file)"],
+                  "--component", component], "skeleton model.json (file)"),
+                ([victims["skeleton model.json (dir)"], "--skeleton", skeleton,
+                  "--component", component], "skeleton model.json (dir)"),
+                ([victims["component model.glb"], "--skeleton", skeleton, "--component", component],
+                 "component model.glb"),
+                ([victims["component buffer"], "--skeleton", skeleton, "--component", component],
+                 "component buffer")):
+            with self.subTest(victim=key):
+                result = subprocess.run(
+                    [sys.executable, "-I", os.path.join(ROOT, "tools", "skinned_glb.py")] + argv,
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("must not overwrite the source", result.stderr)
+                with open(victims[key], "rb") as handle:
+                    self.assertEqual(handle.read(), originals[key], key)
+        alt = os.path.join(component, "MODEL.JSON")
+        if os.path.exists(alt):     # case-insensitive volume: MODEL.JSON is model.json, so it must refuse
+            result = subprocess.run(
+                [sys.executable, "-I", os.path.join(ROOT, "tools", "skinned_glb.py"), alt,
+                 "--skeleton", skeleton, "--component", component],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must not overwrite the source", result.stderr)
+            with open(victims["component model.json"], "rb") as handle:
+                self.assertEqual(handle.read(), originals["component model.json"])
+
+    def test_distinct_output_still_writes_the_glb(self):
+        # The guard must not break the normal path: sources stay byte-identical and the GLB is written.
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root)
+        component_json = os.path.join(component, "model.json")
+        skeleton_json = os.path.join(skeleton, "model.json")
+        originals = {path: _read(path)
+                     for path in (component_json, skeleton_json,
+                                  os.path.join(component, "model.glb"),
+                                  os.path.join(component, "buffers", "01_0.bin"))}
+        out = os.path.join(self.root, "out.glb")
+        result = subprocess.run(
+            [sys.executable, "-I", os.path.join(ROOT, "tools", "skinned_glb.py"), out,
+             "--skeleton", skeleton, "--component", component],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("wrote", result.stdout)
+        with open(out, "rb") as handle:
+            self.assertTrue(handle.read().startswith(b"glTF"))
+        for path, before in originals.items():
+            with open(path, "rb") as handle:
+                self.assertEqual(handle.read(), before, path)
+
+    def test_output_temp_file_does_not_clobber_named_buffer(self):
+        # A source buffer named <output>.tmp must stay intact after exporting <output>.
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root)
+        old_buf = os.path.join(component, "buffers", "01_0.bin")
+        new_buf_rel = "buffers/export.glb.tmp"
+        new_buf = os.path.join(component, "buffers", "export.glb.tmp")
+        os.replace(old_buf, new_buf)
+        model_json_path = os.path.join(component, "model.json")
+        with open(model_json_path, "r", encoding="utf-8") as handle:
+            model = json.load(handle)
+        model["buffer_files"] = [new_buf_rel]
+        _write_json(model_json_path, model)
+        before_hash = hashlib.sha256(_read(new_buf)).hexdigest()
+
+        out = os.path.join(component, "buffers", "export.glb")
+        result = subprocess.run(
+            [sys.executable, "-I", os.path.join(ROOT, "tools", "skinned_glb.py"), out,
+             "--skeleton", skeleton, "--component", component],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(_read(out).startswith(b"glTF"))
+        self.assertTrue(os.path.exists(new_buf))
+        self.assertEqual(hashlib.sha256(_read(new_buf)).hexdigest(), before_hash)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Constant lane masks in wave32 (s_and/or/andn2_saveexec_b32, s_andn2_wrexec_b32).
 ; A constant read as a lane mask gives lane L its bit L (RDNA2 ISA: EXEC is one bit per lane, and an inline
 ; constant or literal source of these 32-bit ops is that mask; -16 is 0xfffffff0). Until 2026-11-22 the translator

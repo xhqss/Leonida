@@ -30,6 +30,7 @@
 #include "vk_pc_tail.h"
 #include "vk_validation.h"
 #include "cs_wave_probe_spv.h"
+#include "spirv_capability.h"
 
 #include <cctype>
 #include <cmath>
@@ -255,8 +256,10 @@ static int run(int argc, char** argv) {
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = qi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
     VkPhysicalDeviceVulkan13Features f13q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan12Features f12q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    f12q.pNext = &f13q;
     VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    f2q.pNext = &f13q;
+    f2q.pNext = &f12q;
     vkGetPhysicalDeviceFeatures2(pd, &f2q);
     const char* sg_env = std::getenv("VKC_SUBGROUP_SIZE");
     const uint32_t req_sg = require_wave64 ? 64u : (sg_env ? uint32_t(std::atoi(sg_env)) : 0u);
@@ -267,6 +270,8 @@ static int run(int argc, char** argv) {
         std::fprintf(stderr, "full 64-wide compute subgroups unavailable\n");
         return 77;
     }
+    // shaderFloat64 and shaderInt64 only for a module that declares them: SHADER-423's address pairs need no
+    // 64-bit integers (TEST-468).
     const bool needs_float64 = leonida::vk_test::spirv_declares_capability(code.data(), code.size(), 10);  // Float64
     if (needs_float64 && !f2q.features.shaderFloat64) {
         std::fprintf(stderr, "unsupported: %s uses Float64 and the device has no shaderFloat64\n", argv[1]);
@@ -286,17 +291,35 @@ static int run(int argc, char** argv) {
         subgroup.subgroupSize == req_sg && spirv_version && spirv_version < 0x00010600u &&
         local_total && local_total <= 1024;
     const bool observed_full = observed && f13q.computeFullSubgroups && local[0] % sgProps.maxSubgroupSize == 0;
+    const bool int64 = leonida::vk_test::needs_shader_int64(code.data(), code.size());
+    if (int64 && !f2q.features.shaderInt64) {
+        std::fprintf(stderr, "unsupported: %s declares Int64 and the device has no shaderInt64\n", argv[1]);
+        return 77;
+    }
+    // 64-bit atomics: the translator's are buffer atomics (rdna2spirv.py --int64-atomics, *_atomic_swap_x2 on
+    // PhysicalStorageBuffer memory), which need shaderBufferInt64Atomics. Without the check a device that lacks it
+    // (MoltenVK) failed the pipeline instead of reporting 77. A shared-memory one gets shaderSharedInt64Atomics too
+    // where the device has it.
+    const bool int64_atomics = leonida::vk_test::declares_capability(code.data(), code.size(),
+                                                                    leonida::vk_test::spirv_capability_int64_atomics);
+    if (int64_atomics && !f12q.shaderBufferInt64Atomics) {
+        std::fprintf(stderr, "unsupported: %s declares Int64Atomics and the device has no shaderBufferInt64Atomics\n",
+                     argv[1]);
+        return 77;
+    }
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.bufferDeviceAddress = VK_TRUE;
+    f12.shaderBufferInt64Atomics = int64_atomics ? VK_TRUE : VK_FALSE;
+    f12.shaderSharedInt64Atomics = int64_atomics && f12q.shaderSharedInt64Atomics ? VK_TRUE : VK_FALSE;
     if (f13q.subgroupSizeControl || require_wave64) {
         f13.subgroupSizeControl = f13q.subgroupSizeControl;
         f13.computeFullSubgroups = require_wave64 || observed_full ? VK_TRUE : VK_FALSE;
         f12.pNext = &f13;
     }
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    f2.features.shaderInt64 = VK_TRUE;
-    f2.features.shaderFloat64 = needs_float64;
+    f2.features.shaderInt64 = int64 ? VK_TRUE : VK_FALSE;
+    f2.features.shaderFloat64 = needs_float64 ? VK_TRUE : VK_FALSE;
     f2.pNext = &f12;
     // OpFmaKHR (rdna2spirv.py --fma khr): VK_KHR_shader_fma, when the device has it.
     leonida::vk_test::ShaderFma fma;

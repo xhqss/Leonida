@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; v_mul_legacy_f32: 0 * anything (inf, -inf, NaN) == 0, finite * finite == normal multiply.
 ; Expected mrt0 bits: 0, 0, 0, 0x40c00000
 v_mov_b32 v0, 0

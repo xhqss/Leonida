@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; SHADER-257: GFX10 32-bit signed typed buffers. Lane 0 writes [-2147483648, 2147483647, -3, 17] at 0x80.
 ; MUBUF loads at out[0..11] test integer DST_SEL=1 for format 63 (X,Y,X,1) and raw words for 73/76.
 ; MTBUF loads at out[12..23] use a bound 32_FLOAT descriptor and take width and identity selectors from the

@@ -7,7 +7,8 @@ Reads timecycle_modifier_data and timecycle_keyframe_data XML documents from an 
 archive (via gamedata_index.ArchiveSource), a carve directory (DirectorySource), or
 plain .xml files, and prints an aggregate JSON summary of the (a, b) number pairs in
 plain modifiers: counts, ranges, RGB triplet b-equality, out-of-[0,1] variables, and
-per-variable b constancy.
+per-variable b constancy. Modifier patterns compare the parsed values to 0 and 1
+without rounding; `distinct_round6` is a separate distribution statistic.
 
 Outputs aggregate counts, ranges, and schema variable names only — never modifier
 names, attribute values, or raw XML. Standard library only.
@@ -143,7 +144,7 @@ def summarize_documents(docs: list[tuple[str, bytes]]) -> dict:
                 bs_.append(b)
                 by_var[ch.tag].append((a, b))
                 mod_vars[ch.tag] = (a, b)
-                mod_bs.add(round(b, 6))
+                mod_bs.add(b)
                 if b == 0.0:
                     var_docs_b0[ch.tag].add(doc_idx)
                     local_var_bs[ch.tag].add(0.0)

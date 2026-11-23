@@ -466,5 +466,30 @@ class GamedataMapsTest(unittest.TestCase):
         self.assertEqual(row["grid"]["width"], 255)
 
 
+class MalformedCarveIndex(unittest.TestCase):
+    """A carve index that parses but has no usable files list names the index, not a bare KeyError."""
+
+    def run_tool(self, index):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "index.json"), "w", encoding="utf-8") as f:
+                json.dump(index, f)
+            result = subprocess.run([sys.executable, "-I", TOOL, root],
+                                    capture_output=True, text=True, errors="replace")
+        return result
+
+    def test_empty_index_names_the_file_and_the_missing_key(self):
+        result = self.run_tool({})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("index.json has no 'files' list", result.stderr)
+        self.assertNotIn("error: 'files'", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_row_without_an_offset_is_named(self):
+        result = self.run_tool({"files": [{"stored": 12}]})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("row 0 needs an 'off'", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

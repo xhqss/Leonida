@@ -393,14 +393,19 @@ class CarryExecWave64EmulateTests(unittest.TestCase):
             rdna2spirv.WAVE64_EMULATE = prev_emu
 
     def _assert_mask_anded_with_active(self, spv, dst_var):
-        """Confirm `OpStore <dst_var> <m>` selects on `OpLogicalAnd %bool <cond> <act>` where <act> loads %active."""
+        """Confirm `OpStore <dst_var> <m>` selects on `OpLogicalAnd %bool <cond> <act>` where <act> is %active."""
         defs = {}
+        active_vals = set()
         stored = None
         for ln in spv.splitlines():
             s = ln.strip()
             if " = " in s:
                 lhs, rhs = s.split(" = ", 1)
                 defs[lhs] = rhs
+                if rhs == "OpLoad %bool %active":
+                    active_vals.add(lhs)
+            elif s.startswith("OpStore %active "):
+                active_vals.add(s.split()[2])
             elif s.startswith(f"OpStore {dst_var} "):
                 stored = s.split()[2]
         self.assertIsNotNone(stored, f"missing OpStore {dst_var}")
@@ -411,8 +416,8 @@ class CarryExecWave64EmulateTests(unittest.TestCase):
         self.assertTrue(and_rhs.startswith("OpLogicalAnd %bool "),
                         f"mask select condition {cond} not ANDed with %active: {and_rhs}")
         operands = and_rhs.split()[2:4]
-        self.assertTrue(any(defs.get(op) == "OpLoad %bool %active" for op in operands),
-                        f"OpLogicalAnd operands {operands} do not load %active")
+        self.assertTrue(any(op in active_vals for op in operands),
+                        f"OpLogicalAnd operands {operands} do not read %active")
 
     def test_emulate_co_and_mad64_mask_by_active(self):
         cases = [

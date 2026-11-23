@@ -30,6 +30,7 @@ Nothing from the package is written outside --work. The report holds module name
 """
 import argparse
 import json
+import math
 import os
 import struct
 import subprocess
@@ -269,6 +270,8 @@ def main(argv=None):
     ap.add_argument("--checked", action="store_true", help="also run CHECKED's programs and compare their output")
     ap.add_argument("--json", help="write the per-program results here")
     a = ap.parse_args(argv)
+    if not math.isfinite(a.timeout) or a.timeout <= 0:
+        ap.error("--timeout must be finite and greater than zero")
     if a.heap_bytes % 4 or a.heap_bytes < TABLE_QWORDS * 8:
         ap.error(f"--heap-bytes must be a multiple of 4 and at least {TABLE_QWORDS * 8}")
     if not 0 <= a.table_qword < 1 << 64:

@@ -1,13 +1,20 @@
 """Regenerate (or check) the translator input fixtures in tests/semantic/fixtures/disasm/ from the hand-written assembly
 sources in runtime/test/shaders/.
 
-    python tests/semantic/regen_fixtures.py            # rewrite the fixtures
-    python tests/semantic/regen_fixtures.py --check    # exit 1 if a fixture differs from what would be generated
+    python tests/semantic/regen_fixtures.py              # rewrite every generated fixture
+    python tests/semantic/regen_fixtures.py --check      # exit 1 if a fixture differs from what would be generated
+    python tests/semantic/regen_fixtures.py NAME [...]   # mark runtime/test/shaders/NAME.asm and write its fixture
 
 The translator (tools/rdna2spirv.py) reads one instruction per tab-indented line and skips the first line. For
 straight-line code it does not need the `; encoding:` comments, so a fixture is the .asm instruction text,
 unchanged, under a one-line header. No assembler is involved, which keeps the tests free of any LLVM version.
 (The .asm syntax itself was written for `llvm-mc -mcpu=gfx1013`; see the comment at the top of each file.)
+
+There is no list to edit. A source opts in with the comment line `ASM_MARK` in its own .asm (comments never reach
+the fixture), so adding a fixture touches only that .asm and the new .s, and two PRs that add different fixtures no
+longer edit the same lines. `--check` compares every marked source with its fixture (a missing fixture is reported)
+and also reports a generated fixture whose source is no longer marked. Hand-written fixtures in the same folder
+(another first line) are left alone.
 """
 import os
 import sys
@@ -16,49 +23,75 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 ASM_DIR = os.path.join(ROOT, "runtime", "test", "shaders")
 FIXTURE_DIR = os.path.join(HERE, "fixtures", "disasm")
-SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_smem_sconst_off", "cs_buf_tail",  # SMEM / raw MUBUF bounds measured on RDNA2
-           "ps_fnan_med3", "ps_fnan_fract",    # float NaN / fract rows measured on RDNA2 hardware
-           "ps_sdwa_dword_hi",   # 16-bit SDWA results with dst_sel:DWORD zero the high half
-           "ps_fnan_med3_s2", "ps_f16_fnan_med3",   # v_med3 with a NaN in S2 or in two operands (the same rule)
-           "ps_sdwa", "ps_ops", "ps_ops2", "ps_ops3", "ps_ops4", "ps_ops5", "ps_ops6", "ps_ops7", "ps_ops8",
-           "ps_legacy_mul", "ps_vcc_x2", "ps_vcmpx_forms", "ps_vcmp_int32", "ps_flat", "cs_bounds", "cs_fmt_1010102", "cs_fmt_sint32", "cs_fmt_int_narrow", "cs_fmt_d16_xyz", "cs_w64x_readlane",
-           "cs_w64x_writelane", "cs_w64x_bpermute", "cs_w32_permute", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w64x_permute", "cs_w64x_ballot", "cs_w64x_readfirstlane",
-           "cs_w64x_load_ballot_load", "cs_w64x_partial", "cs_wave64_ballot", "cs_wm_bfm64", "cs_wm_half_cmp",
-           "cs_wavemask", "cs_w32_permlane_fi", "cs_cvt_f32_sat", "ps_scc_minmax", "ps_fma_literal", "ps_f16_vop2", "ps_outmods_f16",
-           "ps_f32_mods", "ps_f64_mods", "ps_sff_imm", "cs_w32_lds_u8_d16", "cs_w32_lane_wrap", "ps_bary",
-           "cs_w32_lds_subdword", "cs_w32_lds_wide",
-           "cs_oob_select", "cs_oob_tail", "cs_global_mem_ext", "cs_w32_mask_imm", "cs_w64_mask_imm",
-           "cs_buf_swizzle",   # swizzled MUBUF / ADD_TID (test_buffer_swizzle.py)
-           "cs_tbuffer_store",                 # tbuffer_store_format_*, words measured natively on a Radeon 680M
-           # TEST-175: GPU fixtures for the docs/design.md rules that were checked on the CPU only
-           "ps_cmp_nlg", "ps_vcmp_f16", "ps_vcmp_f16_e64", "ps_vcmpx_f16", "ps_vcmpx_f16_e64", "ps_cvt_off", "ps_fmac_f16_mods", "ps_vop3_const_mods", "ps_interp_f32_mods", "ps_interp_mov_mods",
-           "ps_f16_pack_mods",          # v_pack_b32_f16 neg/abs (SHADER-260)
-           "ps_sdwa_f16_const",         # SDWA src_sel on an f16 inline constant (measured on gfx1036)
-           "cs_w64x_andn2_exec",   # s_andn2_saveexec_b64 / s_andn2_wrexec_b64 (test_andn2_exec_b64.py)
-           "cs_w64x_saveexec_b64",   # s_and/s_or/s_andn2_saveexec_b64, s_andn2_wrexec_b64 (test_saveexec_b64.py)
-           "ps_valu16_mad", "ps_valu16_subrev",   # v_mad_u32_u16 / v_mad_i32_i16, v_subrev_f16
-           "ps_valu16_mad_sel",   # v_mad_u32_u16 / v_mad_i32_i16 op_sel S2 / D and clamp (EGEN-HW-MAD-U32-U16)
-           "cs_cvt_pk_u8",   # v_cvt_pk_u8_f32 rounding and NaN (test_cvt_pk_u8.py)
-           "ps_vint_logic3",
-           "ps_vint_bits",
-           "ps_vint_mul24",
-           "ps_vint_minmax",
-           "ps_vint_minmax3",
-           "ps_vcmp_f32_nan", "ps_vcmp_64", "cs_w32_andn2_exec")   # VOPC f32 NaN / 64-bit int compares; s_andn2_saveexec/wrexec_b32
+ASM_MARK = "; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm"
+HEADER_MARK = "test fixture generated by tests/semantic/regen_fixtures.py from runtime/test/shaders/"
+
+
+def marked_names(directory=None):
+    """Names of the .asm sources that carry `ASM_MARK`, in name order: the fixtures this script owns."""
+    directory = directory or ASM_DIR
+    names = []
+    for fname in sorted(os.listdir(directory)) if os.path.isdir(directory) else []:
+        if fname.endswith(".asm"):
+            with open(os.path.join(directory, fname), encoding="utf-8") as f:
+                if any(line.strip() == ASM_MARK for line in f):
+                    names.append(fname[:-4])
+    return names
+
+
+def generated_names(directory=None):
+    """Names of the fixtures this script wrote, in name order: their first line carries `HEADER_MARK`."""
+    directory = directory or FIXTURE_DIR
+    names = []
+    for fname in sorted(os.listdir(directory)) if os.path.isdir(directory) else []:
+        if fname.endswith(".s"):
+            with open(os.path.join(directory, fname), encoding="utf-8") as f:
+                if HEADER_MARK in f.readline():
+                    names.append(fname[:-2])
+    return names
+
+
+SHADERS = tuple(marked_names())
 
 
 def render(name):
     """Fixture text for one shader: header line, then each instruction line indented with a tab."""
     with open(os.path.join(ASM_DIR, name + ".asm"), encoding="utf-8") as f:
         insns = [ln.strip() for ln in f.read().splitlines() if ln.strip() and not ln.lstrip().startswith(";")]
-    head = f"; {name}  test fixture generated by tests/semantic/regen_fixtures.py from runtime/test/shaders/{name}.asm\n"
+    head = f"; {name}  {HEADER_MARK}{name}.asm\n"
     return head + "".join("\t" + ln + "\n" for ln in insns)
+
+
+def mark(name):
+    """Put `ASM_MARK` at the top of NAME.asm unless it is already there."""
+    path = os.path.join(ASM_DIR, name + ".asm")
+    with open(path, encoding="utf-8", newline="") as f:
+        text = f.read()
+    if not any(line.strip() == ASM_MARK for line in text.splitlines()):
+        newline = "\r\n" if "\r\n" in text else "\n"
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(ASM_MARK + newline + text)
+
+
+def shown(path):
+    try:
+        return os.path.relpath(path, ROOT)
+    except ValueError:  # another drive than the repository (a TEMP on C: for a checkout on E:)
+        return path
 
 
 def main(argv):
     check = "--check" in argv
+    named = [a for a in argv if not a.startswith("-")]
+    missing = [n for n in named if not os.path.isfile(os.path.join(ASM_DIR, n + ".asm"))]
+    if missing:
+        print(f"no runtime/test/shaders/{missing[0]}.asm", file=sys.stderr)
+        return 2
+    if named and not check:
+        for name in named:
+            mark(name)
     bad = 0
-    for name in SHADERS:
+    for name in named or marked_names():
         path = os.path.join(FIXTURE_DIR, name + ".s")
         want = render(name)
         if check:
@@ -73,7 +106,11 @@ def main(argv):
             os.makedirs(FIXTURE_DIR, exist_ok=True)
             with open(path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(want)
-            print(f"wrote {os.path.relpath(path, ROOT)}")
+            print(f"wrote {shown(path)}")
+    if check and not named:
+        for name in sorted(set(generated_names()) - set(marked_names())):
+            print(f"{name}: generated fixture whose runtime/test/shaders/{name}.asm is not marked (or is gone)")
+            bad += 1
     return 1 if bad else 0
 
 

@@ -5,27 +5,45 @@ using System.Globalization;
 using System.Text.Json;
 using RpfPreview.Core;
 
+// Optional --jobs N anywhere among the args (default: every core). Stripped before mode/src/outdir.
+var argv = args.ToList();
+int jobs = Environment.ProcessorCount;
+for (int i = 0; i < argv.Count; )
+{
+    if (argv[i] == "--jobs")
+    {
+        if (i + 1 >= argv.Count || !int.TryParse(argv[i + 1], out jobs) || jobs < 1)
+        {
+            Console.Error.WriteLine("--jobs must be at least 1");
+            return 2;
+        }
+        argv.RemoveAt(i);
+        argv.RemoveAt(i);
+        continue;
+    }
+    i++;
+}
 // The mode is checked before the source or the output folder is touched. A typo used to fall through every branch:
 // it created the output folder, printed ok=0 fail=0 skip=0 and exited 0, which make_game reads as a finished stage.
 string[] modes = ["ttpf", "audio", "xma", "models", "textures"];
-if (args.Length < 3) { Usage(); return 2; }
-if (!modes.Contains(args[0])) { Console.Error.WriteLine($"unknown mode '{args[0]}'"); Usage(); return 2; }
-string mode = args[0], src = Path.GetFullPath(args[1]), outRoot = Path.GetFullPath(args[2]);
+if (argv.Count < 3) { Usage(); return 2; }
+if (!modes.Contains(argv[0])) { Console.Error.WriteLine($"unknown mode '{argv[0]}'"); Usage(); return 2; }
+string mode = argv[0], src = Path.GetFullPath(argv[1]), outRoot = Path.GetFullPath(argv[2]);
 // --start/--length scan one window of the file instead of the whole archive. A window is a raw slice of an
 // archive (`levels.rpf` cut at an offset), so it need not carry the file's header and it is not an
 // ArchiveDocument: models and textures then read every resource from its own compression blocks
 // (tools/rpf9dump/Segments.cs). A window is how a multi-GiB archive is exported a piece at a time.
 long scanStart = 0; long? scanLength = null;
-for (int i = 3; i < args.Length; i += 2)
+for (int i = 3; i < argv.Count; i += 2)
 {
-    if (i + 1 >= args.Length || !long.TryParse(args[i + 1], NumberStyles.None, CultureInfo.InvariantCulture, out long bytes) || bytes < 0)
+    if (i + 1 >= argv.Count || !long.TryParse(argv[i + 1], NumberStyles.None, CultureInfo.InvariantCulture, out long bytes) || bytes < 0)
     {
-        Console.WriteLine($"{args[i]} needs a non-negative byte count.");
+        Console.WriteLine($"{argv[i]} needs a non-negative byte count.");
         return 2;
     }
-    if (args[i] == "--start") scanStart = bytes;
-    else if (args[i] == "--length") scanLength = bytes;
-    else { Console.WriteLine($"Unknown option {args[i]}."); return 2; }
+    if (argv[i] == "--start") scanStart = bytes;
+    else if (argv[i] == "--length") scanLength = bytes;
+    else { Console.WriteLine($"Unknown option {argv[i]}."); return 2; }
 }
 bool window = scanStart != 0 || scanLength is not null;
 if (window && mode is not ("models" or "textures"))
@@ -36,16 +54,22 @@ if (window && mode is not ("models" or "textures"))
 // A missing source, or a directory passed as one, is a usage error. Check it before the output folder is
 // created: FileInfo.Length would otherwise throw after <out>/<name> already exists.
 if (!File.Exists(src)) { Console.Error.WriteLine($"source is not a file: {src}"); return 2; }
+long length = new FileInfo(src).Length;
+if (window && scanStart > length)
+{
+    Console.Error.WriteLine($"--start ({scanStart}) exceeds source length ({length}).");
+    return 2;
+}
+long? effectiveScanLength = scanLength is long reqSpan ? Math.Min(reqSpan, length - scanStart) : null;
 var json = new JsonSerializerOptions { WriteIndented = true };
 var sw = Stopwatch.StartNew();
 string baseName = Path.GetFileNameWithoutExtension(src);
 string outDir = Path.Combine(outRoot, baseName); Directory.CreateDirectory(outDir);
-long length = new FileInfo(src).Length;
 int ok = 0, fail = 0, skip = 0, writeFail = 0;
-// Every mode below works on all cores. Core's readers open their own read handle per call, entry and file names
-// come from offsets and indexes, and results are put back in source order, so outputs match a one-thread run.
-// ponytail: every core, no flag; add --jobs if someone needs the machine during a build.
-var par = new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount };
+// Every mode below works on all cores by default. Core's readers open their own read handle per call, entry and
+// file names come from offsets and indexes, and results are put back in source order, so outputs match a
+// one-thread run. --jobs caps that when make_game.py overlaps this with another CPU-heavy stage.
+var par = new ParallelOptions { MaxDegreeOfParallelism = jobs };
 
 if (mode == "ttpf")
 {
@@ -76,7 +100,8 @@ if (mode == "ttpf")
             int n = Interlocked.Increment(ref done);
             if (n % 5000 == 0) Console.WriteLine($"  {n}/{info.Textures.Count}");
         }
-        rows[i] = new { t.Index, t.Name, t.Id, AssetKey = t.AssetKey.ToString("X16"), t.Width, t.Height, t.DxgiFormat, t.Mips, t.SourceMips, t.BaseMipLevel, Limitation = limitation, File = file };
+        rows[i] = new { t.Index, t.Name, t.Id, AssetKey = t.AssetKey.ToString("X16"), t.Width, t.Height,
+            t.Depth, t.Dimension, t.DxgiFormat, t.Mips, t.SourceMips, t.BaseMipLevel, Limitation = limitation, File = file };
     });
     // The manifest is the build's completion marker. Keep successful DDS for retry, but withdraw a stale marker.
     string manifest = Path.Combine(outDir, "manifest.json");
@@ -145,14 +170,14 @@ else if (mode is "models" or "textures")
     if (window)
     {
         // A sub-range is never cached: the index cache is keyed by the file, not by the window inside it.
-        var cands = Scan(src, scanStart, scanLength);
+        var cands = Scan(src, scanStart, effectiveScanLength);
         candidates = cands.Count;
         list = Recover(src, length, cands);
         Console.WriteLine("  a window is scanned again on every run: no index cache is written");
     }
     else
     {
-        byte[] header; using (var f = File.OpenRead(src)) { header = new byte[64]; f.ReadExactly(header); }
+        byte[] header; using (var f = File.OpenRead(src)) { header = new byte[(int)Math.Min(64, length)]; f.ReadExactly(header); }
         var cached = RecoveryIndexCache.Load(mode, src, length, header);
         // A partial index (rpf9-explorer stopped or still indexing) would export only part of the archive: scan again.
         if (cached != null && !ScanCounts.IsFullScan(cached)) { Console.WriteLine($"  cached {mode} index is not marked as a full scan ({cached.Entries.Count:N0} entries), rescanning"); cached = null; }
@@ -230,7 +255,7 @@ else if (mode is "models" or "textures")
     {
         // Which slice of the file this manifest covers, so a later run can name the same window.
         writer.WriteNumber("Start", scanStart);
-        writer.WriteNumber("Length", scanLength ?? (length - scanStart));
+        writer.WriteNumber("Length", effectiveScanLength ?? (length - scanStart));
     }
     writer.WriteEndObject();
     writer.WriteStartArray("Items");
@@ -384,7 +409,7 @@ static void WithdrawMarker(string path)
 
 static void Usage()
 {
-    Console.WriteLine("usage: rpf9dump <mode> <source> <outdir> [--start BYTES] [--length BYTES]");
+    Console.WriteLine("usage: rpf9dump <mode> <source> <outdir> [--jobs N] [--start BYTES] [--length BYTES]");
     Console.WriteLine("  ttpf      texture dictionaries and world texture pools as DDS");
     Console.WriteLine("  models    drawable models as OBJ, with their embedded textures");
     Console.WriteLine("  textures  texture dictionaries as DDS");

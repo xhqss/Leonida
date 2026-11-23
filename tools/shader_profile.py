@@ -7,6 +7,7 @@ Counts each mnemonic (number of shaders using it and total occurrences), groups 
 classifies instructions (ALU vs memory vs branch), computes operation ratios, and summarises register pressure
 per stage (VGPR/SGPR counts from `profile_shader`; `--per-shader` also lists every shader).
 In the JSON report, ratios.alu_to_memory is null when the corpus has ALU instructions and no memory instructions.
+`categories_by_stage` uses the carve index first, then a recognized stage prefix in the filename, otherwise `?`.
 
 `undecoded` counts the llvm-mc 'invalid instruction encoding' warnings shader_disasm.py copies into each .s file.
 by_word lists the four bytes at each warning position, their total occurrences and how many shaders contain them.
@@ -27,6 +28,7 @@ FAMILIES = [("s_buffer_", "smem"), ("s_load", "smem"), ("s_", "scalar"), ("v_", 
             ("buffer_", "buffer"), ("tbuffer_", "buffer"), ("image_", "image"), ("global_", "global"),
             ("flat_", "flat"), ("scratch_", "scratch"), ("exp", "export")]
 
+STAGE_PREFIX = re.compile(r"(ps|vs|gs|hs|ds|cs|ms|as|lib)_", re.IGNORECASE | re.ASCII)
 VGPR_RANGE = re.compile(r"\bv\[(\d+):(\d+)\]")
 VGPR_SINGLE = re.compile(r"\bv(\d+)\b")
 SGPR_RANGE = re.compile(r"\bs\[(\d+):(\d+)\]")
@@ -273,7 +275,7 @@ def stage_map(disasm_dir) -> dict:
     so the name is only a fallback for shaders the index doesn't list. Empty when there is no readable index."""
     path = carve_index_path(disasm_dir)
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             entries = json.load(f)
         return {os.path.splitext(e["file"])[0]: e["stage"] for e in entries
                 if isinstance(e, dict) and isinstance(e.get("file"), str) and isinstance(e.get("stage"), str)}
@@ -327,7 +329,7 @@ def main():
     occ, users = Counter(), Counter()
     word_occ, word_users = Counter(), Counter()    # warned-at word -> warnings, shaders
     unresolved = 0
-    per_stage = defaultdict(Counter)
+    categories_by_stage = defaultdict(Counter)
     reg_stage = defaultdict(list)    # stage -> [(vgpr_count, sgpr_count)]
     shaders = []
     stages = stage_map(a.src)
@@ -335,7 +337,10 @@ def main():
     for entry in shader_files:
         name = entry.name
         n += 1
-        stage = stages.get(name[:-2]) or (name[:2].lower() if name[2:3] == "_" else "?")
+        stage = stages.get(name[:-2])
+        if not stage:
+            prefix = STAGE_PREFIX.match(name)
+            stage = prefix[1].lower() if prefix else "?"
         try:
             with open(entry.path, encoding="utf-8", errors="replace") as f:
                 text = f.read()
@@ -350,7 +355,7 @@ def main():
                             "vgpr_count": regs["vgpr_count"], "sgpr_count": regs["sgpr_count"]})
         occ.update(prof["mnemonics"])
         users.update(prof["mnemonics"].keys())
-        per_stage[stage].update(prof["mnemonics"].keys())
+        categories_by_stage[stage].update(prof["categories"])
         words, bad = warning_words(text)
         word_occ.update(words)
         word_users.update(set(words))
@@ -367,6 +372,7 @@ def main():
     out = {"shaders": n, "mnemonics": len(occ),
            "families": {k: {"mnemonics": v[0], "occurrences": v[1]} for k, v in sorted(fam.items())},
            "categories": cats,
+           "categories_by_stage": dict(sorted(categories_by_stage.items())),
            "ratios": ratios,
            "by_mnemonic": [{"m": m, "shaders": shader_count, "count": occ[m]}
                            for m, shader_count in ranked_users],

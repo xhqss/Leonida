@@ -231,6 +231,21 @@ class TestCommandLine(unittest.TestCase):
             with open(path, "rb") as fh:
                 self.assertEqual(fh.read(), archive(fragment()))
 
+    def test_output_in_a_missing_folder_is_refused_before_the_scan(self):
+        # a typo in the folder used to raise at write time, after a scan that can run for hours
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "a.rpf")
+            with open(path, "wb") as fh:
+                fh.write(archive(fragment(drawables=3)))
+            for flag in ("--json", "--records"):
+                with self.subTest(flag=flag):
+                    out = os.path.join(tmp, "no-such-folder", "out")
+                    result = self.run_tool(path, flag, out)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("no-such-folder", result.stderr)
+                    self.assertNotIn("a.rpf:", result.stdout)   # the scan did not start
+                    self.assertFalse(os.path.exists(os.path.dirname(out)))
+
 
 if __name__ == "__main__":
     unittest.main()

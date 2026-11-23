@@ -229,6 +229,28 @@ With 2D compact layouts plus 2D arrays, cubemaps, and 3D volumes enabled in
 has landed in `breadbbbb/rpf9-explorer` PRs #5, #6, and #7 (compact layouts, multi-slice shapes,
 and BCPack BC1/BC3/BC4/BC5) and is carried by the `e293917` submodule pin.
 
+## Preview a DDS plane
+
+The header lists the mip count, array size, volume depth and cube faces available
+to the PNG decoder. A cube array's `array_size` counts whole cubes.
+
+```powershell
+python -I tools/dds_png.py cubemap.dds --info
+python -I tools/dds_png.py cubemap.dds face.png --layer 1 --face nz --mip 2
+python -I tools/dds_png.py array.dds layer.png --layer 3 --max-size 256
+python -I tools/dds_png.py volume.dds slice.png --mip 1 --z 2
+```
+
+Indices start at zero. Faces are `px`, `nx`, `py`, `ny`, `pz` and `nz`
+(positive and negative X, Y and Z). A legacy cube can omit faces. The default
+preview uses mip 0 of the first layer, first stored face or first volume slice.
+For volumes, `--z` is relative to the selected mip, whose depth halves at each
+level down to one. `--max-size` downsizes that plane after decoding. For a
+seekable file, the converter reads the header and the selected plane.
+
+For uncompressed data, a declared top-level row pitch applies to each layer
+or slice. Lower mips use tightly packed rows, as written by the project exporter.
+
 ## Reproduce
 
 ```powershell

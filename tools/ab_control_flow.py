@@ -11,12 +11,14 @@ What the comparison needs to mean anything, each learned from a run that looked 
   - Every pixel input has to be defined. The vertex shader made here writes all 32 locations; with the game's
     pass-through one, which writes location 0 only, a shader that uses another input as a buffer index reads
     from wherever the driver's leftover value points, differently in each form.
-  - A shader that exports no colour is compared by which pixels it keeps: the colour of those is undefined.
+  - Without an MRT0 export, compare only the mask of MRT0 pixels differing from the clear value.
   - Shaders with loops go to a software driver first (--harness with a Linux build under Mesa llvmpipe). One
     that never ends is killed after --timeout there; on a real GPU it resets the driver. Feed the ones that
     finish back with --names.
-The heap is zeros, so most images are a single colour: this shows the two forms take the same path to the same
-result, not that the result is right. Outcomes go to <out dir>/outcomes.tsv.
+The heap is zeros. Equal MRT0 readbacks can result from different execution paths. By default the harness binds only
+MRT0. The rows in <out dir>/outcomes.tsv distinguish clear-only matches and list unobserved colour targets.
+Pass --all-attachments to use vk_ps_sweep and compare each declared RGBA32F target separately.
+Usage: `python -I tools/ab_control_flow.py --help` lists the options.
 """
 import argparse
 import collections
@@ -42,6 +44,14 @@ HOSTED_FEATURES = {"bufferDeviceAddress", "runtimeDescriptorArray", "shaderInt64
 def is_backward_branch(disassembly):
     """Return whether the disassembly contains a branch to the backward half of the address space."""
     return any(int(target) >= 0x8000 for target in BACK.findall(disassembly))
+
+
+def valid_metadata(metadata):
+    """Whether one index entry is an object whose bindings and features, when present, are lists of scalars."""
+    return isinstance(metadata, dict) and all(
+        isinstance(metadata.get(key, []), list)
+        and all(isinstance(v, (int, str)) for v in metadata.get(key, []))
+        for key in ("bindings", "features"))
 
 
 def supported_pixel_shaders(index):
@@ -189,13 +199,52 @@ def positive_int(text):
     return value
 
 
+def render_targets(forms, name, harness, vs, out, runs, timeout, observed, declared, all_attachments):
+    """Collect repeated readbacks by attachment, retaining only the mask for undeclared MRT0."""
+    count = observed[-1] + 1
+    size = count * READBACK_BYTES
+    images = {target: [[], []] for target in observed}
+    for form, (tag, directory) in enumerate(forms):
+        spirv = os.path.join(directory, name + ".spv")
+        raw = os.path.join(out, f"{tag}.raw")
+        args = ["64", "64", str(count)] if all_attachments else ["8", "92", "c00000", "14500000", "0"]
+        for _ in range(runs):
+            if os.path.isfile(raw):
+                os.remove(raw)
+            data = None
+            failure = None
+            try:
+                h = subprocess.run([harness, vs, spirv, raw, *args], capture_output=True, text=True,
+                                   timeout=timeout)
+                if all_attachments and h.returncode == 3:
+                    failure = "timeout"
+                if h.returncode == 0 and os.path.isfile(raw):
+                    with open(raw, "rb") as readback:
+                        packed = readback.read(size + 1)
+                    if len(packed) == size:
+                        data = packed
+            except subprocess.TimeoutExpired:
+                failure = "timeout"
+            for target in observed:
+                image = failure
+                if data is not None:
+                    image = data[target * READBACK_BYTES:(target + 1) * READBACK_BYTES]
+                    if target not in declared:
+                        image = bytes(image[i:i + 16] != CLEAR for i in range(0, len(image), 16))
+                images[target][form].append(image)
+            if failure == "timeout":
+                break
+    return images
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("repo")
     ap.add_argument("shaders")
     ap.add_argument("out")
     ap.add_argument("--count", type=positive_int, default=150)
-    ap.add_argument("--harness", help="path to vk_texture_test (default: the Windows build in the repo)")
+    ap.add_argument("--all-attachments", action="store_true", help="compare each colour export using vk_ps_sweep")
+    ap.add_argument("--harness", help="override the executable for the selected harness")
     ap.add_argument("--loops", choices=("none", "only"), default="none",
                     help="'only': shaders with backward branches. Use a software driver for those: one that never "
                          "terminates is killed after --timeout seconds, where a real GPU would reset its driver")
@@ -217,8 +266,9 @@ def main(argv=None):
         ap.error(f"cannot read {index_path}: {getattr(e, 'strerror', None) or e}")
     if a.names and not os.path.isfile(a.names):
         ap.error(f"--names {a.names} is not a file")
-    if not isinstance(index, dict) or any(not isinstance(item, dict) for item in index.values()):
-        ap.error(f"{index_path}: expected a JSON object mapping shader names to metadata")
+    if not isinstance(index, dict) or any(not valid_metadata(item) for item in index.values()):
+        ap.error(f"{index_path}: expected a JSON object mapping shader names to metadata "
+                 "(an object whose bindings and features, when present, are lists of numbers or strings)")
     names = supported_pixel_shaders(index)
     print(f"{len(names)} pixel shaders use only the bindings and features the harness provides")
     try:
@@ -234,16 +284,35 @@ def main(argv=None):
         print("ERROR: no shader candidates for the control-flow comparison", file=sys.stderr)
         return 1
     new = os.path.join(a.out, "new")
+    out_existed = os.path.isdir(a.out)
+    new_existed = os.path.isdir(new)
     try:
+        if out_existed:
+            os.listdir(a.out)  # an unreadable output folder is reported here, before anything is written
         os.makedirs(new, exist_ok=True)
     except OSError as e:
         ap.error(f"cannot create {new}: {e.strerror or e}")
     # The texture test's harness: it binds a heap, a descriptor table, a fallback texture and a sampler.
-    exe = "vk_texture_test.exe" if os.name == "nt" else "vk_texture_test"
+    exe = "vk_ps_sweep" if a.all_attachments else "vk_texture_test"
+    if os.name == "nt":
+        exe += ".exe"
     harness = a.harness or os.path.join(a.repo, "runtime", "build", exe)
     try:
         vs = test_vertex_shader(a.out)
     except (OSError, subprocess.CalledProcessError) as e:
+        # Remove only what this run created: its own files and the folders it made, and only while they are
+        # empty, so output another process wrote beside them survives.
+        for path in (os.path.join(a.out, "test_vs.spvasm"), os.path.join(a.out, "test_vs.spv")):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        for path, existed in ((new, new_existed), (a.out, out_existed)):
+            if not existed:
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    pass
         ap.error(f"cannot build the test vertex shader (needs spirv-as and spirv-val on PATH): {e}")
 
     print(f"{len(picked)} branchy pixel shaders picked ({'with loops' if a.loops == 'only' else 'loop-free'}); "
@@ -269,44 +338,52 @@ def main(argv=None):
         if "1 pass spirv-val" not in r1.stdout or "1 pass spirv-val" not in r2.stdout:
             note(name, "a translation is invalid")
             continue
-        # A shader that exports no colour (depth-only passes with an alpha test) leaves the colour of the pixels
-        # it keeps undefined: garbage on a GPU, different every run. What it does decide is which pixels survive,
-        # so compare that: a killed pixel still holds the clear colour.
-        colour = "%out_mrt0" in open(os.path.join(new, name + ".spvasm"), encoding="utf-8").read()
-        res["exports no colour: compared by surviving pixels"] += not colour
-        images = []
-        for tag, spirv in (("old", os.path.join(loopdir, name + ".spv")),
-                           ("new", os.path.join(new, name + ".spv"))):
-            raw = os.path.join(a.out, f"{tag}.raw")
-            got = []
-            for _ in range(a.runs):
-                if os.path.isfile(raw):
-                    os.remove(raw)
-                try:
-                    h = subprocess.run([harness, vs, spirv, raw, "8", "92", "c00000", "14500000", "0"],
-                                       capture_output=True, text=True, timeout=a.timeout)
-                    img = None
-                    if h.returncode == 0 and os.path.isfile(raw):
-                        with open(raw, "rb") as readback:
-                            data = readback.read(READBACK_BYTES + 1)
-                        if len(data) == READBACK_BYTES:
-                            img = data
-                    if img is not None and not colour:
-                        img = bytes(img[i:i + 16] != CLEAR for i in range(0, len(img), 16))
-                    got.append(img)
-                except subprocess.TimeoutExpired:
-                    got.append("timeout")
-                    break
-            images.append(got)
-        outcome = classify_result(True, images[0], images[1])
-        note(name, outcome)
-        if outcome in ("DIFFERENT", "ONLY ONE FORM TERMINATES"):
+        targets = []
+        for directory in (loopdir, new):
+            with open(os.path.join(directory, name + ".spvasm"), encoding="utf-8") as assembly:
+                targets.append(set(re.findall(r"%out_mrt(\d+)\b", assembly.read())))
+        if targets[0] != targets[1]:
+            note(name, "DIFFERENT colour target declarations")
             differ.append(name)
-        elif outcome == "identical":
-            image = images[1][0]
-            step = 16 if colour else 1
-            res["identical and not all one colour"] += len(
-                set(image[i:i + step] for i in range(0, len(image), step))) > 1
+            continue
+        declared = sorted(map(int, targets[0]))
+        observed = sorted({0, *declared}) if a.all_attachments else [0]
+        if a.all_attachments:
+            cached = index.get(name, {}).get("outputs")
+            if cached is not None and (not isinstance(cached, list) or
+                                       any(type(t) is not int for t in cached) or sorted(cached) != declared):
+                note(name, "cached outputs disagree with translated colour targets")
+                continue
+            if observed[-1] > 7:
+                note(name, "colour target outside MRT0..7")
+                continue
+        images = render_targets((("old", loopdir), ("new", new)), name, harness, vs, a.out, a.runs,
+                                a.timeout, observed, declared, a.all_attachments)
+        labels = []
+        for target, (old_runs, new_runs) in images.items():
+            outcome = classify_result(True, old_runs, new_runs)
+            if outcome in ("DIFFERENT", "ONLY ONE FORM TERMINATES") and name not in differ:
+                differ.append(name)
+            if outcome == "identical":
+                image = new_runs[0]
+                if target in declared:
+                    detail = "clear-only" if image == CLEAR * (READBACK_BYTES // len(CLEAR)) else "non-clear"
+                    outcome = f"identical MRT{target}: {detail}"
+                else:
+                    detail = "nonempty" if any(image) else "empty"
+                    outcome = f"identical MRT0 clear-difference mask: {detail}"
+                if target == 0:
+                    step = len(CLEAR) if target in declared else 1
+                    res["identical and not all one colour"] += len(
+                        set(image[i:i + step] for i in range(0, len(image), step))) > 1
+            elif a.all_attachments:
+                outcome = f"MRT{target}: {outcome}"
+            labels.append(outcome)
+        outcome = "; ".join(labels)
+        unbound = sorted(set(declared) - set(observed))
+        if unbound:
+            outcome += "; unobserved " + ", ".join(f"MRT{n}" for n in unbound)
+        note(name, outcome)
     print(dict(res))
     for name in differ[:8]:
         print("   differs:", name[:70])

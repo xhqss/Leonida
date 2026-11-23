@@ -529,6 +529,24 @@ class CarveAndExtraCLITest(unittest.TestCase):
         self.assertEqual(d.get(f"{hashdict.joaat('common_archive_asset'):08x}"), "common_archive_asset")
         self.assertNotIn(f"{hashdict.joaat('pso_metadata_token'):08x}", d)
 
+    def test_archive_index_saved_with_a_utf8_bom_is_read(self):
+        # Windows PowerShell 5.1 (Set-Content, Out-File) and old Notepad write JSON with a UTF-8 BOM; the
+        # names in that index must still be harvested, not end the build with "Expecting value".
+        index = os.path.join(self.carve_dir, "common", "index.json")
+        with open(index, "rb") as f:
+            raw = f.read()
+        with open(index, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + raw)
+
+        p = self.run_tool(self.carve_dir, "--out", self.out_json)
+
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertNotIn("Expecting value", p.stderr)
+        with open(self.out_json, encoding="utf-8") as f:
+            d = json.load(f)
+        self.assertEqual(d.get(f"{hashdict.joaat('common_archive_asset'):08x}"), "common_archive_asset")
+
     def test_build_is_reproducible_with_collisions(self):
         with open(self.extra_file, "wb") as f:
             f.write(b"widget Widget str_85_83667 str_63346_847129")

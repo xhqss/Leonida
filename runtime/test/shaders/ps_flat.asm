@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Flat inputs: attr1.x is read only with v_interp_mov (the provoking vertex's value), so its location is declared
 ; Flat. vs_ids gives the three vertices 0x101, 0x102 and 0x103 there; every pixel must see vertex 0's, 0x101, and
 ; integer maths on it must work (0x101 + 1). Interpolated, those bits come back as something else. attr0 next to

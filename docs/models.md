@@ -801,6 +801,20 @@ head (8,983 v) and biker jacket (9,818 v) produce one skin with 596 ped joints (
 jacket's `GM_U01_*` helpers); every weight sums to 255 and the rest-pose reconstruction error is
 6e-8 m. `python -I tests/test_skinned_glb.py` runs 19 synthetic tests and needs no game files.
 
+`tools/glb_inspect.py` reads such a GLB back without a library, so an export can be checked
+before it is opened in a viewer:
+
+```
+python -I tools/glb_inspect.py out.glb [--json report.json]
+```
+
+It prints the chunk layout and padding, the `counts` of scenes, nodes, meshes, materials, images,
+skins and animations, each mesh's primitive, vertex and triangle counts, each material's
+`baseColorTexture`, each skin's joint count, each animation's channels and duration, and the
+POSITION bounding box (marked `partial` when a POSITION accessor has no `min`/`max`). It reports
+what the JSON chunk says — a field the exporter dropped reads `(missing)` — and never infers
+geometry from the BIN chunk. Standard library only; no game files.
+
 ## What to do next
 
 1. **Done:** [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged upstream.
@@ -815,3 +829,45 @@ jacket's `GM_U01_*` helpers); every weight sums to 255 and the rest-pose reconst
    `levels.rpf` has the same 343,327 rows in a full export (50,731 fragments, 2,509,947,536
    triangles).
 4. Keep the README and issue #29 in sync with the new counts.
+
+### Predict model offsets for placements
+
+Run `python -I tools/world_drawable_lookup.py entities.jsonl archetypes.json names.json`
+with the placement rows from `world_index.py --entities-out`, the definitions from
+`world_archetypes.py`, and a bounded `rpf9_names.py --types dr,ft` report. The command
+prints local scratch JSON. Supply `--manifest path/to/models/manifest.json` for each
+existing export whose listed identities should be excluded.
+
+The lookup requires agreement between the placement archetype, the definition's name and
+assetName, the resource stem's joaat and its 64-bit placement key. It considers type 1
+fragments and type 2 drawables at page offset +16. Multiple offsets for an identity in
+the indexed window are marked ambiguous. Even a single hit is a prediction: a stream
+can mention another model. Export a window around the predicted offset with
+`rpf9dump models <archive> <outdir> --start BYTES --length BYTES`, compare the manifest offset and
+model identity and run `world_build.py --placements` with the exported geometry.
+
+Save the lookup JSON and run
+`python -I tools/world_drawable_verify.py lookup.json first/models/manifest.json second/models/manifest.json`
+to verify single-offset predictions. Supply completed normal model manifests from the
+same source archive. The verifier reads cached JSON only. It uses the world builder's
+name hashes and counts each identity and its placements once. A matching offset and both
+hashes confirm an observation, including dictionary children sharing an offset. The local
+report counts repeat exact observations and lists other offsets for the same identity.
+Without an exact match, a different name at the offset takes precedence over a matching
+identity elsewhere. The coverage flag independently records whether the predicted offset
+falls in a supplied scan (start inclusive, end exclusive). A full scan covers all offsets.
+A covered prediction with no named evidence remains missing. Geometry loadability is
+checked separately by running the normal world builder on confirmed placement rows.
+
+Add `--window-bytes BYTES` to recommend one scan in the name index's archive.
+The optional `export_window` field gives the decimal `start` and `length` for
+`rpf9dump models`. It maximizes the sum of unmatched placement rows with a
+single predicted offset in that index. Each identity contributes its placement
+count once. Ambiguous identities contribute zero. For a tie it takes the earliest
+last offset, then trims the interval to its first and last included bytes.
+An empty selection yields JSON null. Run the lookup separately for each archive.
+
+The budget bounds the half-open range of candidate **starts**. The exporter can
+inspect prefix bytes and read model segments beyond the range. The report
+predicts coverage. Confirm identities and offsets in the exported manifest and
+check the resulting placement count with `world_build.py`.

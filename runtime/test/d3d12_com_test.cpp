@@ -343,6 +343,37 @@ int main(int argc, char** argv) {
         EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
         list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 2.0f, 0, 0, nullptr);
         EXPECT(list->Close() == E_INVALIDARG);
+
+        // State-setting calls on a closed direct list or bundle are ignored and do not mutate recorded state.
+        EXPECT(SUCCEEDED(allocator->Reset()));
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        list->OMSetStencilRef(5);
+        EXPECT(list->Close() == S_OK);
+        EXPECT(rt::d3d12::front_back_stencil_ref(list8.p, front, back) && front == 5 && back == 5);
+        const FLOAT post_close_factor[4] = {0.1f, 0.2f, 0.3f, 0.4f};
+        list->OMSetStencilRef(99);
+        list->OMSetBlendFactor(post_close_factor);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list->IASetIndexBuffer(nullptr);
+        list->SetPipelineState(nullptr);
+        list->ClearState(nullptr);
+        list->ExecuteBundle(bundle.p);
+        EXPECT(rt::d3d12::front_back_stencil_ref(list8.p, front, back) && front == 5 && back == 5);
+        EXPECT(list->Close() == E_FAIL);
+
+        // Post-close state calls on a closed bundle do not append calls or invalidate the bundle.
+        bundle->OMSetStencilRef(99);
+        bundle->OMSetBlendFactor(post_close_factor);
+        bundle->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINELIST);
+        bundle->IASetIndexBuffer(nullptr);
+        bundle->SetPipelineState(nullptr);
+        bundle->ClearState(nullptr);
+        bundle->ExecuteBundle(untouched_bundle.p);
+        EXPECT(SUCCEEDED(allocator->Reset()));
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        list->ExecuteBundle(bundle.p);
+        EXPECT(rt::d3d12::front_back_stencil_ref(list8.p, front, back) && front == 7 && back == 9);
+        EXPECT(list->Close() == S_OK);
     }
 
     EXPECT(d.run([&](VkCommandBuffer cb) {

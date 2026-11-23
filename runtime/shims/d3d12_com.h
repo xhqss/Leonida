@@ -169,6 +169,10 @@ struct VulkanDeviceInfo {
     // VkAccelerationStructureKHR; needs buffer_device_address and the GPU address arena. The standalone device sets it
     // unless LEONIDA_RT_AS=khr (docs/d3d12_vulkan.md 4.8); with it set, ray_tracing is not enabled.
     bool xdxr_acceleration_structures = false;
+    // VK_EXT_mesh_shader with its meshShader feature is enabled on `device` (taskShader is not needed: the game's
+    // shaders have no amplification stage). Mesh-shader PSOs and DispatchMesh work, and CheckFeatureSupport reports
+    // D3D12_MESH_SHADER_TIER_1; without it mesh PSOs are refused and the tier is NOT_SUPPORTED.
+    bool mesh_shader = false;
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
@@ -191,7 +195,14 @@ HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** o
 
 // The same, on a Vulkan instance and device of its own (destroyed with the D3D12 device). Picks the first discrete
 // GPU with the features above. LEONIDA_VK_VALIDATION=1 enables VK_LAYER_KHRONOS_validation.
-HRESULT create_vulkan_device_standalone(REFIID riid, void** out);
+//
+// The queue test settings (LEONIDA_VK_MAX_QUEUES_PER_FAMILY, LEONIDA_VK_GRAPHICS_FAMILY_ONLY; docs/testing.md) give
+// the device fewer Vulkan queues than the GPU has, so the tests run the path where D3D12 queues share one. Only the
+// tests apply them: the game's device (d3d12_xs, LEONIDA_D3D12=vulkan) passes `ignore`, so a variable left set does
+// not serialize the game's queues; it says once that it ignores them.
+enum class QueueTestSettings { apply, ignore };
+HRESULT create_vulkan_device_standalone(REFIID riid, void** out,
+                                        QueueTestSettings queue_test_settings = QueueTestSettings::apply);
 
 // Tells a device from create_vulkan_device* that `outer` (the Xbox-ABI proxy that owns it) is what its children's
 // GetDevice must return. No reference is taken: the outer object owns the device. `outer` may be the proxy's
@@ -354,6 +365,7 @@ struct RootArgumentLayout {
         std::uint32_t compute_offset = rt::rootsig::kNoSgpr;  // compute: first user SGPR
     };
     std::vector<Parameter> parameters;
+    std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
     bool graphics_ok = true;
     bool compute_ok = true;
 };
@@ -365,6 +377,16 @@ std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
 // What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
+
+// Unwraps an Xbox-ABI heap proxy if needed and inspects one of this module's descriptor heaps; returns its owning
+// device identity pointer, or nullptr when `heap` is null or belongs to another implementation.
+IUnknown* descriptor_heap_info(ID3D12DescriptorHeap* heap, D3D12_DESCRIPTOR_HEAP_DESC& desc,
+                               D3D12_GPU_VIRTUAL_ADDRESS& gpu_base);
+
+// Reads the shader-visible descriptor heap GPU base addresses currently bound on `list` (0 when unbound).
+// Returns false when `list` is not one of this module's command lists.
+bool bound_descriptor_heap_bases(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS& cbv_srv_uav,
+                                 D3D12_GPU_VIRTUAL_ADDRESS& sampler);
 
 // The size of every descriptor slot (GetDescriptorHandleIncrementSize), for handle ranges.
 inline constexpr UINT descriptor_size = 32;

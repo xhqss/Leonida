@@ -53,11 +53,16 @@ class Int32ToFloat64(unittest.TestCase):
                 pair, = re.findall(rf"(%\w+) = OpBitcast %v2uint_d {value}\b", text)
                 for i in range(2):
                     word, = re.findall(rf"(%\w+) = OpCompositeExtract %uint {pair} {i}\b", text)
-                    selected, = re.findall(rf"(%\w+) = OpSelect %uint %\w+ {word} %\w+", text)
+                    sel = re.findall(rf"(%\w+) = OpSelect %uint %\w+ {word} %\w+", text)
+                    selected, = sel or [word]
                     pointer, = re.findall(rf"OpStore (%\w+) {selected}\b", text)
                     self.assertIn(f"{pointer} = OpAccessChain %_ptr_Function_uint %vgpr %c{first + i}\n", text)
 
-    def test_vop3_scales_then_clamps_the_double(self):
+    def test_vop3_clamps_the_double_and_ignores_the_scaling(self):
+        # Measured on gfx1036 through tools/hw_oracle (wave32 and wave64 identical on every case,
+        # tools/f64_omod_probe.py): a binary64 destination ignores mul:2/mul:4/div:2 while
+        # denorm_mode_16_64 = 3, the MODE the translator assumes, and clamp still saturates.
+        # See docs/design.md, "32-bit integers to binary64".
         for suffix, opcode in (("i32", "OpConvertSToF"), ("u32", "OpConvertUToF")):
             with self.subTest(suffix=suffix):
                 text = translate_lines("ps_int32_to_f64_mods", [
@@ -66,6 +71,13 @@ class Int32ToFloat64(unittest.TestCase):
                     "exp mrt0 v4, v5, v4, v5 done vm", "s_endpgm",
                 ])
                 value, = re.findall(rf"(%\w+) = {opcode} %double ", text)
-                scaled, = re.findall(rf"(%\w+) = OpFMul %double {value} ", text)
-                clamped, = re.findall(rf"(%\w+) = OpExtInst %double %glsl FClamp {scaled} ", text)
+                self.assertNotIn("OpFMul %double", text)
+                clamped, = re.findall(rf"(%\w+) = OpExtInst %double %glsl FClamp {value} ", text)
                 self.assertIn(f"OpBitcast %v2uint_d {clamped}\n", text)
+                omod_only = translate_lines("ps_int32_to_f64_omod", [
+                    "v_mov_b32 v4, 3",
+                    f"v_cvt_f64_{suffix}_e64 v[4:5], v4 mul:2",
+                    "exp mrt0 v4, v5, v4, v5 done vm", "s_endpgm",
+                ])
+                self.assertNotRegex(omod_only, r"OpFMul %double")
+                self.assertNotIn("FClamp", omod_only)

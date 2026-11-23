@@ -23,6 +23,7 @@ using RemapFn = uint32_t (*)(uint32_t);
 
 // Executable memory within +-2 GiB of `close_to`, so a rel32 branch from the image reaches it. nullptr if none is free.
 inline uint8_t* alloc_near(const void* close_to, std::size_t size) {
+    if (!close_to || size == 0) return nullptr;
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     const uintptr_t gran = si.dwAllocationGranularity;
@@ -30,8 +31,9 @@ inline uint8_t* alloc_near(const void* close_to, std::size_t size) {
     const uintptr_t span = 0x70000000;  // stay well inside the rel32 range from anywhere in a large image
     for (uintptr_t delta = gran; delta < span; delta += gran) {
         for (int side = 0; side < 2; ++side) {
-            const uintptr_t at = side ? center + delta : center - delta;
             if (side == 0 && center < delta) continue;
+            if (side == 1 && UINTPTR_MAX - center < delta) continue;
+            const uintptr_t at = side ? center + delta : center - delta;
             if (void* p = VirtualAlloc(reinterpret_cast<void*>(at), size, MEM_RESERVE | MEM_COMMIT,
                                        PAGE_EXECUTE_READWRITE))
                 return static_cast<uint8_t*>(p);
@@ -44,7 +46,7 @@ inline uint8_t* alloc_near(const void* close_to, std::size_t size) {
 // other argument register as the caller left it. Stack: the caller's call leaves rsp = 8 mod 16; four pushes and
 // 0x68 bytes make it 16-aligned for the call to `fn`, with its 32-byte shadow space and room for xmm0-3.
 inline uint8_t* make_remap_thunk(const void* close_to, int arg, RemapFn fn, const void* original) {
-    if (arg != 0 && arg != 1) return nullptr;
+    if (!close_to || !fn || !original || (arg != 0 && arg != 1)) return nullptr;
     uint8_t* t = alloc_near(close_to, 4096);
     if (!t) return nullptr;
     uint8_t* p = t;
@@ -69,7 +71,10 @@ inline uint8_t* make_remap_thunk(const void* close_to, int arg, RemapFn fn, cons
     put({0x48, 0xB8}); put64(reinterpret_cast<uint64_t>(original));   // mov rax, original
     put({0xFF, 0xE0});                                 // jmp rax
     DWORD old = 0;
-    VirtualProtect(t, 4096, PAGE_EXECUTE_READ, &old);
+    if (!VirtualProtect(t, 4096, PAGE_EXECUTE_READ, &old)) {
+        VirtualFree(t, 0, MEM_RELEASE);
+        return nullptr;
+    }
     FlushInstructionCache(GetCurrentProcess(), t, p - t);
     return t;
 }
@@ -81,6 +86,7 @@ using ResultFn = uint32_t (*)(uint32_t result, uint32_t arg0);
 // register arguments (a stack argument would be one slot off) and an integer result.
 // Stack: rsp = 8 mod 16 at entry; one push and 0x20 bytes of shadow space make it 16-aligned for both calls.
 inline uint8_t* make_result_thunk(const void* close_to, ResultFn fn, const void* original) {
+    if (!close_to || !fn || !original) return nullptr;
     uint8_t* t = alloc_near(close_to, 4096);
     if (!t) return nullptr;
     uint8_t* p = t;
@@ -97,7 +103,10 @@ inline uint8_t* make_result_thunk(const void* close_to, ResultFn fn, const void*
     put({0x48, 0x83, 0xC4, 0x20});                     // add rsp, 0x20
     put({0x59, 0xC3});                                 // pop rcx ; ret
     DWORD old = 0;
-    VirtualProtect(t, 4096, PAGE_EXECUTE_READ, &old);
+    if (!VirtualProtect(t, 4096, PAGE_EXECUTE_READ, &old)) {
+        VirtualFree(t, 0, MEM_RELEASE);
+        return nullptr;
+    }
     FlushInstructionCache(GetCurrentProcess(), t, p - t);
     return t;
 }
@@ -106,14 +115,17 @@ inline uint8_t* make_result_thunk(const void* close_to, ResultFn fn, const void*
 // Returns how many were rewritten.
 inline std::size_t redirect_direct_branches(uint8_t* begin, std::size_t size, const uint8_t* target,
                                             const uint8_t* thunk) {
+    if (!begin || !target || !thunk || size < 5) return 0;
     std::size_t n = 0;
     for (std::size_t i = 0; i + 5 <= size; ++i) {
         if (begin[i] != 0xE8 && begin[i] != 0xE9) continue;
         int32_t rel;
         std::memcpy(&rel, begin + i + 1, 4);
         const uint8_t* next = begin + i + 5;
-        if (next + rel != target) continue;
-        const intptr_t to = thunk - next;
+        const uintptr_t next_addr = reinterpret_cast<uintptr_t>(next);
+        const uintptr_t dst_addr = next_addr + static_cast<uintptr_t>(static_cast<intptr_t>(rel));
+        if (dst_addr != reinterpret_cast<uintptr_t>(target)) continue;
+        const intptr_t to = static_cast<intptr_t>(reinterpret_cast<uintptr_t>(thunk) - next_addr);
         if (to < INT32_MIN || to > INT32_MAX) continue;
         const int32_t rel2 = static_cast<int32_t>(to);
         std::memcpy(begin + i + 1, &rel2, 4);
@@ -136,27 +148,55 @@ struct HookResult {
 template <class MakeThunk>
 inline HookResult redirect_image_calls(uint8_t* base, uint32_t target_rva, MakeThunk make) {
     HookResult r;
+    if (!base) return r.error = "not a mapped PE image", r;
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return r.error = "not a mapped PE image", r;
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || target_rva >= nt->OptionalHeader.SizeOfImage)
-        return r.error = "the RVA is outside the image", r;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER)))
+        return r.error = "not a mapped PE image", r;
+    const uint64_t lfanew = static_cast<uint64_t>(dos->e_lfanew);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64) ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        return r.error = "not a mapped PE64 image", r;
+    const uint64_t image_size = nt->OptionalHeader.SizeOfImage;
+    const uint64_t sec_table_end =
+        lfanew + offsetof(IMAGE_NT_HEADERS64, OptionalHeader) +
+        static_cast<uint64_t>(nt->FileHeader.SizeOfOptionalHeader) +
+        static_cast<uint64_t>(nt->FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+    if (image_size == 0 || sec_table_end > image_size)
+        return r.error = "not a mapped PE64 image", r;
+    if (target_rva >= image_size) return r.error = "the RVA is outside the image", r;
     const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    // Match pe_loader.cpp's effective section span (VirtualSize, falling back to SizeOfRawData when 0), clamped to SizeOfImage.
+    auto exec_section_span = [&](const IMAGE_SECTION_HEADER& s, uint64_t& va, uint64_t& len) -> bool {
+        if (!(s.Characteristics & IMAGE_SCN_MEM_EXECUTE)) return false;
+        va = s.VirtualAddress;
+        const uint64_t raw = s.Misc.VirtualSize ? static_cast<uint64_t>(s.Misc.VirtualSize)
+                                                : static_cast<uint64_t>(s.SizeOfRawData);
+        if (raw == 0 || va >= image_size) return false;
+        len = raw > image_size - va ? image_size - va : raw;
+        return len > 0;
+    };
     bool in_code = false;
-    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i)
-        if ((sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) && target_rva >= sec[i].VirtualAddress &&
-            target_rva < sec[i].VirtualAddress + sec[i].Misc.VirtualSize)
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        uint64_t va = 0, len = 0;
+        if (exec_section_span(sec[i], va, len) && target_rva >= va && target_rva < va + len)
             in_code = true;
+    }
     if (!in_code) return r.error = "the RVA is not in an executable section", r;
     uint8_t* target = base + target_rva;
     uint8_t* thunk = make(target);
     if (!thunk) return r.error = "no memory within 2 GiB of the image for the thunk", r;
     for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
-        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
-        uint8_t* begin = base + sec[i].VirtualAddress;
-        const std::size_t size = sec[i].Misc.VirtualSize;
+        uint64_t va = 0, len = 0;
+        if (!exec_section_span(sec[i], va, len)) continue;
+        uint8_t* begin = base + va;
+        const std::size_t size = static_cast<std::size_t>(len);
         DWORD old = 0;
-        if (!VirtualProtect(begin, size, PAGE_EXECUTE_READWRITE, &old)) return r.error = "VirtualProtect failed", r;
+        if (!VirtualProtect(begin, size, PAGE_EXECUTE_READWRITE, &old)) {
+            if (r.redirected == 0) VirtualFree(thunk, 0, MEM_RELEASE);
+            return r.error = "VirtualProtect failed", r;
+        }
         r.redirected += redirect_direct_branches(begin, size, target, thunk);
         DWORD ignored = 0;
         VirtualProtect(begin, size, old, &ignored);
@@ -168,6 +208,7 @@ inline HookResult redirect_image_calls(uint8_t* base, uint32_t target_rva, MakeT
 
 // The argument-remapping hook (archetype lookup): argument `arg` of every direct call goes through `fn`.
 inline HookResult hook_image_calls(uint8_t* base, uint32_t target_rva, RemapFn fn, int arg) {
+    if (!fn) return HookResult{false, 0, "hook callback is null"};
     if (arg != 0 && arg != 1) return HookResult{false, 0, "only argument 0 or 1 can be remapped"};
     return redirect_image_calls(base, target_rva,
                                 [&](uint8_t* target) { return make_remap_thunk(target, arg, fn, target); });
@@ -175,6 +216,7 @@ inline HookResult hook_image_calls(uint8_t* base, uint32_t target_rva, RemapFn f
 
 // The result-override hook (view-mode getter): every direct call's result goes through `fn` with the first argument.
 inline HookResult hook_image_results(uint8_t* base, uint32_t target_rva, ResultFn fn) {
+    if (!fn) return HookResult{false, 0, "hook callback is null"};
     return redirect_image_calls(base, target_rva,
                                 [&](uint8_t* target) { return make_result_thunk(target, fn, target); });
 }

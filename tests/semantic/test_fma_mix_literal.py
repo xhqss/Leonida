@@ -115,6 +115,39 @@ class FmaMixLiteralTest(unittest.TestCase):
         stored = program(0x3C000001, words=words, text=text)
         self.assertEqual(self.run_ps(listing(printed), blob(stored)), [f2u(1.0)] * 4)
 
+    def test_llvm23_lit_form_of_an_f32_source(self):
+        # llvm-mc 23.1.5's own text and encoding for these bytes: the f32 source's literal 0x40400000 (3.0) prints
+        # in full as lit(...), and the printed encoding keeps only its low half (0). LLVM 21 prints the inline 0 and
+        # drops the literal word. fma(3.0, 2.0, 0) = 6.0. The pipeline library has 5,733 such operands (#4343).
+        text = "v_fma_mix_f32 v1, lit(0x40400000), v2, 0"
+        words = "01 00 20 cc ff 04 02 02"
+        printed = program(0x00000000, words=words, text=text)
+        stored = program(0x40400000, words=words, text=text)
+        self.assertEqual(self.run_ps(listing(printed), blob(stored)), [f2u(6.0)] * 4)
+        self.assertEqual(self.run_ps(listing(printed, invalid=True), blob(stored)), [f2u(6.0)] * 4)
+
+    def test_llvm23_lit_form_next_to_an_inline_constant(self):
+        # The case above, as llvm-mc 23.1.5 prints it: lit(0x3c000001), whose high half 1.0 is src2.
+        text = "v_fma_mix_f32 v1, v2, 1, lit(0x3c000001) op_sel:[0,0,1] op_sel_hi:[0,0,1]"
+        words = "01 60 20 cc 02 03 fd 03"
+        printed = program(0x00000001, words=words, text=text)
+        stored = program(0x3C000001, words=words, text=text)
+        self.assertEqual(self.run_ps(listing(printed), blob(stored)), [f2u(1.0)] * 4)
+
+    def test_lit_around_a_register_is_refused(self):
+        # A register inside lit() is no literal: refused, as before lit() was read (review on #6808).
+        program_ = program(0, words="01 00 20 cc ff 04 02 02", text="v_fma_mix_f32 v1, lit(v2), v2, 0")
+        with self.assertRaises(rdna2spirv.Unsupported):
+            self.run_ps(listing(program_), None)
+
+    def test_llvm23_lit_form_with_another_literal_is_refused(self):
+        # The text names 3.0, the blob holds a literal whose low half differs: refused, as for the cut form.
+        text = "v_fma_mix_f32 v1, lit(0x40400000), v2, 0"
+        words = "01 00 20 cc ff 04 02 02"
+        with self.assertRaises(rdna2spirv.Unsupported):
+            self.run_ps(listing(program(0x00000000, words=words, text=text)),
+                        blob(program(0x40400001, words=words, text=text)))
+
 
 if __name__ == "__main__":
     unittest.main()

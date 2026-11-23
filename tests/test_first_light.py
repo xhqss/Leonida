@@ -596,6 +596,15 @@ class ReadObjTests(unittest.TestCase):
             f.write(text)
         return path
 
+    def test_requires_finite_vertex_positions(self):
+        for coordinates in ("nan 0 0", "0 inf 0", "0 0 -inf", "0 1e999 0"):
+            with self.subTest(coordinates=coordinates):
+                path = self._write_obj(f"v {coordinates}\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+                with self.assertRaises(SystemExit) as caught:
+                    fl.read_obj(path)
+                self.assertIn(path, str(caught.exception))
+                self.assertIn("non-finite vertex coordinates", str(caught.exception))
+
     def test_requires_finite_texture_coordinates(self):
         def triangle(u, v):
             return self._write_obj(

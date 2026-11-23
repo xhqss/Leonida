@@ -44,6 +44,22 @@ def table(output):
 
 
 class CharacterTextureTests(unittest.TestCase):
+    def test_manifest_file_names_are_independent_of_the_export_host(self):
+        entries = [
+            {"File": r"C:\exports\models\cap.v2.mesh", "Materials": [{}]},
+            {"file": "models/shoes.mesh", "materials": [{}]},
+            {"File": r"models\unused.mesh", "Name": "named", "Materials": [{}]},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = write_model(td, {"Items": entries})
+            report_path = pathlib.Path(td) / "report.json"
+            result = run_tool(path, "--json", report_path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected = ["cap.v2", "shoes", "named"]
+            self.assertEqual([row[0] for row in table(result.stdout)], expected)
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual([m["name"] for m in report["models"]], expected)
+
     def test_head_material_reports_diffusetex_and_bumptex(self):
         with tempfile.TemporaryDirectory() as td:
             path = write_model(td, model([{

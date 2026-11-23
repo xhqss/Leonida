@@ -770,6 +770,48 @@ class GameDiscoveryTest(unittest.TestCase):
             self.assertIn(root, roots)
         self.assertEqual([r for r in roots if r.endswith(":\\")], [])
 
+    def test_volume_roots_add_the_users_mount_folders(self):
+        # udisks2 mounts a drive at /media/<user>/<label> (Ubuntu, Debian) or /run/media/<user>/<label> (Fedora,
+        # openSUSE): the per-user folder is a root, so a folder on that drive is in reach like D:\Games is.
+        with mock.patch("getpass.getuser", return_value="alice"):
+            roots = make_game.volume_roots()
+        self.assertEqual(roots[:len(make_game.VOLUME_ROOTS)], list(make_game.VOLUME_ROOTS))
+        self.assertIn(os.path.join("/media", "alice"), roots)
+        self.assertIn(os.path.join("/run/media", "alice"), roots)
+        with mock.patch.object(make_game.os, "name", "posix"), \
+             mock.patch.object(make_game, "known_folders", return_value=[]), \
+             mock.patch("getpass.getuser", return_value="alice"):
+            self.assertIn(os.path.join("/run/media", "alice"), make_game.discovery_roots(self.home))
+
+    def test_volume_roots_without_a_user_name(self):
+        # No USER/LOGNAME and no passwd entry (a bare container): getuser() raises; the shared roots still work.
+        for failure in (KeyError("getpwuid(): uid not found"), OSError("No username set in the environment")):
+            with self.subTest(failure=type(failure).__name__), mock.patch("getpass.getuser", side_effect=failure):
+                self.assertEqual(make_game.volume_roots(), list(make_game.VOLUME_ROOTS))
+        for name in ("", ".", "..", os.path.join("a", "b")):
+            with self.subTest(name=name), mock.patch("getpass.getuser", return_value=name):
+                self.assertEqual(make_game.volume_roots(), list(make_game.VOLUME_ROOTS))
+
+    def test_find_reaches_a_folder_on_a_udisks_drive(self):
+        # <media>/alice/USB DRIVE/GTA VI: three levels below <media>, two below the user's mount folder.
+        media = os.path.join(self.home, "media")
+        package = os.path.join(media, "alice", "USB DRIVE", "GTA VI")
+        self.write_probes(package)
+        elsewhere = os.path.join(self.home, "nohome")
+
+        def find(user_roots):
+            with mock.patch.object(make_game.os, "name", "posix"), \
+                 mock.patch.object(make_game, "VOLUME_ROOTS", (media,)), \
+                 mock.patch.object(make_game, "USER_MOUNT_ROOTS", user_roots), \
+                 mock.patch.object(make_game, "known_folders", return_value=[]), \
+                 mock.patch("getpass.getuser", return_value="alice"), \
+                 mock.patch("os.path.expanduser", return_value=elsewhere), \
+                 mock.patch.object(make_game, "versions", return_value=[self.version]):
+                return make_game.find_dumps()
+
+        self.assertEqual(find(()), [])   # what the shared root alone reaches: not the folder on the drive
+        self.assertEqual(find((media,)), [(package, self.version)])
+
     def test_windows_roots_are_the_drives_that_exist(self):
         with mock.patch.object(make_game.os, "name", "nt"), \
              mock.patch.object(make_game, "known_folders", return_value=[]), \

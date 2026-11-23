@@ -614,7 +614,9 @@ int main() {
                    replay(invalid, VK_NULL_HANDLE, resolve, vk) == ReplayResult::invalid_indirect_arguments;
         };
         CHECK(rejected({IndirectKind::draw, 12, 1, 1, 0, 0, 0}));
-        CHECK(rejected({IndirectKind::draw, 16, 1, 1, 2, 0, 0}));
+        CHECK(!CommandList{}.execute_indirect({IndirectKind::draw, 16, 1, 1, 2, 0, 0}));
+        CHECK(!CommandList{}.execute_indirect({IndirectKind::draw, 16, 1, 1, 0, 2, 2}));
+        CHECK(!CommandList{}.execute_indirect({IndirectKind::draw, 16, 1, 1, 0, 0, 4}));
         CHECK(rejected({IndirectKind::draw, 16, 2, 1, 112, 0, 0}));
         CHECK(rejected({IndirectKind::draw, 16, 1, 1, 4, 2, 16}));
         arguments.buffer_offset = UINT64_MAX - 3;

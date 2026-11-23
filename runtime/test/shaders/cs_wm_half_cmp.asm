@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Wave64 32-bit scalar compare on a zero low half / non-zero high half.
 ; Assemble (as scripts/run_gpu_tests.py / build.py do): llvm-mc -triple=amdgcn--amdpal -mcpu=gfx1013 -show-encoding (wave64 is inferred by the translator from exec_hi/_b64 EXEC use)
 ; Run: VKC_SUBGROUP_SIZE=64 vk_compute_test cs_wm_half_cmp.spv 1 dump

@@ -1,4 +1,5 @@
 """Fixed reference points for the synthetic guest's renderer and input trace (no GPU)."""
+import argparse
 import importlib.util
 import json
 from pathlib import Path
@@ -7,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 path = Path(__file__).resolve().parents[1] / "scripts" / "run_guest_scene.py"
@@ -68,10 +70,53 @@ class GuestSceneReferenceTest(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 1)
                     report = out / "report.json"
-                    self.assertEqual(json.loads(report.read_text(encoding="utf-8"))["error"], "full: exit code 7")
+                    summary = json.loads(report.read_text(encoding="utf-8"))
+                    self.assertEqual(summary["error"], "full: exit code 7")
+                    self.assertEqual(summary["runs"]["full"]["outcome"], "exited")
+                    self.assertEqual(summary["runs"]["full"]["returncode"], 7)
                     self.assertIn(str(report).encode(encoding, "backslashreplace"), result.stdout)
                     self.assertIn(diagnostic.encode(encoding, "backslashreplace"), result.stderr)
                     self.assertNotIn(b"UnicodeEncodeError", result.stderr)
+
+    def test_launch_failure_preserves_run_record_and_logs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "spirv").mkdir()
+            bad_loader = root / "invalid.exe"
+            bad_loader.write_bytes(b"synthetic input that is not an executable")
+            bad_loader.chmod(0o700)
+            out = root / "output"
+            cmd = [sys.executable, "-I", str(path), "--loader", str(bad_loader), "--guest", str(bad_loader),
+                   "--shaders", str(root), "--out", str(out)]
+            if sys.platform != "win32":
+                cmd += ["--wine", str(bad_loader)]
+            result = subprocess.run(cmd, capture_output=True, encoding="utf-8", timeout=20)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+            self.assertIn("could not launch", report["error"])
+            record = json.loads((out / "logs" / "full.json").read_text(encoding="utf-8"))
+            self.assertEqual(record, report["runs"]["full"])
+            self.assertEqual(record["outcome"], "launch_failed")
+            self.assertIsNone(record["returncode"])
+            self.assertEqual(record["cmd"][0], str(bad_loader))
+            self.assertTrue(record["launch_error"])
+            for stream in ("stdout", "stderr"):
+                contents = (out / "logs" / f"full.{stream}.log").read_bytes()
+                self.assertEqual(record[f"{stream}_sha256"], runner.sha256(contents))
+
+    def test_timeout_has_its_own_run_outcome(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = argparse.Namespace(wine=None, loader=root / "loader.exe", guest=root / "guest.exe",
+                                      shaders=root, play_audio=False)
+            session = runner.Session(args, root)
+            session.logs.mkdir()
+            with mock.patch.object(runner.subprocess, "run", side_effect=subprocess.TimeoutExpired("loader", 10)), \
+                    self.assertRaisesRegex(runner.Fail, "timed out"):
+                session.run("full", "full", root, root)
+            self.assertEqual(session.runs["full"]["outcome"], "timed_out")
+            self.assertIsNone(session.runs["full"]["returncode"])
+            self.assertNotIn("launch_error", session.runs["full"])
 
 
 if __name__ == "__main__":

@@ -161,7 +161,7 @@ def _read_history_section(history, codec_key, marker_key):
     if cached is not None and cached[0] == cache_key:
         data = cached[1]
     else:
-        with open(abspath, "r", encoding="utf-8") as fh:
+        with open(abspath, "r", encoding="utf-8-sig") as fh:
             data = json.load(fh)
         if not isinstance(data, dict):
             raise ValueError(f"{path}: expected a JSON object")
@@ -381,7 +381,7 @@ def load_bc_history(codec, history=None):
         if cached is not None and cached[0] == cache_key:
             data = cached[1]
         else:
-            with open(abspath, "r", encoding="utf-8") as fh:
+            with open(abspath, "r", encoding="utf-8-sig") as fh:
                 data = json.load(fh)
             if not isinstance(data, dict):
                 raise ValueError(f"{path}: expected a JSON object")

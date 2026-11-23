@@ -9,6 +9,9 @@ python -I tools\awc_shorts.py <bank.awc | directory> <out> `
     --min-seconds 5 --max-seconds 60 --jobs 8
 ```
 
+If two banks would share an output folder (for example `clip.awc` and `clip.AWC`), the scan is refused
+before writing clips or replacing the catalog. Rename a bank or export the two to separate output roots.
+
 The output is `<out>\<bank>\<stream id>.ogg` plus `<out>\shorts.csv` with bank, stream id, duration,
 packet channel count, packet count and relative path. For a directory scan, `<bank>` keeps the
 path relative to the source directory, without the `.awc` extension. For example, a nested

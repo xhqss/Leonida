@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; V# OOB_SELECT (word3 bits 29:28) picks the MUBUF bounds check (docs/design.md, Buffer bounds checking). RDNA2 rules
 ; (measured on gfx1036, docs/buffer_bounds.md; Mesa's GFX11 column): idx = vindex (0 without idxen), off =
 ; inst_offset + vaddr offset, offs = off + soffset, a dword access:

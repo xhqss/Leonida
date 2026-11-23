@@ -6,6 +6,7 @@ never reads C++ or scene definitions: the images and the manifest are the whole
 contract. PNG support is deliberately small and complete for that contract:
 8-bit RGB or RGBA, non-interlaced, with all five filter types (0-4), because any
 encoder that writes those formats may use any of them.
+RGB must be opaque; tRNS transparency is rejected. Use RGBA for explicit alpha.
 
 Exit codes, identical in every mode:
     0  everything the mode checked passed
@@ -278,6 +279,13 @@ def read_png(path):
     file_bytes = read_file_bytes(path, "PNG image")
     chunks = split_png_chunks(file_bytes, path)
     width, height, colour_type = parse_image_header(chunks, path)
+    if any(chunk_type == b"tRNS" for chunk_type, _ in chunks):
+        if colour_type == PNG_COLOUR_TYPE_RGBA:
+            raise ToolError(f"'{path}': tRNS is forbidden in an RGBA PNG; re-export a valid RGBA image")
+        raise ToolError(
+            f"'{path}': PNG tRNS transparency is not supported; re-export as RGBA "
+            f"with an explicit alpha channel. Ignoring tRNS would compare transparent pixels as opaque"
+        )
 
     compressed_data = b"".join(
         chunk_data for chunk_type, chunk_data in chunks if chunk_type == b"IDAT"
@@ -613,8 +621,17 @@ def load_manifest(path):
     """Load and validate a renderer manifest. Unknown extra keys are ignored."""
     manifest_path = os.path.abspath(path)
     text = read_text_file(manifest_path, "scene manifest")
+
+    def unique_keys(pairs):
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                raise ToolError(f"manifest '{manifest_path}': duplicate key {key!r}")
+            obj[key] = value
+        return obj
+
     try:
-        document = json.loads(text)
+        document = json.loads(text, object_pairs_hook=unique_keys)
     except json.JSONDecodeError as error:
         raise ToolError(
             f"manifest '{manifest_path}' is not valid JSON: {error.msg} at line "
@@ -1481,6 +1498,17 @@ def step_expect_missing_and_invalid(directory):
         "manifest scene with no checks",
     )
     print("ok    failure path: a scene with no checks is rejected, not silently passed")
+
+    duplicate_path = os.path.join(directory, "manifest-duplicate.json")
+    for key, document in (
+        ("renderer", b'{"renderer":"first","renderer":"second"}'),
+        ("r", b'{"scenes":[{"checks":[{"r":255,"r":0}]}]}'),
+    ):
+        write_file_bytes(duplicate_path, document, "duplicate key fixture")
+        assert_tool_error(lambda: load_manifest(duplicate_path),
+                          f"manifest '{duplicate_path}': duplicate key {key!r}",
+                          f"duplicate manifest key {key}")
+    print("ok    manifest: duplicate top-level and nested keys cannot hide declarations")
 
 
 def step_diff_metrics():

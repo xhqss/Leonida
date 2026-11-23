@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Raw barycentric reads (v0 = i, v1 = j) next to v_interp. With vk_harness geometry, raw i/j must equal
 ; the interpolated attr0.xy / 2 on every pixel (attr0 = (0,0), (2,0), (0,2) at the three vertices).
 v_interp_p1_f32_e32 v2, v0, attr0.x

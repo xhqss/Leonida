@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; v_med3_f32 with a quiet NaN in S2, or in two operands: the cases ps_fnan_med3 does not reach (it puts the NaN in S0
 ; only). Inputs are read from memory at run time (not inline constants, which the driver could fold). The V# in s[0:3]
 ; points at 0x1000 (num_records 16); the test seeds 0x1000..0x100c with a..d = 0x40a00000 0x40e00000 0x7fc10001

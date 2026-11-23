@@ -19,6 +19,9 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402  one spelling comparison for every report pair
+
 INTERFACE = re.compile(
     r'MIDL_INTERFACE\("[0-9a-fA-F-]+"\)\s*\n\s*(\w+)\s*:\s*public\s+(\w+)\s*\{\s*public:(.*?)\n\s*\};', re.S)
 METHOD = re.compile(r'virtual\s+(.*?)\s*STDMETHODCALLTYPE\s+(\w+)\s*\((.*)\)\s*(const)?\s*=\s*0\s*;\s*$', re.S)
@@ -145,13 +148,10 @@ def write_if_changed(path, text):
 
 
 def same_path(first, second):
-    """True when writing first would replace second (same file, or a case/symlink alias of it)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
+    """True when writing first would replace second (same file, or a case/symlink alias of it). The comparison is
+    report_paths.same_report_path, which also folds case on a case-insensitive volume: os.path.normcase does that
+    only on Windows, and macOS's default APFS volume would let `R.json` and `r.json` pass as two artifacts."""
+    return same_report_path(first, second)
 
 
 def write_report(path, text):

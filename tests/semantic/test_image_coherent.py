@@ -23,7 +23,8 @@ import rdna2spirv
 
 EPILOGUE = ["exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"]
 # dim -> (address registers, STORE_DIMS index)
-DIMS = {"2D": ("v[4:5]", 0), "2D_ARRAY": ("v[4:6]", 1), "3D": ("v[4:6]", 2), "1D": ("v4", 3)}
+DIMS = {"2D": ("v[4:5]", 0), "2D_ARRAY": ("v[4:6]", 1), "CUBE": ("v[4:6]", 1),
+        "3D": ("v[4:6]", 2), "1D": ("v4", 3)}
 CLASS_TYPES = {0: "%v4float", 1: "%v4uint_st", 2: "%v4int_st"}       # storage view class -> texel type
 
 
@@ -154,7 +155,7 @@ class UnmodelledCoherentReads(unittest.TestCase):
         self.check_refused("image_gather4_lz v[0:3], v[4:5], s[0:7], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_2D glc")
 
     def test_a_coherent_load_without_a_storage_view_is_refused(self):
-        self.check_refused("image_load v[0:3], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_CUBE unorm glc dlc")
+        self.check_refused("image_load v[0:3], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA unorm glc dlc")
         self.check_refused("image_load_mip v[0:3], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D unorm glc dlc")
 
 

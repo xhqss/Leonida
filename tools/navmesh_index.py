@@ -99,7 +99,7 @@ def scan_archive(path, start=None, limit=None):
             if start is None:
                 start = u32(m, 4) or 0
             if not 0 <= start < size:
-                raise SystemExit(f"start {start} is outside {path} ({size} bytes)")
+                raise ValueError(f"start {start} is outside {path} ({size} bytes)")
             end = min(size, start + limit) if limit else size
             rows, total, last, unread, zero = [], 0, start, 0, 0
             total_stored = total_inflated = 0
@@ -170,7 +170,12 @@ def scan_directory(root, pattern=None):
     t0 = time.time()
     # Escape only the caller's root: a folder named "carve[1]" would otherwise be read as a character
     # class by glob and match nothing. The pattern (and "**") stays as the caller's glob.
-    for path in sorted(glob.glob(os.path.join(glob.escape(os.fspath(root)), "**", pattern), recursive=True)):
+    query = pattern.replace(os.altsep, os.sep) if os.altsep else pattern
+    if query.split(os.sep, 1)[0] != "**":
+        query = os.path.join("**", query)
+    matches = glob.iglob(os.path.join(glob.escape(os.fspath(root)), query), recursive=True)
+    # Separated ** segments (e.g. **/tiles/**/*.bin) can still match a pathname more than once.
+    for path in sorted(set(matches) if query.split(os.sep).count("**") > 1 else matches):
         if not os.path.isfile(path):
             continue
         size = os.path.getsize(path)
@@ -335,10 +340,13 @@ def main() -> int:
             with open(a.input, "rb") as f:
                 magic = f.read(8)
         except OSError as e:
-            raise SystemExit(f"{a.input}: {e.strerror or e}")
+            ap.error(f"{a.input}: {getattr(e, 'strerror', None) or e}")
         if len(magic) < 8 or magic[1:4] != b"FPR" or magic[0] not in b"789":
-            raise SystemExit(f"{a.input}: not an RPF7/8/9 archive (magic {magic[:4]!r})")
-        rows, summary = scan_archive(a.input, a.start, a.limit)
+            ap.error(f"{a.input}: not an RPF7/8/9 archive (magic {magic[:4]!r})")
+        try:
+            rows, summary = scan_archive(a.input, a.start, a.limit)
+        except ValueError as e:
+            ap.error(str(e))
 
     add_distribution(summary, rows)
     written = write_outputs(rows, summary, out_path, a.csv)

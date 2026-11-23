@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; s_buffer_load NUM_RECORDS bound, per dword, on the 4-truncated offset. Rule measured on an AMD Radeon RX 6800
 ; (gfx1030) as a raw compute kernel (docs/design.md, Scalar/buffer memory): off = (soffset & ~3) + (imm & ~3);
 ; dword i at o = off + 4*i is 0 when o + 4 > limit (limit = NUM_RECORDS bytes for stride 0), else the dword at

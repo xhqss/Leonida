@@ -1,0 +1,45 @@
+name: XMA2 decoder
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "runtime/xma_decoder/**"
+      - "third_party/xma/**"
+      - ".github/workflows/xma2-decoder.yml"
+  pull_request:
+    paths:
+      - "runtime/xma_decoder/**"
+      - "third_party/xma/**"
+      - ".github/workflows/xma2-decoder.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  windows-ffi:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+      - name: Run synthetic Rust FFI tests
+        shell: pwsh
+        run: |
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP "leonida-xma2-target"
+          cargo fmt --manifest-path runtime/xma_decoder/Cargo.toml -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --manifest-path runtime/xma_decoder/Cargo.toml --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Link and run the synthetic C++ ABI smoke test
+        shell: pwsh
+        run: |
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP "leonida-xma2-target"
+          cargo build --manifest-path runtime/xma_decoder/Cargo.toml --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $library = Join-Path $env:CARGO_TARGET_DIR "debug\leonida_xma2_decoder.lib"
+          $smoke = Join-Path $env:RUNNER_TEMP "leonida-xma2-ffi-smoke.exe"
+          cl /nologo /std:c++20 /EHsc /W4 /DNDEBUG /I runtime/xma_decoder runtime/xma_decoder/tests/ffi_cpp_smoke.cpp $library "/Fe:$smoke" ws2_32.lib userenv.lib ntdll.lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $smoke
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

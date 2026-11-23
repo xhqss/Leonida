@@ -64,7 +64,8 @@ FORMATS = {
     "R8G8B8A8_SINT": ("R8G8B8A8_SINT", 61, 4, "sint8"),
 }
 SIZES = (8, 16, 32, 64)
-DMASKS = (0xf, *range(1, 0xf))
+# The default run reaches only the first two masks. Use a gap to check that selected components pack down.
+DMASKS = (0xf, 0x5, *range(1, 0x5), *range(0x6, 0xf))
 STDERR_TAIL = 20  # lines of the harness's output a failure prints
 
 # Windows reports a crash as an NTSTATUS exit code (unsigned); the ones a driver crash tends to end with

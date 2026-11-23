@@ -61,7 +61,7 @@ class PipelinePreflightTest(PreflightEnv, unittest.TestCase):
         out = os.path.join(self.root, "out")
         os.makedirs(game)
         argv = ["make_game.py", "--game", game, "--work", self.work, "--out", out,
-                "--stages", "shaders,pipelines"]
+                "--stages", "shaders,pipelines", "--no-tui"]
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch("os.name", "nt"), \
                 mock.patch.object(make_game, "below_normal"), \

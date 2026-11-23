@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; SHADER-90: ds_permute_b32 vD, vAddr, vData [offset:N], the forward (scatter) permute (RDNA2 ISA, DS opcode 178).
 ; Every lane that is on in EXEC sends vData to lane ((vAddr + offset) / 4) mod 32; a destination lane nobody sends
 ; to gets 0 (the ISA's tmp[0..63] = 0), and only lanes that are on in EXEC are written (VDST of the others is kept).

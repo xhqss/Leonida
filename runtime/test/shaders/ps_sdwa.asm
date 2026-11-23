@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; SDWA GPU check. Assemble with llvm-mc -mcpu=gfx1013 -show-encoding, translate, run with vk_harness.
 ; Expected mrt0 bits: 0x000000f1, 0xbffefff2, 0x3c003344, 0xbff70000
 ; XOR bit 30 before export to encode the integer result as a finite RGBA32F value.

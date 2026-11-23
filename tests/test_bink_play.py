@@ -51,6 +51,29 @@ class PickTest(unittest.TestCase):
 
 
 class CacheTest(unittest.TestCase):
+    def test_matching_but_damaged_cache_is_rebuilt_from_the_sources(self):
+        with tempfile.TemporaryDirectory() as d:
+            archive, mount, cache = (Path(d) / n for n in ("streams.csv", "mount.xml", "cache.csv"))
+            archive.write_text("source,offset,size,width,height,frames\nsample,32,64,16,16,2\n",
+                               encoding="utf-8", newline="\n")
+            mount.write_text("<filename>$(common)/movies/synthetic.bk2</filename>",
+                             encoding="utf-8", newline="\n")
+            stamp = ("# " + bink_play.stamp(archive) + "|" + bink_play.stamp(mount) + "\n").encode()
+            header = b"path,offset,width,height,frames\n"
+            expected = [("synthetic.bk2", 32, "16", "16", "2")]
+            with mock.patch.object(bink_play, "cache_path", return_value=cache):
+                for damaged in (b"", b"wrong,columns\n", header + b"prefix,1,1,1,1\nbad,row\n",
+                                header + b"x,garbled,1,1,1\n", header + b'x,1,1,1,"2\n',
+                                header + b"\xff,1,1,1,2\n"):
+                    with self.subTest(damaged=damaged):
+                        cache.write_bytes(stamp + damaged)
+                        self.assertEqual(bink_play.load_names(archive, mount), expected)
+                        with mock.patch.object(bink_play.bink_names, "main", side_effect=AssertionError):
+                            self.assertEqual(bink_play.load_names(archive, mount), expected)
+                cache.write_bytes(stamp + header)
+                with mock.patch.object(bink_play.bink_names, "main", side_effect=AssertionError):
+                    self.assertEqual(bink_play.load_names(archive, mount), [])
+
     def test_the_table_is_named_once_and_rebuilt_when_the_archive_changes(self):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)

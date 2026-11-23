@@ -272,5 +272,18 @@ class MalformedIndexTest(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
 
 
+class IndexEncodingTest(unittest.TestCase):
+    def test_index_saved_with_a_utf8_bom_is_read(self):
+        # A Windows editor or PowerShell `>` writes the BOM; the JSON behind it is unchanged.
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8-sig") as f:
+                json.dump({"ps_a": {"stage": "ps", "inputs": [0]}}, f)
+            tool = os.path.join(ROOT, "tools", "spirv_stubs.py")
+            p = subprocess.run([sys.executable, "-I", tool, tmp], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("wrote 1 stubs", p.stdout)
+            self.assertEqual(os.listdir(os.path.join(tmp, "stubs")), ["vs_0.spv"])
+
+
 if __name__ == "__main__":
     unittest.main()

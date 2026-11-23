@@ -277,7 +277,7 @@ def run_one_test(rel, timeout):
         return {"test": rel, "result": "fail", "seconds": timeout, "detail": f"timed out after {timeout} s"}
 
 
-CODE_DIRS = ("tools", "scripts")
+CODE_DIRS = ("tools", "scripts", "runtime/test/shaders")
 
 
 def file_digest(rel):
@@ -289,8 +289,7 @@ def file_digest(rel):
 
 
 def code_digest():
-    """One digest over the Python code the unit tests exercise: tools/, scripts/ and make_game.py (content, not
-    timestamps, so it does not depend on git or on whether the change is committed)."""
+    """Hash make_game.py and the Python files in CODE_DIRS by content, including uncommitted edits."""
     h = hashlib.sha256()
     rels = ["make_game.py"]
     for d in CODE_DIRS:
@@ -354,7 +353,8 @@ def collect_unit(col, out_dir, args):
     n = len(data["results"])
     col.metric("tests.passed", "tests", "Unit-test files passing (last run)", passed, n, "files whose last run exited 0 / files run")
     col.metric("tests.current", "tests", "Unit-test files passing on the current code", current, n,
-               "files that passed with no change since to themselves or to tools/, scripts/, make_game.py / files run")
+               "files that passed with no change since to themselves, make_game.py or Python files under "
+               + ", ".join(d + "/" for d in CODE_DIRS) + " / files run")
 
 
 def group_of_test(name):
@@ -458,8 +458,8 @@ def collect_ctest(col, args):
             col.source("junit", path, "missing")
             continue
         try:
-            root = ET.fromstring(read_utf8(path))
-        except ET.ParseError as e:
+            root = ET.parse(path).getroot()
+        except (ET.ParseError, LookupError, ValueError) as e:
             col.source("junit", path, "invalid", note=str(e))
             continue
         # CTest writes a single testsuite with a disabled count and hostname. pytest wraps its suite in testsuites.

@@ -191,7 +191,7 @@ jobs:
       - name: Translator semantic tests
         env:
           LEONIDA_REQUIRE_SPIRV_TOOLS: ${{ runner.os == 'Linux' && '1' || '0' }}
-        run: python -m unittest discover -s tests/semantic -v
+        run: python -I scripts/run_semantic_tests.py tests/semantic -v
 
   # The Python suites on an Apple Silicon Mac: the standard-library loop of the check job, the translator semantic
   # tests and the pytest files of the translator-tests job, with Homebrew's llvm-mc and SPIRV-Tools. macos-26, not

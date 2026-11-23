@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Ops merged with CPU-only checks (#1479 #1496 #1510 #1514), run once on a GPU.
 ; Lane 0 of a wave32 group computes one result per op and stores eight dwords:
 ;   out[0] = s_quadmask_b32(0x01020408)                   = 0x55        (quads 0, 2, 4, 6 non-zero)

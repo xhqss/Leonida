@@ -101,6 +101,18 @@ class CliTest(unittest.TestCase):
             status = vsi.main(list(argv))
         return status, out.getvalue(), err.getvalue()
 
+    def test_other_document_with_valid_table_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "other.xml")
+            report = os.path.join(tmp, "report.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(DOC.replace("CGraphicsDefinitionsData", "UnrelatedRoot"))
+            status, out, err = self.run_tool(path, "--json", report)
+            self.assertEqual(status, 2)
+            self.assertEqual(out, "")
+            self.assertEqual(err, "ERROR: expected CGraphicsDefinitionsData document root\n")
+            self.assertFalse(os.path.exists(report))
+
     def test_stdout_aggregates_and_no_key_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             status, out, err = self.run_tool(write_doc(tmp))

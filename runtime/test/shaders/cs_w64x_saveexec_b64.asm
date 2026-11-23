@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; s_and_saveexec_b64 and s_or_saveexec_b64 with a compare result in VCC or in an SGPR pair, and s_andn2_saveexec_b64 /
 ; s_andn2_wrexec_b64 with an SGPR-pair source (their VCC form is in cs_w64x_andn2_exec.asm; constant sources are in
 ; cs_w64_mask_imm.asm), in one 64-lane wave (v1 = lane 0..63).

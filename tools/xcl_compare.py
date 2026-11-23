@@ -26,6 +26,7 @@ No game files are used or needed.
 
 import argparse
 import json
+import math
 import os
 import queue
 import shutil
@@ -168,10 +169,16 @@ def _follow(proc, lines, run, known, timeout, cdb, events, out, cmd):
     current, started, last = None, time.monotonic(), time.monotonic()
     done_names = []
     events.put(("start", run.label, " ".join(str(c) for c in cmd)))
+    eof = False
     while True:
         try:
+            if eof:
+                # EOF ends the output stream. The title can still be running.
+                remaining = timeout - (time.monotonic() - last)
+                proc.wait(timeout=max(0.0, min(0.25, remaining)))
+                break
             line = lines.get(timeout=0.25)
-        except queue.Empty:
+        except (queue.Empty, subprocess.TimeoutExpired):
             if time.monotonic() - last > timeout:
                 hung = current or next((n for n in known if n not in done_names), "(before the first check)")
                 stacks = thread_stacks(cdb, proc.pid)
@@ -184,7 +191,8 @@ def _follow(proc, lines, run, known, timeout, cdb, events, out, cmd):
             events.put(("tick", run.label, current, time.monotonic() - started))
             continue
         if line is None:
-            break
+            eof = True
+            continue
         last = time.monotonic()
         if out:
             out.write(line + "\n")
@@ -210,7 +218,6 @@ def _follow(proc, lines, run, known, timeout, cdb, events, out, cmd):
             done_names.append(name)
             events.put(("check", run.label, name))
             current, started = None, time.monotonic()
-    proc.wait()
     run.exit_code = proc.returncode
     if current and run.checks.get(current, {}).get("status") == "RUNNING":
         run.set(current, status="FAIL", reason="the title exited during this check (exit code %s)" % proc.returncode)
@@ -249,16 +256,24 @@ def run_all(args, events):
     known = list(xcl.order)
 
     # 2. gta6rt, restarted with a hung check skipped, up to --max-restarts times.
-    def leonida_cmd(attempt):
-        if (work / "leonida").exists():
-            shutil.rmtree(work / "leonida")
-        game = work / "leonida" / "game"
-        prepare_game(xcl_dir, bins, game)
-        trace = work / "leonida" / ("trace_%d.jsonl" % attempt)
-        return [str(gta6rt), "--run", str(game / bins[1].name), "--game-dir", str(game),
-                "--overlay", str(work / "leonida" / "overlay"), "--trace-d3d12", "--trace", str(trace), "--", "--hello"]
+    # Wipe stale output from an earlier run once; per-attempt restarts reset only game/ and
+    # overlay/ so earlier trace_<attempt>.jsonl files (including the hanging attempt's) survive.
+    leonida_dir = work / "leonida"
+    if leonida_dir.exists():
+        shutil.rmtree(leonida_dir)
+    leonida_dir.mkdir(parents=True, exist_ok=True)
 
-    run_with_restarts(leonida_cmd, dict(os.environ), str(work / "leonida"), leo, known, args.timeout, cdb, events,
+    def leonida_cmd(attempt):
+        game = leonida_dir / "game"
+        overlay = leonida_dir / "overlay"
+        if overlay.exists():
+            shutil.rmtree(overlay)
+        prepare_game(xcl_dir, bins, game)
+        trace = leonida_dir / ("trace_%d.jsonl" % attempt)
+        return [str(gta6rt), "--run", str(game / bins[1].name), "--game-dir", str(game),
+                "--overlay", str(overlay), "--trace-d3d12", "--trace", str(trace), "--", "--hello"]
+
+    run_with_restarts(leonida_cmd, dict(os.environ), str(leonida_dir), leo, known, args.timeout, cdb, events,
                       list(args.skip), args.max_restarts, transcripts["leonida"])
     for name in known:
         if name not in leo.checks:
@@ -463,6 +478,10 @@ def main():
     ap.add_argument("--out", help="report path (default: <work>/report.json)")
     ap.add_argument("--gui", action="store_true", help="show the checks live in a window")
     args = ap.parse_args()
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        ap.error("--timeout must be finite and greater than zero")
+    if args.max_restarts < 0:
+        ap.error("--max-restarts must be non-negative")
     if sys.platform != "win32":
         raise SystemExit("Windows only: both runtimes run Windows executables")
     if args.gui:

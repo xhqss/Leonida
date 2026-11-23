@@ -465,6 +465,73 @@ int main() {
         std::filesystem::remove_all(dir);
     }
 
+    // XboxBvhBuilder.dll's programs (docs/embedded_shaders.md): FSSM in a DXIL container like the game's shaders,
+    // translated into <dir>/bvh (entries named "bvh/<name>") and found by fssm_sha256, the game shaders' key.
+    {
+        const auto builder = container({{fixed, 25}});  // what the DLL passes to slot 62: the whole container
+        const auto untranslated = container({{stored, 40}});
+        const std::string builder_hash = sha256_hex(bytes("hello hello hello leonida"));
+        const auto code = fspx_code(0x5000);
+        const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
+        const auto write = [&](const std::filesystem::path& file, const std::string& text) {
+            std::ofstream out(file, std::ios::binary | std::ios::trunc);
+            out << text;
+        };
+        const std::string game = "\"cs_game\": {\"stage\": \"cs\", \"fssm_sha256\": \"" + hash + "\"}";
+        const std::string program_entry =
+            "{\"stage\": \"cs\", \"fssm_sha256\": \"" + builder_hash +
+            "\", \"bindings\": [], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], \"lds_bytes\": 32768, "
+            "\"uses_code_base\": true, \"wave64\": true, \"subgroup_size\": 64}";
+        std::filesystem::create_directories(dir / "bvh");
+        std::filesystem::create_directories(dir / "fspx");
+        write(dir / "index.json", "{" + game + "}");
+        write(dir / "fspx" / "index.json",
+              "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" + sha256_hex(code) + "\"}}");
+        // The second entry is a program whose metadata failed: no key, so nothing can find it and it is not counted.
+        write(dir / "bvh" / "index.json",
+              "{\"BuilderProgram\": " + program_entry + ",\n \"NoKey\": {\"error\": \"ValueError: synthetic\"}}");
+        {
+            std::ofstream spv(dir / "bvh" / "BuilderProgram.spv", std::ios::binary);
+            spv.write(reinterpret_cast<const char*>(words), sizeof(words));
+        }
+        ShaderLibrary bvh;
+        CHECK(bvh.load(dir.string(), &error) && bvh.size() == 3 && bvh.bvh_size() == 1 && bvh.fspx_size() == 1);
+        const ComputeProgram program = compute_program(builder);
+        CHECK(program.kind == ComputeProgram::Kind::fssm && sha256_hex(program.bytes) == builder_hash);
+        const auto found = bvh.program_candidates("cs", program);
+        CHECK(found.size() == 1 && found[0]->name == "bvh/BuilderProgram" && found[0] == bvh.find("cs", builder_hash));
+        CHECK(found[0]->lds_bytes == 32768 && found[0]->wave64 && found[0]->subgroup_size == 64 &&
+              found[0]->uses_code_base && found[0]->local_size[0] == 64 && found[0]->fspx_code_sha256.empty());
+        CHECK(bvh.spirv(*found[0]).size() == 5);  // <dir>/bvh/BuilderProgram.spv
+        // The other indexes are untouched: the game's shader and the FSPX program are found as before, each by its
+        // own key, and a builder program is neither an FSPX program nor a shader of another stage.
+        CHECK(bvh.find("cs", hash) && bvh.find("cs", hash)->name == "cs_game");
+        CHECK(bvh.program_candidates("cs", compute_program(code)).at(0)->name == "fspx/upscaler_00");
+        CHECK(bvh.fspx_candidates("cs", builder_hash).empty() && bvh.candidates("vs", builder_hash).empty());
+        // A program the translator left out (Box16Rehydration today) has no entry: nothing is found, and no other
+        // program's module stands in for it.
+        CHECK(compute_program(untranslated).kind == ComputeProgram::Kind::fssm);
+        CHECK(bvh.program_candidates("cs", compute_program(untranslated)).empty());
+        // The same program in the game's index too: both entries, the game's first (index order).
+        write(dir / "index.json", "{" + game + ",\n \"cs_same\": " + program_entry + "}");
+        CHECK(bvh.load(dir.string(), &error) && bvh.size() == 4 && bvh.bvh_size() == 1);
+        const auto both = bvh.candidates("cs", builder_hash);
+        CHECK(both.size() == 2 && both[0]->name == "cs_same" && both[1]->name == "bvh/BuilderProgram");
+        write(dir / "index.json", "{" + game + "}");
+        // A broken bvh/index.json leaves the main index and the FSPX one loaded; a missing one is not an error
+        // either, and neither is a broken fspx/index.json for the builder's programs.
+        write(dir / "bvh" / "index.json", "{broken");
+        CHECK(bvh.load(dir.string(), &error) && bvh.size() == 2 && bvh.bvh_size() == 0 && bvh.fspx_size() == 1 &&
+              bvh.program_candidates("cs", program).empty() && bvh.find("cs", hash));
+        std::filesystem::remove(dir / "bvh" / "index.json");
+        CHECK(bvh.load(dir.string(), &error) && bvh.size() == 2 && bvh.bvh_size() == 0 && bvh.find("cs", hash));
+        write(dir / "bvh" / "index.json", "{\"BuilderProgram\": " + program_entry + "}");
+        write(dir / "fspx" / "index.json", "{broken");
+        CHECK(bvh.load(dir.string(), &error) && bvh.size() == 2 && bvh.bvh_size() == 1 && bvh.fspx_size() == 0 &&
+              bvh.program_candidates("cs", program).size() == 1);
+        std::filesystem::remove_all(dir);
+    }
+
     // The review case on #1911: one kind-6 program in two containers whose kind-0 entries differ (32x1x1 and
     // 64x1x1), translated to two different modules. A container picks its own entry by fspx_state_sha256; a bare
     // kind-6 program cannot tell them apart and is refused as ambiguous; with one module for the key it is accepted.

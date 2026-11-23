@@ -15,6 +15,7 @@ values are chosen so that honouring op_sel and ignoring it (reading the low halv
 of them. Standard library only, no game files.
 
 Exit codes: 0 every row matches op_sel being ignored (the gfx1036 measurement), 1 a row differs, 2 harness error, 77 no hardware oracle.
+Usage: `python -I tools/vcmp16_opsel_probe.py --help` lists the options.
 """
 import argparse
 import os

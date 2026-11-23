@@ -22,6 +22,8 @@ HEADER = os.environ.get("AMD_SWIZZLE_HEADER", r"<ref>\mesa-addrlib\gfx10SwizzleP
 BPE_INDEX = {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}
 # Address bits of one block for each pattern table size, as tex_mode_probe.py uses them (12 for 4 KB, 16 for 64 KB).
 BLOCK_BITS = {"256": 8, "4K": 12, "64K": 16}
+# Unsigned/void dtype whose item size is the element size, so detile gathers whole elements in one take.
+_ELEMENT_DTYPE = {1: "u1", 2: "<u2", 4: "<u4", 8: "<u8", 16: "V16"}
 
 
 def block_bits(table_name):
@@ -95,27 +97,50 @@ def _parity(a):
     return a & 1
 
 
-def offsets(eq, bpe, wb, hb, block_bytes=65536):
-    """Byte offset of every element (row-major y, x) for a wb x hb element grid."""
-    y, x = np.mgrid[0:hb, 0:wb].astype(np.int64)
-    off = np.zeros_like(x)
-    for bit, (mx, my) in enumerate(eq):
-        if mx or my:
-            off |= (_parity(x & mx) ^ _parity(y & my)) << bit
-    # Macro-block size in elements, from which coordinate bits the equation uses below block_bytes.
-    xb = max((mx.bit_length() for mx, _ in eq if mx), default=0)
-    yb = max((my.bit_length() for _, my in eq if my), default=0)
-    # The block's own extent from the element count. Deriving it from the x/y bits that appear alone in an
-    # address bit only works for the S modes; in the XOR modes the high bits are almost always XORed, so the
-    # block came out too small (72/75 RDNA2 R_X entries). tex_export.detile_offsets uses this same formula for
-    # 4 KB blocks and it matches every 64 KB entry.
+def _axis_offsets(eq, n, mask_of, shift):
+    """In-block address contribution of one axis: each address bit is an XOR of x bits and y bits, so the offset
+    of (x, y) is the XOR of a function of x alone and a function of y alone. Evaluating those two 1-D tables
+    (length wb and hb) replaces the per-bit parity over the whole wb x hb grid. `shift` drops the low address
+    bits (a right shift distributes over XOR) so detile gets element indices without a pass over the grid."""
+    coord = np.arange(n, dtype=np.int64)
+    acc = np.zeros(n, dtype=np.int64)
+    for bit, masks in enumerate(eq):
+        m = masks[mask_of]
+        if m:
+            acc |= _parity(coord & m) << bit
+    return acc >> shift if shift else acc
+
+
+def _grid(eq, wb, hb, bw, bh, block_bytes, shift):
+    """(hb, wb) int64 array of ((XOR of the address bits) + block * block_bytes) >> shift, built in place."""
+    blocks_x = (wb + bw - 1) // bw
+    col = _axis_offsets(eq, wb, 0, shift)
+    row = _axis_offsets(eq, hb, 1, shift)
+    unit = block_bytes >> shift  # block_bytes is a multiple of 1 << shift, so the shift splits over the sum
+    out = np.bitwise_xor(row[:, None], col[None, :])
+    out += (np.arange(hb, dtype=np.int64) // bh * (blocks_x * unit))[:, None]
+    out += (np.arange(wb, dtype=np.int64) // bw * unit)[None, :]
+    return out
+
+
+def _block_shape(bpe, block_bytes):
+    """Macro-block size in elements, from the element count.
+
+    Deriving it from the x/y bits that appear alone in an address bit only works for the S modes; in the XOR modes
+    the high bits are almost always XORed, so the block came out too small (72/75 RDNA2 R_X entries).
+    tex_export.detile_offsets uses this same formula for 4 KB blocks and it matches every 64 KB entry."""
     elems = block_bytes // bpe
     lb = elems.bit_length() - 1
     bw = 1 << ((lb + 1) // 2)
-    bh = elems // bw
-    blocks_x = (wb + bw - 1) // bw
-    block = (y // bh) * blocks_x + (x // bw)
-    return off + block * block_bytes, (bw, bh, xb, yb)
+    return bw, elems // bw
+
+
+def offsets(eq, bpe, wb, hb, block_bytes=65536):
+    """Byte offset of every element (row-major y, x) for a wb x hb element grid."""
+    xb = max((mx.bit_length() for mx, _ in eq if mx), default=0)
+    yb = max((my.bit_length() for _, my in eq if my), default=0)
+    bw, bh = _block_shape(bpe, block_bytes)
+    return _grid(eq, wb, hb, bw, bh, block_bytes, 0), (bw, bh, xb, yb)
 
 
 def feature(linear, bpe):
@@ -132,12 +157,22 @@ def feature(linear, bpe):
 
 
 def detile(data, eq, bpe, wb, hb, block_bytes=65536):
-    off, _ = offsets(eq, bpe, wb, hb, block_bytes)
-    idx = off // bpe
     raw = np.frombuffer(data[: len(data) // bpe * bpe], np.uint8).reshape(-1, bpe)
-    if idx.max() >= len(raw):
+    bw, bh = _block_shape(bpe, block_bytes)
+    shift = bpe.bit_length() - 1
+    if bpe & (bpe - 1) == 0 and block_bytes % bpe == 0:
+        idx = _grid(eq, wb, hb, bw, bh, block_bytes, shift)
+    else:
+        idx = _grid(eq, wb, hb, bw, bh, block_bytes, 0) // bpe
+    if idx.size and idx.max() >= len(raw):
         return None
-    return raw[idx.reshape(-1)]
+    flat = idx.reshape(-1)
+    if bpe in _ELEMENT_DTYPE:
+        # One gather of whole elements instead of bpe separate byte rows.
+        # Reading `data` as one wide element needs its length to be a multiple of bpe, which the slice above ensures.
+        wide = raw.reshape(-1).view(_ELEMENT_DTYPE[bpe])
+        return wide.take(flat).view(np.uint8).reshape(-1, bpe)
+    return raw[flat]
 
 
 def validate_out_path(out, blob, same_report_path):
