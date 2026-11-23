@@ -1342,6 +1342,24 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
     if (present == 1 || present % 60 == 0)
         std::fprintf(stderr, "[rt] d3d12_xs: PresentX call %llu (%llu plane(s))\n",
                      static_cast<unsigned long long>(present), static_cast<unsigned long long>(plane_count));
+    // What the first present actually names: the display texture's shape, so a white window can be read as "the title
+    // presents a texture this size and format" rather than guessed at.
+    if (present == 1 && planes) {
+        const auto* first = reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes);
+        if (first->ResourceCount && first->ppResources && first->ppResources[0]) {
+            const D3D12_RESOURCE_DESC desc = first->ppResources[0]->GetDesc();
+            D3D12_HEAP_PROPERTIES heap{};
+            D3D12_HEAP_FLAGS heap_flags = D3D12_HEAP_FLAG_NONE;
+            const HRESULT heap_hr = first->ppResources[0]->GetHeapProperties(&heap, &heap_flags);
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: first present plane: %llux%u format %d, %u resource(s), colour space %d, "
+                         "display heap %s, resources %p\n",
+                         static_cast<unsigned long long>(desc.Width), desc.Height, int(desc.Format),
+                         first->ResourceCount, first->ColorSpace,
+                         SUCCEEDED(heap_hr) && (heap_flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY) ? "yes" : "no",
+                         static_cast<void*>(first->ppResources[0]));
+        }
+    }
     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
     return hr_to_u64(state->xbox->PresentX(
         static_cast<UINT>(plane_count),

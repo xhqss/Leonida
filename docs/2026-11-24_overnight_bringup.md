@@ -657,12 +657,25 @@ $env:PATH="E:\VulkanSDK\1.4.363.1\Bin;$env:PATH"
 
 两个附带观测：
 
-1. **窗口是白的**，可能（a）`PresentX` 的合成/拷贝没把图像送到窗口，或（b）标题送上来的那张纹理本身就是空白
-   （237 个 FSPX compute PSO 没建成，后处理链断在里面）。抓一帧本来是最快的判别法，但**两条路都堵住了**：
-   `WindowPresenter::enable_capture()` 在**活动**交换链上调用会 `recreate()` 失败（实测 false）；改成在第一次
-   present 时打开则返回成功、可 `read_back()` 一直 false（`captured_` 没被置起来，说明采集拷贝根本没跑）。
-   下一轮要抓帧，得在**创建设备/交换链时**就把采集打开，或者从 `present_planes` 的合成目标直接读。
-2. **驱动侧的 OOM**：有一次运行在大约 2.5 分钟后死在 `LLVM ERROR: out of memory` / `Allocation failed`
+1. **窗口是白的，但呈现目标是对的**。第一次 present 现在会打出它送来的那张纹理：
+
+   ```text
+   [rt] d3d12_xs: first present plane: 3840x2160 format 28, 1 resource(s), colour space 0, display heap yes,
+                  resources 000000015535FC50
+   ```
+
+   4K、`DXGI_FORMAT_R8G8B8A8_UNORM`（28）、带 `ALLOW_DISPLAY`、单平面、SDR——**形状和标志都对**，所以不是
+   "标题送错东西"，而是那张纹理里没有内容（或者内容就是白的）。候选：(a) 填这张纹理的那几个 pass 正是
+   **237 个没建成的 FSPX compute PSO**（后处理/tonemap 链断在中间）；(b) 纹理的初值就是白的（驱动给的
+   未初始化内容是 0xFF 时会这样）。
+   抓一帧本来是最快的判别法，但**两条路都堵住了**：`WindowPresenter::enable_capture()` 在**活动**交换链上调用会
+   `recreate()` 失败（实测 false）；改成第一次 present 时打开则返回成功、可 `read_back()` 一直 false
+   （`captured_` 没被置起来，说明采集拷贝根本没跑）。下一轮要抓帧，得在**创建设备/交换链时**就把采集打开，
+   或者从 `present_planes` 的合成目标直接读。
+2. **呈现没有节流**：一次运行四分钟 71,518 次（约 300 次/秒），另一次两分钟 **2,019,120 次**（约 16,800 次/秒）——
+   它有时会在"present → 下一帧"里空转，连垂直同步都没有（没注册帧间隔时 `sync_interval` 是 0）。这也是 CPU
+   一直吃满的原因之一。
+3. **驱动侧的 OOM**：有一次运行在大约 2.5 分钟后死在 `LLVM ERROR: out of memory` / `Allocation failed`
    （AMD 的 shader 编译器）。进程工作集当时约 20 GB（标题自己按控制台预算就占这么多），再加上不断重试失败的
    FSPX 编译，就会撞到这台机器的上限。所以"活多久"也要看内存：长时间跑要么先压掉 FSPX 的失败重试，要么确认
    驱动 OOM 是可复现的（下一轮第一件事）。
