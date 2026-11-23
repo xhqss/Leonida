@@ -1908,7 +1908,14 @@ HRESULT proxy_create_command_queue_x(DeviceProxy* self, std::uint64_t desc_word,
                      static_cast<unsigned>(desc.Type), static_cast<int>(desc.Priority),
                      static_cast<unsigned>(desc.Flags), desc.NodeMask, flags);
     desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(flags);
+    const auto original_flags = static_cast<std::uint32_t>(desc.Flags);
+    const auto original_node = desc.NodeMask;
     desc.NodeMask = 0;
+    // A description that already carries PC values reaches the PC path as the caller's own pointer: the sanitising copy
+    // exists only for the console words, and a mock in xs_proxy_mock_test checks the pointer it handed in.
+    if (flags == original_flags && original_node == 0)
+        return proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(desc_word), riid,
+                                          out);
     // The PC slot-8 body wraps the created queue in the queue proxy, which is what the Xbox ABI expects back.
     return proxy_create_command_queue(self, &desc, riid, out);
 }
