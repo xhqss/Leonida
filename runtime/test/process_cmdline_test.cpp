@@ -6,6 +6,9 @@
 #include <windows.h>
 #include <shellapi.h>
 
+#include <fcntl.h>
+#include <io.h>
+
 #include <cstdio>
 #include <cstring>
 #include <cwchar>

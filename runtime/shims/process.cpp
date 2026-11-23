@@ -213,8 +213,14 @@ DWORD_PTR __stdcall game_set_thread_affinity_mask(HANDLE thread, DWORD_PTR mask)
 // the call returns TRUE and the out parameter gets the affinity the thread had. An empty mask names no CPU on any
 // machine and a bad handle is the host's own error: both are passed to the host and fail as on Windows.
 BOOL __stdcall game_set_thread_group_affinity(HANDLE thread, const GROUP_AFFINITY* requested, PGROUP_AFFINITY previous) {
+    // An empty mask names no CPU on any machine. Some Windows builds accept it and clear the affinity instead of
+    // failing, so answer the documented error before the host call rather than depending on the build.
+    if (!requested || requested->Mask == 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     if (SetThreadGroupAffinity(thread, requested, previous)) return TRUE;
-    if (!requested || requested->Mask == 0 || GetLastError() != ERROR_INVALID_PARAMETER) return FALSE;
+    if (GetLastError() != ERROR_INVALID_PARAMETER) return FALSE;
     GROUP_AFFINITY actual = {};
     if (!GetThreadGroupAffinity(thread, &actual)) return FALSE;  // the host's error stands
     if (previous) *previous = actual;
