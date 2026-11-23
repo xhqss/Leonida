@@ -1287,6 +1287,23 @@ public:
         return resources_.find(id) != resources_.end();
     }
 
+    // The registered buffer whose VA range holds `va`, preferring one that holds [va, va + bytes) as buffer_at does: its
+    // ID, first VA and size in bytes. False when none does, or when `acquire(id)` returns false. `acquire` runs with
+    // the registry locked, so the resource cannot finish being removed under it: it takes the caller's reference
+    // (Resource's destructor removes its entry first, which waits for this lock). Used where a console call names a
+    // buffer by VA only (Xbox device slot 70).
+    template<class Acquire>
+    bool buffer_resource_at(std::uint64_t va, std::uint64_t bytes, ResourceId& id, std::uint64_t& start,
+                            std::uint64_t& size, Acquire&& acquire) {
+        std::shared_lock lock(resource_mutex_);
+        BufferVaIndex<ResourceId>::Hit hit{};
+        if (!buffer_vas_.find(va, hit, bytes) || !acquire(hit.id)) return false;
+        id = hit.id;
+        start = hit.start;
+        size = hit.size;
+        return true;
+    }
+
     bool ray_tracing_supported() const { return ray_tracing_ && vk.vkCmdBuildAccelerationStructuresKHR != nullptr; }
     bool xdxr_acceleration_structures() const { return xdxr_ != nullptr; }
 
