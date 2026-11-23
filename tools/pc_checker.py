@@ -18,6 +18,7 @@ From Python (e.g. a launcher):
 
 The CPU and GPU scores are rough relative estimates made for this tool. They are
 not official benchmarks.
+Usage: `python -I tools/pc_checker.py --help` lists the options.
 """
 from __future__ import annotations
 

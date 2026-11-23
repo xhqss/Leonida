@@ -13,6 +13,7 @@ Reads the same inputs as ``world_build.py --placements`` (``world_index.py --ent
 Positions stay in model space; a draw's rows are the entity's world transform as three basis rows plus the
 translation, world = x*row0 + y*row1 + z*row2 + row3 (RAGE Z-up). The file holds decoded game data, so it
 stays in the user's work folder. Standard library only.
+Usage: `python -I tools/sandbox_scene.py --help` lists the options.
 """
 import argparse
 import math

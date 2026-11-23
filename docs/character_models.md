@@ -348,6 +348,13 @@ Character geometry uses GPU meshlets (16-byte headers, up to 128 local vertices 
 | `3`, `4`, `14`, `15` | `0x28` / `0x42` | 4–8 B each | Four UV channels (`UV0` albedo, `UV1` tattoo/suntan/damage, `UV2` wrinkle/micro-detail, `UV3` morphable-model) |
 | `17` | `0x84` | 16 B | Per-vertex basis / blend-shape / ML-deformer stream |
 
+The ped importer and exporter preserve authored `TEXCOORD_1` and higher sets alongside
+`TEXCOORD_0`, including normalized integer input accessors. Ped JSON stores these extra
+sets in `uvs_extra`, an object whose keys are the positive set indices (`"1"`, `"2"`,
+and so on); `uvs` remains set 0. Overlap culling and vertex compaction keep each set
+aligned with the surviving vertices. This preserves vertex data without expanding
+the material importer's supported texture-coordinate bindings.
+
 ### 3-tier LOD budgets and thresholds
 
 Modular ped drawables in `packs.rpf` stream three separate dictionary tiers per item name plus a

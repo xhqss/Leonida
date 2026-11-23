@@ -439,7 +439,13 @@ def parse_transform(text):
     vals = [float(x) for x in text.split(",")]
     if len(vals) != 12:
         raise ValueError("--transform needs 12 comma-separated floats, got %d" % len(vals))
-    return tuple(tuple(f32(v) for v in vals[4 * r:4 * r + 4]) for r in range(3))
+    try:
+        rounded = [f32(v) for v in vals]
+    except (OverflowError, struct.error) as exc:
+        raise ValueError("--transform values must fit in finite float32") from exc
+    if not all(math.isfinite(v) for v in rounded):
+        raise ValueError("--transform values must fit in finite float32")
+    return tuple(tuple(rounded[4 * row:4 * row + 4]) for row in range(3))
 
 
 

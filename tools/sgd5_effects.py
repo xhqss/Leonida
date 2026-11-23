@@ -14,6 +14,7 @@ Use carve_offset to join to shader_carve's index.json by offset. Repeated
 effect or technique names return every match with its offset and row index.
 --shader-hash accepts the Materials[].Shader hex value from an rpf9dump model manifest.
 This reads plain metadata in place. Runtime selection of a technique is unknown.
+Usage: `python -I tools/sgd5_effects.py --help` lists the options.
 """
 import argparse
 import json

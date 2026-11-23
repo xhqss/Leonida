@@ -7,6 +7,7 @@ the 32-byte special-link records (+0xA8, count u32@0xD4), the u16 special-link i
 table (+0xB0, count u32@0xD8), and the polygon +0x20 special-link prefix-sum chain
 across all 0x00010015 navmesh tiles. Emits aggregate counts and invariant pass/fail
 totals only (no game data).
+Usage: `python -I tools/navmesh_links.py --help` lists the options.
 """
 
 import argparse

@@ -608,6 +608,8 @@ are authoring/build-time inputs to that partition:
 
 - `tools/navmesh_nodes.py` (stdlib-only) counts the polygon flag bits under the lane-graph nodes
   ([above](#polygon-flags-under-the-lane-graph)). It reads `navmeshes.rpf` and `levels.rpf` and writes counts only.
+  An `--out` this run cannot write (a folder that cannot be created or written, a read-only existing summary, or
+  one of the two archives) is one `ERROR` line and exit 2 before either archive is read.
 
 ```powershell
 python -I tools/navmesh_decode.py <package>\navmeshes.rpf --out <temp>/navmesh-decode.json --csv <temp>/navmesh-decode.csv

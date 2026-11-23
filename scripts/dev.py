@@ -3,6 +3,8 @@
 
 import argparse
 import json
+import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -38,7 +40,7 @@ def discover() -> dict:
             "id": name,
             "path": path,
             "present": present,
-            "help_argv": ["python", "-I", path, "--help"] if present else None,
+            "help_argv": [sys.executable, "-I", path, "--help"] if present else None,
             "requirements": requirements,
         })
     return {
@@ -49,6 +51,13 @@ def discover() -> dict:
             "reason": "This entry point does not expose live attach, pause, step, input or screenshots.",
         },
     }
+
+
+def format_help_command(argv: list[str]) -> str:
+    if os.name == "nt":
+        quoted = ("'" + arg.replace("'", "''") + "'" for arg in argv)
+        return "& " + " ".join(quoted)
+    return shlex.join(argv)
 
 
 def run_producer(relative_path: str, args: list[str]) -> int:
@@ -98,12 +107,13 @@ def main() -> int:
     if args.json:
         print(json.dumps(result, indent=2))
     else:
+        sys.stdout.reconfigure(encoding="utf-8")
         print("Paths and help commands are relative to the Leonida checkout root.")
         for tool in result["tools"]:
             status = "present" if tool["present"] else "missing"
             print(f"{tool['id']}: {tool['path']} ({status})")
             if tool["help_argv"]:
-                print(f"  Help: {' '.join(tool['help_argv'])}")
+                print(f"  Help: {format_help_command(tool['help_argv'])}")
             print("  Requirements (not checked):")
             for requirement in tool["requirements"]:
                 print(f"    - {requirement}")

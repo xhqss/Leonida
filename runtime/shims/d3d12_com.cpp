@@ -210,6 +210,7 @@ public:
         return type_;
     }
     D3D12_COMMAND_LIST_TYPE type() const { return type_; }
+    bool invalid() const { return invalid_; }
 
     // E_INVALIDARG when a call during recording was invalid, or a query was begun and not ended, as D3D12's Close
     // reports it.
@@ -1577,6 +1578,12 @@ public:
     void STDMETHODCALLTYPE ExecuteCommandLists(UINT count, ID3D12CommandList* const* lists) override {
         constexpr auto method = "ID3D12CommandQueue::ExecuteCommandLists";
         std::lock_guard lock(mutex_);
+        if (count > 0 && !lists) {
+            note_once("ExecuteCommandLists: null command list array with non-zero count");
+            last_result_ = leonida::ReplayResult::unsupported;
+            d3d12_trace::record(method, "failed");
+            return;
+        }
         std::vector<const leonida::CommandList*> recorded;
         std::vector<const GraphicsCommandList*> graphics;
         for (UINT i = 0; i < count; ++i) {
@@ -1593,6 +1600,13 @@ public:
             if (list->type() != desc_.Type) {
                 std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists: list %u has type %d, the queue type %d\n", i,
                              int(list->type()), int(desc_.Type));
+                last_result_ = leonida::ReplayResult::unsupported;
+                d3d12_trace::record(method, "failed");
+                return;
+            }
+            // A list whose recording failed (Close returned E_INVALIDARG) must not replay its earlier commands.
+            if (list->invalid()) {
+                std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists: list %u is invalid; refusing batch\n", i);
                 last_result_ = leonida::ReplayResult::unsupported;
                 d3d12_trace::record(method, "failed");
                 return;

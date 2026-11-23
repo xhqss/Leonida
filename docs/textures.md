@@ -1075,6 +1075,7 @@ python -I tools/ttpf_mips.py check <pool.ttpf> <index> [--allow-provisional] [--
 python -I tools/ttpf_mips.py export <pool.ttpf> <index> <out.dds> [--allow-provisional] [--history <path>]
 python -I tests/test_bcpack.py
 python -I tests/test_bcpack_history_calib.py
+python -I tests/test_bcpack_tool.py
 python -I tests/test_tex_headers.py
 python -I tests/test_ttpf_mips.py
 ```

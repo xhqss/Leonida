@@ -1787,6 +1787,17 @@ def _parse_int(text: str) -> int:
     return value
 
 
+def _parse_limit(text: str) -> int:
+    """--limit: at least 1; 0 stopped before the first target, so census read as an empty corpus."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid integer: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def _parse_classes(text: str) -> tuple[int, ...]:
     if not text.strip():
         return ()
@@ -1869,7 +1880,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_cen = sub.add_parser("census", help="Scan RPF9 archives, carved .smh files or directories for aggregate counts.")
     p_cen.add_argument("paths", nargs="+", help="One or more archive files, .smh files or directories")
     p_cen.add_argument("--json", action="store_true", help="Emit JSON report")
-    p_cen.add_argument("--limit", type=_parse_int, default=None, help="Stop after N groom LOD resources")
+    p_cen.add_argument("--limit", type=_parse_limit, default=None, help="Stop after N groom LOD resources")
 
     p_glb = sub.add_parser("export-glb", help="Export a groom LOD to binary glTF 2.0 (.glb).")
     p_glb.add_argument("path", help="Path to carved .smh/.bin file or RPF9 archive")

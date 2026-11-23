@@ -204,7 +204,7 @@ def main(argv=None):
     from swizzle_search import render  # noqa: F401
     ap = argparse.ArgumentParser()
     ap.add_argument("blob")
-    ap.add_argument("--bpe", type=int, default=8)
+    ap.add_argument("--bpe", type=int, choices=(1, 2, 4, 8, 16), default=8)
     ap.add_argument("--width", type=int, required=True)
     ap.add_argument("--height", type=int, required=True)
     ap.add_argument("--offset", type=int, default=0)

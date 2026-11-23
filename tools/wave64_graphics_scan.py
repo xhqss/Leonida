@@ -42,6 +42,7 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import fssm_header  # noqa: E402
 import rdna2spirv  # noqa: E402  (same directory; WAVE64_RE, stage_of, base_op)
+from report_paths import same_report_path  # noqa: E402
 from shader_ir import parse_file  # noqa: E402
 
 # why each op can depend on lanes outside the executing half is in the docstring; this only gates counting
@@ -167,20 +168,12 @@ def main(argv=None) -> int:
         # name check alone would miss. samefile also catches a case-only spelling on Windows and macOS's
         # default volume, so only when the report already exists does it compare --out against each input
         # rather than statting N listings for nothing.
-        if os.path.exists(args.out):
-            out_abs = os.path.abspath(args.out)
-            try:
-                if os.path.samefile(os.path.abspath(args.src), out_abs):
-                    ap.error("output must not overwrite the source directory")
-            except OSError:
-                pass
-            listings = scanned_paths(args.src)
-            for path in [*listings, *metadata_paths(listings)]:
-                try:
-                    if os.path.isfile(path) and os.path.samefile(out_abs, path):
-                        ap.error(f"output must not overwrite an input it scans: {path}")
-                except OSError:
-                    pass
+        if same_report_path(args.src, args.out):
+            ap.error("output must not overwrite the source directory")
+        listings = scanned_paths(args.src)
+        for path in [*listings, *metadata_paths(listings)]:
+            if same_report_path(path, args.out):
+                ap.error(f"output must not overwrite an input it scans: {path}")
     report = scan_directory(args.src)
     for stage, b in report["per_stage"].items():
         occ = ", ".join("%s x%d" % (op, n) for op, n in b["occurrences"].items()) or "none"

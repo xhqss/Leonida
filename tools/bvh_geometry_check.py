@@ -30,6 +30,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bvh_rehydrate as R  # noqa: E402
+from bvh_index import _publish  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 BOUNDS_TOLERANCE = 1e-4     # of the largest sceneBounds extent
@@ -194,8 +195,11 @@ def main(argv=None):
     print("internal box area: %.6g" % report["internal_area"])
     print("consistent" if report["consistent"] else "NOT consistent")
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+        try:
+            _publish(a.json, lambda f: json.dump(report, f, indent=1), "\n")
+        except OSError as e:
+            print("error: cannot write %s: %s" % (a.json, e.strerror or e), file=sys.stderr)
+            return 2
     return 0 if report["consistent"] else 1
 
 

@@ -6,6 +6,7 @@ label/offset (for branches), hw register, and raw text for anything else.
 
 As a module: parse_file(path) -> {"name", "code_start", "insns": [...], "invalid": [pc...]}
 As a tool:  python -I shader_ir.py <disasm dir> [--limit N]   (parses everything and reports coverage)
+Usage: `python -I tools/shader_ir.py --help` lists the options.
 """
 import argparse
 import os

@@ -11,6 +11,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 import ps_sweep  # noqa: E402
@@ -38,9 +39,13 @@ def synthetic_index():
     return index
 
 
+TARGET_FLOATS = 32 * 32 * 4
+
+
 def write_raw(path, values):
     with open(path, "wb") as f:
         f.write(struct.pack(f"<{len(values)}f", *values))
+        f.write(struct.pack("<f", -1.0) * (TARGET_FLOATS - len(values)))
 
 
 class Sampling(unittest.TestCase):
@@ -142,8 +147,8 @@ class Classification(unittest.TestCase):
     def rec(code):
         return {"i": 0, "code": code, "reason": "", "targets": 1}
 
-    def classify(self, a, b, code_a=0, code_b=0):
-        return ps_sweep.classify_pair(self.rec(code_a), self.rec(code_b), self.raw("a", a), self.raw("b", b))
+    def classify(self, a, b):
+        return ps_sweep.classify_pair(self.rec(0), self.rec(0), self.raw("a", a), self.raw("b", b))
 
     def test_ok_within_tolerance(self):
         self.assertEqual(self.classify([0.5, 1.0, 2.0, -1.0], [0.5004, 1.0004, 2.0, -1.0]), ("OK on both", ""))
@@ -178,17 +183,59 @@ class Classification(unittest.TestCase):
         self.assertEqual(ps_sweep.classify_pair(ok, rec, "x", "y"), ("not translated", ""))
 
     def test_failures_and_timeouts(self):
-        self.assertEqual(self.classify([0.5], [0.5], 0, 77), ("fails on one GPU", "b: missing device feature"))
-        self.assertEqual(self.classify([0.5], [0.5], 4, 0), ("fails on one GPU", "a: exit 4"))
-        self.assertEqual(self.classify([0.5], [0.5], 77, 5), ("fails on both", "77/5"))
-        self.assertEqual(self.classify([0.5], [0.5], 3, 0), ("timeout", ""))
-        self.assertEqual(self.classify([0.5], [0.5], 0, 3), ("timeout", ""))
-
-    def test_lengths_must_match(self):
-        self.assertEqual(self.classify([0.5, 0.5], [0.5]), ("fails on one GPU", "short output"))
+        # A non-success code takes precedence; neither path should even be opened.
+        for a, b, expected in ((0, 77, ("fails on one GPU", "b: missing device feature")),
+                               (4, 0, ("fails on one GPU", "a: exit 4")),
+                               (77, 5, ("fails on both", "77/5")),
+                               (3, 0, ("timeout", "")), (0, 3, ("timeout", ""))):
+            with self.subTest(a=a, b=b):
+                result = ps_sweep.classify_pair(self.rec(a), self.rec(b), self.tmp.name, self.tmp.name)
+                self.assertEqual(result, expected)
 
 
 class CompareCommand(unittest.TestCase):
+    def test_readback_shapes(self):
+        one = struct.pack("<f", 0.25) * TARGET_FLOATS
+        two = one * 2
+        cases = [
+            # recorded counts, raw outputs (None = absent), expected classification and detail
+            (2, 2, two, two, "OK on both", ""),
+            (8, 8, one * 8, one * 8, "OK on both", ""),
+            (2, 2, two, two[:-4] + struct.pack("<f", 1.0), "differs beyond tolerance", "gross (>0.1)"),
+            (1, 1, b"", b"", "invalid readback", "a: wrong output size"),
+            (1, 1, one[:-4], one[:-4], "invalid readback", "a: wrong output size"),
+            (1, 1, one, one[:-4], "invalid readback", "b: wrong output size"),
+            (1, 1, two, two, "invalid readback", "a: wrong output size"),
+            (1, 1, one, one + b"\x00", "invalid readback", "b: wrong output size"),
+            (2, 2, one, one, "invalid readback", "a: wrong output size"),
+            (1, 2, one, one, "invalid readback", "target counts differ"),
+            (None, 1, one, one, "invalid readback", "invalid target count"),
+            (0, 0, b"", b"", "invalid readback", "invalid target count"),
+            (9, 9, one * 9, one * 9, "invalid readback", "invalid target count"),
+            (1, True, one, one, "invalid readback", "invalid target count"),
+            (1, 1, one, None, "invalid readback", "b: missing output"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            sample = [{"name": str(i), "stratum": [False, "none", "structured"]} for i in range(len(cases))]
+            (out / "sample.json").write_text(json.dumps(sample), encoding="utf-8", newline="\n")
+            for side, tag in enumerate(("a", "b")):
+                folder = out / f"{tag}_z"
+                folder.mkdir()
+                with (folder / "results_0.jsonl").open("w", encoding="utf-8", newline="\n") as f:
+                    for i, case in enumerate(cases):
+                        rec = {"i": i, "code": 0, "reason": ""}
+                        if case[side] is not None:
+                            rec["targets"] = case[side]
+                        f.write(json.dumps(rec) + "\n")
+                        data = case[2 + side]
+                        if data is not None:
+                            (folder / f"{i}.raw").write_bytes(data)
+            with contextlib.redirect_stdout(io.StringIO()):
+                ps_sweep.main(["compare", "--out", tmp])
+            rows = json.loads((out / "classes_z.json").read_text(encoding="utf-8"))
+            self.assertEqual([(r["class"], r["sub"]) for r in rows], [case[-2:] for case in cases])
+
     def test_rerun_overrides_and_counts(self):
         with tempfile.TemporaryDirectory() as out:
             with open(os.path.join(out, "sample.json"), "w", encoding="utf-8", newline="\n") as f:
@@ -200,7 +247,7 @@ class CompareCommand(unittest.TestCase):
                 with open(os.path.join(d, "results_0.jsonl"), "w", encoding="utf-8", newline="\n") as f:
                     for i, c in enumerate(codes):
                         f.write(json.dumps({"i": i, "code": c, "reason": "", "targets": 1}) + "\n")
-                    write_raw(os.path.join(d, "0.raw"), [0.25] * 8)
+                write_raw(os.path.join(d, "0.raw"), [0.25] * 8)
                 write_raw(os.path.join(d, "1.raw"), [0.25] * 8)
             # shader 1 timed out on a while another process was starting: its re-run is clean
             re = os.path.join(out, "a_z_re")

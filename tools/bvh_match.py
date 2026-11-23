@@ -304,6 +304,9 @@ def main(argv=None):
     ap.add_argument("--json", help="write the report here")
     a = ap.parse_args(argv)
     if a.json:
+        if os.path.isdir(a.json):
+            print("error: --json is a directory: %s" % a.json, file=sys.stderr)
+            return 2
         # The report is written last, after the inputs have been read, so an aliased input would silently
         # be replaced by it. Refuse the alias before any input is opened, as the other report tools do.
         for what, other in (("the dehydrated input", a.dehydrated), ("the manifest", a.manifest),

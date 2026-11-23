@@ -250,7 +250,8 @@ python -I tools/audio_config.py <carve dir or blob> [--json] [--names FILE] [--j
   `{records, summary}`.
 
 `--names` is optional. The package's debug name stream and the localization credits are local game
-files; nothing from them is committed.
+files; nothing from them is committed. Its strings are read as latin-1 bytes, the same bytes `joaat`
+hashes, so a title with an accented character resolves to the hash a record carries.
 
 ## Limits
 

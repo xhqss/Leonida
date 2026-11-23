@@ -13,6 +13,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <utility>
 #include <vector>
 
 namespace leonida::vk_test {
@@ -39,13 +40,37 @@ inline bool spirv_declares_capability(const void* data, std::size_t bytes, std::
     return false;
 }
 
+// The float widths that the module's OpFmaKHR (4427) results have: OpTypeFloat (22) gives each float type's width,
+// OpTypeVector (23) carries its component's, and an OpFmaKHR's result type (word 1) is one of them. A module with
+// Float64 but only an f32 OpFmaKHR needs only shaderFmaFloat32, so the width comes from the instruction itself.
+inline void spirv_fma_widths(const void* data, std::size_t bytes, bool& f32, bool& f64) {
+    f32 = f64 = false;
+    if (bytes < 20 || bytes % 4) return;
+    std::vector<std::uint32_t> words(bytes / 4);
+    std::memcpy(words.data(), data, bytes);
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> width;   // float type id -> width (a few entries)
+    const auto width_of = [&](std::uint32_t id) -> std::uint32_t {
+        for (const auto& [t, w] : width) if (t == id) return w;
+        return 0;
+    };
+    for (std::size_t i = 5; i < words.size() && (words[i] >> 16);) {
+        const std::uint32_t op = words[i] & 0xffff, count = words[i] >> 16;
+        if (i + count > words.size()) break;
+        if (op == 22 && count >= 3) width.emplace_back(words[i + 1], words[i + 2]);
+        else if (op == 23 && count >= 4 && width_of(words[i + 2])) width.emplace_back(words[i + 1], width_of(words[i + 2]));
+        else if (op == 4427 && count >= 3) (width_of(words[i + 1]) == 64 ? f64 : f32) = true;
+        i += count;
+    }
+}
+
 struct ShaderFma {
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     VkPhysicalDeviceShaderFmaFeaturesKHR features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR};
 #endif
     bool float32 = false;  // the device lists the extension and reports shaderFmaFloat32
+    bool float64 = false;  // ... and shaderFmaFloat64 (OpFmaKHR on doubles: rdna2spirv.py --fma khr, v_div_fmas_f64)
 
-    bool supported() const { return float32; }
+    bool supported() const { return float32 || float64; }
 
     // Asks the physical device. Enables exactly what it reports (shaderFmaFloat16/32/64), so features never
     // fail device creation.
@@ -69,6 +94,7 @@ struct ShaderFma {
         features2(pd, &query);
         features.pNext = nullptr;
         float32 = features.shaderFmaFloat32 == VK_TRUE;
+        float64 = features.shaderFmaFloat64 == VK_TRUE;
 #else
         (void)gipa; (void)inst; (void)pd;
 #endif
@@ -77,7 +103,7 @@ struct ShaderFma {
     // Puts the features structure into the device pNext chain right after `base` (any structure in the chain).
     void link_after(void* base) {
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
-        if (!float32) return;
+        if (!supported()) return;
         auto* b = static_cast<VkBaseOutStructure*>(base);
         features.pNext = b->pNext;
         b->pNext = reinterpret_cast<VkBaseOutStructure*>(&features);
@@ -95,12 +121,17 @@ struct ShaderFma {
 #endif
     }
 
-    // True when the module can be used: it does not need FMAKHR, or the device enables shaderFmaFloat32.
-    // Otherwise says so and the caller returns 77.
+    // True when the module can be used: it does not need FMAKHR, or the device enables the shaderFmaFloat32 /
+    // shaderFmaFloat64 that its OpFmaKHR result widths need. Otherwise says so and the caller returns 77.
     bool accepts(const void* code, std::size_t bytes, const char* name) const {
-        if (float32 || !spirv_declares_capability(code, bytes, 6030)) return true;  // FMAKHR
-        std::fprintf(stderr, "unsupported: %s needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32) and the device "
-                             "lacks it; translate with --fma glsl\n", name);
+        if ((float32 && float64) || !spirv_declares_capability(code, bytes, 6030)) return true;  // FMAKHR
+        bool need32 = false, need64 = false;
+        spirv_fma_widths(code, bytes, need32, need64);
+        if (!need32 && !need64) need32 = true;   // FMAKHR declared but no OpFmaKHR found: keep the old requirement
+        const char* missing = need32 && !float32 ? "shaderFmaFloat32" : need64 && !float64 ? "shaderFmaFloat64" : nullptr;
+        if (!missing) return true;
+        std::fprintf(stderr, "unsupported: %s needs OpFmaKHR (VK_KHR_shader_fma, %s) and the device lacks it; "
+                             "translate with --fma glsl\n", name, missing);
         return false;
     }
 
@@ -108,7 +139,7 @@ struct ShaderFma {
     // shader must refuse the pair when EITHER stage needs FMAKHR, because the device then fails pipeline creation
     // instead of skipping. A file that cannot be read is accepted here; the caller's own module loading reports it.
     bool accepts_file(const char* path) const {
-        if (float32 || !path || !*path) return true;
+        if ((float32 && float64) || !path || !*path) return true;
         std::ifstream in(path, std::ios::binary);
         if (!in) return true;
         const std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());

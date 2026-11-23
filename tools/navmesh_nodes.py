@@ -283,6 +283,24 @@ def summarize(tally, n_nodes, n_sectors, max_dz):
     }
 
 
+def out_problem(path):
+    """Why the summary cannot be written at `path`, or None.
+
+    Checked before the archives are read: the levels graph takes minutes to scan, so a destination this run
+    cannot write should not cost the whole run and then end in a traceback.
+    """
+    parent = os.path.dirname(os.path.abspath(path))
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except OSError as e:
+        return "cannot create its folder: %s" % e
+    if not os.access(parent, os.W_OK):
+        return "its folder is not writable: %s" % parent
+    if os.path.exists(path) and not os.access(path, os.W_OK):
+        return "the existing summary is read-only"
+    return None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("navmeshes", help="navmeshes.rpf")
@@ -299,8 +317,12 @@ def main(argv=None):
     for path in (a.navmeshes, a.levels):
         if not os.path.isfile(path):
             ap.error("%s: no such file" % path)
-    if a.out and (os.path.isdir(a.out) or any(same_report_path(a.out, p) for p in (a.navmeshes, a.levels))):
-        ap.error("--out must be a file other than the two archives")
+    if a.out:
+        if os.path.isdir(a.out) or any(same_report_path(a.out, p) for p in (a.navmeshes, a.levels)):
+            ap.error("--out must be a file other than the two archives")
+        problem = out_problem(a.out)
+        if problem:
+            ap.error("--out: %s" % problem)
     try:
         nodes, read = node_positions(a.levels, a.jobs)
         summary = cross_check(a.navmeshes, nodes, a.max_dz)

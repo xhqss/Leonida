@@ -107,7 +107,7 @@ def decode_file(
     """Decode compressed file and write decompressed blocks to disk."""
     if same_report_path(in_path, out_path):
         raise ValueError(
-            f"output path {out_path!r} names the compressed input {in_path!r}; "
+            f"output path '{out_path}' names the compressed input '{in_path}'; "
             f"refusing to overwrite it"
         )
 

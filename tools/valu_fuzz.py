@@ -36,6 +36,7 @@ llvmpipe at 8 lanes); wave64 programs translated with --emulate use no subgroup 
 
 Needs llvm-mc 21 or newer for --family f16 (docs/testing.md): llvm-mc 18 rejects op_sel on the 16-bit integer VOP3
 forms, so no f16 program assembles and the run stops with exit code 2. --family mem assembles with 18.
+Usage: `python -I tools/valu_fuzz.py --help` lists the options.
 """
 import argparse
 import json

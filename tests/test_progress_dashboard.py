@@ -439,6 +439,19 @@ class Scrub(unittest.TestCase):
 
 
 class Outputs(unittest.TestCase):
+    def test_nonpositive_test_options_are_argument_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            for option in ("--jobs", "--test-timeout"):
+                for value in ("0", "-1"):
+                    with self.subTest(option=option, value=value):
+                        cmd = [sys.executable, "-I", TOOL, "--out", out, "--run-tests",
+                               "--tests", "test_progress_dashboard", option, value]
+                        result = subprocess.run(cmd, capture_output=True, cwd=ROOT, timeout=120)
+                        self.assertEqual(result.returncode, 2, result.stderr.decode("utf-8", "replace"))
+                        self.assertIn(f"{option} must be a positive integer".encode("ascii"), result.stderr)
+                        self.assertFalse(os.path.exists(out))
+
     def test_invalid_test_filter_is_an_argument_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "out")

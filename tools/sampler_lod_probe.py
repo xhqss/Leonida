@@ -23,6 +23,7 @@ Standard library only; the texture is built here, no game files.
 
 Exit codes: 0 every row matches the RDNA2 model (not "the hardware equals Vulkan"), 1 a row differs, 2 harness
 error, 77 no hardware oracle.
+Usage: `python -I tools/sampler_lod_probe.py --help` lists the options.
 """
 import argparse
 import math

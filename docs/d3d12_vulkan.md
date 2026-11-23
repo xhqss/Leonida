@@ -440,7 +440,7 @@ What is implemented (all of it testable without the game):
     enables BC texture compression, and `D3D12_OPTIONS12` reports `RelaxedFormatCastingSupported = TRUE`, so a
     committed or placed texture accepts a castable-format list. Other queries (including `OPTIONS6` and `OPTIONS10`)
     are logged and refused until the trace shows what the game asks (question 11);
-  - Single-sampled `A8_UNORM` 2D textures use one byte per texel in `VK_FORMAT_R8_UNORM`. Their SRVs expose
+  - Single-sampled `A8_UNORM` 1D, 2D and 3D textures use one byte per texel in `VK_FORMAT_R8_UNORM`. Their SRVs expose
     (0, 0, 0, A) before applying the caller's component mapping. Format support includes `MIP` when the Vulkan
     image supports multiple levels. Render-target, depth-stencil and UAV creation are unsupported for this format.
   - reserved resources and `GetResourceTiling` (section 4.2);

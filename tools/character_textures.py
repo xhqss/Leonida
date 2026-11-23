@@ -386,12 +386,15 @@ def main() -> int:
 
     rows = report_rows(report)
     print_report(report)
-    if args.json:
-        write_json(args.json, report, rows)
-        print("wrote", args.json)
-    if args.csv:
-        write_csv(args.csv, rows)
-        print("wrote", args.csv)
+    for path, writer, values in ((args.json, write_json, (report, rows)),
+                                 (args.csv, write_csv, (rows,))):
+        if path:
+            try:
+                writer(path, *values)
+            except OSError as exc:
+                print(f"ERROR: cannot write {path}: {exc.strerror or exc}", file=sys.stderr)
+                return 2
+            print("wrote", path)
     return 0
 
 

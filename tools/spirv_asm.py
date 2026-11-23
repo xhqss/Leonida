@@ -14,6 +14,7 @@ As a module:
 
 As a CLI:
     python3 -I tools/spirv_asm.py input.spvasm -o output.spv [--target-env vulkan1.2]
+Usage: `python -I tools/spirv_asm.py --help` lists the options.
 """
 import argparse
 import array

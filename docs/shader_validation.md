@@ -2192,6 +2192,11 @@ and a vec4 at every input location), the runtime's bindless set 0 with only its 
 push-constant block and 32x32 `RGBA32F` targets cleared to -1. Everything is identical on every GPU, so the same
 sample can be run on each and compared; `ps_sweep.py compare` classifies each shader: OK on both, differs beyond
 tolerance (1e-3 absolute plus relative), NaN or all-zero on one GPU only, fails on one GPU, fails on both, timeout.
+When both workers exit successfully, `compare` requires matching target counts (1–8) and exactly 16,384 bytes per
+target in each raw file (32 × 32 pixels × 16 bytes). A missing file, a wrong byte length or an invalid or mismatched
+count is reported as `invalid readback`, not as a GPU result. Failed and timed-out draws are classified by exit
+code without reading either file. The size check establishes completeness; this command still compares float values
+with tolerance, not byte-for-byte equality.
 Variant `t` (`VKS_TEX=1`) replaces the fallback images with an 8x8 gradient (2D, 2D array, 1D, 3D) and a linear
 sampler so sampled values are not all zero.
 

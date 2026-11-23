@@ -12,6 +12,7 @@ s[8:9] at 0x0/0x40/0x60, a world translation at 0x30 and a 4x4 at 0x160; and a p
 COLOR inputs that loads one T# from s[8:9] + 0x20 and samples it once. vk_sandbox fills that table (see its
 header). --check renders one frame headless and prints only counts: exit 0 when the frame is covered and, with
 textures, shows texture detail; 77 when the package, the pair or a GPU is missing. Standard library only.
+Usage: `python -I tools/sandbox.py --help` lists the options.
 """
 import argparse
 import json

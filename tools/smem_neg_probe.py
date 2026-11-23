@@ -12,6 +12,7 @@ whatever the hardware rule turns out to be. Rows the assembler rejects (a negati
 by hand as `.long` words. Standard library only; no game files.
 
 Exit codes: 0 every row matches the translator, 1 a mismatch, 2 harness error, 77 no hardware oracle.
+Usage: `python -I tools/smem_neg_probe.py --help` lists the options.
 """
 import argparse
 import os

@@ -1133,7 +1133,7 @@ int main(int argc, char** argv) {
             if (feat == "meshShader") want_mesh = true;
             else if (feat == "fragmentShaderBarycentric") want_bary = true;
             else if (feat == "fragmentShaderPixelInterlock") want_lock = true;
-            else if (feat == "shaderFmaFloat32") want_fma = true;   // OpFmaKHR (rdna2spirv.py --fma khr)
+            else if (feat == "shaderFmaFloat32" || feat == "shaderFmaFloat64") want_fma = true;   // OpFmaKHR (--fma khr)
             else if (feat == "shaderSubgroupClock" || feat == "shaderDeviceClock") want_clock = true;
         }
     }
@@ -1313,6 +1313,21 @@ int main(int argc, char** argv) {
                 return "no " + feat;
             if (feat == "shaderStorageImageArrayDynamicIndexing" && !f2.features.shaderStorageImageArrayDynamicIndexing)
                 return "no " + feat;
+            // A device without the OpFmaKHR width can reject the module itself, so skip before vkCreateShaderModule.
+            if (feat == "shaderFmaFloat32") {
+#ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
+                if (!(ext_fma && fma.shaderFmaFloat32)) return "no VK_KHR_shader_fma (shaderFmaFloat32)";
+#else
+                return "no VK_KHR_shader_fma (shaderFmaFloat32)";
+#endif
+            }
+            if (feat == "shaderFmaFloat64") {
+#ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
+                if (!(ext_fma && fma.shaderFmaFloat64)) return "no VK_KHR_shader_fma (shaderFmaFloat64)";
+#else
+                return "no VK_KHR_shader_fma (shaderFmaFloat64)";
+#endif
+            }
         }
         return {};
     };
@@ -1353,13 +1368,6 @@ int main(int argc, char** argv) {
             if (feat == "geometryShader" && !f2.features.geometryShader) return "no geometryShader";
             if (feat == "fragmentShaderBarycentric" && !(ext_bary && bary.fragmentShaderBarycentric)) return "no fragmentShaderBarycentric";
             if (feat == "fragmentShaderPixelInterlock" && !(ext_lock && lock.fragmentShaderPixelInterlock)) return "no fragmentShaderPixelInterlock";
-            if (feat == "shaderFmaFloat32") {
-#ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
-                if (!(ext_fma && fma.shaderFmaFloat32)) return "no VK_KHR_shader_fma (shaderFmaFloat32)";
-#else
-                return "no VK_KHR_shader_fma (shaderFmaFloat32)";
-#endif
-            }
             if (feat == "shaderSubgroupClock" && !(ext_clock && clock.shaderSubgroupClock)) return "no shaderSubgroupClock";
             if (feat == "shaderDeviceClock" && !(ext_clock && clock.shaderDeviceClock)) return "no shaderDeviceClock";
             if (feat == "shaderFloat64" && !f2.features.shaderFloat64) return "no shaderFloat64";

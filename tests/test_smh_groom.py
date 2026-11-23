@@ -1029,5 +1029,20 @@ class CliTests(unittest.TestCase):
             self.assertIn("must not overwrite", err_buf.getvalue())
 
 
+    def test_cli_census_limit_below_one_is_refused(self):
+        """--limit 0 used to stop at the first target and report an empty corpus with exit 0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for value in ("0", "-1"):
+                with self.subTest(limit=value):
+                    proc = subprocess.run(
+                        [sys.executable, "-I", os.path.join(TOOLS, "smh_groom.py"),
+                         "census", tmp, "--limit", value],
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(proc.returncode, 2)
+                    self.assertIn("--limit", proc.stderr)
+                    self.assertIn("at least 1", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

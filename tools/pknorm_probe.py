@@ -21,6 +21,7 @@ Sides (each prints the dword per case; the probe compares them):
 
 Exit code: 0 when every hardware word equals the translator's, 1 when one differs, 2 on a harness error, 77 when the
 hardware oracle is unavailable. Nothing here reads game files.
+Usage: `python -I tools/pknorm_probe.py --help` lists the options.
 """
 import argparse
 import os

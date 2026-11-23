@@ -125,6 +125,40 @@ int main() {
           "a batch with a COPY list on the DIRECT queue is refused");
     check(wait_idle(device.p, queues[0].p) && read_word() == 0, "and its matching DIRECT list did not run either");
 
+    // 3. Null command-list array: count == 0 is a no-op, count > 0 is refused without crashing.
+    queues[0]->ExecuteCommandLists(0, nullptr);
+    check(rt::d3d12::last_execute_result(queues[0].p) == leonida::ReplayResult::success,
+          "ExecuteCommandLists(0, nullptr) succeeds as a no-op");
+    queues[0]->ExecuteCommandLists(1, nullptr);
+    check(rt::d3d12::last_execute_result(queues[0].p) != leonida::ReplayResult::success,
+          "ExecuteCommandLists(1, nullptr) is refused without crashing");
+    check(wait_idle(device.p, queues[0].p), "the queue still signals after a null-array refusal");
+
+    // 4. A closed-but-invalid list (Close returned E_INVALIDARG after recording a copy) must not execute.
+    Ref<ID3D12CommandAllocator> invalid_allocator;
+    Ref<ID3D12GraphicsCommandList> invalid_list;
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&invalid_allocator.p))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, invalid_allocator.p, nullptr,
+                                         IID_PPV_ARGS(&invalid_list.p))))
+        return 1;
+    invalid_list->CopyBufferRegion(readback.p, 0, upload.p, 0, sizeof marker);
+    invalid_list->CopyBufferRegion(readback.p, 0, nullptr, 0, sizeof marker);  // invalidates recording
+    check(invalid_list->Close() == E_INVALIDARG, "invalid recording causes Close to return E_INVALIDARG");
+
+    ID3D12CommandList* invalid_alone[] = {invalid_list.p};
+    queues[0]->ExecuteCommandLists(1, invalid_alone);
+    check(rt::d3d12::last_execute_result(queues[0].p) != leonida::ReplayResult::success,
+          "a closed-but-invalid list is refused by ExecuteCommandLists");
+    check(wait_idle(device.p, queues[0].p) && read_word() == 0,
+          "and its earlier CopyBufferRegion did not modify the destination buffer");
+
+    ID3D12CommandList* valid_then_invalid[] = {copy_list.p, invalid_list.p};
+    queues[0]->ExecuteCommandLists(2, valid_then_invalid);
+    check(rt::d3d12::last_execute_result(queues[0].p) != leonida::ReplayResult::success,
+          "a batch containing an invalid list is refused");
+    check(wait_idle(device.p, queues[0].p) && read_word() == 0,
+          "and the valid list in that batch did not run either");
+
     ID3D12CommandList* alone[] = {copy_list.p};
     queues[0]->ExecuteCommandLists(1, alone);
     check(rt::d3d12::last_execute_result(queues[0].p) == leonida::ReplayResult::success,

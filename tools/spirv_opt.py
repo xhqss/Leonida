@@ -36,6 +36,7 @@ As a module:
 
 As a CLI:
     python3 -I tools/spirv_opt.py input.spvasm -o output.spvasm
+Usage: `python -I tools/spirv_opt.py --help` lists the options.
 """
 import argparse
 import sys

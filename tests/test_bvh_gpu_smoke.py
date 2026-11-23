@@ -175,6 +175,26 @@ class Cli(unittest.TestCase):
         with self.assertRaises(SystemExit):
             smoke.main(["--spirv", ".", "--heap-bytes", "100"])
 
+    def test_default_heap_bytes_is_16_mib(self):
+        # At the default --table-qword 0x2000, BuildKDOP accesses ~2 MiB and RadixCount ~8 MiB; 1 MiB faults on NVIDIA.
+        import subprocess
+        import unittest.mock as mock
+        seen = []
+
+        def fake_run(cmd, env=None, **_kwargs):
+            init = Path(env["VKC_HEAP_INIT"]).read_bytes()
+            seen.append((int(env["VKC_OUT_WORDS"]), len(init), struct.unpack_from("<Q", init, 0)[0]))
+            Path(env["VKC_DUMP"]).write_bytes(init)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "Demo.spv").write_bytes(b"")
+            with mock.patch.object(smoke, "find_vk_compute_test", return_value=Path(d) / "vkc"), \
+                    mock.patch.object(smoke.subprocess, "run", side_effect=fake_run):
+                code = smoke.main(["--spirv", d, "--no-validation"])
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, [((16 << 20) // 4, 16 << 20, 0x2000)] * 2)
+
     def test_missing_dll(self):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(SystemExit) as e:

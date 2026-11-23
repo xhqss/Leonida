@@ -2,6 +2,9 @@
 
 Sources: printable runs in carved blobs (selected archives fully; PSO/RBF blobs everywhere), shader names, and
 any extra text/binary files given (e.g. the exe once it arrives: run with --extra path\\to\\exe).
+A carved stream that inflates to a whole number of 64 KiB blocks continues in the next one (docs/page_directory.md),
+so a blob is harvested together with its continuation streams: a name across the boundary stays whole, and a PSO or
+RBF blob in an archive that is not harvested fully is read past its first stream.
 When multiple names share a hash, the dictionary keeps the lexicographically first spelling.
 The output cannot overwrite an input index, extra file, or harvested blob (including hard-link aliases).
 An index.json saved with a UTF-8 BOM (Windows PowerShell 5.1, old Notepad) is read, not refused.
@@ -29,6 +32,13 @@ MAX_NAME_LEN = 201
 PART = re.compile(r"[^./:\\]+")
 # Where re.split would yield an empty piece; only matters for --min 0 or less, which keeps "" as a name.
 EMPTY_PART = re.compile(r"[./:\\]{2}|[./:\\]$")
+# Carved stream heads (hex, as index.json has them) of the PSO and RBF blobs harvested in every archive.
+META_HEADS = ("5053494e", "52424630")                # PSIN, RBF0
+# Heads that start a stream of their own, never the continuation of the stream before (an XML declaration with or
+# without a UTF-8 BOM, besides the blob heads above).
+NEW_STREAM_HEADS = META_HEADS + ("3c3f786d6c", "efbbbf3c3f786d6c")
+# A stream whose inflated size is a non-zero multiple of this continues in the next one (docs/page_directory.md).
+CONTINUATION_BLOCK = 65536
 
 
 def joaat(s: str) -> int:
@@ -146,8 +156,11 @@ def main():
             reason = getattr(e, "strerror", None) or (f"no {e} key" if isinstance(e, KeyError) else e)
             print(f"ERROR: cannot read {p}: {reason}", file=sys.stderr)
             return 2
+        chain = []          # the streams of the blob being read: its first stream and those that continue it
         for row_idx, r in enumerate(rows):
             if r.get("type") == "bink2":
+                harvest(b"".join(chain), strings, a.min)
+                chain = []
                 continue
             head = r.get("head")
             off = r.get("off")
@@ -159,20 +172,29 @@ def main():
             if err is not None:
                 print(f"ERROR: cannot read {p}: {err}", file=sys.stderr)
                 return 2
-            meta = head.startswith("5053494e") or head.startswith("52424630")
-            if arch in full or meta:
-                blob = os.path.join(arch_dir, f"{off:012x}.bin")
-                try:
-                    with open(blob, "rb") as f:
-                        if output_stat is not None and os.path.samestat(os.fstat(f.fileno()), output_stat):
-                            print(f"ERROR: --out {a.out} is one of the inputs ({blob}); choose another output file",
-                                  file=sys.stderr)
-                            return 2
-                        data = f.read()
-                except OSError:
-                    missing.append(blob)
+            # A row continues the blob before it when that stream filled whole 64 KiB blocks and this one does
+            # not start a stream of its own; it is read with that blob, whatever its own head says.
+            last = len(chain[-1]) if chain else 0
+            if not (last and last % CONTINUATION_BLOCK == 0 and not head.startswith(NEW_STREAM_HEADS)):
+                harvest(b"".join(chain), strings, a.min)
+                chain = []
+                if not (arch in full or head.startswith(META_HEADS)):
                     continue
-                harvest(data, strings, a.min)
+            blob = os.path.join(arch_dir, f"{off:012x}.bin")
+            try:
+                with open(blob, "rb") as f:
+                    if output_stat is not None and os.path.samestat(os.fstat(f.fileno()), output_stat):
+                        print(f"ERROR: --out {a.out} is one of the inputs ({blob}); choose another output file",
+                              file=sys.stderr)
+                        return 2
+                    data = f.read()
+            except OSError:
+                missing.append(blob)
+                harvest(b"".join(chain), strings, a.min)
+                chain = []
+                continue
+            chain.append(data)
+        harvest(b"".join(chain), strings, a.min)
         print(f"{arch}: {len(strings)} strings so far", flush=True)
     if missing:
         print(f"WARNING: {len(missing)} carved blobs listed in an index.json could not be read and were skipped "

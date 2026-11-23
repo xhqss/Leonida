@@ -269,6 +269,28 @@ class ArchiveTest(unittest.TestCase):
                 self.assertNotIn("Traceback", cp.stderr)
                 self.assertEqual(cp.stdout, "")
 
+    def test_cli_refuses_an_unwritable_out_before_the_archives_are_read(self):
+        # Both archives are read before the summary is written, so a --out that cannot be written used to cost
+        # the whole run and then end in a traceback.
+        out = os.path.join(self.tmp.name, "read-only.json")
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
+            f.write("{}\n")
+        os.chmod(out, 0o444)
+        try:
+            junk = os.path.join(self.tmp.name, "junk.rpf")
+            with open(junk, "wb") as f:
+                f.write(b"not an archive")
+            cp = subprocess.run([sys.executable, "-I", TOOL, junk, self.levels, "--out", out],
+                                capture_output=True, text=True)
+            self.assertEqual(cp.returncode, 2, cp.stderr)
+            self.assertIn("read-only", cp.stderr)
+            self.assertNotIn("Traceback", cp.stderr)
+            self.assertNotIn("not an RPF9 archive", cp.stderr)   # refused before either archive is read
+            with open(out, "rb") as f:
+                self.assertEqual(f.read(), b"{}\n")
+        finally:
+            os.chmod(out, 0o666)
+
     def test_cli_reports_a_file_that_is_not_an_archive(self):
         junk = os.path.join(self.tmp.name, "junk.rpf")
         with open(junk, "wb") as f:

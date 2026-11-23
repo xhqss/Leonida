@@ -316,16 +316,16 @@ The loader-side runs behind these numbers are recorded in [`runtime/test/bink_de
   the mount lists ([section 8](#8-names-from-the-mount-lists)), and the folder names group the streams by use. What
   the game does with each folder at run time is not established.
 - **Audio association.** The header gives a track count, sample rate, flags and track IDs, but not which audio
-  belongs to which video frame beyond the interleaving described by the Bink format. `BinkOpenTrack` and
-  `BinkGetTrackData` return 16-bit PCM for all 229 tracks (the byte count each run prints; `runtime/test/bink_audio_test.md`,
-  [coverage above](#decode-coverage-over-the-whole-archive)), but no track was matched to a language or a mix.
-- **Audio association.** `BinkOpenTrack`, `BinkGetTrackID`, `BinkGetTrackType`, `BinkGetTrackMaxSize`, and
-  `BinkGetTrackData` now succeed on all 229 tracks across the 196 audio-bearing streams
-  ([section 4](#audio-track-decoding-binkopentrack--binkgettrackdata-asset-323)): positional track index `i` maps
-  1:1 to header `track_ids[i]` (`0..3`), `BinkGetTrackType` returns `(flags << 16) | sample_rate`, and
-  `BinkGetTrackData` returned 145,920 bytes on frame 0 and 7,680 bytes on frame 1 across all 229 tracks (with
-  frame 2 also checked on 1-, 2-, and 4-track samples; later frames were not swept and may return 7,680 or 0 bytes).
-  Which language or mix role the game assigns to track IDs `0, 1, 2, 3` at run time remains unknown.
+  belongs to which video frame beyond the interleaving described by the Bink format. `BinkOpenTrack`,
+  `BinkGetTrackID`, `BinkGetTrackType`, `BinkGetTrackMaxSize`, and `BinkGetTrackData` succeed on all 229 tracks
+  across the 196 audio-bearing streams
+  ([section 4](#audio-track-decoding-binkopentrack--binkgettrackdata-asset-323)) and return 16-bit PCM for every
+  one of them (the byte count each run prints; `runtime/test/bink_audio_test.md`,
+  [coverage above](#decode-coverage-over-the-whole-archive)): positional track index `i` maps 1:1 to header
+  `track_ids[i]` (`0..3`), `BinkGetTrackType` returns `(flags << 16) | sample_rate`, and `BinkGetTrackData`
+  returned 145,920 bytes on frame 0 and 7,680 bytes on frame 1 across all 229 tracks (with frame 2 also checked on
+  1-, 2-, and 4-track samples; later frames were not swept and may return 7,680 or 0 bytes). Which language or mix
+  role the game assigns to track IDs `0, 1, 2, 3` at run time remains unknown.
 - **Playback integration.** The executable is not in the package. Where the game calls `BinkOpen`, which flags it
   passes, whether it uses `BinkDoFrameAsync`, `BinkGoto`, subtitles or the GPU path, and how it schedules movies
   against streaming are all unknown.

@@ -960,6 +960,8 @@ def main(argv=None) -> int:
         help="list VS/PS names in the carve index and exit",
     )
     a = ap.parse_args(argv)
+    if a.min_coverage is not None and not 0.0 <= a.min_coverage <= 1.0:
+        ap.error("--min-coverage must be between 0 and 1")
     if a.camera:
         if not math.isfinite(a.yaw):
             ap.error("--yaw must be finite")

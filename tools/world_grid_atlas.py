@@ -225,7 +225,7 @@ def load_manifests(work: str) -> list:
         path = os.path.join(root, "manifest.json")
         if not os.path.isfile(path):
             continue
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             manifest = json.load(f)
         for item in manifest.get("Items", []):
             for t in item.get("Textures", []):

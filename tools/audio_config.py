@@ -126,7 +126,7 @@ def scan(blob, min_ms=MIN_MS, max_ms=MAX_MS):
     out = []
     end = len(blob) - 20
     pos = 4
-    while pos < end:
+    while pos <= end:  # a marker with exactly 20 bytes after it is complete
         record = blob[pos:pos + 2] == MARKER_1 and _record_at(blob, pos, pos, min_ms, max_ms)
         if not record:
             pos += 1
@@ -148,8 +148,8 @@ def scan_stream(chunks, min_ms=MIN_MS, max_ms=MAX_MS):
     for chunk in chunks:
         buf += chunk
         end = base + len(buf) - 20
-        while pos < end:
-            i = buf.find(MARKER_1, pos - base, end - base + 1)
+        while pos <= end:
+            i = buf.find(MARKER_1, pos - base, end - base + 2)  # +2 for the two marker bytes
             if i < 0:
                 pos = end
                 break
@@ -187,7 +187,7 @@ def load_names(path):
     for item in pool.split(b"\x00"):
         if not item:
             continue
-        text = item.decode("utf-8", "replace")
+        text = item.decode("latin-1")    # a name's bytes, as hashdict.py and awc_names.py read them
         key = joaat(normalized_name(text))
         if key not in names:
             names[key] = text

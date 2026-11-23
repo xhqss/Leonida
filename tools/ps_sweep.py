@@ -40,6 +40,7 @@ timed out while another process was starting.
 
 Shaders are numbered by their place in `sample.json`; the summary lines and everything under `<dir>` except
 `sample.json` (which names the sampled shaders, so keep it out of reports) are counts and numbers only.
+Usage: `python -I tools/ps_sweep.py --help` lists the options.
 """
 from collections import Counter
 import argparse
@@ -279,13 +280,6 @@ def cmd_run(a):
     print("done", a.tag, a.variant, a.lo)
 
 
-def floats(path):
-    with open(path, "rb") as f:
-        data = f.read()
-    n = len(data) // 4
-    return struct.unpack(f"<{n}f", data[: n * 4])
-
-
 def written_stats(vals):
     """(has NaN, every written value is zero, nothing written). The harness clears every target to -1."""
     written = [x for x in vals if x != -1.0]
@@ -300,9 +294,23 @@ def classify_pair(rec_a, rec_b, raw_a, raw_b, tol=TOLERANCE):
     if 3 in (code_a, code_b):
         return "timeout", ""
     if code_a == 0 and code_b == 0:
-        fa, fb = floats(raw_a), floats(raw_b)
-        if len(fa) != len(fb):
-            return "fails on one GPU", "short output"
+        targets_a, targets_b = rec_a.get("targets"), rec_b.get("targets")
+        if any(type(n) is not int or not 1 <= n <= 8 for n in (targets_a, targets_b)):
+            return "invalid readback", "invalid target count"
+        if targets_a != targets_b:
+            return "invalid readback", "target counts differ"
+        size = W * H * 16 * targets_a  # RGBA32F, packed target by target
+        outputs = []
+        for tag, path in (("a", raw_a), ("b", raw_b)):
+            try:
+                with open(path, "rb") as f:
+                    data = f.read(size + 1)  # detect trailing bytes without reading an unbounded file
+            except FileNotFoundError:
+                return "invalid readback", f"{tag}: missing output"
+            if len(data) != size:
+                return "invalid readback", f"{tag}: wrong output size"
+            outputs.append(struct.unpack(f"<{size // 4}f", data))
+        fa, fb = outputs
         nan_a, zero_a, none_a = written_stats(fa)
         nan_b, zero_b, none_b = written_stats(fb)
         if (nan_a, zero_a, none_a) != (nan_b, zero_b, none_b):

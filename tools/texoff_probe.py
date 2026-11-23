@@ -16,6 +16,7 @@ ignored. The rule checked is the translator's: every field is sign-extended from
 (tests/test_texel_offsets.py). Standard library only; the texture is built here, no game files.
 
 Exit codes: 0 every row matches the rule, 1 a mismatch, 2 harness error, 77 no hardware oracle.
+Usage: `python -I tools/texoff_probe.py --help` lists the options.
 """
 import argparse
 import os

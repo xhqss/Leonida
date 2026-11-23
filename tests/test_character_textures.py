@@ -276,6 +276,18 @@ class CharacterTextureTests(unittest.TestCase):
                         self.assertIn("ERROR:", err.getvalue())
                         self.assertIn("Permission denied", err.getvalue())
 
+    def test_unwritable_report_path_exits_2_without_traceback(self):
+        with tempfile.TemporaryDirectory() as td:
+            write_model(pathlib.Path(td) / "a", model([{"Name": "m", "Materials": []}]))
+            blocker = pathlib.Path(td) / "file_parent"
+            blocker.write_text("x", encoding="utf-8")
+            bad_json = blocker / "out.json"
+            proc = subprocess.run([sys.executable, "-I", TOOL, td, "--json", str(bad_json)],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertNotIn("Traceback", proc.stderr)
+            self.assertIn("ERROR: cannot write", proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

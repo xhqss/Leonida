@@ -1,5 +1,7 @@
 """Exercise developer tool discovery through its public command line."""
+from contextlib import ExitStack
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -52,12 +54,13 @@ class DiscoveryTests(unittest.TestCase):
             ("boot-trace", PRODUCERS[0], "guest-scene", PRODUCERS[1]),
             ("guest-scene", PRODUCERS[1], "boot-trace", PRODUCERS[0]),
         ):
-            with self.subTest(tool=tool_id):
+            with self.subTest(tool=tool_id), ExitStack() as cleanup:
                 producer = self.checkout / present_path
                 producer.parent.mkdir(exist_ok=True)
                 producer.write_text(
                     "import sys\nprint(sys.argv[1:])\n", encoding="utf-8", newline="\n",
                 )
+                cleanup.callback(producer.unlink)
                 # A namesake file in the caller's directory must not count.
                 decoy = self.cwd / missing_path
                 decoy.parent.mkdir(exist_ok=True)
@@ -78,12 +81,11 @@ class DiscoveryTests(unittest.TestCase):
                 self.assertIsNone(missing["help_argv"])
                 self.assertIs(inventory["live_controls"]["available"], False)
                 self.assertTrue(inventory["live_controls"]["reason"].strip())
-                help_result = subprocess.run(
-                    found["help_argv"], cwd=self.checkout, capture_output=True, timeout=10,
-                )
+                self.assertEqual(found["help_argv"][0], sys.executable)
+                help_result = subprocess.run(found["help_argv"], cwd=self.checkout, capture_output=True,
+                                             env={**os.environ, "PATH": ""}, timeout=10)
                 self.assertEqual(help_result.returncode, 0, help_result.stderr)
                 self.assertEqual(help_result.stdout.strip(), b"['--help']")
-                producer.unlink()
 
     def test_invalid_option_is_an_error(self):
         result = self.invoke("discover", "--no-such-option")

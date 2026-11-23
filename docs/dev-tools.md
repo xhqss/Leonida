@@ -13,7 +13,9 @@ The inventory always describes the checkout containing that script.
 
 `boot-trace` points to the analyzer for startup JSONL and D3D12 stderr logs.
 `guest-scene` points to the headless synthetic guest runner. Run a listed help
-command from the checkout root to see the producer's options. The inventory
+command from the checkout root to see the producer's options. The text
+inventory displays commands for PowerShell on Windows and POSIX shells
+on other platforms. The inventory
 checks for each producer script and lists its prerequisites without checking
 those prerequisites or running the producer. Live attach, pause, step, input,
 and screenshots are unavailable through this entry point.
@@ -26,7 +28,8 @@ and screenshots are unavailable through this entry point.
 - `tools` lists entries by `id`. Each `path` uses forward slashes and is
   relative to the checkout root. `present` indicates whether the script is
   a file. `help_argv` is a list of arguments for a command run from the checkout
-  root, or `null` when the script is missing. `requirements` lists prerequisites
+  root. Its first argument is the Python executable running discovery. It
+  is `null` when the script is missing. `requirements` lists prerequisites
   for using the producer.
 - `live_controls` contains an `available` boolean and a `reason`.
 

@@ -20,6 +20,7 @@ Commands
                                      resolved names are game data, so never commit or post it).
 
 Resolved names are game strings. Only counts belong in issues and pull requests.
+Usage: `python -I tools/save_keys.py --help` lists the options.
 """
 import argparse
 import collections

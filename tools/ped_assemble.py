@@ -980,6 +980,15 @@ def _part_from_dict(raw: dict, *, default_name: str, default_space: str, base_di
     triangles = _normalize_triangles(raw.get("triangles", raw.get("indices", [])))
     normals = [(float(n[0]), float(n[1]), float(n[2])) for n in raw["normals"]] if raw.get("normals") else None
     uvs = [(float(u[0]), float(u[1])) for u in raw["uvs"]] if raw.get("uvs") else None
+    raw_extra = raw.get("uvs_extra", {})
+    if not isinstance(raw_extra, dict) or any(
+        re.fullmatch(r"[1-9][0-9]{0,8}", str(key)) is None for key in raw_extra
+    ):
+        raise PedAssembleError(f"{name}: uvs_extra keys must be positive texture coordinate set indices")
+    uvs_extra = {
+        int(key): [(float(u[0]), float(u[1])) for u in values]
+        for key, values in raw_extra.items()
+    }
     colors = None
     if raw.get("colors"):
         colors = [
@@ -1001,6 +1010,7 @@ def _part_from_dict(raw: dict, *, default_name: str, default_space: str, base_di
         translation=(float(trans[0]), float(trans[1]), float(trans[2])),
         normals=normals,
         uvs=uvs,
+        uvs_extra=uvs_extra,
         colors=colors,
         joints_0=joints_0,
         weights_0=weights_0,
@@ -1050,6 +1060,9 @@ def part_to_dict(part: MeshPart) -> dict:
         out["normals"] = [list(n) for n in part.normals]
     if part.uvs is not None:
         out["uvs"] = [list(u) for u in part.uvs]
+    if part.uvs_extra:
+        out["uvs_extra"] = {str(key): [list(u) for u in values]
+                            for key, values in sorted(part.uvs_extra.items())}
     if part.colors is not None:
         out["colors"] = [list(c) for c in part.colors]
     if part.joints_0 is not None:
@@ -1242,6 +1255,9 @@ def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
             for name, allowed in _GLB_ATTRIBUTE_TYPES.items():
                 if name in attrs:
                     check_accessor(attrs[name], f"{where}.{name}", allowed)
+            for name, index in attrs.items():
+                if re.fullmatch(r"TEXCOORD_[1-9][0-9]{0,8}", name):
+                    check_accessor(index, f"{where}.{name}", ("VEC2",))
             if "indices" in prim:
                 check_accessor(prim["indices"], f"{where}.indices", ("SCALAR",))
             if "material" not in prim:
@@ -1473,6 +1489,12 @@ def read_glb_parts(path: str) -> list[MeshPart]:
                 [tuple(float(x) for x in u) for u in read_accessor(attrs["TEXCOORD_0"])]
                 if "TEXCOORD_0" in attrs else None
             )
+            uvs_extra = {
+                int(semantic[9:]): [tuple(float(x) for x in u)
+                                   for u in read_accessor(accessor)]
+                for semantic, accessor in attrs.items()
+                if re.fullmatch(r"TEXCOORD_[1-9][0-9]{0,8}", semantic)
+            }
             colors = None
             if "COLOR_0" in attrs:
                 raw_c = read_accessor(attrs["COLOR_0"])
@@ -1541,6 +1563,7 @@ def read_glb_parts(path: str) -> list[MeshPart]:
                 translation=trans,
                 normals=normals,
                 uvs=uvs,
+                uvs_extra=uvs_extra,
                 colors=colors,
                 joints_0=joints_0,
                 weights_0=weights_0,
@@ -1944,6 +1967,16 @@ def build_assembled_glb(
             uv_bytes = _pack_f32_vec(aligned.uvs, 2)
             uv_bv = _append_bv(bin_buf, buffer_views, uv_bytes, target=TARGET_ARRAY_BUFFER)
             attrs["TEXCOORD_0"] = _append_accessor(accessors, uv_bv, COMPONENT_FLOAT, n_verts, "VEC2")
+
+        if any(type(key) is not int or not 1 <= key <= 999999999 for key in aligned.uvs_extra):
+            raise PedAssembleError(f"{part.name}: uvs_extra keys must be positive texture coordinate set indices")
+        for key, values in sorted(aligned.uvs_extra.items()):
+            if f"TEXCOORD_{key - 1}" not in attrs:
+                raise PedAssembleError(f"{part.name}: texture coordinate sets must start at 0 without gaps")
+            if len(values) != n_verts or any(len(u) != 2 for u in values):
+                raise PedAssembleError(f"{part.name}: TEXCOORD_{key} must contain one VEC2 per vertex")
+            uv_bv = _append_bv(bin_buf, buffer_views, _pack_f32_vec(values, 2), target=TARGET_ARRAY_BUFFER)
+            attrs[f"TEXCOORD_{key}"] = _append_accessor(accessors, uv_bv, COMPONENT_FLOAT, n_verts, "VEC2")
 
         if aligned.colors is not None and len(aligned.colors) == n_verts:
             col_bytes = _pack_f32_vec(aligned.colors, 4)

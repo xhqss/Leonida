@@ -1090,6 +1090,21 @@ def run_suite(a, work: str) -> int:
                 ok, detail = judge_cs_dump(rc, msg, [0, 0x40040000], wave64=False, partial=False, emulated=False,
                                            hexwords=True)
                 results.append((name, ok, detail))
+        elif name == "cs_div_fmas_f64":
+            # One-rounding binary64 FMA: strict where the translator emitted OpFmaKHR on doubles (shaderFmaFloat64,
+            # --fma khr); under the default GLSL Fma the split result (0) is allowed, as cs_fma_fused allows it.
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
+            if rc == UNSUPPORTED:      # no shaderFloat64, or (--fma khr) no shaderFmaFloat64
+                results.append((name, None, unsupported_skip(msg)))
+            else:
+                words = (dump_words(msg) or [])[:2] if rc == 0 else []
+                strict = "shaderFmaFloat64" in ((index.get(name) or {}).get("features") or ())
+                fused, split = [0, 0x3c300000], [0, 0]
+                ok = rc == 0 and (words == fused or (not strict and words == split))
+                detail = " ".join(hex(x) for x in words) if words else msg
+                if ok and words == split:
+                    detail += " (split: the driver rounds GLSL Fma on doubles twice; --fma khr fixes it)"
+                results.append((name, ok, detail))
         elif name == "cs_cvt_f32_sat":
             # #300's saturating float -> int conversions: one dispatch per input word in s4 (VKC_SGPRS).
             wrong, skip = [], None

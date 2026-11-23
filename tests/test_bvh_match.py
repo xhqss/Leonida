@@ -499,6 +499,15 @@ class TestPieces(unittest.TestCase):
         self.assertEqual(M.parse_shader_hashes(""), frozenset())
         self.assertEqual(M.parse_shader_hashes(None), frozenset())
 
+    def test_json_directory_is_refused_before_reading_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = M.main([os.path.join(directory, "missing.bvh"),
+                             os.path.join(directory, "missing.json"), "--json", directory])
+            self.assertEqual(rc, 2)
+            self.assertIn("is a directory", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

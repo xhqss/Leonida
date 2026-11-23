@@ -22,6 +22,7 @@ check and its result is printed; --json writes the raw words. Standard library o
 Select the GPU with LEONIDA_VK_DEVICE, as for ps_oracle. Exit codes: 0 every check holds (the gfx1036
 measurement), 1 a check differs, 2 a harness error, 77 no pixel-shader oracle on this device (see ps_oracle) or a
 wave32 pixel stage (the programs are wave64).
+Usage: `python -I tools/ps_helper_probe.py --help` lists the options.
 """
 import argparse
 import json

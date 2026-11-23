@@ -132,6 +132,8 @@ def load_dialogue(path):
         langs = [f[5:] for f in reader.fieldnames or [] if f.startswith("text_")]
         out = {}
         for row in reader:
+            if row["wave"] is None:
+                raise ValueError(f"{path}: line {reader.line_num} is missing wave")
             wave = row["wave"].lower()
             if wave in out:
                 previous = tags_packet(comments(wave, out[wave], langs))

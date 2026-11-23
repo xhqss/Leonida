@@ -570,6 +570,71 @@ class CarveAndExtraCLITest(unittest.TestCase):
         self.assertEqual(mapping["18c8836d"], "str_63346_847129")
 
 
+class ContinuationStreamTest(unittest.TestCase):
+    """A carved stream that fills whole 64 KiB blocks continues in the next one (docs/page_directory.md): the
+    blob is harvested with its continuation, so a name across the boundary is kept whole."""
+
+    NAME = b"synthetic_rig_name"
+    CUT = 8                       # the boundary falls after "syntheti"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.carve = os.path.join(self.tmp.name, "carve")
+        self.out = os.path.join(self.tmp.name, "hashes.json")
+
+    def write_archive(self, arch, streams):
+        """One archive folder of carved streams laid out back to back, as rpf9_carve.py writes them."""
+        folder = os.path.join(self.carve, arch)
+        os.makedirs(folder)
+        rows, off = [], 0
+        for data in streams:
+            with open(os.path.join(folder, f"{off:012x}.bin"), "wb") as f:
+                f.write(data)
+            rows.append({"off": off, "stored": len(data), "size": len(data), "head": data[:16].hex()})
+            off += 0x10000 * ((len(data) + 0xFFFF) // 0x10000)
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"files": rows}, f)
+
+    def first_stream(self, magic, size=65536):
+        """`size` bytes starting with `magic` and ending in the first CUT bytes of NAME."""
+        tail = b"\x00" + self.NAME[:self.CUT]
+        return magic + b"\x01" * (size - len(magic) - len(tail)) + tail
+
+    def names(self, *args):
+        p = subprocess.run([sys.executable, "-I", TOOL, self.carve, "--out", self.out, *args],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(self.out, encoding="utf-8") as f:
+            return set(json.load(f).values())
+
+    def test_pso_blob_is_read_past_its_first_stream(self):
+        # levels is not in the default --archives: only PSIN/RBF0 blobs are read there, now with their continuation
+        self.write_archive("levels", [self.first_stream(b"PSIN" + bytes(12)),
+                                      self.NAME[self.CUT:] + b"\x00continuation_only_name\x00"])
+        names = self.names()
+        self.assertIn(self.NAME.decode(), names)
+        self.assertIn("continuation_only_name", names)
+        self.assertNotIn(self.NAME[:self.CUT].decode(), names)
+
+    def test_name_across_the_boundary_of_a_fully_harvested_archive(self):
+        # a first stream of 128 KiB continues as well (docs/page_directory.md)
+        self.write_archive("common", [self.first_stream(b"\x00" * 16, 2 * 65536), self.NAME[self.CUT:] + b"\x00"])
+        names = self.names()
+        self.assertIn(self.NAME.decode(), names)
+        self.assertNotIn(self.NAME[:self.CUT].decode(), names)
+        self.assertNotIn(self.NAME[self.CUT:].decode(), names)
+
+    def test_streams_that_do_not_continue_are_harvested_apart(self):
+        # a stream short of a whole block ends its blob, and a new PSIN stream never continues the one before
+        self.write_archive("common", [self.first_stream(b"\x00" * 16, 65535), self.NAME[self.CUT:] + b"\x00",
+                                      self.first_stream(b"\x00" * 16), b"PSIN" + self.NAME[self.CUT:] + b"\x00"])
+        names = self.names()
+        self.assertNotIn(self.NAME.decode(), names)
+        self.assertIn(self.NAME[:self.CUT].decode(), names)
+        self.assertIn(self.NAME[self.CUT:].decode(), names)
+
+
 class OutputPathTest(unittest.TestCase):
     def test_out_creates_its_parent_directory(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -354,6 +354,18 @@ class TestFolder(unittest.TestCase):
         self.assertIn("line 5", r.stderr)
         self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), [])     # nothing was tagged
 
+    def test_cli_dialogue_row_missing_wave_is_one_error_line(self):
+        with open(self.dialogue, "w", encoding="utf-8", newline="") as fh:
+            fh.write("label,wave,text_en\n")
+            fh.write("ONLY_LABEL\n")
+        r = subprocess.run([sys.executable, "-I", TOOL, self.opus, "--names", self.names,
+                            "--dialogue", self.dialogue], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(len(r.stderr.strip().splitlines()), 1)
+        self.assertIn("line 2", r.stderr)
+        self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

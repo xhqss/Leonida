@@ -37,6 +37,7 @@ DX10 DDS when every source mip uses a supported codec.
 
 Standard library only. The tile patterns and tail formula are the public AMD
 Gfx10 4 KiB/64 KiB layouts recorded in docs/textures.md and docs/textures_arrays.md.
+Usage: `python -I tools/ttpf_mips.py --help` lists the options.
 """
 import argparse
 import glob

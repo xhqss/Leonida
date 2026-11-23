@@ -153,6 +153,29 @@ class PlainLogicTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             wga.linear_fit([1.0, 1.0], [2.0, 3.0])
 
+    def test_load_manifests_accepts_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as td:
+            tex_dir = os.path.join(td, "assets", "levels", "textures")
+            os.makedirs(tex_dir)
+            manifest = {
+                "Items": [{
+                    "Offset": 0x1000,
+                    "Dir": "dictionary_at_0000000000001000",
+                    "Textures": [{
+                        "Index": 0,
+                        "Name": "watersystemheightmap",
+                        "Width": 64,
+                        "Height": 64,
+                        "Format": "R16_UNORM",
+                    }],
+                }]
+            }
+            with open(os.path.join(tex_dir, "manifest.json"), "wb") as f:
+                f.write(b"\xef\xbb\xbf" + json.dumps(manifest).encode("utf-8"))
+            recs = wga.load_manifests(td)
+            self.assertEqual(len(recs), 1)
+            self.assertEqual(recs[0]["name"], "watersystemheightmap")
+
 
 # ---- synthetic work folder and carve ---------------------------------------------------------------------------
 

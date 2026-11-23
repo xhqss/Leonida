@@ -3024,11 +3024,12 @@ HRESULT command_list(ID3D12Device* device, UINT node_mask, D3D12_COMMAND_LIST_TY
     return released(hr, &out);
 }
 
-HRESULT command_list1(ID3D12Device* device, UINT node_mask, D3D12_COMMAND_LIST_TYPE type, bool output = true) {
+HRESULT command_list1(ID3D12Device* device, UINT node_mask, D3D12_COMMAND_LIST_TYPE type, bool output = true,
+                      D3D12_COMMAND_LIST_FLAGS flags = D3D12_COMMAND_LIST_FLAG_NONE) {
     Ref<ID3D12Device4> device4;
     if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device4.p)))) return E_NOINTERFACE;
     void* out = nullptr;
-    return released(device4->CreateCommandList1(node_mask, type, D3D12_COMMAND_LIST_FLAG_NONE,
+    return released(device4->CreateCommandList1(node_mask, type, flags,
                                                 __uuidof(ID3D12GraphicsCommandList), output ? &out : nullptr),
                     &out);
 }
@@ -4128,6 +4129,15 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"command list1: null output, type 99", [](ID3D12Device* d) {
              return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(99), false);
+         }},
+        {"command list1: flags 1", [](ID3D12Device* d) {
+             return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, true, D3D12_COMMAND_LIST_FLAGS(1));
+         }},
+        {"command list1: flags 0xffffffff", [](ID3D12Device* d) {
+             return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, true, D3D12_COMMAND_LIST_FLAGS(0xffffffffu));
+         }},
+        {"command list1: null output, flags 1", [](ID3D12Device* d) {
+             return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, false, D3D12_COMMAND_LIST_FLAGS(1));
          }},
         // CreateCommandSignature (no root signature). A null description faults in the host runtime, so it is not
         // compared.
@@ -6829,11 +6839,11 @@ int main() {
                 return rt::d3d12::last_execute_result(queue.p) == result;
             };
             using R = leonida::ReplayResult;
-            EXPECT(refuse(E_INVALIDARG, R::invalid_query,  // begun and never ended
+            EXPECT(refuse(E_INVALIDARG, R::unsupported,  // begun and never ended; invalid list is refused at execution
                           [&] { list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0); }));
-            EXPECT(refuse(E_INVALIDARG, R::success,  // timestamps have no Begin; the call is dropped
+            EXPECT(refuse(E_INVALIDARG, R::unsupported,  // timestamps have no Begin; invalid list is refused at execution
                           [&] { list->BeginQuery(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0); }));
-            EXPECT(refuse(E_INVALIDARG, R::success,  // offset not a multiple of 8
+            EXPECT(refuse(E_INVALIDARG, R::unsupported,  // offset not a multiple of 8; invalid list is refused at execution
                           [&] { list->ResolveQueryData(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, readback.p, 4); }));
             EXPECT(refuse(S_OK, R::invalid_query,  // past the end of the heap
                           [&] { list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 3, 2, readback.p, 0); }));
@@ -6843,7 +6853,7 @@ int main() {
                 list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 0);
                 list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 0);
             }));
-            EXPECT(refuse(E_INVALIDARG, R::invalid_query,  // a stream-output query begun and never ended
+            EXPECT(refuse(E_INVALIDARG, R::unsupported,  // a stream-output query begun and never ended; invalid list is refused
                           [&] { list->BeginQuery(so.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM2, 0); }));
             EXPECT(refuse(S_OK, R::invalid_query,  // into a texture
                           [&] { list->ResolveQueryData(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, rt_resource.p, 0); }));
