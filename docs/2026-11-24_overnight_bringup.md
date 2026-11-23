@@ -621,17 +621,20 @@ $env:PATH="E:\VulkanSDK\1.4.363.1\Bin;$env:PATH"
 的失真，不是翻译器的语义问题——和 `docs/shader_disasm.md` 里那类已知问题同源。
 
 **05:00 之后的第四批把瓶颈定位搬了一次家**：又抓了 315 个 payload（翻译成 146），语料到 **27,098**（FSPX 541 条）。
-但下一次启动仍然有 218 条 miss，而这 218 条里：
+第五批（05:5x）：278 个 payload 只翻出 **47** 个（`fall-through into undecodable words` 一次吃掉 160 个），
+语料 **27,145**（FSPX 588 条）。同一次启动的 `slot 67` 失败数从 280 降到 **236**——收集仍然有收益，
+但收益越来越集中在"翻译器翻不出来的那批"上。下一次启动仍然有 ~236 条 miss，而这批的构成是：
 
 | 分类 | 数量 |
 | --- | --- |
 | 已在语料里 | **0** |
-| **已经 unpack+反汇编过、但翻译器拒了** | **169** |
-| 这一轮才第一次出现 | 49 |
+| **已经 unpack+反汇编过、但翻译器拒了** | **169**（第四批测的同一现象） |
+| 这一轮才第一次出现 | 少量 |
 
 也就是说：**收集已经不是瓶颈了，翻译器才是**。把这 169 条逐条单独跑 `rdna2spirv.py`，拒的理由分布和 9.6 上表一致
-（`s_flbit_i32_b64 of a lane mask`、`fall-through into undecodable words`、`CS thread-group-size SGPR`、`ds_append`）。
-所以下一轮最值钱的一件事不是再抓 payload，而是**补翻译器的那几类语义**——每补一类，一次启动就少一批 `slot 67` 失败。
+（`fall-through into undecodable words` 最大、`s_flbit_i32_b64 of a lane mask`、`CS thread-group-size SGPR`、
+`ds_append`）。所以下一轮最值钱的一件事不是再抓 payload，而是**补翻译器的那几类语义**——每补一类，
+一次启动就少一批 `slot 67` 失败。
 
 另外两条"看起来像 bug 其实不是"的结论，留给下一轮省时间：
 
@@ -827,8 +830,8 @@ $env:LEONIDA_SKIP_ASSERTS='1'
   `985a3e30e`（槽位 81 的两种答法）、`d770c68e9`（DStorage zlib）、`e45f1dbe3`（音频 9 个导入的桩）、
   `25e824342`（slot 67 整体 payload dump）、`a52fe7d23`（FSPX 记录）、`f072e446a` + `8b031fb9d`（present 计数
   与白窗口的记录）、`13b163d0a`（首帧呈现目标的形状）。
-- 语料在仓库外：`E:\temp\wait_work\leonida-work\shaders\spirv-561b65a`，本轮 26,556 → **27,098**
-  （那条 PS + **541 条 FSPX**）。改动前的索引备份：`tmp/corpus-index-before-fspx.json`。
+- 语料在仓库外：`E:\temp\wait_work\leonida-work\shaders\spirv-561b65a`，本轮 26,556 → **27,145**
+  （那条 PS + **588 条 FSPX**）。改动前的索引备份：`tmp/corpus-index-before-fspx.json`。
 - **从未推送**，也不打算推送（用户明确：不做 PR，改为同步上游）。
 - 本文档与代码提交分开：改文档时只提交这一个文件。
 
