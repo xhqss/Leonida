@@ -211,7 +211,7 @@ public:
         }
         swapchain_ = VK_NULL_HANDLE;
         // A capture still pending has its copy complete once the queue is idle: write it before the buffer goes.
-        for (Frame& frame : frames_) write_pending_capture(frame);
+        finish_pending_capture();
         release_capture();
         composer_.reset();
         for (Frame& frame : frames_) {
@@ -494,8 +494,8 @@ private:
         Frame& frame = frames_[frame_index_ % frames_.size()];
         if (const VkResult waited = vkWaitForFences_(device, 1, &frame.done, VK_TRUE, UINT64_MAX); waited != VK_SUCCESS)
             return stop(waited);
-        // That fence also covers the capture copy this slot made two presents ago: its pixels are now readable.
-        write_pending_capture(frame);
+        // Every submit copies into the same mapped buffer, even if its frame is outside the disk capture stride.
+        if (const VkResult r = finish_pending_capture(); r != VK_SUCCESS) return stop(r);
 
         std::uint32_t image = 0;
         VkResult acquired = acquire(frame.acquired, &image);
@@ -624,21 +624,9 @@ private:
                 last_tore_ = true;
                 ++tear_presents_;
             }
-            // LEONIDA_CAPTURE: this frame's copy is in the staging buffer. Its fence, waited when the slot comes
-            // round again, says when the pixels are readable; write_pending_capture() then writes the file.
             if (capture_to_disk_ && capture_ && capture_ptr_ && capture_written_ < capture_limit_ &&
-                (presented_ - 1) % std::uint64_t(capture_every_) == 0) {
-                // The buffer is shared by the two frames in flight: a capture still pending in the other slot
-                // (only with a stride of 1) is written now, after its fence, before this frame overwrites it.
-                Frame& other = frames_[frame_index_ % frames_.size()];
-                if (other.capture_serial &&
-                    vkWaitForFences_(device, 1, &other.done, VK_TRUE, UINT64_MAX) == VK_SUCCESS)
-                    write_pending_capture(other);
-                frame.capture_serial = ++capture_serial_;
-                frame.capture_number = presented_;
-                frame.capture_extent = extent_;
-                frame.capture_format = format_;
-            }
+                (presented_ - 1) % std::uint64_t(capture_every_) == 0)
+                pending_capture_ = frame.done;
         }
         if (capture_ && capture_ptr_) {
             captured_ = true;
@@ -665,11 +653,6 @@ private:
         VkFence done = VK_NULL_HANDLE;
         VkSemaphore acquired = VK_NULL_HANDLE;
         std::array<VkImageView, 2> views{};  // the plane views of the last composed present, until the frame is reused
-        // LEONIDA_CAPTURE: the capture serial this frame's copy wrote, once that fence has been waited (0: none).
-        std::uint64_t capture_serial = 0;
-        std::uint64_t capture_number = 0;  // the present number the file is named after
-        VkExtent2D capture_extent{};
-        VkFormat capture_format = VK_FORMAT_UNDEFINED;
     };
 
     // Whether `source` is a colour texture the device knows, so present() can refuse it before acquiring an image.
@@ -1065,20 +1048,20 @@ private:
         }
     }
 
-    // Writes the captured frame in `frame` as <dir>/frame_NNNNN.ppm, once the fence covering its copy has been waited
-    // and while the staging buffer is still mapped. The shared buffer holds the newest captured copy, so a frame
-    // whose serial a later capture has overtaken is dropped (only with a stride below the frames in flight).
-    void write_pending_capture(Frame& frame) {
-        const std::uint64_t serial = frame.capture_serial;
-        if (!serial) return;
-        frame.capture_serial = 0;
-        if (!capture_to_disk_ || !capture_ptr_ || serial != capture_serial_) return;
-        if (capture_written_ >= std::uint64_t(capture_limit_) || capture_dir_.empty()) return;
-        const VkExtent2D extent = frame.capture_extent;
-        const VkFormat format = frame.capture_format;
-        const std::uint64_t number = frame.capture_number;
+    VkResult finish_pending_capture() {
+        if (!pending_capture_) return VK_SUCCESS;
+        const VkResult waited = vkWaitForFences_(context_.device(), 1, &pending_capture_, VK_TRUE, UINT64_MAX);
+        pending_capture_ = VK_NULL_HANDLE;
+        if (waited == VK_SUCCESS) write_capture();
+        return waited;
+    }
+
+    void write_capture() {
+        const VkExtent2D extent = captured_extent_;
+        const VkFormat format = captured_format_;
+        const std::uint64_t number = presented_;
         const std::size_t texels = std::size_t(extent.width) * extent.height;
-        if (!texels) return;
+        if (!capture_ptr_ || !texels || texels > capture_size_ / 4) return;
         std::vector<std::uint8_t> rgb(texels * 3);
         std::uint64_t sum[3] = {0, 0, 0};
         const std::uint8_t* src = capture_ptr_;
@@ -1164,6 +1147,7 @@ private:
             std::lock_guard lock(context_.submit_mutex());
             vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use
         }
+        if (finish_pending_capture() != VK_SUCCESS) return false;
         stale_ = true;  // until this succeeds
         tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;
         VkSurfaceCapabilitiesKHR caps{};
@@ -1464,12 +1448,12 @@ private:
     bool captured_ = false;
     VkExtent2D captured_extent_{};
     VkFormat captured_format_ = VK_FORMAT_UNDEFINED;
-    // LEONIDA_CAPTURE: write the copies the staging buffer makes to <capture_dir_> (see write_pending_capture()).
+    // LEONIDA_CAPTURE: write the copies the staging buffer makes to <capture_dir_> (see finish_pending_capture()).
     bool capture_to_disk_ = false;
     std::string capture_dir_;
     int capture_every_ = 30;  // presented frames between files
     int capture_limit_ = 24;  // files at most
-    std::uint64_t capture_serial_ = 0;   // the copy counter, so a write knows the buffer still holds its frame
+    VkFence pending_capture_ = VK_NULL_HANDLE;  // owns the shared staging bytes until written
     std::uint64_t capture_written_ = 0;
 
     PFN_vkGetPhysicalDeviceSurfaceSupportKHR vkGetPhysicalDeviceSurfaceSupportKHR_ = nullptr;

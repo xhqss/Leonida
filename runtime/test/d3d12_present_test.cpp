@@ -1,4 +1,4 @@
-// Milestone M0 (docs/d3d12_vulkan.md section 6): a window shows a stable clear colour for 60 frames, through the
+// Milestone M0 (docs/d3d12_vulkan.md section 6): a window shows clear colours for 60 frames, through the
 // Vulkan-backed device behind the Xbox-ABI proxy, with no Vulkan validation errors. Each frame resets the list,
 // moves the back buffer PRESENT -> RENDER_TARGET, clears it, moves it back, executes, presents and signals a fence.
 // The window is then resized, which recreates the swapchain and scales the blit. The presented images are copied
@@ -359,6 +359,7 @@ int main() {
     UpdateWindow(window);
     pump();
 
+    const FLOAT alternate[4] = {1.f, 0.f, 0.f, 1.f};
     const FLOAT colour[4] = {0.2f, 0.6f, 0.9f, 1.0f};
     bool screen_checked = false;
     {
@@ -449,7 +450,9 @@ int main() {
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
             list->ResourceBarrier(1, &barrier);
-            list->ClearRenderTargetView(rtv, colour, 0, nullptr);
+            const auto next = presenter->presented() + 1;
+            const bool red = next <= 4 && next % 2 == 1;
+            list->ClearRenderTargetView(rtv, red ? alternate : colour, 0, nullptr);
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
             list->ResourceBarrier(1, &barrier);
@@ -649,13 +652,26 @@ int main() {
             char narrow[MAX_PATH * 3]{};
             WideCharToMultiByte(CP_ACP, 0, capture_dir, -1, narrow, static_cast<int>(sizeof narrow), nullptr, nullptr);
             char path[MAX_PATH * 3 + 32]{};
-            int files = 0;
+            int exact_files = 0;
             for (int i = 1; i <= 4; ++i) {
                 std::snprintf(path, sizeof path, "%s\\frame_%05d.ppm", narrow, i);
-                if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) ++files;
+                std::ifstream ppm(path, std::ios::binary);
+                std::string magic, dimensions, max_value;
+                std::getline(ppm, magic);
+                std::getline(ppm, dimensions);
+                std::getline(ppm, max_value);
+                const int expected[] = {i % 2 ? 255 : 51, i % 2 ? 0 : 153, i % 2 ? 0 : 230};
+                bool exact = magic == "P6" && dimensions == std::to_string(width) + " " + std::to_string(height) &&
+                             max_value == "255";
+                for (size_t n = 0; exact && n < size_t(width) * height * 3; ++n) {
+                    const int sample = ppm.get();
+                    exact = sample != EOF && std::abs(sample - expected[n % 3]) <= 1;
+                }
+                if (exact && ppm.get() == EOF) ++exact_files;
+                ppm.close();
                 DeleteFileA(path);
             }
-            int lines = 0, matching = 0, black = 0;
+            int lines = 0, matching = 0;
             std::ifstream index(std::string(narrow) + "\\index.txt");
             for (std::string line; std::getline(index, line);) {
                 const auto at = line.find("mean rgb ");
@@ -663,21 +679,16 @@ int main() {
                 if (at == std::string::npos || std::sscanf(line.c_str() + at, "mean rgb %lf %lf %lf", &r, &g, &b) != 3)
                     continue;
                 ++lines;
-                if (std::fabs(r - 51) <= 3.0 && std::fabs(g - 153) <= 3.0 && std::fabs(b - 230) <= 3.0) ++matching;
-                if (r < 8 && g < 8 && b < 8) ++black;
+                const bool red = lines % 2 == 1;
+                if (line.starts_with("frame " + std::to_string(lines) + " ") &&
+                    std::fabs(r - (red ? 255 : 51)) <= 3.0 && std::fabs(g - (red ? 0 : 153)) <= 3.0 &&
+                    std::fabs(b - (red ? 0 : 230)) <= 3.0) ++matching;
             }
-            // The test resizes and injects failures on purpose, so a frame caught mid-transition is a near miss rather
-            // than a bug; half the frames with the cleared colour is the signal, and a capture reading the wrong
-            // buffer shows up as black frames, which is a hard failure.
-            EXPECT(files >= 2);
-            EXPECT(lines >= 2);
-            EXPECT(matching * 2 >= lines);
-            EXPECT(black == 0);
-            std::printf("capture: %d file(s), %d line(s), %d with the cleared colour, %d black\n", files, lines,
-                        matching, black);
+            std::printf("capture: %d correct images, %d index rows, %d matching frame colours\n", exact_files, lines, matching);
             index.close();
             DeleteFileA((std::string(narrow) + "\\index.txt").c_str());
             RemoveDirectoryA(narrow);
+            EXPECT(exact_files == 4 && lines == 4 && matching == 4);
         }
 
         presenter.reset();  // before the device's queue and resources go
