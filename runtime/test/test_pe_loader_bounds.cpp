@@ -931,6 +931,55 @@ void test_headers_and_reloc_tail_bounds() {
 
 }  // namespace
 
+// The loader writes into the mapped image twice before protect_sections(): the import address table and the TLS
+// index. The functions after it read the headers back from the mapping, so a write that lands there must be refused,
+// as the loader already refuses a section or a base relocation there. Each image below crashed or loaded corrupt
+// headers before.
+void test_writes_into_headers() {
+    std::printf("\n--- Import address table and TLS index inside the headers ---\n");
+
+    // One import from a DLL nothing provides, so it binds to an unimplemented thunk and nothing outside is loaded.
+    // The descriptor, the lookup table and the names sit in .text (RVA 0x1000, file 0x200).
+    auto image_with_import = [](uint32_t iat_rva) {
+        auto img = make_base_image(0x2000, 0x400);
+        std::fill(img.begin() + 0x200, img.end(), uint8_t{0});
+        auto* d = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(img.data() + 0x200);  // RVA 0x1000, then a zero one
+        d->Name = 0x1040;
+        d->OriginalFirstThunk = 0x1060;
+        d->FirstThunk = iat_rva;
+        std::memcpy(img.data() + 0x240, "leonida_none.dll\0", 17);
+        *reinterpret_cast<uint64_t*>(img.data() + 0x260) = 0x1080;  // by name, then the zero terminator
+        std::memcpy(img.data() + 0x282, "nothing\0", 8);              // hint at 0x1080, name after it
+        nt_header_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = {
+            0x1000, 2 * sizeof(IMAGE_IMPORT_DESCRIPTOR)};
+        return img;
+    };
+    // The 8-byte slot covers e_lfanew (0x3C): the bound address would replace it.
+    expect_loader_rejection("Import address table at RVA 0x38 is rejected", image_with_import(0x38),
+                            "an import address table lands in the headers");
+    expect_loader_rejection("Import address table ending on SizeOfHeaders is rejected", image_with_import(0x1F8),
+                            "an import address table lands in the headers");
+    expect_loader_success("Import address table at exactly SizeOfHeaders loads", image_with_import(0x200));
+
+    auto image_with_tls_index = [](uint32_t index_rva) {
+        auto img = make_base_image(0x2000, 0x400);
+        std::fill(img.begin() + 0x200, img.end(), uint8_t{0});
+        const uint64_t base = nt_header_of(img)->OptionalHeader.ImageBase;
+        auto* tls = reinterpret_cast<IMAGE_TLS_DIRECTORY64*>(img.data() + 0x200);  // RVA 0x1000
+        tls->AddressOfIndex = base + index_rva;
+        tls->SizeOfZeroFill = 0x10;  // not an all-zero directory, which would count as absent
+        nt_header_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS] = {
+            0x1000, sizeof(IMAGE_TLS_DIRECTORY64)};
+        return img;
+    };
+    // The index would replace e_lfanew; an index at the image base itself was also never written.
+    expect_loader_rejection("TLS index at RVA 0x3C is rejected", image_with_tls_index(0x3C),
+                            "the TLS index lands in the headers");
+    expect_loader_rejection("TLS index at RVA 0 is rejected", image_with_tls_index(0),
+                            "the TLS index lands in the headers");
+    expect_loader_success("TLS index at exactly SizeOfHeaders loads", image_with_tls_index(0x200));
+}
+
 int main() {
     std::printf("test_pe_loader_bounds: PE Loader boundary checks, virtual address range wrapping, and import table null termination\n");
 
@@ -950,6 +999,7 @@ int main() {
         test_directory_count();
         test_forwarder_ordinal_range();
         test_headers_and_reloc_tail_bounds();
+        test_writes_into_headers();
     } catch (const std::exception& e) {
         std::printf("FATAL: Unhandled exception during test execution: %s\n", e.what());
         ++g_failures;

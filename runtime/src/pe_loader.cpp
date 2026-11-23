@@ -1691,6 +1691,11 @@ void Loader::initialize_tls(Module& m) {
     if (tls->AddressOfIndex) {
         index_rva = rva_in(m, tls->AddressOfIndex, "the TLS index");
         require_range(m.name, index_rva, sizeof(uint32_t), m.size, "the TLS index");
+        // The index is written below, and every later step reads the headers back from the mapping. An index at
+        // RVA 0 would not be written at all (index_rva doubles as "no index").
+        const auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
+        if (index_rva < nt->OptionalHeader.SizeOfHeaders)
+            throw std::runtime_error(m.name + ": the TLS index lands in the headers");
     }
 
     if (!module_tls_slots()) throw std::runtime_error(m.name + ": this thread has no TLS array");
@@ -1911,6 +1916,9 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
 
 void Loader::bind_imports(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
+    // Read before the first address is written: an entry in the headers would replace what the steps after this
+    // one read back from the mapping (e_lfanew, the section table), so it is refused like a section there.
+    const uint64_t headers_end = nt->OptionalHeader.SizeOfHeaders;
 
     // Thunk tables have no length field: they end at a zero entry, so each step is checked against the image.
     auto bind_thunks = [&](const std::string& dll, uint64_t lookup_rva, uint64_t iat_rva) {
@@ -1927,6 +1935,8 @@ void Loader::bind_imports(Module& m) {
                 uint32_t hint = static_cast<uint32_t>(lookup->u1.AddressOfData);
                 name = read_string(m.name, m.base, m.size, hint + sizeof(uint16_t), "an import name");
             }
+            if (iat_rva < headers_end)
+                throw std::runtime_error(m.name + ": an import address table lands in the headers");
             at<IMAGE_THUNK_DATA64>(m.base, static_cast<uint32_t>(iat_rva))->u1.Function =
                 reinterpret_cast<uint64_t>(resolve(m, dll, name, ord, by_ord));
         }
