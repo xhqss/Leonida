@@ -18,6 +18,9 @@
 //     stored byte. Views between the two typeless families give a null descriptor, unless a castable-format list
 //     names the view's format: then a B8G8R8X8 view of a B8G8R8A8 texture reads alpha 1, and a B8G8R8A8 view of a
 //     B8G8R8X8 one the stored byte, as on WARP and AMD's D3D12 driver.
+//   - A8_UNORM: where VK_KHR_maintenance5 gives VK_FORMAT_A8_UNORM_KHR a colour attachment, a render target is
+//     sized, created, cleared (whole and in a rectangle), copied back and sampled through two views; a second
+//     device told maintenance5 is off, and every GPU without the format, refuse such targets as before.
 // Multisample SRVs: four masked triangles seed different values per sample and array layer. A compute shader reads
 // them back using the T#s for the 2D, full-array and sliced-array views. The test builds its pipelines in Vulkan
 // and binds the device's set (rt::d3d12::bindless_set). Without glslangValidator the GPU readbacks are skipped.
@@ -317,6 +320,7 @@ bool sample_through_set(vktest::Device& d, VkDescriptorSet set0, VkDescriptorSet
 
 int main() {
     vktest::Device d;
+    d.request_maintenance5 = true;  // A8_UNORM render targets, where the GPU has VK_FORMAT_A8_UNORM_KHR
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
     if (device_status != vktest::DeviceStatus::ready) return 1;
@@ -340,6 +344,7 @@ int main() {
         info.sampler_filter_minmax = d.sampler_filter_minmax;
         info.custom_border_color = d.custom_border_color;
         info.custom_border_color_without_format = d.custom_border_color_without_format;
+        info.maintenance5 = d.maintenance5;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -486,28 +491,66 @@ int main() {
                             texel(x, y).data(), 4);
 
         constexpr DXGI_FORMAT byte_formats[] = {DXGI_FORMAT_A8_UNORM, DXGI_FORMAT_R8_UNORM};
-        D3D12_FEATURE_DATA_FORMAT_SUPPORT support{DXGI_FORMAT_A8_UNORM};
-        EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))));
-        EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != 0);
-        EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_GATHER) != 0);
-        EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_MIP) != 0);
-        EXPECT(!(support.Support1 & (D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE |
-                                     D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)) && !support.Support2);
-        for (UINT count : {1u, 4u}) {
-            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality_levels{DXGI_FORMAT_A8_UNORM, count};
-            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality_levels,
-                                                         sizeof(quality_levels))));
-            EXPECT(quality_levels.NumQualityLevels == (count == 1 ? 1u : 0u));
+        // A8_UNORM render targets are VK_FORMAT_A8_UNORM_KHR images where VK_KHR_maintenance5 is enabled and the
+        // format can be rendered to, sampled and copied; elsewhere the layer refuses them. The same checks run on
+        // a second device over the same GPU that is told maintenance5 is off, which must refuse them as before.
+        bool a8_render_target = false;
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+        if (d.maintenance5) {
+            VkFormatProperties a8_properties{};
+            d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
+                d.physical, VK_FORMAT_A8_UNORM_KHR, &a8_properties);
+            constexpr VkFormatFeatureFlags a8_needed =
+                VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+            a8_render_target = (a8_properties.optimalTilingFeatures & a8_needed) == a8_needed;
         }
-        for (auto flag : {D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
-                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS}) {
-            auto desc = texture_desc;
-            desc.Format = DXGI_FORMAT_A8_UNORM;
-            desc.Flags = flag;
-            EXPECT(FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                          __uuidof(ID3D12Resource), nullptr)));
-            EXPECT(device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes == UINT64_MAX);
+#endif
+        std::printf("A8_UNORM render targets: %s\n",
+                    a8_render_target ? "VK_FORMAT_A8_UNORM_KHR (VK_KHR_maintenance5)" : "refused (no A8 attachment)");
+        const auto check_a8_support = [&](ID3D12Device* on, bool render_target) {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT support{DXGI_FORMAT_A8_UNORM};
+            EXPECT(SUCCEEDED(on->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))));
+            EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != 0);
+            EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_GATHER) != 0);
+            EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_MIP) != 0);
+            EXPECT(((support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) != 0) == render_target);
+            if (!render_target) EXPECT(!(support.Support1 & D3D12_FORMAT_SUPPORT1_BLENDABLE));
+            EXPECT(!(support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) && !support.Support2);
+            for (UINT count : {1u, 4u}) {
+                D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality_levels{DXGI_FORMAT_A8_UNORM, count};
+                EXPECT(SUCCEEDED(on->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality_levels,
+                                                         sizeof(quality_levels))));
+                EXPECT(quality_levels.NumQualityLevels == (count == 1 ? 1u : 0u));
+            }
+            // What sizing answers, creation does: the retail boot's 2D, 1-mip, 1-sample render target included.
+            for (auto flag : {D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                              D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS}) {
+                auto desc = texture_desc;
+                desc.Format = DXGI_FORMAT_A8_UNORM;
+                desc.Flags = flag;
+                const bool expect_created = render_target && flag == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+                Ref<ID3D12Resource> created;
+                const HRESULT hr = on->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                               D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                               IID_PPV_ARGS(&created.p));
+                EXPECT(SUCCEEDED(hr) == expect_created);
+                const auto allocation = on->GetResourceAllocationInfo(0, 1, &desc);
+                EXPECT((allocation.SizeInBytes != UINT64_MAX) == expect_created);
+                if (expect_created) EXPECT(allocation.SizeInBytes >= UINT64(size) * size && allocation.Alignment);
+            }
+            return 0;
+        };
+        EXPECT(check_a8_support(device.p, a8_render_target) == 0);
+        {
+            auto fallback_info = info;
+            fallback_info.maintenance5 = false;
+            ID3D12Device* fallback = nullptr;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(fallback_info, IID_PPV_ARGS(&fallback))));
+            const int fallback_result = check_a8_support(fallback, false);
+            fallback->Release();
+            EXPECT(fallback_result == 0);
         }
         Ref<ID3D12Resource> byte_textures[2];
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT byte_placed[2]{}, a8_mip_placed{};
@@ -2844,6 +2887,140 @@ int main() {
                         valid_depth_srvs, d.validation_errors() - validation_before_depth);
 #endif
             EXPECT(d.validation_errors() == validation_before_depth);
+        }
+
+        // A8_UNORM render target: cleared whole to one alpha and in a rectangle to another, then copied to a
+        // readback buffer (one byte per texel, as D3D12 lays A8 out) and sampled through its default view (0, 0, 0, A)
+        // and a remapped one (A in R, 1 in B). The clear values are the D3D12 rounding of 0.6 and 0.2 (153, 51).
+        if (a8_render_target) {
+            auto a8_desc = texture_desc;
+            a8_desc.Format = DXGI_FORMAT_A8_UNORM;
+            a8_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            Ref<ID3D12Resource> a8_target, a8_readback;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &a8_desc,
+                                                             D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                             IID_PPV_ARGS(&a8_target.p))));
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT a8_footprint{};
+            UINT64 a8_total = 0;
+            device->GetCopyableFootprints(&a8_desc, 0, 1, 0, &a8_footprint, nullptr, nullptr, &a8_total);
+            EXPECT(a8_footprint.Footprint.Format == DXGI_FORMAT_A8_UNORM && a8_total);
+            const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+            const auto readback_desc = buffer_desc(a8_total, D3D12_RESOURCE_FLAG_NONE);
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&a8_readback.p))));
+            Ref<ID3D12DescriptorHeap> a8_rtv_heap, a8_srv_heap;
+            const D3D12_DESCRIPTOR_HEAP_DESC a8_rtv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                                                       0};
+            const D3D12_DESCRIPTOR_HEAP_DESC a8_srv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+                                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&a8_rtv_hd, IID_PPV_ARGS(&a8_rtv_heap.p))));
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&a8_srv_hd, IID_PPV_ARGS(&a8_srv_heap.p))));
+            const UINT a8_rtv_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            const UINT a8_srv_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            const std::uint64_t a8_rtv_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(a8_rtv_heap.p, 9))(a8_rtv_heap.p);
+            const std::uint64_t a8_srv_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(a8_srv_heap.p, 9))(a8_srv_heap.p);
+            const D3D12_CPU_DESCRIPTOR_HANDLE a8_rtv{SIZE_T(a8_rtv_cpu)};
+            // An RTV in another format of an A8 target, or an A8 RTV of an R8 texture, stays a null view.
+            const D3D12_CPU_DESCRIPTOR_HANDLE a8_bad_rtv{SIZE_T(a8_rtv_cpu + a8_rtv_step)};
+            D3D12_RENDER_TARGET_VIEW_DESC r8_view{};
+            r8_view.Format = DXGI_FORMAT_R8_UNORM;
+            r8_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            std::memset(reinterpret_cast<void*>(a8_bad_rtv.ptr), 0x77, a8_rtv_step);
+            device->CreateRenderTargetView(a8_target.p, &r8_view, a8_bad_rtv);
+            EXPECT(std::all_of(reinterpret_cast<std::uint8_t*>(a8_bad_rtv.ptr),
+                               reinterpret_cast<std::uint8_t*>(a8_bad_rtv.ptr) + sizeof(leonida::TargetView),
+                               [](std::uint8_t byte) { return byte == 0; }));
+            device->CreateRenderTargetView(a8_target.p, nullptr, a8_rtv);
+            EXPECT(!std::all_of(reinterpret_cast<std::uint8_t*>(a8_rtv.ptr),
+                                reinterpret_cast<std::uint8_t*>(a8_rtv.ptr) + sizeof(leonida::TargetView),
+                                [](std::uint8_t byte) { return byte == 0; }));
+            D3D12_SHADER_RESOURCE_VIEW_DESC a8_view{};
+            a8_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            a8_view.Format = DXGI_FORMAT_A8_UNORM;
+            a8_view.Texture2D.MipLevels = 1;
+            a8_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            device->CreateShaderResourceView(a8_target.p, &a8_view, {SIZE_T(a8_srv_cpu)});
+            a8_view.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
+                D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_3, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,
+                D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0);
+            device->CreateShaderResourceView(a8_target.p, &a8_view, {SIZE_T(a8_srv_cpu + a8_srv_step)});
+            for (UINT k = 0; k < 2; ++k) {
+                const auto* t = reinterpret_cast<const std::uint8_t*>(a8_srv_cpu + k * a8_srv_step);
+                EXPECT(!std::all_of(t, t + sizeof(g::ImageWords), [](std::uint8_t byte) { return byte == 0; }));
+            }
+
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            const FLOAT full[4] = {0.9f, 0.1f, 0.3f, 0.6f}, part[4] = {0.0f, 1.0f, 0.0f, 0.2f};
+            list->ClearRenderTargetView(a8_rtv, full, 0, nullptr);
+            const D3D12_RECT a8_rect{2, 1, 6, 5};
+            list->ClearRenderTargetView(a8_rtv, part, 1, &a8_rect);
+            const auto to_copy =
+                transition(a8_target.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &to_copy);
+            D3D12_TEXTURE_COPY_LOCATION a8_from{a8_target.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            D3D12_TEXTURE_COPY_LOCATION a8_to{a8_readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+            a8_to.PlacedFootprint = a8_footprint;
+            list->CopyTextureRegion(&a8_to, 0, 0, 0, &a8_from, nullptr);
+            const auto to_read = transition(a8_target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &to_read);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            ++packed_signal;
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, packed_signal)) &&
+                   SUCCEEDED(fence->SetEventOnCompletion(packed_signal, nullptr)));
+
+            const auto a8_expected = [&](UINT x, UINT y) {
+                const bool inside = x >= UINT(a8_rect.left) && x < UINT(a8_rect.right) && y >= UINT(a8_rect.top) &&
+                                    y < UINT(a8_rect.bottom);
+                return std::uint8_t(inside ? 51 : 153);
+            };
+            void* a8_mapped = nullptr;
+            const D3D12_RANGE a8_range{0, SIZE_T(a8_total)};
+            EXPECT(SUCCEEDED(a8_readback->Map(0, &a8_range, &a8_mapped)) && a8_mapped);
+            UINT a8_copy_differ = 0;
+            for (UINT y = 0; y < size; ++y)
+                for (UINT x = 0; x < size; ++x) {
+                    const std::uint8_t got = static_cast<const std::uint8_t*>(a8_mapped)[
+                        a8_footprint.Offset + y * a8_footprint.Footprint.RowPitch + x];
+                    if (got != a8_expected(x, y) && a8_copy_differ++ < 4)
+                        std::fprintf(stderr, "A8 target copy texel %u,%u: got %u, want %u\n", x, y, unsigned(got),
+                                     unsigned(a8_expected(x, y)));
+                }
+            const D3D12_RANGE a8_none{};
+            a8_readback->Unmap(0, &a8_none);
+            EXPECT(a8_copy_differ == 0);
+            std::printf("A8 render target: cleared and copied back, %u texels matched\n", texels);
+#ifdef LEONIDA_TEST_CS_SAMPLE_SPV
+            // cs_sample.comp samples one tile to the right through a wrapping sampler, so texel (x, y) reads the
+            // stored texel at the same place.
+            SampleKeys a8_keys[2]{};
+            for (UINT k = 0; k < 2; ++k) {
+                std::memcpy(a8_keys[k].tsharp, reinterpret_cast<const void*>(a8_srv_cpu + k * a8_srv_step),
+                            sizeof(a8_keys[k].tsharp));
+                std::memcpy(a8_keys[k].ssharp, sampler_bytes, sizeof(a8_keys[k].ssharp));
+                a8_keys[k].first = k * texels;
+            }
+            std::vector<std::uint8_t> a8_pixels(2 * bytes);
+            EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), set0_layout, a8_keys, a8_pixels.data()));
+            UINT a8_sample_differ = 0;
+            for (UINT i = 0; i < texels; ++i) {
+                const std::uint8_t a = a8_expected(i % size, i / size);
+                const std::uint8_t want[2][4] = {{0, 0, 0, a}, {a, 0, 255, 0}};
+                for (UINT k = 0; k < 2; ++k) {
+                    const std::uint8_t* got = a8_pixels.data() + k * bytes + 4 * i;
+                    if (std::memcmp(got, want[k], 4) != 0 && a8_sample_differ++ < 4)
+                        std::fprintf(stderr, "A8 target view %u texel %u: got %u,%u,%u,%u, want %u,%u,%u,%u\n", k, i,
+                                     unsigned(got[0]), unsigned(got[1]), unsigned(got[2]), unsigned(got[3]),
+                                     unsigned(want[k][0]), unsigned(want[k][1]), unsigned(want[k][2]),
+                                     unsigned(want[k][3]));
+                }
+            }
+            EXPECT(a8_sample_differ == 0);
+            std::printf("A8 render target: default and remapped views sampled, %u texels matched each\n", texels);
+#endif
         }
 
         upload.reset();

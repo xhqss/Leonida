@@ -464,6 +464,9 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     case VK_FORMAT_R8_SNORM:
     case VK_FORMAT_R8_UINT:
     case VK_FORMAT_R8_SINT: return {1, 1};
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+    case VK_FORMAT_A8_UNORM_KHR: return {1, 1};  // A8_UNORM render targets
+#endif
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
     case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
     case VK_FORMAT_BC4_UNORM_BLOCK:
@@ -1140,6 +1143,9 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     case VK_FORMAT_R8G8_UNORM:
     case VK_FORMAT_R8G8B8A8_UNORM:
     case VK_FORMAT_B8G8R8A8_UNORM: is_integer = false; unorm = {255, 255, 255, 255}; break;
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+    case VK_FORMAT_A8_UNORM_KHR: is_integer = false; unorm = {0, 0, 0, 255}; break;  // A8_UNORM render targets
+#endif
     case VK_FORMAT_R8G8B8A8_SRGB:
     case VK_FORMAT_B8G8R8A8_SRGB:  // the colour channels go through the sRGB curve on the GPU
         is_integer = false;

@@ -121,6 +121,8 @@ public:
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
     // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
     leonida::SubgroupSizeCaps subgroup;
+    bool request_maintenance5 = false;  // set before create(): enable VK_KHR_maintenance5 where available
+    bool maintenance5 = false;          // VK_KHR_maintenance5 and its maintenance5 feature are enabled
     bool custom_border_color = false;  // VK_EXT_custom_border_color and customBorderColors enabled
     bool custom_border_color_without_format = false;
 
@@ -548,6 +550,22 @@ public:
             *v13_.next() = &custom_border;
         }
 
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+        // VK_KHR_maintenance5, for the tests that ask for it (VK_FORMAT_A8_UNORM_KHR).
+        VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+        if (request_maintenance5 && std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maintenance5_features};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            maintenance5 = maintenance5_features.maintenance5 == VK_TRUE;
+            if (maintenance5) {
+                maintenance5_features.pNext = *v13_.next();
+                *v13_.next() = &maintenance5_features;
+            }
+        }
+#endif
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
         device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
         device_info.pQueueCreateInfos = queue_infos.data();
@@ -593,6 +611,9 @@ public:
 #endif
         if (custom_border_color) device_extensions.push_back(custom_border_color_name);
         if (mesh_shader) device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+        if (maintenance5) device_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+#endif
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);

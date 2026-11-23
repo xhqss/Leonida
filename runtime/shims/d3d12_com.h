@@ -154,6 +154,9 @@ struct VulkanDeviceInfo {
     bool fragment_shader_barycentric = false;
     bool fragment_shader_interlock = false;
     bool maintenance8 = false;
+    // VK_KHR_maintenance5 and its maintenance5 feature are enabled on `device`: VK_FORMAT_A8_UNORM_KHR is a valid
+    // format there, so A8_UNORM render targets get a real alpha-only image where the GPU can render to one.
+    bool maintenance5 = false;
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
     bool debug_utils = false;

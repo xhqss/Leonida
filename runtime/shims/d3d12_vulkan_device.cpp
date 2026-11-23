@@ -623,6 +623,23 @@ struct DeviceState {
     // True when VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 lacks native STORAGE_IMAGE but mutable R32_UINT+{R32_UINT,E5B9G9R9}
     // is supported, so R9G9B9E5_SHAREDEXP UAV textures are backed by R32_UINT with separate storage/sampled views.
     bool r9g9b9e5_uav_emulated = false;
+    // True when VK_KHR_maintenance5 is enabled and VK_FORMAT_A8_UNORM_KHR can be sampled, copied and rendered to:
+    // A8_UNORM render targets are then alpha-only images (texture_format). Otherwise A8 textures are R8 images
+    // read through a swizzle, and render targets of the format are refused.
+    bool a8_render_target = false;
+
+    bool probe_a8_render_target() const {
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+        if (!info.maintenance5) return false;
+        VkFormatProperties properties{};
+        format_properties(info.physical, VK_FORMAT_A8_UNORM_KHR, &properties);
+        constexpr VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                                VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        return (properties.optimalTilingFeatures & needed) == needed;
+#else
+        return false;
+#endif
+    }
 
     // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
     UINT no_output_sample_counts = 0;
@@ -946,12 +963,21 @@ struct DeviceState {
     // The format a texture description is created with, D24S8 and R9G9B9E5 UAV fallbacks included.
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
         if (!xr_bias_compatible(desc)) return {};
-        // A8_UNORM is an R8_UNORM image in 1D, 2D and 3D, as the host makes all three (a title's boot sizes a 1D one).
-        if (desc.Format == DXGI_FORMAT_A8_UNORM &&
-            (desc.SampleDesc.Count != 1 ||
-             (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
-                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))))
-            return {};
+        // A8_UNORM is an R8_UNORM image in 1D, 2D and 3D (PR #7755), except as a render target: that needs a real
+        // alpha-only image, VK_KHR_maintenance5's A8 colour attachment (PR #7593).
+        if (desc.Format == DXGI_FORMAT_A8_UNORM) {
+            if (desc.SampleDesc.Count != 1 ||
+                (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
+                return {};
+            if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) {
+                if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return {};
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+                if (a8_render_target) return {VK_FORMAT_A8_UNORM_KHR, VK_IMAGE_ASPECT_COLOR_BIT};
+#endif
+                log_once("A8_UNORM render targets need VK_KHR_maintenance5's A8 colour attachment; format", desc.Format);
+                return {};
+            }
+        }
         if (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
             if ((desc.SampleDesc.Count != 1 && (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
                                                (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) ||
@@ -1133,9 +1159,20 @@ struct DeviceState {
         // format is 8_UINT reads it from X.
         const bool stencil = (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) && image.format == g::stencil_format;
         const VkFormat logical_format = r9g9b9e5_as_r32_uint ? VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 : image_format;
-        VkFormat view_format =
-            stencil ? image_format : g::vulkan_view_format(logical_format, image.format, allow_channel_cast);
-        VkFormat channels_format = view_format;  // whose channels the T#'s swizzle selects from
+        bool alpha_image = false;  // an A8_UNORM render target's image: alpha holds what an R8 image holds in R
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+        alpha_image = image_format == VK_FORMAT_A8_UNORM_KHR;
+#endif
+        VkFormat view_format = stencil ? image_format
+                               : alpha_image
+                                   ? (image.format == g::format_from_vulkan(VK_FORMAT_R8_UNORM) ? image_format
+                                                                                                : VK_FORMAT_UNDEFINED)
+                                   : g::vulkan_view_format(logical_format, image.format, allow_channel_cast);
+        VkFormat channels_format = alpha_image ? VK_FORMAT_R8_UNORM : view_format;  // whose channels the swizzle picks
+        if (alpha_image && (view_format == VK_FORMAT_UNDEFINED || storage)) {
+            log_once("A8_UNORM render target viewed in another format or for storage; format", int(image.format));
+            return false;
+        }
         if (view_format == VK_FORMAT_UNDEFINED) {  // a 96-bit texture's T# names RGB32; its image is RGBA32
             view_format = rgb96_view_format(image_format, image.format);
             channels_format = rgb96_named_format(view_format);
@@ -1182,6 +1219,11 @@ struct DeviceState {
             }
         }
         view_info.components = g::vulkan_swizzle(swizzle, channels_format);
+        if (alpha_image) {  // the R8 image's R is this image's A
+            for (VkComponentSwizzle* c : {&view_info.components.r, &view_info.components.g, &view_info.components.b,
+                                          &view_info.components.a})
+                if (*c == VK_COMPONENT_SWIZZLE_R) *c = VK_COMPONENT_SWIZZLE_A;
+        }
         // The cast: MSVC's enums are ints, and it rejects int to VkImageAspectFlags in braces as narrowing.
         view_info.subresourceRange = {
             VkImageAspectFlags(stencil                                   ? VK_IMAGE_ASPECT_STENCIL_BIT
@@ -3596,6 +3638,11 @@ public:
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
             if (desc.RTVFormats[i] == DXGI_FORMAT_UNKNOWN) continue;
             graphics_.color_formats[i] = vulkan_format(desc.RTVFormats[i], false).format;
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+            // The A8_UNORM render target's own image (DeviceState::texture_format): the attachment takes alpha.
+            if (desc.RTVFormats[i] == DXGI_FORMAT_A8_UNORM && device_.a8_render_target)
+                graphics_.color_formats[i] = VK_FORMAT_A8_UNORM_KHR;
+#endif
             if (graphics_.color_formats[i] == VK_FORMAT_UNDEFINED) {
                 log_once("render-target format not supported yet:", desc.RTVFormats[i]);
                 return E_INVALIDARG;
@@ -4450,8 +4497,13 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             return false;
         }
     }
-    const VkFormat resource_format =
+    VkFormat resource_format =
         resource.r9g9b9e5_as_r32_uint() ? VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 : resource.format();
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+    // An A8_UNORM render target's alpha-only image takes the same T# (8_UNORM, alpha from X) as the R8 image other
+    // A8 textures have; bind_image views it with its own format.
+    if (resource_format == VK_FORMAT_A8_UNORM_KHR) resource_format = VK_FORMAT_R8_UNORM;
+#endif
     VkFormat named = resource_format;
     if (volume) {
         const bool compatible = vulkan_format(desc.Format, false).typeless
@@ -4779,6 +4831,10 @@ public:
             !device_properties || !queue_families)
             return;
         state_.r9g9b9e5_uav_emulated = state_.probe_r9g9b9e5_uav_emulation();
+        state_.a8_render_target = state_.probe_a8_render_target();
+        std::fprintf(stderr, "[rt] d3d12: A8_UNORM render targets %s\n",
+                     state_.a8_render_target ? "on VK_FORMAT_A8_UNORM_KHR (VK_KHR_maintenance5)"
+                                             : "not supported (no VK_KHR_maintenance5 A8 colour attachment)");
         memory_properties(info.physical, &state_.memory);
         {
             char text[4] = {};
@@ -5980,7 +6036,15 @@ public:
             const bool typed_bgra8_listed = r && !typed_rgba8 && rgba8_any_order(rd.Format) &&
                                             r->has_castable_formats();
             if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
-                view = {};
+                // Only an A8_UNORM render target has an alpha-only image to render to (texture_format); an R8 one,
+                // or an A8 view of another format, has nowhere to put alpha.
+                bool a8_image = false;
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+                a8_image = r && r->format() == VK_FORMAT_A8_UNORM_KHR;
+#endif
+                if (!a8_image || rd.Format != DXGI_FORMAT_A8_UNORM ||
+                    (desc && desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != DXGI_FORMAT_A8_UNORM))
+                    view = {};
             } else if (rd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP ||
                        (desc && desc->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) {
                 if (rd.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP || !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
@@ -7434,6 +7498,16 @@ public:
                         limits.maxMipLevels > 1)
                         fs->Support1 |= D3D12_FORMAT_SUPPORT1_MIP;
                 }
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+                // Render targets are alpha-only images (texture_format): what that format offers.
+                if (state_.a8_render_target) {
+                    VkFormatProperties alpha{};
+                    state_.format_properties(state_.info.physical, VK_FORMAT_A8_UNORM_KHR, &alpha);
+                    fs->Support1 |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
+                    if (alpha.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)
+                        fs->Support1 |= D3D12_FORMAT_SUPPORT1_BLENDABLE;
+                }
+#endif
                 return d3d12_trace::result(method, S_OK);
             }
 
@@ -9251,6 +9325,20 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     }
 #endif
 
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+    // VK_KHR_maintenance5 makes VK_FORMAT_A8_UNORM_KHR a valid format: A8_UNORM render targets (texture_format).
+    VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+    if (has_device_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maintenance5};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.maintenance5 = maintenance5.maintenance5 == VK_TRUE;
+        if (info.maintenance5) {
+            maintenance5.pNext = *v13.next();
+            *v13.next() = &maintenance5;
+        }
+    }
+#endif
+
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     // VK_KHR_shader_fma: OpFmaKHR is a single-rounding multiply-add in SPIR-V (GLSL.std.450 Fma may round twice).
     // Translated shaders built with `rdna2spirv.py --fma khr` need it (index capability FMAKHR, feature
@@ -9388,6 +9476,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.fragment_shader_interlock) device_extensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
     if (info.maintenance8) device_extensions.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+#endif
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+    if (info.maintenance5) device_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 #endif
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
