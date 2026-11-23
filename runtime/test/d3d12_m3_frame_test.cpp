@@ -12,7 +12,16 @@
 //           color, depth or stencil. Only that probe is inside BeginQuery/EndQuery(OCCLUSION): Vulkan permits MRT
 //           occlusion counts multiplied by the number of written color outputs even with PRECISE (D3D-209). The same
 //           probe is also inside a BINARY_OCCLUSION query (it must report occlusion), and a second binary query wraps
-//           a probe of N's own pixels at N's own depth, which loses every depth test (0x0 samples).
+//           a probe of N's own pixels at N's own depth, which loses every depth test (0x0 samples). A pipeline-
+//           statistics query spans the whole pass-1 draw sequence and the occlusion resolve, so the layer's helper
+//           dispatches must not be counted as the application's compute work (D3D-162). The probes read depth through
+//           a read-only DSV while the buffer is in DEPTH_READ, and the real draws switch it back to DEPTH_WRITE. The
+//           depth/stencil buffer is also copied into a second one (CopyResource) and two probes test the copy: F's
+//           rectangle at F's depth (passes only where nothing was written) and G's rectangle through the stencil test
+//           (passes only where the copied stencil is N's reference), so a copy that lost the contents is visible.
+//           The same two rectangles are also drawn into a 4x multisampled pair of its own and resolved into a 1x
+//           target that is read back next to the others: pixel-aligned rectangles make the resolve equal to the
+//           single-sampled rendering of N and F.
 //   barrier the first target goes RENDER_TARGET -> PIXEL_SHADER_RESOURCE | COPY_SOURCE, the second to COPY_SOURCE.
 //   pass 2  a descriptor-table SRV of the first target (the M2 path: heaps, T#, S#, hash table) sampled by a translated PS
 //           that swaps red and blue and writes a root constant to alpha, into a third target.
@@ -55,9 +64,14 @@ constexpr UINT dim = 64;                  // every target is 64x64
 constexpr UINT pitch = dim * 4;           // 256, both for RGBA8 and for R32F
 constexpr UINT image_bytes = pitch * dim;
 constexpr UINT slots = 3, frames = 6;      // three frames in flight, six frames
-// The readback buffer of a slot: the query result at 0, then the three images, each at a 512-byte aligned offset.
+// The readback buffer of a slot: the query results at 0 (an occlusion sample count, two binary results), the
+// pipeline statistics at 24, the two copy probes at 112 and 120, then the three images, each at a 512-byte aligned
+// offset.
+constexpr UINT64 offset_statistics = 24;    // D3D12_QUERY_DATA_PIPELINE_STATISTICS: 11 x UINT64
+constexpr UINT64 offset_depth_copy = 112, offset_stencil_copy = 120;
 constexpr UINT64 offset_rt0 = 512, offset_rt1 = offset_rt0 + image_bytes, offset_rt2 = offset_rt1 + image_bytes;
-constexpr UINT64 readback_bytes = offset_rt2 + image_bytes;
+constexpr UINT64 offset_msaa = offset_rt2 + image_bytes;  // the resolved 4x target: N and F only
+constexpr UINT64 readback_bytes = offset_msaa + image_bytes;
 
 struct Rect { int x0, y0, x1, y1; };  // pixels, half open, y down
 struct Draw {
@@ -86,12 +100,18 @@ Frame frame_of(UINT n) {
 struct Reference {
     std::vector<std::uint8_t> rt0, rt2;  // RGBA8
     std::vector<float> rt1;
+    std::vector<std::uint8_t> msaa;      // RGBA8: N and F only, as the resolved 4x target must read
     UINT64 samples = 0;
+    // Samples the two probes over the copied depth/stencil buffer must make visible: F's rectangle at F's depth over
+    // the copy passes only where the copied depth is N's (0.25 < 0.75), and G's rectangle with stencil EQUAL 1 only
+    // where the copied stencil is N's reference.
+    UINT64 depth_copy_samples = 0, stencil_copy_samples = 0;
 };
 Reference reference_of(const Frame& fr, bool first_pass_only) {
     Reference ref;
     ref.rt0.assign(image_bytes, 0);
     ref.rt2.assign(image_bytes, 0);
+    ref.msaa.assign(image_bytes, 0);
     ref.rt1.assign(dim * dim, -1.0f);
     std::vector<float> depth(dim * dim, 1.0f);
     std::vector<std::uint8_t> stencil(dim * dim, 0);
@@ -110,6 +130,10 @@ Reference reference_of(const Frame& fr, bool first_pass_only) {
                 depth[i] = d->depth;
                 stencil[i] = std::uint8_t(d->stencil_ref);
                 put(i, *d);
+                ref.msaa[i * 4 + 0] = d->k0;   // the 4x target only ever sees N and F
+                ref.msaa[i * 4 + 1] = d->k1;
+                ref.msaa[i * 4 + 2] = d->k2;
+                ref.msaa[i * 4 + 3] = 255;
                 if (d == &fr.f) ++ref.samples;
             }
     }
@@ -118,6 +142,14 @@ Reference reference_of(const Frame& fr, bool first_pass_only) {
             const UINT i = UINT(y) * dim + UINT(x);
             if (inside(fr.g.rect, x, y) && stencil[i] == fr.g.stencil_ref) put(i, fr.g);
         }
+    for (int y = 0; y < int(dim); ++y) {    // what the probes over the copied depth/stencil buffer must count
+        for (int x = 0; x < int(dim); ++x) {
+            const UINT i = UINT(y) * dim + UINT(x);
+            // The depth probe writes F's 0.75 and tests LESS: it passes only where nothing has been written yet.
+            if (inside(fr.f.rect, x, y) && depth[i] >= 1.0f) ++ref.depth_copy_samples;
+            if (inside(fr.g.rect, x, y) && stencil[i] == fr.g.stencil_ref) ++ref.stencil_copy_samples;
+        }
+    }
     for (UINT i = 0; !first_pass_only && i < dim * dim; ++i) {  // pass 2: (b, g, r, alpha)
         ref.rt2[i * 4 + 0] = ref.rt0[i * 4 + 2];
         ref.rt2[i * 4 + 1] = ref.rt0[i * 4 + 1];
@@ -173,6 +205,7 @@ int main(int argc, char** argv) {
         info.bindless_partially_bound = d.partially_bound;
         info.image_view_min_lod = d.image_view_min_lod;
         info.occlusion_query_precise = d.occlusion_query_precise;
+        info.pipeline_statistics_query = d.pipeline_statistics_query;
         info.shader_dir = (root_dir / "spirv").string();
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
@@ -237,8 +270,14 @@ int main(int argc, char** argv) {
         ds.StencilReadMask = ds.StencilWriteMask = 0xff;
         ds.FrontFace = ds.BackFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_REPLACE,
                                       D3D12_COMPARISON_FUNC_ALWAYS};
-        Ref<ID3D12PipelineState> pso_a, pso_c, pso_p, pso_query;
+        Ref<ID3D12PipelineState> pso_a, pso_c, pso_p, pso_query, pso_stencil, pso_msaa;
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso_a.p))));
+        // The same state at 4x into one render target, for the multisampled block of the frame.
+        auto msaa_pso_desc = pso_desc;
+        msaa_pso_desc.NumRenderTargets = 1;
+        msaa_pso_desc.RTVFormats[1] = DXGI_FORMAT_UNKNOWN;
+        msaa_pso_desc.SampleDesc.Count = 4;
+        EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&msaa_pso_desc, IID_PPV_ARGS(&pso_msaa.p))));
         auto probe_desc = pso_desc;
         probe_desc.PS = {query_container.data(), query_container.size()};
         probe_desc.NumRenderTargets = 1;
@@ -253,6 +292,12 @@ int main(int argc, char** argv) {
         ds.FrontFace = ds.BackFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
                                       D3D12_COMPARISON_FUNC_EQUAL};
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso_c.p))));
+        // The stencil test of C with no colour writes: the probe over a copied stencil buffer only counts.
+        auto stencil_probe_desc = pso_desc;
+        stencil_probe_desc.NumRenderTargets = 1;
+        stencil_probe_desc.RTVFormats[1] = DXGI_FORMAT_UNKNOWN;
+        stencil_probe_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0;
+        EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&stencil_probe_desc, IID_PPV_ARGS(&pso_stencil.p))));
         pso_desc.pRootSignature = root2.p;
         pso_desc.VS = {vs2_container.data(), vs2_container.size()};
         pso_desc.PS = {ps2_container.data(), ps2_container.size()};
@@ -279,6 +324,15 @@ int main(int argc, char** argv) {
         auto depth_desc = image_desc;
         depth_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
         depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        // The 4x multisampled pair the same two rectangles are also drawn into, and the 1x target they resolve into:
+        // rectangles are pixel-aligned, so every sample of a pixel takes the same path and the resolve equals the
+        // single-sampled rendering of N and F.
+        auto msaa_color_desc = image_desc;
+        msaa_color_desc.SampleDesc.Count = 4;
+        auto msaa_depth_desc = depth_desc;
+        msaa_depth_desc.SampleDesc.Count = 4;
+        auto resolved_desc = image_desc;
+        resolved_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
         constexpr D3D12_RESOURCE_STATES rt0_rest = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_COPY_SOURCE;
         constexpr D3D12_RESOURCE_STATES copy_rest = D3D12_RESOURCE_STATE_COPY_SOURCE;
 
@@ -300,9 +354,9 @@ int main(int argc, char** argv) {
                                                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         const D3D12_DESCRIPTOR_HEAP_DESC sampler_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1,
                                                            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-        const D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3 * slots,
+        const D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4 * slots,
                                                        D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
-        const D3D12_DESCRIPTOR_HEAP_DESC dsv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, slots,
+        const D3D12_DESCRIPTOR_HEAP_DESC dsv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 4 * slots,
                                                        D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         Ref<ID3D12DescriptorHeap> srv_heap, sampler_heap, rtv_heap, dsv_heap;
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&srv_heap_desc, IID_PPV_ARGS(&srv_heap.p))));
@@ -332,12 +386,20 @@ int main(int argc, char** argv) {
         sampler_desc.MaxLOD = D3D12_FLOAT32_MAX;
         device->CreateSampler(&sampler_desc, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(sampler_cpu)});
 
-        D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 3 * slots, 0};
+        D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 5 * slots, 0};
         Ref<ID3D12QueryHeap> query_heap;
         EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&query_heap.p))));
+        // Pipeline statistics around the whole pass-1 draw sequence, with the occlusion resolve inside it: the layer's
+        // own helper dispatches must not be counted as the application's compute work (D3D-162). A device without the
+        // feature has no such heap and the test runs without the statistics part.
+        D3D12_QUERY_HEAP_DESC statistics_desc{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, slots, 0};
+        Ref<ID3D12QueryHeap> statistics_heap;
+        const bool statistics = SUCCEEDED(device->CreateQueryHeap(&statistics_desc, IID_PPV_ARGS(&statistics_heap.p)));
+        if (!statistics) std::puts("no pipeline-statistics query heap on this device; skipping that part");
 
         struct Slot {
-            Ref<ID3D12Resource> rt0, rt1, rt2, depth, readback;
+            Ref<ID3D12Resource> rt0, rt1, rt2, depth, depth_copy, readback;
+            Ref<ID3D12Resource> msaa_color, msaa_depth, msaa_resolved;
             Ref<ID3D12CommandAllocator> allocator;
             Ref<ID3D12GraphicsCommandList> list;
             Ref<ID3D12Fence> fence;
@@ -345,7 +407,8 @@ int main(int argc, char** argv) {
             int frame = -1;                       // the frame in flight in this slot, -1 when none
         };
         std::array<Slot, slots> ring;
-        D3D12_CPU_DESCRIPTOR_HANDLE rtvs[slots][3], dsvs[slots];
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvs[slots][3], dsvs[slots], dsvs_read_only[slots], dsvs_copy[slots];
+        D3D12_CPU_DESCRIPTOR_HANDLE msaa_rtvs[slots], msaa_dsvs[slots];
         std::uint32_t keys[slots][8];
         const auto readback_desc = buffer_desc(readback_bytes);
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
@@ -362,15 +425,41 @@ int main(int argc, char** argv) {
             EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &depth_desc,
                                                              D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr,
                                                              IID_PPV_ARGS(&slot_.depth.p))));
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &depth_desc,
+                                                             D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr,
+                                                             IID_PPV_ARGS(&slot_.depth_copy.p))));
             EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
                                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                              IID_PPV_ARGS(&slot_.readback.p))));
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &msaa_color_desc,
+                                                             D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                             IID_PPV_ARGS(&slot_.msaa_color.p))));
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &msaa_depth_desc,
+                                                             D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr,
+                                                             IID_PPV_ARGS(&slot_.msaa_depth.p))));
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &resolved_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
+                                                             IID_PPV_ARGS(&slot_.msaa_resolved.p))));
+            msaa_rtvs[s] = {SIZE_T(rtv_cpu + std::uint64_t(3 * slots + s) * rtv_step)};
+            device->CreateRenderTargetView(slot_.msaa_color.p, nullptr, msaa_rtvs[s]);
+            msaa_dsvs[s] = {SIZE_T(dsv_cpu + std::uint64_t(3 * slots + s) * dsv_step)};
+            device->CreateDepthStencilView(slot_.msaa_depth.p, nullptr, msaa_dsvs[s]);
             for (UINT i = 0; i < 3; ++i) rtvs[s][i] = {SIZE_T(rtv_cpu + std::uint64_t(s * 3 + i) * rtv_step)};
             device->CreateRenderTargetView(slot_.rt0.p, nullptr, rtvs[s][0]);
             device->CreateRenderTargetView(slot_.rt1.p, nullptr, rtvs[s][1]);
             device->CreateRenderTargetView(slot_.rt2.p, nullptr, rtvs[s][2]);
             dsvs[s] = {SIZE_T(dsv_cpu + std::uint64_t(s) * dsv_step)};
             device->CreateDepthStencilView(slot_.depth.p, nullptr, dsvs[s]);
+            // A second view of the same depth buffer that forbids depth and stencil writes, for the probe draws while
+            // the buffer is in DEPTH_READ.
+            dsvs_read_only[s] = {SIZE_T(dsv_cpu + std::uint64_t(slots + s) * dsv_step)};
+            D3D12_DEPTH_STENCIL_VIEW_DESC read_only{};
+            read_only.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+            read_only.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+            read_only.Flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH | D3D12_DSV_FLAG_READ_ONLY_STENCIL;
+            device->CreateDepthStencilView(slot_.depth.p, &read_only, dsvs_read_only[s]);
+            dsvs_copy[s] = {SIZE_T(dsv_cpu + std::uint64_t(2 * slots + s) * dsv_step)};
+            device->CreateDepthStencilView(slot_.depth_copy.p, &read_only, dsvs_copy[s]);
             D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
             srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -445,10 +534,16 @@ int main(int argc, char** argv) {
             list->RSSetViewports(1, &viewport);
             list->RSSetScissorRects(1, &scissor);
             list->OMSetRenderTargets(2, rtvs[s], FALSE, &dsvs[s]);
+            if (statistics) list->BeginQuery(statistics_heap.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, s);
             draw(list, fr.n, fr.n.stencil_ref);
-            // The probe must leave F's depth/stencil/color inputs intact for the real two-output draw below.
+            // The probes read the depth buffer N just wrote through a read-only DSV while it is in DEPTH_READ; the
+            // real draws switch it back to DEPTH_WRITE. The probe must leave F's depth/stencil/color inputs intact for
+            // the real two-output draw below either way.
+            D3D12_RESOURCE_BARRIER to_read_only =
+                transition(slot_.depth.p, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_READ);
+            list->ResourceBarrier(1, &to_read_only);
             list->SetPipelineState(pso_query.p);
-            list->OMSetRenderTargets(1, rtvs[s], FALSE, &dsvs[s]);
+            list->OMSetRenderTargets(1, rtvs[s], FALSE, &dsvs_read_only[s]);
             list->BeginQuery(query_heap.p, D3D12_QUERY_TYPE_OCCLUSION, s);
             draw(list, fr.f, fr.f.stencil_ref);
             list->EndQuery(query_heap.p, D3D12_QUERY_TYPE_OCCLUSION, s);
@@ -461,6 +556,9 @@ int main(int argc, char** argv) {
             list->BeginQuery(query_heap.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 2 * slots + s);
             draw(list, fr.n, fr.n.stencil_ref);
             list->EndQuery(query_heap.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 2 * slots + s);
+            D3D12_RESOURCE_BARRIER to_depth_write =
+                transition(slot_.depth.p, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            list->ResourceBarrier(1, &to_depth_write);
             list->SetPipelineState(pso_a.p);
             list->OMSetRenderTargets(2, rtvs[s], FALSE, &dsvs[s]);
             draw(list, fr.f, fr.f.stencil_ref);
@@ -470,6 +568,63 @@ int main(int argc, char** argv) {
             list->ResolveQueryData(query_heap.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, slots + s, 1, slot_.readback.p, 8);
             list->ResolveQueryData(query_heap.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 2 * slots + s, 1,
                                    slot_.readback.p, 16);
+            // The statistics range ends after the resolves above, whose helper dispatches it must not count.
+            if (statistics) {
+                list->EndQuery(statistics_heap.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, s);
+                list->ResolveQueryData(statistics_heap.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, s, 1,
+                                       slot_.readback.p, offset_statistics);
+            }
+
+            // Depth/stencil copies in the frame: a copy of the pass's depth/stencil buffer that the two probes below
+            // test against. A copy that lost the contents (left at the clear value) would let every pixel of F's
+            // rectangle through the depth test and fail G's stencil test everywhere, so the two counts tell them apart.
+            D3D12_RESOURCE_BARRIER copy_in[2] = {
+                transition(slot_.depth.p, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                transition(slot_.depth_copy.p, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_DEST)};
+            list->ResourceBarrier(2, copy_in);
+            list->CopyResource(slot_.depth_copy.p, slot_.depth.p);
+            D3D12_RESOURCE_BARRIER copy_out[2] = {
+                transition(slot_.depth.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE),
+                transition(slot_.depth_copy.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_DEPTH_READ)};
+            list->ResourceBarrier(2, copy_out);
+            list->SetPipelineState(pso_query.p);
+            list->OMSetRenderTargets(1, rtvs[s], FALSE, &dsvs_copy[s]);
+            list->BeginQuery(query_heap.p, D3D12_QUERY_TYPE_OCCLUSION, 3 * slots + s);
+            draw(list, fr.f, fr.f.stencil_ref);
+            list->EndQuery(query_heap.p, D3D12_QUERY_TYPE_OCCLUSION, 3 * slots + s);
+            list->SetPipelineState(pso_stencil.p);
+            list->BeginQuery(query_heap.p, D3D12_QUERY_TYPE_OCCLUSION, 4 * slots + s);
+            draw(list, fr.g, fr.g.stencil_ref);
+            list->EndQuery(query_heap.p, D3D12_QUERY_TYPE_OCCLUSION, 4 * slots + s);
+            list->SetPipelineState(pso_a.p);
+            list->ResolveQueryData(query_heap.p, D3D12_QUERY_TYPE_OCCLUSION, 3 * slots + s, 1, slot_.readback.p,
+                                   offset_depth_copy);
+            list->ResolveQueryData(query_heap.p, D3D12_QUERY_TYPE_OCCLUSION, 4 * slots + s, 1, slot_.readback.p,
+                                   offset_stencil_copy);
+            D3D12_RESOURCE_BARRIER copy_back =
+                transition(slot_.depth_copy.p, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            list->ResourceBarrier(1, &copy_back);
+
+            // Multisampled rendering and resolve in the frame: the near and far rectangles into a 4x target of its
+            // own, resolved into a 1x one and read back. Every sample of a pixel takes the same path, so the resolve
+            // must equal the single-sampled rendering of N and F (what the reference expects below).
+            list->ClearRenderTargetView(msaa_rtvs[s], black, 0, nullptr);
+            list->ClearDepthStencilView(msaa_dsvs[s], D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0,
+                                        nullptr);
+            list->SetPipelineState(pso_msaa.p);
+            list->OMSetRenderTargets(1, &msaa_rtvs[s], FALSE, &msaa_dsvs[s]);
+            draw(list, fr.n, fr.n.stencil_ref);
+            draw(list, fr.f, fr.f.stencil_ref);
+            D3D12_RESOURCE_BARRIER resolve_in[2] = {
+                transition(slot_.msaa_color.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE),
+                transition(slot_.msaa_resolved.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RESOLVE_DEST)};
+            list->ResourceBarrier(2, resolve_in);
+            list->ResolveSubresource(slot_.msaa_resolved.p, 0, slot_.msaa_color.p, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+            D3D12_RESOURCE_BARRIER resolve_out[2] = {
+                transition(slot_.msaa_color.p, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                transition(slot_.msaa_resolved.p, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)};
+            list->ResourceBarrier(2, resolve_out);
+            copy_image(list, slot_, slot_.msaa_resolved.p, DXGI_FORMAT_R8G8B8A8_UNORM, offset_msaa);
 
             D3D12_RESOURCE_BARRIER between[2] = {transition(slot_.rt0.p, D3D12_RESOURCE_STATE_RENDER_TARGET, rt0_rest),
                                                  transition(slot_.rt1.p, D3D12_RESOURCE_STATE_RENDER_TARGET, copy_rest)};
@@ -537,6 +692,20 @@ int main(int argc, char** argv) {
             compare("rt0", offset_rt0, want.rt0.data(), 4);
             compare("rt1", offset_rt1, want.rt1.data(), 4);
             compare("rt2", offset_rt2, want.rt2.data(), 4);
+            compare("resolved 4x", offset_msaa, want.msaa.data(), 4);
+            // The statistics range covers six DrawIndexedInstanced(6) calls: the near rectangle, the three probes and
+            // the two real far/overlay draws. Two indexed triangles each, and no compute in the range at all, so the
+            // layer's occlusion-sum and any other helper dispatch must not appear as compute invocations (D3D-162).
+            if (statistics) {
+                D3D12_QUERY_DATA_PIPELINE_STATISTICS stats{};
+                std::memcpy(&stats, base + offset_statistics, sizeof(stats));
+                if (stats.IAPrimitives != 12 || stats.CSInvocations != 0) {
+                    std::fprintf(stderr, "frame %u: IA primitives %llu, compute invocations %llu (want 12 and 0)\n", n,
+                                 static_cast<unsigned long long>(stats.IAPrimitives),
+                                 static_cast<unsigned long long>(stats.CSInvocations));
+                    ++mismatches;
+                }
+            }
             const bool precise = d.occlusion_query_precise;
             if (precise ? samples != want.samples : samples == 0) {
                 std::fprintf(stderr, "frame %u: occlusion query counted %llu samples, want %llu\n", n,
@@ -551,9 +720,23 @@ int main(int argc, char** argv) {
                              static_cast<unsigned long long>(binary_hidden));
                 ++mismatches;
             }
+            // The probes over the copied depth/stencil buffer must count exactly what the copied contents imply.
+            UINT64 depth_copy = 0, stencil_copy = 0;
+            std::memcpy(&depth_copy, base + offset_depth_copy, 8);
+            std::memcpy(&stencil_copy, base + offset_stencil_copy, 8);
+            if (precise ? depth_copy != want.depth_copy_samples || stencil_copy != want.stencil_copy_samples
+                        : !depth_copy || !stencil_copy) {
+                std::fprintf(stderr,
+                             "frame %u: copied depth let %llu samples through (want %llu), copied stencil %llu "
+                             "(want %llu)\n",
+                             n, static_cast<unsigned long long>(depth_copy),
+                             static_cast<unsigned long long>(want.depth_copy_samples),
+                             static_cast<unsigned long long>(stencil_copy),
+                             static_cast<unsigned long long>(want.stencil_copy_samples));
+                ++mismatches;
+            }
             total_samples += samples;
-            ++frames_checked;
-            slot_.readback->Unmap(0, nullptr);
+            ++frames_checked;            slot_.readback->Unmap(0, nullptr);
             return true;
         };
 
@@ -565,14 +748,17 @@ int main(int argc, char** argv) {
         CloseHandle(event);
 
         for (auto& slot_ : ring) {
-            slot_.rt0.reset(); slot_.rt1.reset(); slot_.rt2.reset(); slot_.depth.reset(); slot_.readback.reset();
+            slot_.rt0.reset(); slot_.rt1.reset(); slot_.rt2.reset(); slot_.depth.reset(); slot_.depth_copy.reset();
+            slot_.msaa_color.reset(); slot_.msaa_depth.reset(); slot_.msaa_resolved.reset();
+            slot_.readback.reset();
             slot_.list.reset(); slot_.allocator.reset(); slot_.fence.reset();
         }
         index_buffer.reset();
-        pso_a.reset(); pso_c.reset(); pso_p.reset(); pso_query.reset();
+        pso_a.reset(); pso_c.reset(); pso_p.reset(); pso_query.reset(); pso_stencil.reset(); pso_msaa.reset();
         root1.reset(); root2.reset();
         srv_heap.reset(); sampler_heap.reset(); rtv_heap.reset(); dsv_heap.reset();
         query_heap.reset();
+        statistics_heap.reset();
         queue.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
@@ -583,8 +769,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    std::printf("M3: %u frames, %u in flight, two render targets + D24S8 depth/stencil, barriers, an occlusion query with "
-                "a visible and a fully occluded binary probe and "
+    std::printf("M3: %u frames, %u in flight, two render targets + D24S8 depth/stencil, barriers, a read-only depth "
+                "window, a copied depth/stencil buffer probed twice, a 4x target resolved into a fourth and read back, "
+                "an occlusion query with a visible and a fully occluded binary probe, pipeline statistics over the "
+                "pass and "
                 "%s matched all %u pixels of three targets per frame "
                 "(error 0) and every sample count (%llu samples in all%s)\n",
                 frames, slots, first_pass_only ? "first-pass isolation (third target stays clear)" :
