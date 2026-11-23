@@ -85,6 +85,22 @@ constexpr std::uint32_t kStoragePrivate = 6;
 constexpr std::uint32_t kDecorationLocation = 30;
 constexpr std::uint32_t kGlslUnpackHalf2x16 = 62;
 
+inline constexpr bool is_interface_only_decoration(std::uint32_t dec) {
+    switch (dec) {
+    case 13:  // NoPerspective
+    case 14:  // Flat
+    case 15:  // Patch
+    case 16:  // Centroid
+    case 17:  // Sample
+    case 18:  // Invariant
+    case kDecorationLocation:
+    case 31:  // Component
+        return true;
+    default:
+        return false;
+    }
+}
+
 struct Inst {
     std::uint16_t opcode = 0;
     std::vector<std::uint32_t> words;
@@ -217,6 +233,15 @@ inline std::map<std::uint32_t, std::uint32_t> collect_located_vars(const Module&
 
 }  // namespace spirv_detail
 
+// Highest usable vec4 Location (capped at 29, MoltenVK's 124-component limit) for a device's stage interface limits.
+// Reserves 4 components for BuiltIn Position (so 128 -> 29, 124 -> 29, 64 -> 14).
+inline constexpr std::uint32_t f16_half_top_location(std::uint32_t max_vertex_output_components,
+                                                     std::uint32_t max_fragment_input_components) {
+    const std::uint32_t limit = std::min(max_vertex_output_components, max_fragment_input_components);
+    if (limit < 8) return 0;
+    return std::min<std::uint32_t>(29u, limit / 4u - 2u);
+}
+
 // Specializes/patches `vs_words` and (if needed) `ps_words` so that every entry in `ps_entry.f16_halves` is
 // exported by the VS at the exact smooth location the PS reads, within `0..top_location` (default 29, MoltenVK's
 // 124-component vertex output limit counting gl_Position).
@@ -230,18 +255,7 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
         if (error) *error = msg;
         return false;
     };
-    if (ps_entry.f16_halves.empty()) return true;
-
-    // Fast path: every PS half pair is already exported at the exact same locations by VS.
-    bool already_linked = true;
-    for (const auto& [param, ps_pair] : ps_entry.f16_halves) {
-        const auto it = vs_entry.f16_halves.find(param);
-        if (it == vs_entry.f16_halves.end() || it->second != ps_pair) {
-            already_linked = false;
-            break;
-        }
-    }
-    if (already_linked) return true;
+    if (ps_entry.f16_halves.empty() && vs_entry.f16_halves.empty()) return true;
 
     using namespace spirv_detail;
     Module vs_mod, ps_mod;
@@ -276,13 +290,39 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
         if (!ps_static_half_locs.count(loc)) ps_raw_locs.insert(loc);
     }
 
+    // Fast path: every PS half pair is already exported at the exact same locations by VS, all static halves fit
+    // within 0..top_location, and no unused VS static half collides with a raw PS input.
+    bool already_linked = true;
+    for (const auto& [param, ps_pair] : ps_entry.f16_halves) {
+        const auto it = vs_entry.f16_halves.find(param);
+        if (it == vs_entry.f16_halves.end() || it->second != ps_pair || ps_pair[0] > top_location ||
+            ps_pair[1] > top_location) {
+            already_linked = false;
+            break;
+        }
+    }
+    if (already_linked) {
+        for (const auto& [param, vs_pair] : vs_entry.f16_halves) {
+            const bool used_by_ps = ps_entry.f16_halves.count(param) != 0;
+            for (std::uint32_t loc : vs_pair) {
+                if (loc > top_location || (!used_by_ps && ps_raw_locs.count(loc))) {
+                    already_linked = false;
+                    break;
+                }
+            }
+            if (!already_linked) break;
+        }
+    }
+    if (already_linked) return true;
+
     // Choose paired [lo, hi] locations for every param in ps_entry.f16_halves.
-    // Keep PS's existing locations unchanged whenever none collides with VS raw outputs or exceeds top_location.
+    // Keep PS's existing locations unchanged whenever none collides with VS/PS raw outputs/inputs or exceeds top_location.
     bool keep_ps_locs = true;
     std::set<std::uint32_t> seen_ps_halves;
     for (const auto& [param, pair] : ps_entry.f16_halves) {
         for (std::uint32_t loc : pair) {
-            if (loc > top_location || vs_raw_locs.count(loc) || !seen_ps_halves.insert(loc).second) {
+            if (loc > top_location || vs_raw_locs.count(loc) || ps_raw_locs.count(loc) ||
+                !seen_ps_halves.insert(loc).second) {
                 keep_ps_locs = false;
                 break;
             }
@@ -542,12 +582,15 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
             continue;
         }
 
-        // Update or remove OpDecorate Location on static VS f16_halves outputs.
-        if (inst.opcode == kOpDecorate && inst.words.size() >= 4 && inst.words[2] == kDecorationLocation) {
+        // Update Location or strip interface-only decorations on static VS f16_halves outputs.
+        if (inst.opcode == kOpDecorate && inst.words.size() >= 3) {
             const std::uint32_t target = inst.words[1];
-            if (demote_vars.count(target)) continue;  // drop Location decoration from demoted Private variable
-            const auto it = vs_var_new_loc.find(target);
-            if (it != vs_var_new_loc.end()) inst.words[3] = it->second;
+            const std::uint32_t dec = inst.words[2];
+            if (demote_vars.count(target) && is_interface_only_decoration(dec)) continue;
+            if (dec == kDecorationLocation && inst.words.size() >= 4) {
+                const auto it = vs_var_new_loc.find(target);
+                if (it != vs_var_new_loc.end()) inst.words[3] = it->second;
+            }
             out_insts.push_back(std::move(inst));
             continue;
         }

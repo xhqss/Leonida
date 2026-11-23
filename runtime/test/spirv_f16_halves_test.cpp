@@ -178,12 +178,19 @@ bool verify_spirv_structure(const std::vector<std::uint32_t>& words, std::uint32
         }
     }
     for (const Inst& inst : mod.insts) {
-        if (inst.opcode == kOpDecorate && inst.words.size() >= 4 && inst.words[2] == kDecorationLocation) {
+        if (inst.opcode == kOpDecorate && inst.words.size() >= 3) {
             const auto it = var_storage.find(inst.words[1]);
-            if (it != var_storage.end() && it->second == storage_class) {
-                if (!out_loc_to_var.emplace(inst.words[3], inst.words[1]).second) return false;  // duplicate Location
+            const std::uint32_t dec = inst.words[2];
+            if (dec == kDecorationLocation && inst.words.size() >= 4) {
+                if (it != var_storage.end() && it->second == storage_class) {
+                    if (!out_loc_to_var.emplace(inst.words[3], inst.words[1]).second) return false;  // duplicate Location
+                }
             }
-            if (it != var_storage.end() && it->second == kStoragePrivate) return false;  // Private cannot have Location
+            if (it != var_storage.end() && it->second == kStoragePrivate &&
+                (dec == 13 || dec == 14 || dec == 15 || dec == 16 || dec == 17 || dec == 18 ||
+                 dec == kDecorationLocation || dec == 31)) {
+                return false;  // Private cannot carry interface-only decorations (Flat/NoPerspective/Location/Component/...)
+            }
         }
     }
     return true;
@@ -291,6 +298,123 @@ int main() {
         const auto vs_orig = vs_w, ps_orig = ps_w;
         std::string err;
         CHECK(!link_f16_halves(vs_w, vs_e, ps_w, ps_e, &err));
+        CHECK(!err.empty());
+        CHECK(vs_w == vs_orig && ps_w == ps_orig);
+    }
+
+    // 6. Fast-path top_location enforcement: matching VS/PS static halves above top_location must be relocated (or
+    //    rejected when they do not fit), not silently passed through unchanged.
+    {
+        ShaderEntry vs_e, ps_e;
+        vs_e.f16_halves = {{0, {28, 29}}, {1, {26, 27}}};
+        ps_e.f16_halves = {{0, {28, 29}}};
+        auto vs_w = build_vs(0x00010500u, 2, vs_e.f16_halves);
+        auto ps_w = build_ps(0x00010500u, {0, 1}, ps_e.f16_halves);
+        std::string err;
+        // 64-component Vulkan minimum limit -> top_location = 14; both VS and PS must relocate param 0 into <= 14
+        // and demote unused param 1 (at 26, 27) to Private.
+        CHECK(link_f16_halves(vs_w, vs_e, ps_w, ps_e, &err, 14));
+        std::map<std::uint32_t, std::uint32_t> vs_locs, ps_locs;
+        int vs_unpacks = 0, vs_privs = 0, ps_unpacks = 0, ps_privs = 0;
+        std::set<std::uint32_t> vs_ep, ps_ep;
+        CHECK(verify_spirv_structure(vs_w, kStorageOutput, vs_locs, vs_unpacks, vs_privs, vs_ep));
+        CHECK(verify_spirv_structure(ps_w, kStorageInput, ps_locs, ps_unpacks, ps_privs, ps_ep));
+        CHECK(vs_privs == 2);
+        CHECK(vs_locs.rbegin()->first <= 14);
+        CHECK(ps_locs.rbegin()->first <= 14);
+        CHECK(vs_locs.count(13) == 1 && vs_locs.count(14) == 1);
+        CHECK(ps_locs.count(13) == 1 && ps_locs.count(14) == 1);
+    }
+
+    // 7. Empty ps_entry.f16_halves with out-of-budget VS static halves: unused VS halves > top_location must be
+    //    demoted to Private instead of returning early and failing pipeline creation on a <124-component device.
+    {
+        ShaderEntry vs_e, ps_e;
+        vs_e.f16_halves = {{0, {28, 29}}};
+        auto vs_w = build_vs(0x00010500u, 2, vs_e.f16_halves);
+        auto ps_w = build_ps(0x00010500u, {0, 1}, {});
+        const auto ps_orig = ps_w;
+        std::string err;
+        CHECK(link_f16_halves(vs_w, vs_e, ps_w, ps_e, &err, 14));
+        CHECK(ps_w == ps_orig);
+        std::map<std::uint32_t, std::uint32_t> vs_locs;
+        int unpacks = 0, privs = 0;
+        std::set<std::uint32_t> ep_iface;
+        CHECK(verify_spirv_structure(vs_w, kStorageOutput, vs_locs, unpacks, privs, ep_iface));
+        CHECK(privs == 2);
+        CHECK(vs_locs.size() == 2 && vs_locs.rbegin()->first == 1);
+    }
+
+    // 8. Unused VS static half colliding with a raw PS input: fast path must not leave the unused VS half at a
+    //    Location the PS reads as a raw input.
+    {
+        ShaderEntry vs_e, ps_e;
+        vs_e.f16_halves = {{0, {28, 29}}, {1, {26, 27}}};
+        ps_e.f16_halves = {{0, {28, 29}}};
+        auto vs_w = build_vs(0x00010500u, 2, vs_e.f16_halves);
+        auto ps_w = build_ps(0x00010500u, {0, 1, 26}, ps_e.f16_halves);
+        std::string err;
+        CHECK(link_f16_halves(vs_w, vs_e, ps_w, ps_e, &err, 29));
+        std::map<std::uint32_t, std::uint32_t> vs_locs;
+        int unpacks = 0, privs = 0;
+        std::set<std::uint32_t> ep_iface;
+        CHECK(verify_spirv_structure(vs_w, kStorageOutput, vs_locs, unpacks, privs, ep_iface));
+        CHECK(privs == 2);
+        CHECK(!vs_locs.count(26) && !vs_locs.count(27));
+        CHECK(vs_locs.count(28) == 1 && vs_locs.count(29) == 1);
+    }
+
+    // 9. Demoting a static VS half variable strips non-Location interface-only decorations (e.g. Flat, Component)
+    //    so the resulting Private variable remains valid SPIR-V.
+    {
+        ShaderEntry vs_e, ps_e;
+        vs_e.f16_halves = {{0, {28, 29}}, {1, {26, 27}}};
+        ps_e.f16_halves = {{0, {26, 27}}};  // forces param 1 (IDs 14, 15) to be demoted to Private
+        auto vs_w = build_vs(0x00010500u, 2, vs_e.f16_halves);
+        // Inject OpDecorate 14 Flat and OpDecorate 15 Component 0 right after OpDecorate 15 Location 27.
+        Module m;
+        CHECK(m.parse(vs_w));
+        std::vector<Inst> patched;
+        for (const Inst& inst : m.insts) {
+            patched.push_back(inst);
+            if (inst.opcode == kOpDecorate && inst.words.size() >= 4 && inst.words[2] == kDecorationLocation &&
+                inst.words[3] == 27) {
+                patched.push_back(make_inst(kOpDecorate, {inst.words[1] - 1, 14}));       // Flat
+                patched.push_back(make_inst(kOpDecorate, {inst.words[1], 31, 0}));        // Component 0
+            }
+        }
+        m.insts = std::move(patched);
+        vs_w = m.serialize();
+
+        auto ps_w = build_ps(0x00010500u, {0, 1}, ps_e.f16_halves);
+        std::string err;
+        CHECK(link_f16_halves(vs_w, vs_e, ps_w, ps_e, &err));
+        std::map<std::uint32_t, std::uint32_t> vs_locs;
+        int unpacks = 0, privs = 0;
+        std::set<std::uint32_t> ep_iface;
+        CHECK(verify_spirv_structure(vs_w, kStorageOutput, vs_locs, unpacks, privs, ep_iface));
+        CHECK(privs == 2);
+    }
+
+    // 10. Device-limit helper f16_half_top_location() and out-of-budget fast-path rejection.
+    {
+        CHECK(f16_half_top_location(128, 128) == 29);
+        CHECK(f16_half_top_location(124, 128) == 29);
+        CHECK(f16_half_top_location(120, 120) == 28);
+        CHECK(f16_half_top_location(64, 64) == 14);
+        CHECK(f16_half_top_location(64, 128) == 14);
+        CHECK(f16_half_top_location(4, 64) == 0);
+
+        // Matching VS/PS static halves at [28, 29], but 14 raw VS outputs (0..13) leave only location 14 free (< 2):
+        // must fail cleanly instead of taking the fast path with out-of-range locations.
+        ShaderEntry vs_e, ps_e;
+        vs_e.f16_halves = {{0, {28, 29}}};
+        ps_e.f16_halves = {{0, {28, 29}}};
+        auto vs_w = build_vs(0x00010500u, 14, vs_e.f16_halves);
+        auto ps_w = build_ps(0x00010500u, {0}, ps_e.f16_halves);
+        const auto vs_orig = vs_w, ps_orig = ps_w;
+        std::string err;
+        CHECK(!link_f16_halves(vs_w, vs_e, ps_w, ps_e, &err, 14));
         CHECK(!err.empty());
         CHECK(vs_w == vs_orig && ps_w == ps_orig);
     }
