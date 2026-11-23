@@ -21,6 +21,24 @@
 凌晨之后又往前推了一步：控制台原语拓扑 19 的 Blit PSO 现在按三角形列表建成，语料里缺的 Blit VS 已翻译
 并入（26,555 → 26,556），`no translated vs` 归零。剩下的停点就是上面那条页表写入（9.2、9.3）。
 
+**03:00–04:30 这一段又把硬停点换了三次**（§9.4）：
+
+1. `LEONIDA_DUMP_SHADERS` 现在连 **DXBC 容器**一起写（`<stage>-<sha>.dxbc`），于是 dump 出来的程序可以
+   真正翻译了——容器里有签名、PSV0 和 FSSM 头部（`COMPUTE_PGM_RSRC2`、线程组大小）。用一个缺译文的 PS
+   验证过：语料 26,556 → **26,557**，那条 `no translated ps` 消失，它要的 PSO 建了出来。
+2. 设备槽位 81 的两种答法都试了（§9.2b 的假设）：**都不是页表 AV 的原因**，AV 发生在工作线程上，
+   与主线程的槽位 81 无关。这条假设可以划掉。
+3. 页表写入 AV 的真面目查清了（`LEONIDA_PROBE_ARRAY` 探针）：那确实是一张 8 字节 PTE 的页表，
+   数组里是 PTE 的字节偏移；但数组**只读到前 ~8 KB 就断了**，后面是堆垃圾，标题又不看读返回长度，
+   于是拿垃圾偏移去写 PTE。README 级的坑，但根因在流读取。
+4. **给 DStorage 补上 zlib 解压**（`src/zlib_inflate.h` 从 `shader_library.h` 拆出去复用）之后，
+   那条 AV **消失了**：启动推进到 **16.4 s**，死在音频初始化之后的 `0xC0000409`（fastfail）。
+   也就是说页表 AV 是"流数据没解压出来 → 布局表是垃圾"的下游症状，不是页表本身的问题。
+5. **音频的 9 个导入从"返回 0"改成"写出参"**（新的 `runtime/shims/audio.cpp`）：窗口 `Americas`
+   起来之后**不再死**——实测一次运行活过 8 分钟、`Responding`、工作集 19.9 GB，一直在建 FSPX compute PSO
+   （每条都因为语料里没有译文而失败，标题不因此退出）。**这是本晚最好的状态：从"15 秒必死"到"能一直活着"**；
+   画面还停在白色（只有一次 `PresentX ready`，没有第二帧）。
+
 ---
 
 ## 2. 起点与终点
@@ -59,6 +77,15 @@
 | 02:01 | trace-75 | **309.2 s** `AV @+0x2215c35` | fence 槽位 12 返 `E_NOTIMPL` → 自旋 → 看门狗 |
 | 02:03 | trace-77 | **11.27 s** `AV read @+0x25a087d` | #7290 修好 fence 后的新停点（拓扑 19） |
 | 02:21 | trace-78 | **5.58 s** `int3 @+0x344196` | 复核：默认不跳过 assert 时的稳定停点 |
+| 02:44 | trace-86..89 | **11.6 s** `AV read @+0x25a087d` | 加了设备槽位 81 的参数日志；同一处页表写入 |
+| 03:13 | play.log | 窗口 + `PresentX ready`，然后 `no translated ps` | 缺译文的 PS（`452212e5…`），PSO 建不出来 |
+| 03:2x | trace-90 | 6.0 s `int3 @+0x344196` | 不带 `LEONIDA_SKIP_ASSERTS` 的默认停点（复现） |
+| 03:3x | trace-91 | 12.5 s `AV @+0x25a087d` | 把 PS 并进语料后，同一个 AV（说明与 PS 无关） |
+| 03:4x | trace-92..95 | 12–15 s `AV @+0x25a087d` | `LEONIDA_PROBE_ARRAY` 探针：页表、数组、流状态 |
+| 03:5x | trace-96 | 13.0 s 同一 AV | `LEONIDA_SLOT81=zero`：AV 不变 → 槽位 81 不是原因 |
+| 04:0x | trace-97 | **16.4 s `0xC0000409`** | DStorage zlib 上线后 AV 消失，死在音频初始化之后 |
+| 04:1x | trace-98..100 | 15.2×2 s `0xC0000005` 写 `0x20` | 音频的 out 参数没写：`memset([ctx+0x38]=0)`、`call *0` |
+| 04:2x | trace-101 / run-audio3.log | **活过 8 分钟** | 音频桩落地：窗口 `Americas` 在前台且 `Responding`，19.9 GB，一直在建 FSPX compute PSO |
 
 要点：**"窗口拉起后未响应"的那一次就是 309 s 那次**（见第 8 节）。
 
@@ -380,6 +407,163 @@ its console address"，即标题确实会拿控制台地址当指针用；那我
 `CS group size` / `CS thread-group-size SGPR` 而拒绝。要补它们得拿到带头的 FSSM 块（容器里那份），
 不是这条 dump 路径能给的。另外 8 个反汇编失败的是 FSPX kind-6，不是 FSSM 布局。
 
+（这条"dump 不含头部"的限制在 §9.4.1 已经解决：现在 dump 连 DXBC 容器一起写。）
+
+---
+
+## 9.4 03:00–04:30：dump 带容器、槽位 81 被否掉、DStorage zlib
+
+### 9.4.1 `LEONIDA_DUMP_SHADERS` 现在也写 DXBC 容器
+
+`dump_untranslated_shader()` 原来只写 `<stage>-<sha16>.fssm`，也就是"程序"本身——而翻译器要的东西一半在
+容器里：签名（`ISG1`/`OSG1`/`OSG5`）、`PSV0`（输出寄存器、MRT），以及 FSSM 头部 0x138..0x144 的
+`COMPUTE_PGM_RSRC2` 与线程组大小。所以 7.1b 那条链对 dump 出来的程序只能翻译 VS（不需要这些），
+compute 会报 `CS group size`——**不是翻译器的毛病，是 dump 少了东西**。
+
+现在 `dump_untranslated_shader(..., container, container_bytes)` 在 program 旁边再写一份 `<name>.dxbc`
+（只有真的是 DXBC 容器时才写），note 里加一行 `container bytes`。`tools/rdna2spirv.py` 的
+`shader_container()` 正好在 `.s` 的两级父目录找同名 `.dxbc`，所以：
+
+```text
+tmp/ps4522/fssm/ps-452212e59d983c3b.fssm   -> 反汇编到 tmp/ps4522/asm/
+tmp/ps4522/ps-452212e59d983c3b.dxbc        -> 翻译器读签名/PSV0/头部
+```
+
+实测这条 PS（`452212e5…`，wave64、1 个 `R11G11B10_FLOAT` 目标 + D32 深度、无顶点输入）干净反汇编、
+`spirv-val` 通过，并进语料后 **26,556 → 26,557**；重跑时 `no translated ps` 归零，它要的那个
+`CreatePipelineState` 建了出来，启动继续往前走。所以那 40 个"翻不出来的程序"里，**只要 dump 里有容器**，
+就能按 7.1 的链补进语料——这条路径比去 `shaders.rpf` 反查快得多。
+
+### 9.4.2 设备槽位 81：试了两种答法，都不是页表 AV 的原因
+
+§9.2b 的推论是"槽位 81 答不上来 → 标题走回退路径 → 用垃圾偏移写页表"。现在槽位 81 有了可切换的答法
+（`LEONIDA_SLOT81=zero|page64`，默认仍是 `E_NOTIMPL`），实测：
+
+| 答法 | 停点 |
+| --- | --- |
+| 不设（`E_NOTIMPL`） | 12.1–15.9 s `AV @+0x25a087d` |
+| `zero`（`S_OK`，`*kind = 0`） | 13.0 s **同一个 AV，同一个索引 2073** |
+
+并且有一次运行里槽位 81 **根本没被调用**（`trace-96`：日志里没有 `slot 81` 那行），页表 AV 照样发生。
+结论：**槽位 81 与页表 AV 无关**；那条 AV 在**工作线程**上（栈底是 `KERNEL32.DLL+0x2dda7` = 线程入口），
+与主线程的槽位 81 是两条线。§9.2b 的第 1 号待办可以划掉（槽位本身仍然没实现，见 §13）。
+
+### 9.4.3 页表 AV 的真相：流读到一半就断了，而标题不看读了多少
+
+`LEONIDA_PROBE_ARRAY=<dir>` 这个探针在 AV 那一刻把现场拆开写进 trace，做三件事：读
+`[rsp+0x3c]`（这个帧的数组长度）、把 `r14` 指向的数组整段落盘、把 `[rax]` 起的页表头部 4 KiB 落盘，
+再顺着 `[rsp+0x48]`（保存的第三个参数）和 `[rsp+0x50]`（保存的流对象）打出流的状态（`trace-93`）：
+
+```text
+at      game_scarlett_master.exe+0x25a087d
+gprs    rax=0xe1409d0（页表基址） rdx=0x819（循环下标 2073） r9=0x689acce8（出错的数组项）
+array   count=3627  min=0x10  max=0xff9b2bcf
+head    0x9d8 0x9e0 0x9e8 0x9f0 0xc38 0xc40 …          <- 8 字节步长，正是 PTE 的字节偏移
+tail    … 0x31c4d802 0x10 0x689accf0 0x10 …             <- 8 字节一组的堆垃圾
+stream  buffer=0x147906a80  capacity=0x1000  held=0  pos=0
+table   0x9d0: 00500000 606068c4 | 0x9d8: 00500001 9838d707 …   <- 确实是 PTE 表（低字 = 页号）
+```
+
+三件事对上了：
+
+1. 页表**是真的**：偏移 0x9d0 起是 8 字节 PTE，低字 `0x00500000 + i`。所以前 2000 多项写进去是合法的。
+2. 数组**前 ~8,152 字节是正常的 PTE 偏移**（正好两个 4 KiB 读缓冲），之后变成 `(随机值, 0x10)` 的配对，
+   那是堆里上一任使用者留下的内容——典型的"只填了一半的缓冲区"。
+3. 现场那个 `-8` 的加法（`add $0xfffffff8,%r9d`）说明数组项 = PTE 字节偏移 + 8；一个垃圾项
+   `0x689accf0` 就变成 `0x689acce8` 的偏移，落到页表外，`region=reserve` 只是它恰好落进别人的保留区。
+
+而"只填一半"的原因在**读取方**：`0x1425a0630` 这个函数分两次从流里读——先 4 字节拿个数，再
+`count*4` 字节拿数组——**两处调用都把返回值丢掉了**（`call 0x1451d2260` 之后不看 `eax`）。
+流不够长时它照样往下走，缓冲区剩下的就是没初始化过的堆。这条链最后由 DStorage 的 zlib 短读解释通（9.4.4）。
+
+顺带确认：那段数组**在 exe 里搜不到**（拿 `0x9d8 0x9e0 0x9e8 0x9f0` 的小端字节串搜整个镜像，无命中），
+所以数据来自运行时读的资源，不是镜像里的静态表。
+
+### 9.4.4 DStorage 的 zlib：补上之后那条 AV 消失了
+
+`runtime/shims/dstorage.cpp` 原来对 zlib / BCPack / swizzle 一律 `E_NOTIMPL`，日志里也就一直有
+
+```text
+[rt] dstorage: zlib, BCPack and swizzle requests are not implemented yet (E_NOTIMPL)
+[rt] dstorage: an entry failed with 0x80004001 (command type 0)
+```
+
+`E_NOTIMPL` 意味着目标缓冲区**一个字节都没动**，而标题当它读成功了——于是流里的数据就是上一任内容，
+和 9.4.3 观察到的"前 8 KB 正常、后面是堆垃圾"完全吻合。
+
+做法：把 `shader_library.h` 里自带的 inflate（RFC 1950/1951 + Adler-32，纯 C++、无第三方）**拆到**
+`runtime/src/zlib_inflate.h`，`shader_library.h` 只是 include 它，`dstorage.cpp` 也 include 它，
+然后 `execute_zlib_request()` 变成：
+
+```text
+源（文件 read_file_range / 内存 guarded_move）-> SourceSize 字节
+  -> leonida::zlib_inflate(..., DestinationSize)
+  -> 长度必须正好等于 DestinationSize，否则 E_DSTORAGE_INVALID_DESTINATION_SIZE（目标一字节不动）
+  -> 拷进 Destination
+```
+
+BCPack 和 swizzle 仍然 `E_NOTIMPL`（那两个是 GPU 侧的排布变换，不是解压）；`IntermediateSize` 对 zlib
+必须为 0，保持原来的拒绝。
+
+效果（`trace-97`）：
+
+```text
+14.2 s  unimplemented: acphal.dll!ApuCreateHeap / AcpHalAllocateShapeContexts
+15.x s  device slot 81 routed to console page-size query
+16.4 s  退出码 0xC0000409（STATUS_STACK_BUFFER_OVERRUN / fastfail）
+```
+
+**`+0x25a087d` 那条 AV 再没出现过**，启动从 12 s 推到 16.4 s。留下的新停点是音频初始化之后的 fastfail，
+不是 AV、也没进异常处理器（fastfail 不走 VEH，所以 trace 里连 `exception` 事件都没有）。
+
+### 9.5 音频的 22 个导入：把"返回 0"变成"写出参"，窗口活过 8 分钟
+
+zlib 之后的新停点是 `0xC0000409`（fastfail）与 `0xC0000005`（写地址 `0x20`）交替出现，两者都在
+`AcpHalAllocateShapeContexts` 之后。反汇编调用点（`game_scarlett_master.exe+0x43aec40` 起）把责任分清了：
+
+```asm
+1443aec68: movq $0x15e,[0x149ae98e0]              ; 350 个 shape context
+1443aec73: call AcpHalAllocateShapeContexts(&0x149ae98d0)
+1443aec80: r8d = [0x149ae98e0] << 6               ; r8 = 350*64 = 22400
+1443aec87: rcx = [0x149ae9908]                    ; = ctx + 0x38
+1443aec94: call memset(rcx, 0, r8d)               ; 写 0x20 -> AV
+```
+
+也就是 `AcpHalAllocateShapeContexts` 的职责是"把 count*64 字节的块写进 `ctx+0x38`"，而未实现导入返回 0
+让这个字段一直是 0，标题就把 memset 打到空指针附近。同一段里还有三处：
+
+```asm
+1443aecf2: call ApuAlloc(&block, 0, 0x222e00, 0x800)   ; 出参在栈上，返回 HRESULT
+1443aed18: r15 = block                                 ; 350 项的表用这块内存填（每项 0x1700+0x200）
+1443aed91: call AcpHalCreate(&hal)                     ; 传的是 &global
+1443aedb7: rax = [hal];  call *(%rax)                  ; 把 hal 当对象：取 vtable[0] 并调用
+```
+
+最后一条是关键：`AcpHalCreate` 写出的不是"不透明句柄"，而是**对象指针**——标题立刻解引用它取 vtable 并调用
+第一项（参数 `(0x1000, 0x1000)`）。返回一个全零缓冲区会被 `call *0` 打死。
+
+新增 `runtime/shims/audio.cpp`，把这条链上有实测形状的 9 个导入做成桩（`AcpHal.dll`）：
+
+| 导入 | 桩的行为 |
+| --- | --- |
+| `AcpHalAllocateShapeContexts(ctx)` | 按 `ctx+0x10` 的数量提交 `count*64` 字节，写 `ctx+0x38` |
+| `AcpHalCreate(out)` | 写一个对象指针，`[handle]` 是 16 项 vtable，全部返回 `S_OK` |
+| `AcpHalReleaseShapeContexts(handle)` | `S_OK` |
+| `ApuCreateHeap(size, flags)` | `S_OK`（首调用实测 `477102080` 字节、`flags 0x226e00`） |
+| `ApuAlloc(out, align, size, flags)` | 提交页对齐的 `size` 字节，写出参 |
+| `ApuFree(p)` | `VirtualFree` |
+| `ApuIsVirtualAddressValid(p, size)` | 非空即 1 |
+| `ApuMapVirtualAddress(p, size)` / `ApuMapApuAddress(token)` | 一张"32 位 token ↔ 指针"的小表（宿主地址 64 位，直接截断会撞车） |
+
+`xapu.dll` 与 `chad.dll` 的 10 个仍未实现：它们的调用点还没走到非答不可的地方。
+
+效果（`trace-101`，写这段时那次运行还活着）：**进程活过 8 分钟**，窗口 `Americas` 在前台、`Responding`，
+工作集 19.9 GB，日志里连续出现 `slot 67` 的 FSPX compute PSO（`call 259` 以上）——每一条都因为
+`no translated compute shader for FSPX kind-6 and kind-0` 而 `E_INVALIDARG`，标题并不因此退出。
+
+这是本晚最好的状态：**从"15 秒必死"变成"能一直活着"**。剩下的问题是画面：全程只有一次 `PresentX ready`，
+没有第二帧，窗口是白的——所以它还停在初始化/PSO 阶段，没进渲染循环。
+
 ---
 
 ## 10. 构建与测试
@@ -446,7 +630,9 @@ $env:LEONIDA_SKIP_ASSERTS='1'
 | `LEONIDA_SKIP_ASSERTS=N` | 跳过前 N 个 guest `int3`（#7204） |
 | `LEONIDA_SKIP_INT3=1` | 同上的旧开关 |
 | `LEONIDA_UNIMPLEMENTED=log\|stop\|fail` | 未实现导入的策略 |
-| `LEONIDA_DUMP_SHADERS=<dir>` | 语料里没有的 shader 写到该目录（见 7.1b） |
+| `LEONIDA_DUMP_SHADERS=<dir>` | 语料里没有的 shader 写到该目录（见 7.1b、9.4.1；现在连 `.dxbc` 容器一起写） |
+| `LEONIDA_PROBE_ARRAY=<dir>` | 页表写入 AV 那一刻把数组、页表头、流状态写进 trace 并落盘（见 9.4.3） |
+| `LEONIDA_SLOT81=zero\|page64` | 设备槽位 81 的两种实验答法（见 9.4.2；默认仍是 `E_NOTIMPL`） |
 | `LEONIDA_TRACE_PSO=1` | 每解析一条 pipeline state stream 就打一行 subobject 走位 |
 | `LEONIDA_COMMIT_ON_FAULT=1` | 诊断用：AV 落在 `MEM_RESERVE` 时提交那一页并重试（见 9.2b） |
 | `--trace-d3d12` | **别在长时间运行里用**，日志量会把进程拖到看门狗的 30 秒门槛 |
@@ -473,36 +659,53 @@ $env:LEONIDA_SKIP_ASSERTS='1'
 
 ## 13. 下一次接手的第一梯队
 
-1. **实现设备槽位 81**（9.2b）：一次查询，形状是 `(1, 0x11100, &kind=6, &out{页大小, 标志, ...})`，
-   调用方按 56 字节结构遍历并读 `out+0x18`。答不上来时标题走回退路径，接着用垃圾偏移写页表。
-   先按"返回 64 KiB 或 4 KiB 页大小 + 标志"去试，用 `--trace` 看 PTE 偏移是否变得合理。
-2. **`+0x25a087d` 的页表写入 AV**：有了第 1 条再回看这条。若仍然散射，说明数组本身来自别处
-   （标题自己的 static），要顺着 `getter`（`0x1451d2260`）往里查。
-3. **`d3d12_depth_resolve` 的"拒绝却改写了目标"**：测到的现象是 `Close` 已经是 `E_INVALIDARG`、
-   批处理也被拒（`list 0 is invalid; refusing batch`），但目标纹理的字节和清屏值不一致，
-   而 `resolve_and_read(..., run_invalid=true)` 这条路径期望目标一字不改。得查是"拒绝前已经在某处落盘"
+按 04:30 的状态排序。**先读这一条**：现在的停点不再是"崩"，而是"活着但不渲染"——窗口 `Americas`
+在前台、`Responding`、进程能一直活着，只有一次 `PresentX ready`、没有第二帧、画面全白。
+
+1. **FSPX compute 的语料**（当前最硬的一条）：`slot 67` 已经在几百次调用上失败，每条都是
+   `no translated compute shader for FSPX kind-6 and kind-0`。实测 270 次调用里 **270 个不同 sha256**，
+   但只有 **176 个不同的 (kind 6, kind 7) 尺寸对**——说明 `sha256` 键把 kind 0（dispatch state）也算进去了，
+   而 kind 0 每次都在变。所以先别急着翻译 270 个程序：先用 §9.4.1 的新 dump（连容器一起写）把它们抓下来，
+   看清"真正不同的 kind 6 程序有几个"。若只有几十个（`amd_fidelityfx_upscaler_xbox.dll` 里就 29 个），
+   就按 `docs/fspx.md` 的链翻译；若真是几百个，那是**查找键**的问题，不是语料的问题。
+   语料里 `fspx/<name>.json`（kind 0 的 word 3/4/6：线程组、wave32、`COMPUTE_PGM_RSRC2`）就是翻译器要的头部。
+2. **画面为什么还是白的**：只有一次 `PresentX ready`，没有第二帧。要么标题卡在初始化（它每 20 秒才建一个
+   FSPX PSO，说明中间在做重活），要么第一帧提交了但交换链没把图像拷出来。先看
+   `LEONIDA_TRACE_PSO`/`--trace` 在 8 分钟里有没有 `Present` 事件；没有就是没进渲染循环。
+3. **`xapu.dll` / `chad.dll` 的 10 个导入**：仍是未实现。`XApuConnect(&a,&b,&c)` 有三个出参
+   （`+0x43aee69` 实测），`XApuEnqueueCommand`/`XApuDequeueResult` 共享一个全局句柄；音频命令队列一旦被真正用到，
+   这三个出参就得像 §9.5 那样写出真东西。
+4. **其余 compute 程序的语料**（若 §1 判定是真缺程序）：按 §9.4.1 的链（dump 带 `.dxbc` → 反汇编 → 翻译 → 并库）。
+5. **`d3d12_depth_resolve` 的"拒绝却改写了目标"**：`Close` 已经是 `E_INVALIDARG`、批处理也被拒
+   （`list 0 is invalid; refusing batch`），但目标纹理的字节和清屏值不一致，而
+   `resolve_and_read(..., run_invalid=true)` 期望目标一字不改。得查是"拒绝前已经在某处落盘"
    还是测试自己复用了缓冲区。
-4. **`slot 67` 的 FSPX compute PSO**：两个 shader（`9e132485…`、`7b6436b0…`）已 dump 在
-   `tmp/missing-shaders/`，但它们是 FSPX kind-6，反汇编要按 `docs/fspx.md` 的布局来，不是 FSSM 那条链。
-5. **其余 23 个 compute 程序的语料**：需要带 FSSM 头部的块（头部 0x138..0x144 是 `COMPUTE_PGM_RSRC2` 和线程组
-   大小，dump 出来的"程序"不含它），所以要先从它们的来源（某个 DLL 或 `shaders.rpf`）取容器，再走 7.1 的链。
-6. **代理的 PC 槽位与控制台槽位冲突**（`ee38ebbaa` 修了测试这一侧）：61/62/78/79/80 在两边含义不同。
+6. **设备槽位 81 本身**（9.4.2 已证明它与页表 AV 无关，但仍是未实现的槽位）：形状是
+   `(token, 0x11100, &count=6, out[6] 每项 0x38 字节)`，调用方读 `out+0`（页大小 0x10000/0x1000）、
+   `out+8`（标志字节）、`out+0x18`（句柄）。`LEONIDA_SLOT81=zero|page64` 是现成的实验开关。
+7. **代理的 PC 槽位与控制台槽位冲突**（`ee38ebbaa` 修了测试这一侧）：61/62/78/79/80 在两边含义不同。
    以后任何"PC 形状的调用者"都不能直接拿代理当 `ID3D12Device*` 用；要么问 `inner`，要么让代理按调用者分流。
-7. 音频 `AcpHal` / `xapu` / `chad` 的未实现导入（上游 A20 的 open ask；`chad.dll` 现在有 5 个 `XDsp*` 走
-   未实现导入策略，不阻塞启动）。
-8. `pipeline_cache` 里 `shard-7/9` 那两个 `indirect_diffuse_lighting_CS_ScreenProbes_*` 模块：需要先弄清是
-   翻译器不收敛还是驱动侧的问题，再决定要不要单独跑。
+8. **那个"流读到一半"的读取方**（9.4.3）：`0x1425a0630` 丢掉两次读的返回值，是我们这边数据短了才暴露的。
+   zlib 补上后它没再犯，但如果以后又看到"前 N KB 正常、后面是堆垃圾"的数组，先怀疑**上游少给了字节**，
+   而不是数组本身。
+9. BCPack / swizzle 的 DStorage 请求仍是 `E_NOTIMPL`（GPU 侧排布变换，需要先有 texture layout 那一套）。
+10. `pipeline_cache` 里 `shard-7/9` 那两个 `indirect_diffuse_lighting_CS_ScreenProbes_*` 模块：需要先弄清是
+    翻译器不收敛还是驱动侧的问题，再决定要不要单独跑。
 
 ---
 
 ## 14. 仓库状态
 
-- 分支 `main`，**领先 `origin/main` 91 个提交**（`origin/main` = `dfe4e4ad3`），0 落后，工作树干净
+- 分支 `main`，**领先 `origin/main` 100 个提交**（`origin/main` = `dfe4e4ad3`），0 落后，工作树干净
   （只剩未跟踪的 `.idea/`、`tmp/`）。注意：`origin/main` 在 02:5x 被**本会话之外的进程** fast-forward 过
   （reflog 里是 `fetch origin --recurse-submodules=no --progress --prune`，不是本会话发的），上游已到
   `dfe4e4ad3`（`d3d12: guard null pInputElementDescs and validate graphics/compute PSO descriptors (#6689)`）；
   按用户要求**没有合并**。
-- 本晚四个提交：`13d2785b0`（本记录）、`d435276bb`（拓扑 19 + 四组诊断）、`946ef794c`（slot 81 参数 +
-  `LEONIDA_COMMIT_ON_FAULT`）、`ed61a963b`（本记录的 9.2b 更新）。
+- 本晚的提交（全部本地）：
+  `13d2785b0`（本记录）、`d435276bb`（拓扑 19 + 四组诊断）、`946ef794c`（slot 81 参数 +
+  `LEONIDA_COMMIT_ON_FAULT`）、`ed61a963b`（9.2b 更新）、`ee38ebbaa`（设备测试改问 `inner`）、
+  `ad5e665cf` + `3f2481c8c`（文档）、`69183c269`（dump 带 `.dxbc`）、`091db69f2`（页表数组探针）、
+  `985a3e30e`（槽位 81 的两种答法）、`d770c68e9`（DStorage zlib）、`e45f1dbe3`（音频 9 个导入的桩）。
+- 语料在仓库外：`E:\temp\wait_work\leonida-work\shaders\spirv-561b65a`，本轮 26,556 → **26,557**（那条 PS）。
 - **从未推送**，也不打算推送（用户明确：不做 PR，改为同步上游）。
-- 本文档与那一笔代码提交分开：改文档时只提交这一个文件。
+- 本文档与代码提交分开：改文档时只提交这一个文件。
