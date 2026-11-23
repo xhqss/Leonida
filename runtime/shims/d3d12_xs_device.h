@@ -135,7 +135,14 @@ ID3D12DescriptorHeap* heap_proxy_real_heap(const void* heap);
 inline constexpr std::uint64_t kXmemDescriptorHeapAttributes = (0x80ULL << 16) | 4ULL;
 using DescriptorHeapBackingAlloc = void* (*)(std::size_t byte_size, std::uint64_t attributes);
 using DescriptorHeapBackingFree = void (*)(void* ptr, std::uint64_t attributes);
-// Installs (or clears when both are null) the backing allocator consulted by CreateDescriptorHeap (slot 14).
+// Committed resources take their memory through the same hooks. Measured locally at a title's call sites: around its
+// first full-screen render targets (device slot 127) the title installs an allocation hook that takes only allocations
+// whose page-size field (bits 14..15) is 2, bump-allocates them from an arena of a fixed size, and then asserts that
+// little of the arena is left unused, so a resource the hook never sees fails the check. The object type of a resource
+// allocation is not measured and is left 0; the allocator ID is the D3D one above.
+inline constexpr std::uint64_t kXmemCommittedResourceAttributes = (0x80ULL << 16) | (2ULL << 14);
+// Installs (or clears when both are null) the backing allocator consulted by CreateDescriptorHeap (slot 14) and by
+// CreateCommittedResource3 (slot 127).
 void set_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, DescriptorHeapBackingFree free);
 // Installs the default bridge (used by D3D12XboxCreateDevice) only when no explicit allocator has been set.
 void set_default_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, DescriptorHeapBackingFree free);
