@@ -29,6 +29,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <cwchar>
 #include <mutex>
 #include <string>
 
@@ -163,6 +165,105 @@ inline std::string debug_text(const EXCEPTION_RECORD& r) {
     return utf8_from_ansi(a, static_cast<int>(n ? n - 1 : strlen(a)));
 }
 
+// LEONIDA_PROBE_ARRAY (diagnostic, with --trace): the retail title's GPU page-table writer (game_scarlett_master.exe
+// +0x25a087d) walks a 4-byte array, adds -8 to each entry and reads/writes a PTE at `table + entry`. When it faults,
+// what the array holds and how far the walk got is the whole question: a short array of offsets into the table, or
+// console addresses that no table can index. The walk keeps its array in r14, the entry index in rdx and the entry
+// count at [rsp+0x3c] (the frame's local, from the disassembly at 0x1425a0630); the table base is rax, the faulting
+// entry r9. The event carries the head and tail of the array, the range, and how many entries are at or beyond count*4,
+// beside the region the table base sits in.
+inline std::string probe_array(const CONTEXT& c) {
+    static const std::wstring dir = [] {
+        wchar_t value[1024] = {};
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_PROBE_ARRAY", value, 1024);
+        return n > 1 ? std::wstring(value, n) : std::wstring();
+    }();
+    if (dir.empty() || !c.R14) return {};
+    const auto count = *reinterpret_cast<const std::uint32_t*>(c.Rsp + 0x3c);
+    const auto* values = reinterpret_cast<const std::uint32_t*>(c.R14);
+    const std::uint32_t at = static_cast<std::uint32_t>(c.Rdx);
+    std::uint64_t lo = ~0ull, hi = 0, beyond = 0;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::uint64_t v = values[i];
+        lo = v < lo ? v : lo;
+        hi = v > hi ? v : hi;
+        if (v >= std::uint64_t(count) * 4) ++beyond;
+    }
+    // The whole array and the head of the table it indexes, so the shape can be read offline: a run of increasing
+    // offsets, a sparse list of console addresses, or a buffer the title never filled.
+    wchar_t path[MAX_PATH];
+    std::swprintf(path, MAX_PATH, L"%s\\probe-array.bin", dir.c_str());
+    if (FILE* f = _wfopen(path, L"wb")) {
+        std::fwrite(values, 4, count, f);
+        std::fclose(f);
+    }
+    std::swprintf(path, MAX_PATH, L"%s\\probe-table.bin", dir.c_str());
+    if (FILE* f = _wfopen(path, L"wb")) {
+        std::fwrite(reinterpret_cast<const void*>(c.Rax), 1, 0x1000, f);
+        std::fclose(f);
+    }
+    char text[512];
+    std::snprintf(text, sizeof text,
+                  ",\"array\":{\"count\":%u,\"index\":%u,\"entry\":\"%llx\",\"min\":\"%llx\",\"max\":\"%llx\","
+                  "\"beyond_table\":%llu,\"head\":[\"%x\",\"%x\",\"%x\",\"%x\"],"
+                  "\"tail\":[\"%x\",\"%x\",\"%x\",\"%x\"]}",
+                  count, at, static_cast<unsigned long long>(c.R9), static_cast<unsigned long long>(lo),
+                  static_cast<unsigned long long>(hi), static_cast<unsigned long long>(beyond), values[0], values[1],
+                  values[2], values[3], values[at > 3 ? at - 3 : 0], values[at > 2 ? at - 2 : 0],
+                  values[at > 1 ? at - 1 : 0], values[at]);
+    MEMORY_BASIC_INFORMATION mbi{};
+    std::string tail;
+    if (VirtualQuery(reinterpret_cast<const void*>(c.Rax), &mbi, sizeof mbi)) {
+        char table[160];
+        std::snprintf(table, sizeof table, ",\"table_base\":\"%llx\",\"table_region\":\"%s\"",
+                      static_cast<unsigned long long>(c.Rax), mbi.State == MEM_COMMIT ? "commit" : "reserve");
+        tail = table;
+    }
+    // The frame's saved third argument (rbx, [rsp+0x48]) and the stream the records came from ([rsp+0x50], the buffered
+    // reader the two-call getter at 0x1451d2260 works on): its buffer, how far it was read and how much it holds. A
+    // record array that turns to noise part way through is a read past the end, and these fields say so.
+    const auto arg3 = *reinterpret_cast<const std::uint64_t*>(c.Rsp + 0x48);
+    const auto stream = *reinterpret_cast<const std::uint64_t*>(c.Rsp + 0x50);
+    char frame[320];
+    std::snprintf(frame, sizeof frame, ",\"arg3\":\"%llx\"", static_cast<unsigned long long>(arg3));
+    tail += frame;
+    if (stream) {
+        const auto* s = reinterpret_cast<const std::uint8_t*>(stream);
+        std::uint64_t source = 0, buffer = 0;
+        std::uint32_t at_in_buffer = 0, held = 0, capacity = 0;
+        std::memcpy(&source, s, sizeof source);       // the object that refills the buffer
+        std::memcpy(&buffer, s + 8, sizeof buffer);
+        std::memcpy(&at_in_buffer, s + 0x20, sizeof at_in_buffer);
+        std::memcpy(&held, s + 0x24, sizeof held);
+        std::memcpy(&capacity, s + 0x28, sizeof capacity);
+        std::snprintf(frame, sizeof frame,
+                      ",\"stream\":{\"at\":\"%llx\",\"source\":\"%llx\",\"buffer\":\"%llx\",\"pos\":%u,\"held\":%u,"
+                      "\"capacity\":%u}",
+                      static_cast<unsigned long long>(stream), static_cast<unsigned long long>(source),
+                      static_cast<unsigned long long>(buffer), at_in_buffer, held, capacity);
+        tail += frame;
+        // The source and the reader as words: a size, a declared length or a name pointer in either says what was
+        // supposed to be there and how much of it.
+        char words[512] = {};
+        std::size_t used = 0;
+        const auto append_words = [&](std::uint64_t at, int count, const char* label) {
+            used += std::snprintf(words + used, sizeof words - used, ",\"%s\":[\"%llx\"", label,
+                                  static_cast<unsigned long long>(at));
+            for (int i = 0; i < count && at; ++i) {
+                std::uint64_t word = 0;
+                std::memcpy(&word, reinterpret_cast<const void*>(at + 8 * std::size_t(i)), sizeof word);
+                used += std::snprintf(words + used, sizeof words - used, ",\"%llx\"",
+                                      static_cast<unsigned long long>(word));
+            }
+            used += std::snprintf(words + used, sizeof words - used, "]");
+        };
+        append_words(source, 8, "source_words");
+        append_words(stream, 6, "reader_words");
+        tail += words;
+    }
+    return std::string(text) + tail;
+}
+
 inline void log_exception(const EXCEPTION_POINTERS& info) {
     const EXCEPTION_RECORD& r = *info.ExceptionRecord;
     try {
@@ -207,6 +308,7 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                               c.R12, c.R13, c.R14, c.R15);
                 f += ",\"gprs\":";
                 f += regs;
+                f += probe_array(c);
             }
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);
