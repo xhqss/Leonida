@@ -6,6 +6,7 @@ import struct
 import subprocess
 import tempfile
 import unittest
+import zlib
 
 
 def awc_rpf(path):
@@ -19,6 +20,42 @@ def awc_rpf(path):
     bank = (b"ADAT" + struct.pack("<IIII", 0xFF000001, 1, hlen, (2 << 29) | 0x1234)
             + tag(0x76, 32, hlen) + tag(0x55, 64, hlen + 32) + bytes(fmt) + b"\x11" * 64)
     path.write_bytes(b"9FPR" + bytes(0x1000 - 4) + bank + bytes(0x1000))
+
+
+def texture_dictionary_rpf(path):
+    # "9FPR" archive holding one recoverable texture dictionary: a zlib system block at 0x1010 (16 zero
+    # bytes into a 4 KiB page, where the recovery scan looks) inflating to a 1-texture dictionary
+    # (R8_UNORM 4x4, one mip, inline name "probe"), then zero padding to the next 16-byte boundary and a
+    # zlib graphics block inflating to the 4096 bytes the descriptor allocates. System pointers use base
+    # 0x50000000 and graphics pointers 0x60000000, matching RageTextureDecoder's pointer checks. The
+    # resource page-count block sits at 0x48, inside the free 16 bytes below the descriptor at 0x50: it
+    # must not overlap the descriptor, whose width field at t+0x38 the decoder validates against the
+    # allocation ("Descriptor allocation disagrees with AMD mip layout").
+    t = 0x50                                    # the one texture descriptor, 0x70 bytes
+    system = bytearray(0xD0)
+    system[0x08:0x10] = struct.pack("<Q", 0x50000000 + 0x40)          # -> resource page counts (at 0x48)
+    system[0x20:0x28] = struct.pack("<Q", 0x50000000 + 0xB0)          # -> name hashes
+    system[0x28:0x2A] = struct.pack("<H", 1)                          # dictionary count
+    system[0x30:0x38] = struct.pack("<Q", 0x50000000 + 0xB8)          # -> texture pointer array
+    system[0x38:0x3A] = struct.pack("<H", 1)                          # dictionary count
+    system[0x3A:0x3C] = struct.pack("<H", 1)                          # >= count
+    system[t + 0x08:t + 0x0C] = struct.pack("<I", 4096)               # allocation in elements
+    system[t + 0x0C:t + 0x0E] = struct.pack("<H", 1)                  # element bytes (R8_UNORM)
+    system[t + 0x18:t + 0x20] = struct.pack("<Q", 0x60000000)         # graphics pointer, offset 0
+    system[t + 0x28:t + 0x30] = struct.pack("<Q", 0x50000000 + t + 0x50)
+    system[t + 0x30:t + 0x38] = struct.pack("<Q", 0x50000000 + 0xC0)  # -> inline-name descriptor
+    system[t + 0x38:t + 0x3A] = struct.pack("<H", 4)                  # width
+    system[t + 0x3A:t + 0x3C] = struct.pack("<H", 4)                  # height
+    system[t + 0x3C:t + 0x3E] = struct.pack("<H", 1)                  # depth
+    system[t + 0x3E:t + 0x43] = bytes([1, 61, 5, 0, 1])               # 2D, R8_UNORM, tag 5, -, 1 mip
+    system[0x48:0x4A] = bytes([1, 1])                                 # system/graphics resource pages
+    system[0xB0:0xB4] = struct.pack("<I", 0x11111111)                 # name hash
+    system[0xB8:0xC0] = struct.pack("<Q", 0x50000000 + t)             # pointer to the texture descriptor
+    system[0xC0:0xC8] = struct.pack("<Q", 0)                          # descriptor: inline name follows
+    system[0xC8:0xCE] = b"probe\x00"
+    system_z = zlib.compress(bytes(system))
+    payload = system_z + b"\x00" * (-len(system_z) % 16) + zlib.compress(bytes(4096))
+    path.write_bytes(b"9FPR" + struct.pack("<I", 0x1000) + bytes(0x1010 - 8) + payload)
 
 
 def run(*args):
@@ -43,6 +80,29 @@ class Rpf9dumpExitCodeTest(unittest.TestCase):
             self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
             self.assertEqual(wav.read_bytes()[:4], b"RIFF")
             self.assertEqual(wav.read_bytes()[-64:], b"\x11" * 64)
+
+    def test_failed_texture_write_exits_nonzero_and_withholds_manifest(self):
+        # A per-item write failure must fail the run like ttpf and xma do: make_game resumes the
+        # textures/models stages on the mere existence of manifest.json, so a manifest published after a
+        # failed DDS write would mark the stage finished with the file missing forever.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "textures.rpf"
+            texture_dictionary_rpf(src)
+            sub = root / "out" / "textures" / "textures"
+            dds = sub / "dictionary_at_0000000000001010" / "000_probe.dds"
+            blocker = Path(str(dds) + ".partial")
+            blocker.mkdir(parents=True)          # the write of this one DDS fails
+            failed = run("textures", src, root / "out")
+            self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+            self.assertFalse(dds.exists(), failed.stdout)          # the blocked write must not have succeeded
+            self.assertFalse((sub / "manifest.json").exists(), failed.stdout)
+            self.assertFalse((sub / "manifest.json.partial").exists())
+            blocker.rmdir()
+            retry = run("textures", src, root / "out")
+            self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+            self.assertTrue((sub / "manifest.json").exists())
+            self.assertEqual(dds.read_bytes()[:4], b"DDS ")
 
 
 if __name__ == "__main__":

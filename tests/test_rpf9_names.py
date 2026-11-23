@@ -333,6 +333,22 @@ class NamesTest(unittest.TestCase):
         self.assertEqual(rows[1]["offset"], 0x40 + len(first), rows)
         self.assertEqual(rows[1]["names"], ["bravo.#ft"], rows)
 
+    def test_name_across_first_feed_boundary(self):
+        first = stream(b"alpha.#dr")
+        # With level 0 this arrives almost verbatim: the second name straddles
+        # the first compressed feed and the final stream shares its last read.
+        text = b" " * (rpf9_names.INITIAL_FEED - 10) + b"bravo.#ft " + b" " * 9000
+        second = zlib.compress(text, level=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "t.rpf")
+            make_blob(arc, first, second, stream(b"charlie.#dd"))
+            rows, summary = rpf9_names.scan_archive(arc)
+        self.assertEqual(summary["streams"], 3)
+        self.assertEqual([r["names"] for r in rows], [["alpha.#dr"], ["bravo.#ft"], ["charlie.#dd"]])
+        self.assertEqual(rows[1]["size"], len(text))
+        self.assertEqual(rows[1]["stored"], len(second))
+        self.assertEqual(rows[2]["offset"], 0x40 + len(first) + len(second))
+
     def test_scan_archive_closes_mmap_on_validation_errors(self):
         cases = (
             ("bad_magic", b"NOPE" + bytes(60), None, "not an RPF9 archive"),

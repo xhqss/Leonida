@@ -1,7 +1,8 @@
-// Compare ID3D12Resource::GetDesc on the Vulkan-backed device with Windows D3D12 (the default adapter and WARP):
+// Compare ID3D12Resource::GetDesc on the Vulkan-backed device with Windows D3D12 (the layer's own adapter and WARP):
 // what a description that leaves fields at their defaults (Alignment 0, MipLevels 0) reads back as.
 // No game data or shaders. Run explicitly (needs Vulkan hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
 #include "vk_test_device.h"
+#include "host_adapter.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
@@ -183,9 +184,10 @@ int main() {
         for (const bool warp : {false, true}) {
             Ref<IDXGIAdapter> adapter;
             Ref<ID3D12Device> host;
-            if (warp && FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p)))) continue;
+            std::string adapter_name;
+            if (!hostadapter::reference(factory.p, vk, warp, &adapter.p, adapter_name)) continue;
             if (FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) continue;
-            const char* name = warp ? "WARP" : "the default adapter";
+            const char* name = adapter_name.c_str();
             const Totals totals = compare(ours.p, host.p, name, cases);
             std::printf("resource desc against %s: %u of %zu descriptions match, %u differ, %u refused by the host, "
                         "%u not created by the layer\n",
@@ -196,7 +198,7 @@ int main() {
         }
     }
     if (!references) {
-        std::fprintf(stderr, "no D3D12 reference device (default adapter or WARP)\n");
+        std::fprintf(stderr, "no D3D12 reference device (hardware adapter or WARP)\n");
         return 1;
     }
     if (mismatched || !matched) return 1;

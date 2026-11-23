@@ -61,11 +61,12 @@ def translate(body):
             return rdna2spirv.translate(src)
 
 
-def run(body, memory):
-    """s[0:1] = 0 (the saddr base, from push constants), v0 = 0 (lane 0)."""
+def run(body, memory, nlanes=1):
+    """s[0:1] = 0 (the saddr base, from push constants), v0 = lane index."""
     spv = translate(body)
     mem = dict(memory)
-    si.run_workgroup(spv, 1, 32, inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+    si.run_workgroup(spv, nlanes, 32,
+                     inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
                      push_constants=[0] * 36, memory=mem)
     return mem
 
@@ -123,12 +124,96 @@ class GlobalAtomics(unittest.TestCase):
                 self.assertEqual(atomic(kind, m, d), (m, MODEL[kind](m, d)))
 
     def test_rejected_forms(self):
-        for line in ("global_atomic_add_x2 v[4:5], v1, v[2:3], s[0:1] glc", "global_atomic_inc v5, v1, v2, s[0:1] glc",
-                     "global_atomic_fmin v5, v1, v2, s[0:1] glc", "global_atomic_add v5, v1, v2, s[0:1] glc slc",
+        for line in ("global_atomic_add_x2 v[4:5], v1, v[2:3], s[0:1] glc", "global_atomic_inc_x2 v[4:5], v1, v[2:3], s[0:1] glc",
+                     "global_atomic_fmin_x2 v[4:5], v1, v[2:3], s[0:1] glc",
+                     "global_atomic_add v5, v1, v2, s[0:1] glc slc",
                      "global_atomic_cmpswap v5, v1, v2, s[0:1] glc"):
             with self.subTest(line=line):
                 with self.assertRaises(rdna2spirv.Unsupported):
                     translate(["v_mov_b32_e32 v1, 0", line])
+
+    def test_float_min_max(self):
+        # IEEE 754 single-precision fmin/fmax via CAS + GLSL NMin/NMax: NaN returns the other operand, -0.0 < +0.0.
+        pos0, neg0 = 0x00000000, 0x80000000
+        one, neg2, half = 0x3F800000, 0xC0000000, 0x3F000000
+        pinf, ninf, qnan = 0x7F800000, 0xFF800000, 0x7FC00001
+        cases = [
+            ("fmin", one, half, half),
+            ("fmin", half, one, half),
+            ("fmin", one, neg2, neg2),
+            ("fmin", pos0, neg0, neg0),
+            ("fmin", neg0, pos0, neg0),
+            ("fmin", one, pinf, one),
+            ("fmin", one, ninf, ninf),
+            ("fmin", qnan, one, one),
+            ("fmin", one, qnan, one),
+            ("fmax", one, half, one),
+            ("fmax", half, one, one),
+            ("fmax", neg2, one, one),
+            ("fmax", pos0, neg0, pos0),
+            ("fmax", neg0, pos0, pos0),
+            ("fmax", one, pinf, pinf),
+            ("fmax", one, ninf, one),
+            ("fmax", qnan, one, one),
+            ("fmax", one, qnan, one),
+        ]
+        for kind, m, d, expected in cases:
+            with self.subTest(op=kind, m=hex(m), d=hex(d)):
+                self.assertEqual(atomic(kind, m, d), (m, expected))
+                self.assertEqual(atomic(kind, m, d, glc=False), (0xDEAD, expected))
+
+    def test_float_min_max_inactive_and_off_addressing(self):
+        # Inactive lane (v0 != 0) must leave memory untouched and preserve vdst; lane 0 runs global_atomic_fmax via off.
+        one, two = 0x3F800000, 0x40000000
+        body = [
+            f"v_mov_b32_e32 v8, {TARGET:#x}", "v_mov_b32_e32 v9, 0",
+            f"v_mov_b32_e32 v2, {two:#x}", "v_mov_b32_e32 v5, 0xdead",
+            "v_cmp_eq_u32_e32 vcc_lo, 0, v0",
+            "s_and_saveexec_b32 s4, vcc_lo",
+            "global_atomic_fmax v5, v[8:9], v2, off glc",
+            "s_mov_b32 exec_lo, s4",
+            "s_waitcnt vmcnt(0)",
+            f"v_lshlrev_b32_e32 v6, 2, v0",
+            f"v_add_nc_u32_e32 v6, {OUT:#x}, v6",
+            "global_store_dword v6, v5, s[0:1]",
+        ]
+        mem = run(body, {TARGET: one}, nlanes=2)
+        self.assertEqual(mem.get(TARGET), two)
+        self.assertEqual(mem.get(OUT), one)
+        self.assertEqual(mem.get(OUT + 4), 0xDEAD)
+
+    def test_float_min_max_multi_lane_cas_contention(self):
+        # Two active lanes race on TARGET: lane 0 proposes 1.0f, lane 1 proposes -2.0f.
+        init, one, neg2 = 0x40400000, 0x3F800000, 0xC0000000    # 3.0, 1.0, -2.0
+        for kind, expected in (("fmin", neg2), ("fmax", init)):
+            with self.subTest(op=kind):
+                body = [
+                    f"v_mov_b32_e32 v1, {TARGET:#x}",
+                    "v_cmp_eq_u32_e32 vcc_lo, 0, v0",
+                    f"v_mov_b32_e32 v2, {neg2:#x}",
+                    f"v_cndmask_b32_e32 v2, v2, {one:#x}, vcc_lo",
+                    f"global_atomic_{kind} v5, v1, v2, s[0:1] glc",
+                    "s_waitcnt vmcnt(0)",
+                    "v_lshlrev_b32_e32 v6, 2, v0",
+                    f"v_add_nc_u32_e32 v6, {OUT:#x}, v6",
+                    "global_store_dword v6, v5, s[0:1]",
+                ]
+                mem = run(body, {TARGET: init}, nlanes=2)
+                self.assertEqual(mem.get(TARGET), expected)
+                # One lane saw the initial 3.0f; the second saw the first lane's post-op value.
+                seen = {mem.get(OUT), mem.get(OUT + 4)}
+                self.assertIn(init, seen)
+
+    def test_float_min_max_offsets_and_first_read(self):
+        one, two = 0x3F800000, 0x40000000
+        for offset in (-2048, -4, 4, 2044):
+            with self.subTest(offset=offset):
+                self.assertEqual(atomic("fmin", two, one, offset=offset), (two, one))
+                self.assertEqual(atomic("fmax", one, two, offset=offset), (one, two))
+        from shader_ir import parse_line as parse
+        self.assertEqual(rdna2spirv.read_before_write_vgprs([parse("\tglobal_atomic_fmax v1, v2, s[0:1]")]), {1, 2})
+        self.assertEqual(rdna2spirv.read_before_write_vgprs([parse("\tglobal_atomic_fmax v5, v1, v2, s[0:1] glc")]),
+                         {1, 2})
 
     def test_first_read_analysis(self):
         # Without glc operand 0 is the address (read); with glc it is vdst (written).

@@ -730,6 +730,162 @@ class AwcAndArchiveScanTest(unittest.TestCase):
                     rep = json.load(f)
                 self.assertEqual(rep["records"], [])
 
+# The packed blocks are anim_clips sequences, so the synthetic ones come from that tool's test encoder.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_anim_clips import encode_sequence  # noqa: E402
+
+
+def build_synthetic_curve_clip(sequences, frames, formats, pad=()):
+    """A synthetic RSC8 clip whose blocks are real encoded sequences.
+
+    `sequences` are `encode_sequence` outputs (each grown by its `pad` bytes so the builder's block sizes
+    fit), `frames` their frame counts and `formats` the value format of each track-directory entry.
+    """
+    pad = list(pad) or [0] * len(sequences)
+    blocks = []
+    for seq, extra in zip(sequences, pad):
+        seq = bytearray(seq) + bytes(extra)
+        struct.pack_into("<I", seq, 0x04, len(seq) - 0x20)
+        struct.pack_into("<I", seq, 0x10, len(seq))
+        blocks.append(bytes(seq))
+    clip = bytearray(build_synthetic_rsc8(
+        block_frames=list(frames), track_count=len(formats), anim_payload_len=len(blocks[0]) - 0x20,
+    ))
+    dec = rsc8_audio.decode_rsc8(bytes(clip))
+    base = rsc8_audio.RSC8_VIRTUAL_BASE
+    for seq, block in zip(blocks, dec["anim"]["blocks"]):
+        assert block["anim_size"] == len(seq), (block["anim_size"], len(seq))
+        clip[base + block["voff"]:base + block["voff"] + len(seq)] = seq
+    at = base + dec["anim_desc"]["track_ptr"]
+    for i, fmt in enumerate(formats):
+        struct.pack_into("<III", clip, at + 12 * i, 0x01000000 + i, rsc8_audio.TRACK_SCHEMA_HASH, fmt)
+    return bytes(clip)
+
+
+class FacialCurvesTest(unittest.TestCase):
+    NF = 70                                              # more than 64 frames: two type-10 chunks, one boundary
+    RAMP = [3 * f + (f * f) // 7 for f in range(NF)]     # track 2, component 0 (type 10)
+    STEPS = [(5 * f) % 16 for f in range(NF)]            # track 1 (type 4, 4 bits)
+    FORMATS = (4, 4, 3)                                  # two one-value tracks and one two-value track
+
+    def clip(self):
+        seq = encode_sequence(self.NF, [
+            (2, 0, 0, 0.25),
+            (4, 1, 0, (4, 0.5, -1.0, self.STEPS)),
+            (10, 2, 0, (0.125, 2.0, self.RAMP)),
+            (2, 2, 1, -0.75),
+        ])
+        return build_synthetic_curve_clip([seq], [self.NF], self.FORMATS)
+
+    def test_track_type_hash_is_facialtranslation(self):
+        from anim_index import joaat32
+        self.assertEqual(joaat32("facialtranslation"), rsc8_audio.TRACK_SCHEMA_HASH)
+        self.assertIn(rsc8_audio.TRACK_SCHEMA_HASH, rsc8_audio.anim_clips.TRACK_TYPES)
+
+    def test_block_decodes_to_the_encoded_values(self):
+        clip = self.clip()
+        dec = rsc8_audio.decode_rsc8(clip, curves=True)
+        self.assertTrue(dec["valid"], dec["checks"])
+        self.assertEqual(dec["curves"], {
+            "decoded": True,
+            "error": None,
+            "frames": self.NF,
+            "frames_match": True,
+            "quantize_bits_match": True,
+            "tracks_with_values": 3,
+            "channels": {"02_static_float": 2, "04_quantize_float": 1, "10_delta2_float": 1},
+            "delta2_boundaries": 1,
+            "delta2_boundaries_closed": 1,
+            "components": {"4:1": 2, "3:2": 1},
+        })
+        values, frames, tracks = rsc8_audio.decode_facial_curves(
+            memoryview(clip)[rsc8_audio.RSC8_VIRTUAL_BASE:], dec["anim"], dec["anim_desc"])
+        self.assertEqual(frames, self.NF)
+        self.assertEqual([t[2] for t in tracks], list(self.FORMATS))
+        self.assertEqual(values[0], [(0.25,)] * self.NF)
+        self.assertEqual(values[1], [(x * 0.5 - 1.0,) for x in self.STEPS])
+        self.assertEqual(values[2], [(x * 0.125 + 2.0, -0.75) for x in self.RAMP])
+
+    def test_curves_are_opt_in(self):
+        clip = self.clip()
+        self.assertIsNone(rsc8_audio.decode_rsc8(clip)["curves"])
+        bank = build_synthetic_awc([{"id": 0x00112233, "rsc8": clip, "samples": 56000}])
+        res = rsc8_audio.decode_awc_bank(bank)
+        self.assertIsNone(res["records"][0]["curves"])
+
+    def test_two_blocks_share_their_boundary_frame(self):
+        def seq(lo):
+            ints = [(lo + f) % 16 for f in range(33)]
+            return encode_sequence(33, [(4, 0, 0, (4, 1.0, 0.0, ints)), (2, 1, 0, 0.5)])
+
+        clip = build_synthetic_curve_clip([seq(0), seq(32)], [33, 33], (4, 4), pad=(0, 16))
+        dec = rsc8_audio.decode_rsc8(clip, curves=True)
+        self.assertTrue(dec["valid"], dec["checks"])
+        self.assertEqual(dec["anim"]["frame_count"], 65)
+        self.assertTrue(dec["curves"]["decoded"])
+        self.assertEqual(dec["curves"]["frames"], 65)
+        self.assertTrue(dec["curves"]["frames_match"])
+        values, _frames, _tracks = rsc8_audio.decode_facial_curves(
+            memoryview(clip)[rsc8_audio.RSC8_VIRTUAL_BASE:], dec["anim"], dec["anim_desc"])
+        self.assertEqual(values[0], [(float(f % 16),) for f in range(65)])
+
+    def test_block_that_does_not_decode_is_counted_not_raised(self):
+        clip = bytearray(self.clip())
+        dec = rsc8_audio.decode_rsc8(bytes(clip))
+        block = rsc8_audio.RSC8_VIRTUAL_BASE + dec["anim"]["blocks"][0]["voff"]
+        frame_offset = struct.unpack_from("<I", clip, block + 0x0C)[0]
+        struct.pack_into("<I", clip, block + 0x0C, frame_offset - 4)     # definitions no longer end at the frames
+        bad = rsc8_audio.decode_rsc8(bytes(clip), curves=True)
+        self.assertTrue(bad["valid"], bad["checks"])                     # the structural checks still pass
+        self.assertFalse(bad["curves"]["decoded"])
+        self.assertTrue(bad["curves"]["error"])
+
+        bank = build_synthetic_awc([
+            {"id": 0x00112233, "rsc8": self.clip(), "samples": 56000},
+            {"id": 0x00112233, "rsc8": bytes(clip), "samples": 56000},
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "synth.rpf")
+            with open(rpf, "wb") as f:
+                f.write(b"9FPR" + struct.pack("<III", 0x100, 0, 0) + bytes(0xF0))
+                f.write(bank)
+                f.write(bytes(0x40))
+            _records, plain = rsc8_audio.scan_rpf(rpf)
+            self.assertEqual(plain["curve_clips"], 0)
+            records, summary = rsc8_audio.scan_rpf(rpf, curves=True)
+            self.assertEqual(summary["curve_clips"], 2)
+            self.assertEqual(summary["curve_clips_decoded"], 1)
+            self.assertEqual(sum(summary["curve_errors"].values()), 1)
+            self.assertEqual(summary["curve_frames_mismatch"], 0)
+            self.assertEqual(summary["curve_quantize_bits_mismatch"], 0)
+            self.assertEqual(summary["curve_channels"],
+                             {"02_static_float": 2, "04_quantize_float": 1, "10_delta2_float": 1})
+            self.assertEqual(summary["curve_components"], {"4:1": 2, "3:2": 1})
+            self.assertEqual(summary["curve_delta2_boundaries"], 1)
+            self.assertEqual(summary["curve_delta2_boundaries_closed"], 1)
+            self.assertEqual([r["curves"]["decoded"] for r in records], [True, False])
+
+            # The CLI flag reaches bank, directory and archive scans, and the report holds counts, not values.
+            awc = os.path.join(tmp, "bank.awc")
+            with open(awc, "wb") as f:
+                f.write(bank)
+            for source in (rpf, awc, tmp):
+                out_json = os.path.join(tmp, "report.json")
+                if os.path.exists(out_json):
+                    os.remove(out_json)
+                cp = subprocess.run(
+                    [sys.executable, "-I", TOOL, source, out_json, "--curves", "--quiet"],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(cp.returncode, 0, cp.stderr)
+                with open(out_json, encoding="utf-8") as f:
+                    rep = json.load(f)
+                self.assertEqual(rep["summary"]["curve_clips"], 2, source)
+                self.assertEqual(rep["summary"]["curve_clips_decoded"], 1, source)
+                for rec in rep["records"]:
+                    self.assertFalse([k for k, v in rec["curves"].items() if isinstance(v, list)], source)
+
+
 def build_synthetic_empty_bank(flags=0xFF210001, hdr_sz=20):
     """Build a synthetic zero-stream ADAT bank whose flag-selected tables fill the header exactly.
 
@@ -847,12 +1003,12 @@ def build_minimal_tag_bank(sid, tags):
     return bytes(hdr) + b"".join(parts)
 
 
-def build_synthetic_grid20(entries):
-    """8-byte header (magic 12345678, unknown) + 20-byte entries, field order as measured."""
-    out = struct.pack("<II", rsc8_audio.GRID20_MAGIC, 7)
-    for value, p, z, lo, hi, s, t, counter in entries:
-        out += struct.pack("<fHHHHHHI", value, p, z, lo, hi, s, t, counter)
-    return out
+def build_synthetic_grid20(entries, trailer=2 / 3):
+    """u32 magic 12345678 + 20-byte entries {u32 position, f32 value, 6 x u16} + f32 trailer (ASSET-256)."""
+    out = struct.pack("<I", rsc8_audio.GRID20_MAGIC)
+    for position, value, p, z, lo, hi, s, t in entries:
+        out += struct.pack("<IfHHHHHH", position, value, p, z, lo, hi, s, t)
+    return out + struct.pack("<f", trailer)
 
 
 def build_synthetic_indexruns(groups, declared=None, hash_=0x4C633D07):
@@ -865,9 +1021,9 @@ def build_synthetic_indexruns(groups, declared=None, hash_=0x4C633D07):
 
 class UndocumentedTagsTest(unittest.TestCase):
     GRID = build_synthetic_grid20([
-        (14.21, 0, 0, 1, 2, 0x39CC, 0x4C15, 2894),
-        (14.12, 32, 0, 1, 2, 0x4193, 0x4C03, 5181),
-        (14.03, 32, 1, 2, 3, 0x49B5, 0x4B15, 7488),
+        (20, 14.21, 0, 0, 1, 2, 0x39CC, 0x4C15),
+        (2894, 14.12, 32, 0, 1, 2, 0x4193, 0x4C03),
+        (5181, 14.03, 32, 1, 2, 3, 0x49B5, 0x4B15),
     ])
     RUNS = build_synthetic_indexruns([(2, [1, 5, 9]), (2, [20, 21])])
 
@@ -875,15 +1031,16 @@ class UndocumentedTagsTest(unittest.TestCase):
         g = rsc8_audio.decode_grid20_table(self.GRID)
         self.assertTrue(g["size_ok"])
         self.assertTrue(g["magic_ok"])
-        self.assertEqual(g["unknown"], 7)
         self.assertEqual(g["entries"], 3)
-        self.assertEqual(g["counter_first"], 2894)
-        self.assertEqual(g["counter_last"], 7488)
-        self.assertTrue(g["counter_increasing"])
+        self.assertEqual(g["position_first"], 20)
+        self.assertEqual(g["position_last"], 5181)
+        self.assertTrue(g["position_increasing"])
+        self.assertAlmostEqual(g["tail_f32"], 2 / 3, places=6)
         self.assertTrue(g["p_multiple_of_32"])
-        empty = rsc8_audio.decode_grid20_table(struct.pack("<II", rsc8_audio.GRID20_MAGIC, 0))
+        empty = rsc8_audio.decode_grid20_table(build_synthetic_grid20([]))
         self.assertTrue(empty["size_ok"] and empty["magic_ok"])
         self.assertEqual(empty["entries"], 0)
+        self.assertIsNone(empty["position_last"])
 
     def test_grid20_flags_violations(self):
         bad_magic = struct.pack("<II", 87654321, 0) + self.GRID[8:]
@@ -891,11 +1048,20 @@ class UndocumentedTagsTest(unittest.TestCase):
         self.assertFalse(rsc8_audio.decode_grid20_table(self.GRID[:-1])["size_ok"])
         self.assertFalse(rsc8_audio.decode_grid20_table(self.GRID[:6])["size_ok"])
         flat = build_synthetic_grid20([
-            (1.0, 0, 0, 0, 1, 0, 0, 500),
-            (2.0, 32, 0, 0, 1, 0, 0, 400),
+            (500, 1.0, 0, 0, 0, 1, 0, 0),
+            (400, 2.0, 32, 0, 0, 1, 0, 0),
         ])
-        self.assertFalse(rsc8_audio.decode_grid20_table(flat)["counter_increasing"])
-        skewed = build_synthetic_grid20([(1.0, 33, 0, 0, 1, 0, 0, 10)])
+        self.assertFalse(rsc8_audio.decode_grid20_table(flat)["position_increasing"])
+        # The trailer is a float after the entries, not a position: its bits never enter the position checks.
+        tail = build_synthetic_grid20([
+            (500, 1.0, 0, 0, 0, 1, 0, 0),
+            (900, 2.0, 32, 0, 0, 1, 0, 0),
+        ], trailer=0.5)
+        g = rsc8_audio.decode_grid20_table(tail)
+        self.assertTrue(g["position_increasing"])
+        self.assertEqual(g["position_last"], 900)
+        self.assertEqual(g["tail_f32"], 0.5)
+        skewed = build_synthetic_grid20([(10, 1.0, 33, 0, 0, 1, 0, 0)])
         self.assertFalse(rsc8_audio.decode_grid20_table(skewed)["p_multiple_of_32"])
 
     def test_indexrun_group_parse(self):
@@ -913,6 +1079,20 @@ class UndocumentedTagsTest(unittest.TestCase):
         self.assertFalse(rsc8_audio.decode_index_runs(self.RUNS, grid_entries=10)["indices_within_grid"])
         self.assertIsNone(rsc8_audio.decode_index_runs(self.RUNS)["indices_within_grid"])
 
+        # Non-ascending runs must still check the true maximum, not only run[-1].
+        non_asc = build_synthetic_indexruns([(2, [100, 0])])
+        r_na = rsc8_audio.decode_index_runs(non_asc, grid_entries=10)
+        self.assertFalse(r_na["indices_ascending"])
+        self.assertEqual(r_na["index_max"], 100)
+        self.assertFalse(r_na["indices_within_grid"])
+
+        # Empty runs contain no indices and must not report an overrun against grid_entries=0.
+        empty = struct.pack("<I", 0)
+        r_empty = rsc8_audio.decode_index_runs(empty, grid_entries=0)
+        self.assertEqual((r_empty["groups"], r_empty["values"]), (0, 0))
+        self.assertIsNone(r_empty["index_max"])
+        self.assertTrue(r_empty["indices_within_grid"])
+
     def test_indexrun_flags_violations(self):
         declared_bad = build_synthetic_indexruns([(2, [1, 2])], declared=3)
         self.assertFalse(rsc8_audio.decode_index_runs(declared_bad)["group_count_matches"])
@@ -929,7 +1109,7 @@ class UndocumentedTagsTest(unittest.TestCase):
 
     def test_bank_tally_and_scan_summary(self):
         grid25 = build_synthetic_grid20([
-            (float(i), 32 * i, i % 17, i, i + 1, 0x39CC + i, 0x4C15 - i, 1000 + 7 * i)
+            (1000 + 7 * i, float(i), 32 * i, i % 17, i, i + 1, 0x39CC + i, 0x4C15 - i)
             for i in range(25)
         ])
         bank = build_minimal_tag_bank(0x00112233, {
@@ -943,6 +1123,7 @@ class UndocumentedTagsTest(unittest.TestCase):
         self.assertEqual(res["grid20_streams"], 1)
         self.assertEqual(res["grid20_entries"], 25)
         self.assertEqual(res["grid20_invalid"], 0)
+        self.assertEqual(res["grid20_position_past_samples"], 0)
         self.assertEqual(res["indexrun_streams"], 1)
         self.assertEqual(res["indexrun_groups"], 2)
         self.assertEqual(res["indexrun_invalid"], 0)
@@ -957,6 +1138,18 @@ class UndocumentedTagsTest(unittest.TestCase):
         res_bad = rsc8_audio.decode_awc_bank(bad)
         self.assertEqual(res_bad["indexrun_index_overruns"], 1)
         self.assertEqual(res_bad["grid20_invalid"], 0)
+
+        # Positions that reach the 0x76 sample count are counted (the package has none).
+        long_grid = build_synthetic_grid20([
+            (50000, 1.0, 0, 0, 0, 1, 0, 0),
+            (96000, 2.0, 32, 0, 0, 1, 0, 0),
+        ])
+        past = build_minimal_tag_bank(0x00778899, {
+            0x55: b"\xF8\x00" + bytes(62),
+            0x76: struct.pack("<I", 96000) + bytes(4) + struct.pack("<H", 48000) + bytes(18) + b"\x0B\x01",
+            0x5A: long_grid,
+        })
+        self.assertEqual(rsc8_audio.decode_awc_bank(past)["grid20_position_past_samples"], 1)
 
         with tempfile.TemporaryDirectory() as tmp:
             rpf = os.path.join(tmp, "synth.rpf")
@@ -983,6 +1176,139 @@ class UndocumentedTagsTest(unittest.TestCase):
                 rep = json.load(f)
             self.assertEqual(rep["summary"]["grid20_entries"], 25)
             self.assertEqual(rep["summary"]["indexrun_groups"], 2)
+
+
+def _joaat(name):
+    """Jenkins one-at-a-time, the hash the cue names and the tag ids are stored as."""
+    h = 0
+    for c in name.encode("ascii"):
+        h = (h + c) & 0xFFFFFFFF
+        h = (h + (h << 10)) & 0xFFFFFFFF
+        h ^= h >> 6
+    h = (h + (h << 3)) & 0xFFFFFFFF
+    h ^= h >> 11
+    return (h + (h << 15)) & 0xFFFFFFFF
+
+
+def build_synthetic_markers(records):
+    """16-byte cue records: u32 name hash, f32 value, u32 sample offset, u32 extra. No header."""
+    return b"".join(struct.pack("<IfII", name, value, offset, extra) for name, value, offset, extra in records)
+
+
+class MarkerRecordsTest(unittest.TestCase):
+    INTRO, BEAT, OUTRO = _joaat("intro"), _joaat("beat"), _joaat("outro")
+    MARKS = build_synthetic_markers([
+        (INTRO, 0.0, 0, 0),
+        (BEAT, 1.0, 24000, 0),
+        (BEAT, 2.0, 48000, 0),
+        (OUTRO, 0.0, 90000, 3),
+    ])
+
+    def test_tag_ids_are_the_low_byte_of_the_chunk_name_hash(self):
+        for name, tag in (
+            ("markers", rsc8_audio.TAG_MARKER),
+            ("data", rsc8_audio.TAG_DATA),
+            ("peak", rsc8_audio.TAG_PEAK),
+            ("seektable", rsc8_audio.TAG_SEEKTABLE),
+            ("streamformat", rsc8_audio.TAG_STREAMED_MUSIC),
+        ):
+            self.assertEqual(_joaat(name) & 0xFF, tag, name)
+
+    def test_decodes_every_record_not_a_header(self):
+        m = rsc8_audio.decode_marker_records(self.MARKS, 96000)
+        self.assertTrue(m["size_ok"])
+        self.assertEqual(m["records"], 4)
+        self.assertEqual(m["names"], {self.INTRO: 1, self.BEAT: 2, self.OUTRO: 1})
+        self.assertEqual(m["first_name"], self.INTRO)
+        self.assertNotEqual(m["first_name"], rsc8_audio.MARKER_NAME_COMMON)
+        self.assertTrue(m["offsets_ascending"])
+        self.assertEqual(m["offset_max"], 90000)
+        self.assertEqual(m["extra_max"], 3)
+        self.assertTrue(m["offsets_within_samples"])
+        # Two cues may share one sample offset; that is still in order.
+        tied = build_synthetic_markers([(self.BEAT, 1.0, 10, 0), (self.OUTRO, 0.0, 10, 0)])
+        self.assertTrue(rsc8_audio.decode_marker_records(tied)["offsets_ascending"])
+        self.assertIsNone(rsc8_audio.decode_marker_records(tied)["offsets_within_samples"])
+
+    def test_flags_violations(self):
+        self.assertFalse(rsc8_audio.decode_marker_records(b"")["size_ok"])
+        self.assertFalse(rsc8_audio.decode_marker_records(self.MARKS[:-1])["size_ok"])
+        self.assertFalse(rsc8_audio.decode_marker_records(self.MARKS[:8])["size_ok"])
+        swapped = build_synthetic_markers([(self.BEAT, 1.0, 500, 0), (self.INTRO, 0.0, 0, 0)])
+        self.assertFalse(rsc8_audio.decode_marker_records(swapped)["offsets_ascending"])
+        self.assertFalse(rsc8_audio.decode_marker_records(self.MARKS, 89999)["offsets_within_samples"])
+
+    def test_bank_tally_and_scan_summary(self):
+        fmt = struct.pack("<I", 96000) + bytes(4) + struct.pack("<H", 48000) + bytes(18) + b"\x0B\x01"
+        music = build_minimal_tag_bank(0x00112233, {0x55: b"\xF8\x00" + bytes(62), 0x76: fmt, 0xBD: self.MARKS})
+        speech = build_minimal_tag_bank(0x00445566, {
+            0x55: b"\xF8\x00" + bytes(62),
+            0xBD: build_synthetic_markers([(rsc8_audio.MARKER_NAME_COMMON, 2.0, 0, 2)]),
+        })
+        broken = build_minimal_tag_bank(0x00778899, {0x55: b"\xF8\x00" + bytes(62), 0xBD: self.MARKS[:-4]})
+
+        res = rsc8_audio.decode_awc_bank(music)
+        self.assertEqual(res["marker_streams"], 1)
+        self.assertEqual(res["marker_records"], 4)
+        self.assertEqual(res["marker_invalid"], 0)
+        self.assertEqual(res["marker_first_names"], {f"0x{self.INTRO:08x}": 1})
+        res_bad = rsc8_audio.decode_awc_bank(broken)
+        self.assertEqual(res_bad["marker_streams"], 1)
+        self.assertEqual(res_bad["marker_invalid"], 1)
+        self.assertEqual(res_bad["marker_records"], 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "synth.rpf")
+            with open(rpf, "wb") as f:
+                f.write(b"9FPR" + struct.pack("<III", 0x100, 0, 0) + bytes(0xF0))
+                for bank in (music, speech, music, broken):
+                    f.write(bank)
+                    f.write(bytes(0x40))
+            _records, summary = rsc8_audio.scan_rpf(rpf)
+            self.assertEqual(summary["marker_streams"], 4)
+            self.assertEqual(summary["marker_records"], 9)
+            self.assertEqual(summary["marker_invalid"], 1)
+            self.assertEqual(summary["marker_first_names"], {
+                f"0x{self.INTRO:08x}": 2,
+                f"0x{rsc8_audio.MARKER_NAME_COMMON:08x}": 1,
+            })
+
+            # Directory and single-bank scans merge the per-name map the same way.
+            for i, bank in enumerate((music, speech, music)):
+                with open(os.path.join(tmp, f"bank{i}.awc"), "wb") as f:
+                    f.write(bank)
+            os.remove(rpf)
+            out_json = os.path.join(tmp, "report.json")
+            cp = subprocess.run(
+                [sys.executable, "-I", TOOL, tmp, out_json, "--quiet"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(cp.returncode, 0, cp.stderr)
+            with open(out_json, encoding="utf-8") as f:
+                rep = json.load(f)
+            self.assertEqual(rep["summary"]["marker_records"], 9)
+            self.assertEqual(rep["summary"]["marker_first_names"][f"0x{self.INTRO:08x}"], 2)
+            _records, single = rsc8_audio.scan_single_file(os.path.join(tmp, "bank1.awc"))
+            self.assertEqual(single["marker_first_names"], {f"0x{rsc8_audio.MARKER_NAME_COMMON:08x}": 1})
+
+    def test_speech_stream_companion_decodes_its_marker(self):
+        clip = build_synthetic_rsc8()
+        bank = build_synthetic_awc([{"id": 0x00112233, "rsc8": clip, "samples": 48000}])
+        comp = {}
+        real = rsc8_audio._make_record
+
+        def spy(bank_offset, tag_offset, stream_id, decoded, companion):
+            comp.update(companion or {})
+            return real(bank_offset, tag_offset, stream_id, decoded, companion)
+
+        rsc8_audio._make_record = spy
+        try:
+            rsc8_audio.decode_awc_bank(bank)
+        finally:
+            rsc8_audio._make_record = real
+        self.assertEqual(comp["markers"]["records"], 1)
+        self.assertEqual(comp["markers"]["first_name"], rsc8_audio.MARKER_NAME_COMMON)
+        self.assertTrue(comp["markers"]["offsets_within_samples"])
 
 
 if __name__ == "__main__":

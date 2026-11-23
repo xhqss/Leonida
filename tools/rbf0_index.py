@@ -30,6 +30,11 @@ import struct
 import sys
 import zlib
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from zero_span import gap_split  # noqa: E402
+
 MAGIC = b"RBF0"
 PROLOGUE = b"\xfb\xff\x01\x00"
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
@@ -102,8 +107,8 @@ def parse_rbf0(data, string_limit=None):
                     raise RbfError("close tag is not FF FF", at)
                 if not stack:
                     raise RbfError("close without an open element", at)
-                attrs, seen = stack.pop()
-                if seen < attrs:
+                attrs, seen, content_started = stack.pop()
+                if not content_started and seen < attrs:
                     attr_mismatches += 1
                 if not stack:
                     root_end = p
@@ -114,8 +119,10 @@ def parse_rbf0(data, string_limit=None):
                     raise RbfError("text tag is not FD FF", at)
                 n = struct.unpack("<I", take(4, "text length"))[0]
                 raw = take(n, "text")
-                if stack and stack[-1][1] < stack[-1][0]:
-                    attr_mismatches += 1
+                if stack and not stack[-1][2]:
+                    if stack[-1][1] < stack[-1][0]:
+                        attr_mismatches += 1
+                    stack[-1][2] = True
                 text = raw.split(b"\x00", 1)[0].decode("utf-8", "replace")
                 if string_limit is None or len(strings) < string_limit:
                     strings.append(text)
@@ -134,9 +141,11 @@ def parse_rbf0(data, string_limit=None):
                 word0, word1, attrs = struct.unpack("<HHH", raw)
                 if word0 or word1:
                     raise RbfError(f"element header word is not zero ({word0}, {word1})", at)
-                if stack and stack[-1][1] < stack[-1][0]:
-                    attr_mismatches += 1
-                stack.append([attrs, 0])
+                if stack and not stack[-1][2]:
+                    if stack[-1][1] < stack[-1][0]:
+                        attr_mismatches += 1
+                    stack[-1][2] = True
+                stack.append([attrs, 0, False])
                 elements += 1
                 max_depth = max(max_depth, len(stack))
                 if not root:
@@ -164,7 +173,7 @@ def parse_rbf0(data, string_limit=None):
                 raise RbfError(f"unknown record type {kind:#04x}", at)
             values += 1
             types[TYPE_NAMES.get(kind, f"{kind:#04x}")] += 1
-            if stack and stack[-1][1] < stack[-1][0]:
+            if stack and not stack[-1][2] and stack[-1][1] < stack[-1][0]:
                 stack[-1][1] += 1
     except RbfError as exc:
         status = "truncated" if exc.truncated else "bad"
@@ -243,27 +252,10 @@ def join_resource(rows, index, read, check_gap=True):
         blob += read(nxt)
         chunks += 1
         parsed = parse_rbf0(blob, string_limit=None)
-        if parsed["complete"] or parsed["status"] == "bad":
+        if parsed["status"] != "truncated":
             break
         j += 1
     return blob, chunks, parsed
-
-
-def _categorise(strings):
-    """Aggregate counts only: no string is returned from here."""
-    distinct = set(strings)
-    out = {
-        "distinct": len(distinct),
-        "path_like": sum(1 for s in distinct if "/" in s),
-        "identifier_like": sum(1 for s in strings if IDENT.fullmatch(s) is not None),
-        "empty": sum(1 for s in strings if not s),
-        "keywords": {},
-    }
-    lowered = [s.lower() for s in strings]
-    for word in KEYWORDS:
-        out["keywords"][word] = {"occurrences": sum(1 for s in lowered if word in s),
-                                 "distinct": sum(1 for s in distinct if word in s.lower())}
-    return out
 
 
 def resources_from_rows(rows, read, check_gap=True, string_limit=16):
@@ -386,10 +378,9 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
                 if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                     pos = s + 1
                     continue
-                gap = mm[last:s]
-                z = gap.count(0) == len(gap)
-                zero += len(gap) if z else 0
-                unread += 0 if z else len(gap)
+                gap_zero, gap_unread = gap_split(mm, last, s)
+                zero += gap_zero
+                unread += gap_unread
                 rows.append({"offset": s, "stored": blen, "size": blen, "head": mm[s:s + 8]})
                 last = pos = s + blen
                 continue
@@ -410,18 +401,16 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
                 pos = s + 1
                 continue
             used = p - s - len(d.unused_data)
-            gap = mm[last:s]
-            z = gap.count(0) == len(gap)
-            zero += len(gap) if z else 0
-            unread += 0 if z else len(gap)
+            gap_zero, gap_unread = gap_split(mm, last, s)
+            zero += gap_zero
+            unread += gap_unread
             rows.append(_row(out, s, used))
             last = pos = s + used
             if progress and len(rows) % 2000 == 0:
                 progress(len(rows), pos, end)
-        gap = mm[last:end]
-        z = gap.count(0) == len(gap)
-        zero += len(gap) if z else 0
-        unread += 0 if z else len(gap)
+        gap_zero, gap_unread = gap_split(mm, last, end)
+        zero += gap_zero
+        unread += gap_unread
         mspan = end - span_start
     with ArchiveReader(path) as reader:
         records = resources_from_rows(rows, reader.read, check_gap=True, string_limit=string_limit)
@@ -433,6 +422,7 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
 def scan_dir(path, string_limit=16):
     """Index already-carved files. Sorting by a leading hexadecimal file name keeps archive order."""
     entries = []
+    unnamed = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
         # rpf9_carve.py's index.json and any .csv report sit next to the streams; they are not payloads.
@@ -441,12 +431,18 @@ def scan_dir(path, string_limit=16):
         with open(full, "rb") as f:
             data = f.read()
         match = re.match(r"([0-9a-fA-F]{6,})", name)
-        offset = int(match.group(1), 16) if match else len(entries)
-        entries.append((offset, data))
+        if match:
+            entries.append((int(match.group(1), 16), data))
+        else:
+            unnamed.append(data)
+    next_offset = max((e[0] for e in entries), default=-1) + 1
+    for data in unnamed:
+        entries.append((next_offset, data))
+        next_offset += 1
     entries.sort(key=lambda e: e[0])
     rows = [_row(data, offset, len(data)) for offset, data in entries]
-    by_offset = {row["offset"]: data for row, (_, data) in zip(rows, entries)}
-    records = resources_from_rows(rows, lambda row: by_offset[row["offset"]], check_gap=False,
+    by_row = {id(row): data for row, (_, data) in zip(rows, entries)}
+    records = resources_from_rows(rows, lambda row: by_row[id(row)], check_gap=False,
                                   string_limit=string_limit)
     summary = summarise(rows, records, sum(len(d) for _, d in entries), 0, 0, "directory")
     summary["directory"] = path
@@ -464,7 +460,7 @@ def write_output(path, records, summary, all_strings=False):
             doc["sample_strings"] = r["_all_strings"] if all_strings else r["sample"]
             doc["sample_truncated"] = not all_strings and r["strings"] > len(r["sample"])
             docs.append(doc)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "files": docs}, f, indent=1)
         return
     with open(path, "w", encoding="utf-8", newline="") as f:

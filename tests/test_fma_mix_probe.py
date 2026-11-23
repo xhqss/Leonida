@@ -65,14 +65,13 @@ class Inputs(unittest.TestCase):
 
 
 class Translator(unittest.TestCase):
-    def test_translator_rounds_twice(self):
-        # docs/design.md, Known approximations: nearest-mode v_fma_mix* takes the f32 Fma and then narrows. If the
-        # translator is changed to round once (after a hardware measurement), this test and that sentence change too.
+    def test_translator_rounds_once(self):
+        # docs/design.md, Known approximations: v_fma_mix* rounds once straight to f16 (measured on RDNA2 hardware).
         got = probe.run_translator()
         rule, _ = probe.verdict(list(zip(probe.CASES, got)))
-        self.assertEqual(rule, probe.DOUBLE)
+        self.assertEqual(rule, probe.SINGLE)
         for case, w in zip(probe.CASES, got):
-            self.assertEqual(w, word(case, BY_HAND[case.name][1]), case.name)
+            self.assertEqual(w, word(case, BY_HAND[case.name][0]), case.name)
 
     def test_compute_listing_gives_the_pixel_shader_words(self):
         # The Vulkan side's shader (operands from user SGPRs, one store per case) on the CPU interpreter, with the
@@ -149,7 +148,7 @@ class Command(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             rc = probe.main([])
         self.assertEqual(rc, 0)
-        self.assertIn("translator: follows double rounding", buf.getvalue())
+        self.assertIn("translator: follows single rounding", buf.getvalue())
 
     def test_unknown_side_and_missing_build_are_usage_errors(self):
         import contextlib

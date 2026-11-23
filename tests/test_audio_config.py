@@ -224,13 +224,13 @@ class TestCli(unittest.TestCase):
             with open(blob, "wb") as f:
                 f.write(b"\x00" * 4 + make_record(0x2000, 123_456))
             missing = os.path.join(tmp, "missing")
-            cases = (([missing], missing, "does not exist"),
-                     ([tmp, "--names", os.path.join(tmp, "no_pool.txt")], "no_pool.txt", "name pool"),
-                     ([tmp, "--names", tmp], tmp, "name pool"))          # a folder as the pool
-            for args, path, message in cases:
+            cases = (([missing], missing, "does not exist", 2),
+                     ([tmp, "--names", os.path.join(tmp, "no_pool.txt")], "no_pool.txt", "name pool", 1),
+                     ([tmp, "--names", tmp], tmp, "name pool", 1))          # a folder as the pool
+            for args, path, message, expected in cases:
                 with self.subTest(message=message, args=[os.path.basename(x) for x in args]):
                     p = subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
-                    self.assertEqual(p.returncode, 1)
+                    self.assertEqual(p.returncode, expected)
                     self.assertIn(path, p.stderr)
                     self.assertIn(message, p.stderr)
                     self.assertNotIn("Traceback", p.stderr)

@@ -41,7 +41,7 @@ source with `ast` instead of running it:
 | class | meaning |
 |---|---|
 | handled-exact | the name is compared with `op` (`==`, `in`) or is a key of a mnemonic table (`NOOPS`, `F2`, ...) |
-| handled-family | no exact name, but it starts with a prefix `_insn` or a method it hands `op` to tests with `op.startswith` |
+| handled-family | no exact name, but it starts with a prefix `_insn` or a method it hands `op` to tests with `op.startswith`, or ends with a suffix one of their if/elif chains tests with `op.endswith` (alone, or beside a `<stem> in self.TABLE` guard, which limits the family to that table's stems: `s_*_saveexec_b32/b64` and `EXEC_LOGIC`) |
 | refused | the name sits in a test whose whole body is `raise Unsupported(...)` |
 | unknown | none of these: the final `raise Unsupported(op)` is what it reaches |
 

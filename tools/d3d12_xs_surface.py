@@ -10,7 +10,8 @@ Checks that always run:
   * 116 slots, ordinals 1..116 exactly once, 23 functions + 93 GUID data;
   * every standard GUID in the table is byte-identical to the Windows SDK, when the SDK is found;
   * GUIDs are valid RFC 4122 version 4, unique, and the 10 console GUIDs are not in the SDK set;
-  * the 88 IID ordinals 28..115 are alphabetical, except IID_ID3D12ConsDmaCommandList pinned at 100.
+  * the 88 IID ordinals 28..115 are alphabetical, except IID_ID3D12ConsDmaCommandList pinned at 100;
+  * the four unresolved console command-list IIDs are not assigned values or ordinals in the local tables.
 
 Optional checks:
   * ``--scarab PATH`` cross-checks the table against a SCARAB checkout (values, ordinals, catalogue).
@@ -262,6 +263,16 @@ CONSOLE_IIDS = {
     "IID_IGraphicsUnknown": (0xACEEEA63, 0xE0A9, 0x4A1C, 0xBB, 0xEC, 0x71, 0xB2, 0xF4, 0x85, 0xF7, 0x58),
 }
 
+# The four console command-list interfaces whose IIDs SCARAB reports as not exported and not
+# recovered (doc section 4). The local tables must not assign a value; a title trace is one
+# possible future source. They must stay out of DATA_EXPORTS and CONSOLE_IIDS.
+UNRECOVERED_CONSOLE_IIDS = (
+    "ID3D12ConsComputeCommandList",
+    "ID3D12ConsComputeCommandList6",
+    "ID3D12ConsComputeCommandList8",
+    "ID3D12ConsCopyCommandList6",
+)
+
 # The 11 catalogue rows labelled "method" that are not interface methods (doc section 5).
 CATALOGUE_NON_METHODS = {
     "UINT_MAX",
@@ -365,6 +376,20 @@ def check_guid_values():
     return errors
 
 
+def check_unrecovered_console_iids():
+    """The four unresolved command-list IIDs are absent from the local export table and CONSOLE_IIDS; the
+    vendor-runtime observation is SCARAB's."""
+    errors = []
+    export_names = {name for _n, name, _kind, _ev in DATA_EXPORTS}
+    for interface in UNRECOVERED_CONSOLE_IIDS:
+        for name in (interface, "IID_" + interface):
+            if name in export_names:
+                errors.append("%s must not be assigned to the 93-GUID export table" % name)
+            if name in CONSOLE_IIDS:
+                errors.append("%s must not be assigned a local GUID value" % name)
+    return errors
+
+
 def check_iid_order():
     """The 88 IID names at 28..115 are alphabetical, except the DMA IID pinned at 100."""
     errors = []
@@ -389,13 +414,18 @@ def find_sdk_include():
             root = os.environ.get(var)
             if root:
                 candidates += glob.glob(os.path.join(root, "Windows Kits", "10", "Include", "*"))
+
     best = None
     for path in candidates:
         path = os.path.normpath(path)                 # "...\um\" has an empty basename
         um = path if os.path.basename(path).lower() == "um" else os.path.join(path, "um")
         shared = os.path.join(os.path.dirname(um), "shared")
         if os.path.isdir(um):
-            key = os.path.basename(os.path.dirname(um))
+            name = os.path.basename(os.path.dirname(um))
+            try:
+                key = (1, tuple(map(int, name.split("."))))
+            except ValueError:
+                key = (0, name)
             if best is None or key > best[0]:
                 best = (key, um, shared)
     if not best:
@@ -561,6 +591,7 @@ def main(argv=None):
     errors += check_data_classes()
     errors += check_guid_values()
     errors += check_iid_order()
+    errors += check_unrecovered_console_iids()
 
     sdk_checked = 0
     if args.sdk or args.require_sdk:
@@ -584,8 +615,9 @@ def main(argv=None):
             print("FAIL: " + e)
         return 1
     if args.check or args.sdk or args.scarab:
-        print("PASS: 116 slots (23 functions + 93 GUID data), %d standard + %d console GUIDs"
-              % (len(STANDARD_GUIDS), len(CONSOLE_IIDS)))
+        print("PASS: 116 slots (23 functions + 93 GUID data), %d standard + %d console GUIDs, "
+              "%d command-list IIDs not exported"
+              % (len(STANDARD_GUIDS), len(CONSOLE_IIDS), len(UNRECOVERED_CONSOLE_IIDS)))
     return 0
 
 

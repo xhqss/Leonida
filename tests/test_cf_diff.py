@@ -5,12 +5,14 @@ llvm-mc).
 """
 import os
 import random
+import subprocess
 import sys
 import tempfile
 
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOL = os.path.join(ROOT, "tools", "cf_diff.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import cf_diff  # noqa: E402
@@ -29,6 +31,20 @@ SCC_MASK_CASES = {
     "loop closed by s_andn2_b32 exec + s_cbranch_scc1": [
         ("vloop", (0, 3, True), None, [("probe", 9), ("op", "s_add_u32 s10, s10, 1")])],
 }
+
+
+@pytest.mark.parametrize("count", ["0", "-1"])
+def test_empty_program_batch_is_a_usage_error(count, capsys, monkeypatch):
+    def unexpected_suite(*args, **kwargs):
+        pytest.fail("started a suite with no programs")
+
+    monkeypatch.setattr(cf_diff, "run_suite", unexpected_suite)
+    with pytest.raises(SystemExit) as exc:
+        cf_diff.main(["--programs", count])
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert "--programs must be at least 1" in captured.err
+    assert captured.out == ""
 
 
 def test_generation_is_deterministic():
@@ -107,6 +123,13 @@ def test_self_test_passes():
     assert cf_diff.self_test() is True
 
 
+def test_no_arguments_prints_usage():
+    proc = subprocess.run([sys.executable, "-I", TOOL], capture_output=True, text=True, timeout=5)
+    assert proc.returncode == 2
+    assert "usage:" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
 def test_generator_covers_every_shape():
     kinds = set()
 
@@ -118,4 +141,13 @@ def test_generator_covers_every_shape():
                     walk(x)
     for i in range(200):
         walk(cf_diff.generate(random.Random(i), 32))
-    assert {"if", "ifelse", "cmpx", "vccz", "sif", "sloop", "vloop", "irr", "sccmask", "csel", "probe"} <= kinds
+    assert {"if", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop",
+            "irr", "sccmask", "csel", "probe"} <= kinds
+
+
+@pytest.mark.parametrize("op_name", ("andn2", "orn2", "xor", "nand", "nor", "xnor"))
+@pytest.mark.parametrize("wave", (32, 64))
+def test_saveexec_variants_match(op_name, wave):
+    body = [("saveexec", FEW_LANES, op_name, "s_cbranch_scc0", [("probe", 13), ("op", "v_add_nc_u32 v9, 1, v9")])]
+    status, detail = cf_diff.run_case(f"ps_saveexec_{op_name}", body, wave, structured=True)
+    assert status == "match", detail

@@ -40,6 +40,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import warnings
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -54,6 +55,7 @@ if HERE not in sys.path:
 
 import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
@@ -534,6 +536,22 @@ class RdnaFlatTranslationTests(unittest.TestCase):
 
 class EndToEndFlatExecutionTests(unittest.TestCase):
     """End-to-end translation and execution of RDNA2 flat pixel shaders."""
+
+    def test_p0_and_interpolated_read_of_one_f32_location(self) -> None:
+        with open(os.path.join(HERE, "fixtures", "mixed_f32_varying.asm"), encoding="ascii") as fixture:
+            lines = fixture.read().splitlines()
+        shader = support.translate_lines("ps_mixed_f32_varying", lines)
+        attrs = {0: [(f32_to_bits(x), 0, 0, 0) for x in (2.0, 6.0, 10.0)]}
+        for weights, interpolated in (((0.25, 0.25, 0.5), 7.0), ((0.5, 0.5, 0.0), 4.0)):
+            with self.subTest(weights=weights):
+                inputs = support.varyings(shader, attrs, weights)
+                self.assertEqual(si.run_fragment(shader, inputs)["%out_mrt0"],
+                                 (f32_to_bits(2.0), f32_to_bits(interpolated)) * 2)
+
+        for fallback in ("BARY_FALLBACK", "F16_HALVES"):
+            with self.subTest(fallback=fallback), mock.patch.object(rdna2spirv, fallback, True):
+                with self.assertRaisesRegex(rdna2spirv.Unsupported, "need per-vertex inputs"):
+                    support.translate_lines("ps_mixed_f32_varying", lines)
 
     def test_ps_flat_model_execution(self):
         asm = (

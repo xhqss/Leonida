@@ -28,11 +28,12 @@ import sys
 
 # Left out: anything that writes memory or images, LDS, and the rare instructions the harness has no setup for.
 # Loads are fine: with empty user data they read zeros from the start of the harness's heap, the same for both.
-NEEDS = re.compile(r"^\t(image_store|image_atomic|buffer_store|tbuffer_|global_store|global_atomic|ds_|s_swappc|"
+NEEDS = re.compile(r"^\t(image_store|image_atomic|buffer_(?:store|atomic)|tbuffer_|global_store|global_atomic|ds_|s_swappc|"
                    r"s_getpc|s_sendmsg|s_sleep)", re.M)
 BRANCH = re.compile(r"^\ts_c?branch", re.M)
 BACK = re.compile(r"^\ts_c?branch\S* (\d+)", re.M)
 CLEAR = struct.pack("<4f", -1, -1, -1, -1)      # what vk_texture_test clears the image to
+READBACK_BYTES = 64 * 64 * len(CLEAR)  # vk_texture_test writes a 64x64 RGBA32F image
 LOCATIONS = 32      # every pixel-shader input location gets a defined value
 SUPPORTED_BINDINGS = {0, 1, 2}
 HOSTED_FEATURES = {"bufferDeviceAddress", "runtimeDescriptorArray", "shaderInt64"}
@@ -111,7 +112,7 @@ def write_outcomes(out_dir, outcomes):
     """Write (shader name, outcome) pairs to the harness's tab-separated report."""
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, "outcomes.tsv")
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write("".join(f"{name}\t{outcome}\n" for name, outcome in outcomes))
     return path
 
@@ -169,7 +170,7 @@ OpFunctionEnd
 """
     src, dst = os.path.join(out_dir, "test_vs.spvasm"), os.path.join(out_dir, "test_vs.spv")
     os.makedirs(out_dir, exist_ok=True)
-    with open(src, "w", encoding="utf-8") as f:
+    with open(src, "w", encoding="utf-8", newline="\n") as f:
         f.write(asm)
     runner(["spirv-as", "--target-env", "vulkan1.2", src, "-o", dst], check=True)
     runner(["spirv-val", "--target-env", "vulkan1.2", dst], check=True)
@@ -205,6 +206,15 @@ def main(argv=None):
     a = ap.parse_args(argv)
     disasm = os.path.join(a.shaders, "dxbc", "disasm")
     old = os.path.join(a.shaders, "spirv")
+    import json
+    with open(os.path.join(old, "index.json"), encoding="utf-8") as f:
+        index = json.load(f)
+    names = supported_pixel_shaders(index)
+    print(f"{len(names)} pixel shaders use only the bindings and features the harness provides")
+    picked = select_candidates(index, disasm, old, count=a.count, loops=a.loops, names_file=a.names)
+    if not picked:
+        print("ERROR: no shader candidates for the control-flow comparison", file=sys.stderr)
+        return 1
     new = os.path.join(a.out, "new")
     os.makedirs(new, exist_ok=True)
     # The texture test's harness: it binds a heap, a descriptor table, a fallback texture and a sampler.
@@ -212,17 +222,10 @@ def main(argv=None):
     harness = a.harness or os.path.join(a.repo, "runtime", "build", exe)
     vs = test_vertex_shader(a.out)
 
-    import json
-    with open(os.path.join(old, "index.json"), encoding="utf-8") as f:
-        index = json.load(f)
-    names = supported_pixel_shaders(index)
-    print(f"{len(names)} pixel shaders use only the bindings and features the harness provides")
-    picked = select_candidates(index, disasm, old, count=a.count, loops=a.loops, names_file=a.names)
     branches = sorted(len(BRANCH.findall(open(os.path.join(disasm, name + ".s"), encoding="utf-8",
                                                  errors="replace").read())) for name in picked)
     print(f"{len(picked)} branchy pixel shaders picked ({'with loops' if a.loops == 'only' else 'loop-free'}); "
-          f"branches per shader: median {branches[len(branches) // 2] if branches else 0}, "
-          f"max {branches[-1] if branches else 0}")
+          f"branches per shader: median {branches[len(branches) // 2]}, max {branches[-1]}")
 
     # Both forms from the current translator, so the control-flow arrangement is the only difference.
     loopdir = os.path.join(a.out, "dispatch")
@@ -260,7 +263,12 @@ def main(argv=None):
                 try:
                     h = subprocess.run([harness, vs, spirv, raw, "8", "92", "c00000", "14500000", "0"],
                                        capture_output=True, text=True, timeout=a.timeout)
-                    img = open(raw, "rb").read() if h.returncode == 0 and os.path.isfile(raw) else None
+                    img = None
+                    if h.returncode == 0 and os.path.isfile(raw):
+                        with open(raw, "rb") as readback:
+                            data = readback.read(READBACK_BYTES + 1)
+                        if len(data) == READBACK_BYTES:
+                            img = data
                     if img is not None and not colour:
                         img = bytes(img[i:i + 16] != CLEAR for i in range(0, len(img), 16))
                     got.append(img)

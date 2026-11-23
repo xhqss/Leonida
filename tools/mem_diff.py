@@ -254,7 +254,9 @@ class RefMachine:
                     for c in range(ncomp):
                         self.v[vdata + c] = 0
                     return
-                name = "GFX10_FORMAT_" + fm.split("BUF_FMT_")[-1].rstrip("]")
+                # LLVM omits the default MTBUF instruction format from its listing.
+                fmt = DEFAULT_TBUFFER_FORMAT if fm is None else fm.split("BUF_FMT_")[-1].rstrip("]")
+                name = "GFX10_FORMAT_" + fmt
             else:
                 name = FORMAT_NAMES[descriptor_format]
             widths, kind = parse_format(name)
@@ -541,8 +543,10 @@ def gen_global(rng, prog):
     return [("v", VDATA + i) for i in range(n)]
 
 
-# The five formats tbuffer loads use in the 1.0.2.1 corpus (counted over all 26,503 shaders).
-TBUFFER_FORMATS = ("16_16_SNORM", "8_8_8_8_UNORM", "8_8_8_8_UINT", "2_10_10_10_UNORM", "16_16_16_16_UINT")
+DEFAULT_TBUFFER_FORMAT = "8_UNORM"
+# Exercise the implicit LLVM spelling alongside the five MTBUF formats found in the 1.0.2.1 corpus.
+TBUFFER_FORMATS = ("16_16_SNORM", "8_8_8_8_UNORM", "8_8_8_8_UINT", "2_10_10_10_UNORM", "16_16_16_16_UINT",
+                   DEFAULT_TBUFFER_FORMAT)
 XYZW = 4 | 5 << 3 | 6 << 6 | 7 << 9
 OOB_STRUCTURED, OOB_RAW = 1 << 28, 3 << 28       # V# word3 OOB_SELECT
 
@@ -589,7 +593,8 @@ def gen_buffer_format(rng, prog):
         addr_mods = "offen"
     vdata = reg_range("v", VDATA, ncomp)
     if tbuffer:
-        prog.lines.append(f"tbuffer_load_format_{suffix} {vdata}, {operands} format:[BUF_FMT_{fname}] {addr_mods}")
+        format_mod = "" if fname == DEFAULT_TBUFFER_FORMAT else f" format:[BUF_FMT_{fname}]"
+        prog.lines.append(f"tbuffer_load_format_{suffix} {vdata}, {operands}{format_mod} {addr_mods}")
     else:
         prog.lines.append(f"buffer_load_format_{suffix} {vdata}, {operands} {addr_mods}")
     prog.lines.append("s_waitcnt vmcnt(0)")
@@ -640,7 +645,7 @@ def run_one(name, prog):
         dis = os.path.join(tmp, "disasm")
         os.mkdir(dis)
         path = os.path.join(dis, name + ".s")
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(_listing(prog.lines))
         with open(os.path.join(tmp, name + ".dxbc"), "wb") as f:
             f.write(STUB_DXBC)

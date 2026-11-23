@@ -10,6 +10,7 @@ import struct
 import subprocess
 import sys
 from fractions import Fraction
+from itertools import permutations
 
 import pytest
 
@@ -70,6 +71,17 @@ def test_signed_zeros():
     assert vf.f16_op("add", 0x8000, 0x8000) == (0x8000, False)    # -0 + -0 = -0
     assert vf.f16_op("sub", 0x8000, 0x0000) == (0x8000, False)    # -0 - +0 = -0
     assert vf.f16_op("max", 0x0000, 0x8000)[1]                    # +0 vs -0: not promised, so uncertain
+
+
+@pytest.mark.parametrize("operands,expected", [
+    ((0x0000, 0x8000, 0x0000), 0x0000),  # +0, -0, +0
+    ((0x8000, 0x0000, 0x8000), 0x8000),  # -0, +0, -0
+    ((0xBC00, 0x0000, 0x8000), 0x8000),  # -1 < -0 < +0
+    ((0x3C00, 0x0000, 0x8000), 0x0000),  # -0 < +0 < +1
+])
+def test_f16_med3_orders_signed_zeros(operands, expected):
+    for args in dict.fromkeys(permutations(operands)):
+        assert vf.f16_op("med3", *args) == (expected, False), args
 
 
 @pytest.mark.parametrize("a,b,c,true,double", [
@@ -496,3 +508,61 @@ def test_emulated_wave64_is_compared_at_any_subgroup_size(monkeypatch, capsys, t
     status, out = _run_main(monkeypatch, capsys, tmp_path, UNPINNED, ["--wave", "64", "--emulate"])
     assert status == 1, out
     assert "MISMATCH" in out and "0 skipped" in out
+
+
+def test_pc_tail_ubo_forwarded_to_translator_and_vk_compute_test(monkeypatch, tmp_path):
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append((list(cmd), kw.get("env")))
+        out_dir = tmp_path / "spirv"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "index.json").write_text("{}", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(vf.mc_command, "mc_command", lambda: ["llvm-mc"])
+    monkeypatch.setattr(vf.subprocess, "run", fake_run)
+    vf.translate([], tmp_path, False)
+    vf.translate([], tmp_path, False, pc_tail=True)
+    assert "--pc-tail-ubo" not in cmds[0][0]
+    assert "--pc-tail-ubo" in cmds[1][0]
+
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / ("vk_compute_test" + (".exe" if os.name == "nt" else ""))).touch()
+    monkeypatch.delenv("LEONIDA_PC_TAIL_UBO", raising=False)
+    prog = vf.FAMILIES["mem"](1, 0, 32)
+    vf.run_gpu(prog, tmp_path / "a.spv", str(build), {}, False, tmp_path / "a.bin")
+    vf.run_gpu(prog, tmp_path / "a.spv", str(build), {}, False, tmp_path / "a.bin", pc_tail=True)
+    assert "LEONIDA_PC_TAIL_UBO" not in cmds[2][1]
+    assert cmds[3][1]["LEONIDA_PC_TAIL_UBO"] == "1"
+
+
+def test_pc_tail_ubo_from_flag_or_env(monkeypatch, tmp_path):
+    for extra, env_val, want in (
+        ([], "", False),
+        (["--pc-tail-ubo"], "", True),
+        ([], "1", True),
+        ([], "true", True),
+        ([], "0", False),
+    ):
+        seen_t, seen_g = [], []
+
+        def fake_translate(progs, work, _emulate, pc_tail=False):
+            seen_t.append(pc_tail)
+            (work / "spirv").mkdir(parents=True, exist_ok=True)
+            for p in progs:
+                (work / "spirv" / (p.name + ".spv")).touch()
+            return {p.name: {} for p in progs}, ""
+
+        def fake_run_gpu(p, _spv, _build, _entry, _emulate, dump, pc_tail=False):
+            seen_g.append(pc_tail)
+            return 77, "unsupported: test"
+
+        monkeypatch.setenv("LEONIDA_PC_TAIL_UBO", env_val)
+        monkeypatch.setattr(vf, "translate", fake_translate)
+        monkeypatch.setattr(vf, "run_gpu", fake_run_gpu)
+        monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "mem", "--programs", "1",
+                                          "--wave", "32", "--work", str(tmp_path), *extra])
+        vf.main()
+        assert seen_t == [want] and seen_g == [want], (extra, env_val)

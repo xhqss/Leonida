@@ -233,7 +233,7 @@ int test_clear_resets_table() {
     return 0;
 }
 
-int test_erase_and_cluster_compact() {
+int test_erase_and_reinsert() {
     DescriptorTable table(16);
 
     const std::uint32_t k1[8] = {1, 10, 100, 1000, 2, 20, 200, 2000};
@@ -310,12 +310,12 @@ int test_change_tracking() {
     EXPECT(!changes.all && changes.slots.size() == 1 && changes.slots.front() == slot);
     EXPECT(table.read_slot(slot, read) && read[8] == 43);
 
-    // Erasing marks the slot it was in and the ones the cluster compaction moved.
+    // Erasing marks only the slot it was in: no other entry moves.
     EXPECT(table.insert(k2, 7));
     table.take_changes();
     EXPECT(table.erase(k1));
     changes = table.take_changes();
-    EXPECT(!changes.all && !changes.slots.empty() && changes.slots.front() == slot);
+    EXPECT(!changes.all && changes.slots.size() == 1 && changes.slots.front() == slot);
 
     // Growth changes the mask, so everything re-uploads.
     const std::size_t before = table.capacity();
@@ -366,7 +366,91 @@ int test_relocation_marks_both_slots() {
     return 0;
 }
 
+// Shaders keep probing the GPU copy of the table while an erase is uploaded without waiting for idle
+// (BindlessSet::flush_needs_idle), so an erase must leave every other key's slot exactly as it was.
+int test_erase_moves_no_other_entry() {
+    DescriptorTable table(64);
+    const std::uint32_t slots = std::uint32_t(table.capacity());
+    // Five keys with one home: they fill five consecutive slots, the cluster the old erase compacted.
+    std::array<DescriptorKey, 5> keys{};
+    for (std::uint32_t i = 0; i < keys.size(); ++i) {
+        auto& key = keys[i];
+        key[0] = i + 1;
+        while ((hash_descriptor_key(key) & (slots - 1)) != slots - 2) ++key[7];  // the cluster wraps the end
+        EXPECT(table.insert_or_update(key.data(), 200 + i) == DescriptorTable::InsertResult::added);
+    }
+    table.take_changes();
+    const auto before = table.build_gpu_buffer();
+
+    EXPECT(table.erase(keys[1].data()));
+    const DescriptorTable::Changes changes = table.take_changes();
+    EXPECT(!changes.all && changes.slots.size() == 1);
+    const std::uint32_t hole = changes.slots.front();
+    const auto after = table.build_gpu_buffer();
+    for (std::uint32_t s = 0; s < slots; ++s) {
+        const bool same = std::memcmp(&before[1 + s * 10], &after[1 + s * 10], 10 * sizeof(std::uint32_t)) == 0;
+        EXPECT(same == (s != hole));
+    }
+    for (std::uint32_t w = 0; w < 10; ++w) EXPECT(after[1 + hole * 10 + w] == 0);  // an empty slot: a miss
+    for (std::uint32_t i = 0; i < keys.size(); ++i) EXPECT(table.lookup(keys[i]) == (i == 1 ? 0u : 200 + i));
+
+    // Keys past the hole are still found after more erases, and a new key of the same home reuses the hole.
+    EXPECT(table.erase(keys[0].data()));
+    EXPECT(table.lookup(keys[4]) == 204 && table.lookup(keys[3]) == 203);
+    DescriptorKey extra = keys[0];
+    extra[0] = 100;
+    while ((hash_descriptor_key(extra) & (slots - 1)) != slots - 2) ++extra[7];
+    table.take_changes();
+    EXPECT(table.insert_or_update(extra.data(), 300) == DescriptorTable::InsertResult::added);
+    const DescriptorTable::Changes reuse = table.take_changes();
+    EXPECT(reuse.slots.size() == 1 && reuse.slots.front() == slots - 2);  // the first hole of the probe window
+    EXPECT(table.lookup(extra) == 300 && table.size() == 4);
+    return 0;
+}
+
+int test_unresolvable_hash_collision() {
+    DescriptorTable table(32);
+    std::array<DescriptorKey, 9> keys{};
+    for (std::uint32_t i = 0; i < keys.size(); ++i) {
+        keys[i][0] = i;
+        // Invert the final FNV multiplication to make every complete hash zero.
+        std::uint32_t prefix = kFnvOffsetBasis;
+        for (int word = 0; word < 7; ++word) prefix = (prefix ^ keys[i][word]) * kFnvPrime;
+        keys[i][7] = prefix;
+        EXPECT(hash_descriptor_key(keys[i]) == 0);
+    }
+    for (std::uint32_t i = 0; i < 8; ++i) table.insert(keys[i], i + 1);
+    const auto before = table.build_gpu_buffer();
+    bool rejected = false;
+    try { table.insert(keys[8], 9); }
+    catch (const std::length_error&) { rejected = true; }
+    EXPECT(rejected && table.size() == 8 && table.capacity() == 32);
+    EXPECT(table.build_gpu_buffer() == before);
+    for (std::uint32_t i = 0; i < 8; ++i) EXPECT(table.lookup(keys[i]) == i + 1);
+    EXPECT(table.insert_or_update(keys[0].data(), 99) == DescriptorTable::InsertResult::replaced);
+    EXPECT(table.lookup(keys[0]) == 99);
+    EXPECT(table.erase(keys[0]));
+    EXPECT(table.insert(keys[8], 9) && table.lookup(keys[8]) == 9);
+    return 0;
+}
+
+int test_capacity_overflow() {
+    for (std::uint32_t requested : {0x80000001u, 0xffffffffu}) {
+        bool rejected = false;
+        try { DescriptorTable table(requested); }
+        catch (const std::length_error&) { rejected = true; }
+        EXPECT(rejected);
+    }
+    for (std::uint32_t requested : {0u, 1u, 16u, 17u, 31u, 32u}) {
+        DescriptorTable table(requested);
+        EXPECT(table.capacity() == (requested <= 16 ? 16 : 32));
+    }
+    return 0;
+}
+
 int main() {
+    EXPECT(test_unresolvable_hash_collision() == 0);
+    EXPECT(test_capacity_overflow() == 0);
     EXPECT(test_fnv1a_hash_matches_contract() == 0);
     EXPECT(test_ssharp_key_padding() == 0);
     EXPECT(test_basic_insertion_and_lookup() == 0);
@@ -376,9 +460,10 @@ int main() {
     EXPECT(test_gpu_buffer_serialization() == 0);
     EXPECT(test_change_tracking() == 0);
     EXPECT(test_relocation_marks_both_slots() == 0);
+    EXPECT(test_erase_moves_no_other_entry() == 0);
     EXPECT(test_multithreaded_insert_and_lookup() == 0);
     EXPECT(test_clear_resets_table() == 0);
-    EXPECT(test_erase_and_cluster_compact() == 0);
+    EXPECT(test_erase_and_reinsert() == 0);
 
     std::printf("descriptor_table_test: all tests passed (0 failures)\n");
     return 0;

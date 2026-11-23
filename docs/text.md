@@ -17,24 +17,47 @@ into the logical resource.
 
 ```
 descriptor   ptr index | u32 | u32 0x10 | ptr | 01 01 00 00 | u32 hash_bytes | ptr hash
-             | u32 0x10 | u32 blob_bytes | ptr blob
+             | u32 0x10 | u32 blob_bytes | ptr blob | ... more entries (u32 tag, u32 bytes, ptr)
 ptr          u32 0x5xxxxxxx, u32 0
 hash entry   16 bytes: u32 joaat(lowercase label), u32 0, u8 1, u8[2], u24 index (at +11), u8
-index entry  16 bytes: u64, u64 (blob offset << 20 | flags)
-blob         NUL-terminated UTF-8 strings
+index entry  16 bytes: u64, u64 (offset in its blob chunk << 20 | flags); the chunk is flags & 3
+blob         NUL-terminated UTF-8 strings, in one or more chunks
 ```
 
 A hash entry whose first word is 0, whose second word is not 0, or whose byte at +8 is not 1 is an empty slot. Text
 keeps the game's inline markup (`~o~`, `~s~`, `~n~`, `~sl:0.05:0.9~`, `~COLOR_SUBTITLE_FOREIGN_DIALOGUE~`, ...).
 
+### Blob chunks
+
+From the blob on, the descriptor is a run of 16-byte entries: u32 tag, u32 bytes, pointer. The run ends at the first
+16 bytes whose pointer word is not a `0x5xxxxxxx` pointer. A table with more than 1 MiB of text has several tag
+`0x10` entries instead of one. Each is a blob chunk of at most 1 MiB, and the chunks need not be contiguous. An
+index entry's second word names its chunk: its low 20 bits are always `0b1cc`, where `cc` is the chunk, and the bits
+above them are the offset inside that chunk.
+
+Measured on `data.rpf` (counts only):
+
+| | |
+|---|---:|
+| Tables with more than one chunk | 23 (3 of them contiguous) |
+| Chunks per such table | 2-4 |
+| Index entries in them | 649,246 |
+| Low 20 bits `0b100` / `0b101` / `0b110` / `0b111`, all tables | 3,914,583 / 220,161 / 66,416 / 6,721 |
+| Index entries pointing at the start of a string, chunk = `flags & 3` | 4,207,881 of 4,207,881 |
+
+Before this rule, `text_tables.py` read every offset from the first chunk, which is a full 1 MiB. The offset then
+landed inside some other string, so 293,292 strings in those 23 tables came out with the wrong text and no error.
+The other 14,459 `data.rpf` tables read the same as before. So do all 15,951 tables of `story000.rpf` and all 78
+of `shared_minigame000.rpf`.
+
 | Archive | Tables |
 |---|---:|
-| `data.rpf` | 14,440 |
-| `story000.rpf` | 15,831 |
+| `data.rpf` | 14,482 |
+| `story000.rpf` | 15,951 |
 | `shared_minigame000.rpf` | 78 |
-| **Total** | **30,349** tables, 7,172,826 strings |
+| **Total** | **30,511** tables, 7,530,381 strings |
 
-The same 14,440 `data.rpf` tables come out of a directory carved by `rpf9_carve.py`, the archive read directly, and
+The same 14,482 `data.rpf` tables come out of a directory carved by `rpf9_carve.py`, the archive read directly, and
 an older carve that wrote each resource as one file.
 
 ### Language
@@ -49,6 +72,9 @@ The tables carry no language field. Each table's language is guessed from the fi
    - Spanish splits by Spain's second-person plural (`vosotros`, `habéis`) and vocabulary against Latin America's
      (`ustedes`, `celular`, `ahorita`).
    - A table without a marker keeps the plain `es` or `zh` code.
+
+The table below counts these per-table guesses. Since the nested-archive rule (next section), they are the `guess`
+column of `--tables`.
 
 | Language | Tables | Distinct label hashes | Hashes with a second, different text |
 |---|---:|---:|---:|
@@ -80,6 +106,39 @@ leaves a few dozen of them (about 35 for `ja`, `ko`, `ru` and `zh-Hant`). Above 
 
 The dialogue table keeps one text per label and language: the last table read wins. `--strings` writes every table
 separately, so nothing is lost.
+
+### Language from the nested archive
+
+In `data.rpf`, `story000.rpf` and `shared_minigame000.rpf` every string table sits in one of 13 nested RPF9 archives:
+`9FPR` headers at 4 KiB-aligned offsets, whose data offset at +4 stays inside the file. Each of those archives holds a
+single language. `text_tables.py` therefore gives every table in a nested archive the guess that most of that archive's
+tables share (`xx` left out), when that guess covers more than half of them. A table outside a nested archive, or in an
+archive with no majority, keeps its own guess. The tool finds the archive in an `.rpf` source, or in the archive that an
+`rpf9_carve.py` directory's `index.json` names. Without it, every table keeps its own guess.
+`story000_restofworld.rpf` has 18 nested archives, but the descriptor search finds no string table in it: none of its
+101 `0DRP` resources matches the table descriptor.
+
+Measured with the per-table guess (counts only):
+
+| | `data.rpf` | `story000.rpf` | `shared_minigame000.rpf` | `story000_restofworld.rpf` |
+|---|---:|---:|---:|---:|
+| Nested archives (all) | 41 | 436 | 48 | 18 |
+| Nested archives holding string tables | 13 | 13 | 13 | 0 |
+| Tables in them / all tables | 14,440 / 14,440 | 15,831 / 15,831 | 78 / 78 | 0 / 0 |
+| Tables per archive | 1,109-1,113 | 1,214-1,220 | 6 | - |
+| Per-table guess equal to its archive's language | 57.7%-99.9% | 72.2%-100% | 66.7%-100% | - |
+| Tables whose language changes | 2,075 | 849 | 5 | 0 |
+| `xx` before / after | 869 / 0 | 188 / 0 | 2 / 0 | 0 / 0 |
+| Plain `es` before / after | 659 / 0 | 553 / 0 | 2 / 0 | 0 / 0 |
+| Plain `zh` before / after | 203 / 0 | 47 / 0 | 0 / 0 | 0 / 0 |
+
+The three archives that hold tables share the 13 languages in the same order: `en`, `pt`, `zh-Hans`, `zh-Hant`, `fr`,
+`de`, `it`, `ja`, `ko`, `es-419`, `pl`, `ru`, `es-ES`. The lowest agreement is in the Spanish archives: in `data.rpf` and
+`story000.rpf` 208 to 314 tables per archive had no variant marker, and in `shared_minigame000.rpf` the `es-ES` archive
+agrees on 4 of its 6 tables.
+
+Reading `story000.rpf` this way needs the `rpf9_carve.py` that checks a gap in chunks (#2117): one unread gap there is
+9.56 GB, and slicing it whole ran out of memory.
 
 ## Dialogue
 
@@ -126,7 +185,7 @@ keys and their text sit in different archives.
 | Output | Columns |
 |---|---|
 | `--dialogue` | `wave`, `key`, `label`, `speaker`, `text_<lang>` per language |
-| `--tables` | `source`, `offset`, `lang`, `group`, `strings`, `resolved` |
+| `--tables` | `source`, `offset`, `lang`, `guess` (the per-table guess), `archive` (nested archive offset), `group`, `strings`, `resolved` |
 | `--strings` | `source`, `offset`, `lang`, `hash`, `label`, `text` |
 
 Standard library only. The four archives above take about 2 minutes on one core from a carve.
@@ -136,7 +195,18 @@ Standard library only. The four archives above take about 2 minutes on one core 
 
 ## Open questions
 
-- **Language per table.** The game must know each table's language. A field or a naming rule outside the tables
-  (the TOC or the executable) would replace the guess.
+- **Language per table.** The nested archive now groups the tables of `data.rpf`, `story000.rpf` and
+  `shared_minigame000.rpf` by language, but the language code of each archive is still the majority guess of its
+  tables. A field or a naming rule outside the tables (the TOC or the executable) would name it directly. The
+  descriptor search finds no string table in `story000_restofworld.rpf`, so no nested archive there has a table
+  language to name.
 - **Which text the game picks.** When a label has two texts in one language, which table wins at run time
   (load order, mission scope, the foreign-dialogue subtitle option) is not established.
+- **Hash entries whose byte at +8 is 5, 7 or 8.** `data.rpf` has 3,026 of them, in 62 tables, and none of those tables
+  is guessed as English. They are not strings: their u24 at +11 runs 0, 2, 4, ... in every table. That is, in units
+  of 16 bytes, an index into a 32-byte record array, the descriptor entry tagged `0x956a9df5`, whose size is exactly
+  32 bytes times the number of such entries. Another entry, tagged `0x10075946`, holds 32-byte records whose first
+  word is a blob reference like an index entry's second word. All 7,345 of them point at the start of a string.
+  A group record holds a u32 count equal to the u32 after it (1-7). Read as (first record, count), its first word
+  and that count cover the `0x10075946` array exactly in only 34 of the 62 tables, so the layout is not decoded.
+  `text_tables.py` skips these entries.

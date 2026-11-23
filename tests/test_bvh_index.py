@@ -10,6 +10,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -152,6 +153,11 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(row["kind"], "xml")
         self.assertFalse(row["fragment"])
         self.assertEqual(row["root_element"], "SSetupData")
+        with_enc = b'\xef\xbb\xbf<?xml version="1.0" encoding="UTF-8"?>\n<CMapData><name>x</name></CMapData>'
+        row_enc = bvh_index.classify(with_enc, len(with_enc))
+        self.assertEqual(row_enc["kind"], "xml")
+        self.assertFalse(row_enc["fragment"])
+        self.assertEqual(row_enc["root_element"], "CMapData")
 
     def test_xml_fragment(self):
         text = b"/americas/map/x_bvh.rpf</filename><Item/>" + b" " * 40
@@ -225,6 +231,19 @@ class ScanTest(unittest.TestCase):
         self.assertIn("--out and --csv must use different paths", err.getvalue())
         self.assertFalse(os.path.exists(out))
 
+    def test_directory_with_glob_metacharacters_in_its_name(self):
+        # Before: os.path.join(path, "**", "*.bin"/"*.rpf") fed a root like "carve[1]" straight to glob, which
+        # read "[1]" as a character class and matched nothing.
+        folder = os.path.join(self.dir, "carve[1]")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "a.bin"), "wb") as f:
+            f.write(bvh_payload(4))
+        with open(os.path.join(folder, "b.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(2)]))
+        rows, summary = bvh_index.scan_dir(folder)
+        self.assertEqual([r["kind"] for r in rows], ["bvh4"])
+        self.assertEqual(summary[0]["streams"], 1)
+
     def test_directory_of_payloads(self):
         for name, payload in (("a.bin", bvh_payload(4)), ("b.bin", instance_payload()), ("c.bin", b"z" * 80)):
             with open(os.path.join(self.dir, name), "wb") as f:
@@ -232,6 +251,42 @@ class ScanTest(unittest.TestCase):
         rows, summary = bvh_index.scan_dir(self.dir)
         self.assertEqual({r["kind"] for r in rows}, {"bvh4", "instance208", "raw"})
         self.assertEqual(summary[0]["streams"], 3)
+
+    def test_carved_bvh_fill_requires_all_declared_node_bytes(self) -> None:
+        n = 1200
+        complete = bvh_payload(n)
+        chunk = complete[:65536]
+        for name, payload in (("complete.bin", complete), ("chunk.bin", chunk)):
+            with open(os.path.join(self.dir, name), "wb") as f:
+                f.write(payload)
+
+        rows, _ = bvh_index.scan_dir(self.dir)
+        by_kind = {row["kind"]: row for row in rows}
+        self.assertEqual(by_kind["bvh4"]["fill"]["total"], n * 64)
+        self.assertEqual(by_kind["bvh4-chunk"]["node_count"], n)
+        self.assertNotIn("fill", by_kind["bvh4-chunk"])
+
+        archive = os.path.join(self.dir, "chunks.rpf")
+        with open(archive, "wb") as f:
+            f.write(make_rpf([chunk]))
+        (archived,), _ = bvh_index.scan_rpf(archive)
+        self.assertEqual(archived["kind"], "bvh4-chunk")
+        self.assertNotIn("fill", archived)
+
+    def test_folder_name_with_glob_characters_is_a_path(self):
+        # glob read "[v1]" as a character class, so a folder named like this indexed nothing and exited 0.
+        folder = os.path.join(self.dir, "carve [v1]")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "a.bin"), "wb") as f:
+            f.write(bvh_payload(4))
+        rows, summary = bvh_index.scan_dir(folder)
+        self.assertEqual([r["kind"] for r in rows], ["bvh4"])
+        archives = os.path.join(self.dir, "pack [1]")
+        os.makedirs(archives)
+        with open(os.path.join(archives, "a.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(2)]))
+        rows, summary = bvh_index.scan_dir(archives)
+        self.assertEqual([r["kind"] for r in rows], ["bvh4"])
 
     def test_empty_and_short_archives_have_no_streams(self):
         for name, data in (("empty.rpf", b""), ("short.rpf", b"9FPR")):
@@ -257,6 +312,36 @@ class ScanTest(unittest.TestCase):
         rows, summaries = bvh_index.scan_dir(self.dir)
         self.assertEqual([r["kind"] for r in rows], ["bvh4"])
         self.assertEqual(len(summaries), 1)
+        self.assertIsInstance(summaries[0], dict)
+        self.assertEqual(summaries[0]["streams"], 1)
+
+    def test_directory_of_rpfs_writes_flat_summaries(self):
+        one = os.path.join(self.dir, "one")
+        two = os.path.join(self.dir, "two")
+        os.makedirs(one)
+        os.makedirs(two)
+        with open(os.path.join(one, "a.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(2)]))
+        for name, n in (("a.rpf", 2), ("b.rpf", 3)):
+            with open(os.path.join(two, name), "wb") as f:
+                f.write(make_rpf([bvh_payload(n)]))
+
+        out1 = os.path.join(self.dir, "one.json")
+        out2 = os.path.join(self.dir, "two.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bvh_index.main([one, "--out", out1]), 0)
+            self.assertEqual(bvh_index.main([two, "--out", out2]), 0)
+        with open(out1, encoding="utf-8") as f:
+            doc1 = json.load(f)
+        self.assertIsInstance(doc1["summary"], dict)
+        self.assertEqual(doc1["summary"]["streams"], 1)
+        self.assertEqual(doc1["summary"]["bvh4_nodes"], 2)
+        with open(out2, encoding="utf-8") as f:
+            doc2 = json.load(f)
+        self.assertIsInstance(doc2["summary"], list)
+        self.assertEqual(len(doc2["summary"]), 2)
+        self.assertTrue(all(isinstance(item, dict) for item in doc2["summary"]))
+        self.assertEqual([item["bvh4_nodes"] for item in doc2["summary"]], [2, 3])
 
     def test_cli_rejects_a_limit_below_one(self):
         path = os.path.join(self.dir, "one.rpf")
@@ -341,6 +426,85 @@ class ScanTest(unittest.TestCase):
                 bvh_index.main([self.dir, "--out", outdir])
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("is a folder, not a report file", err.getvalue())
+
+
+class _Unprintable:
+    """A cell whose str() fails part-way through the CSV, standing in for a write that dies mid-report."""
+
+    def __str__(self):
+        raise OSError("simulated write failure")
+
+
+class PublishTest(unittest.TestCase):
+    """write_outputs stages each report next to its destination and swaps it in: a run that fails while writing
+    keeps the previous report instead of leaving it truncated (before: open(dest, "w") emptied it first)."""
+
+    OLD_JSON = '{"summary": {"previous": true}, "streams": []}'
+    OLD_CSV = "source,offset\nprevious.rpf,0\n"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.out = os.path.join(self.dir, "index.json")
+        self.csv = os.path.join(self.dir, "index.csv")
+        with open(self.out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(self.OLD_JSON)
+        with open(self.csv, "w", encoding="utf-8", newline="") as f:
+            f.write(self.OLD_CSV)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def read(self, path):
+        with open(path, encoding="utf-8", newline="") as f:
+            return f.read()
+
+    def assert_previous_reports_kept(self):
+        self.assertEqual(self.read(self.out), self.OLD_JSON)
+        self.assertEqual(self.read(self.csv), self.OLD_CSV)
+        self.assertEqual(sorted(os.listdir(self.dir)), ["index.csv", "index.json"])
+
+    def test_json_serialization_failure_keeps_previous_reports(self):
+        rows = [{"source": "a.rpf", "offset": 0, "bad": object()}]
+        with self.assertRaises(TypeError):
+            bvh_index.write_outputs(rows, [{"streams": 1}], self.out, self.csv)
+        self.assert_previous_reports_kept()
+
+    def test_csv_write_failure_keeps_previous_csv(self):
+        rows = [{"source": _Unprintable(), "offset": 0}]
+        with self.assertRaises(OSError):
+            bvh_index.write_outputs(rows, [{"streams": 1}], None, self.csv)
+        self.assert_previous_reports_kept()
+
+    def test_interrupted_write_keeps_previous_report(self):
+        with mock.patch.object(bvh_index.json, "dump", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                bvh_index.write_outputs([], [{"streams": 0}], self.out, self.csv)
+        self.assert_previous_reports_kept()
+
+    def test_reports_replaced_with_published_mode(self):
+        rows = [{"source": "a.rpf", "offset": 16, "bounds_min": [1, 2, 3]}]
+        with mock.patch.object(bvh_index, "published_mode", wraps=bvh_index.published_mode) as published, \
+                mock.patch.object(bvh_index.os, "chmod", wraps=os.chmod) as chmod:
+            bvh_index.write_outputs(rows, [{"streams": 1}], self.out, self.csv)
+        self.assertEqual([c.args for c in published.call_args_list], [(self.out,), (self.csv,)])
+        self.assertEqual(len(chmod.call_args_list), 2)
+        for call, dest in zip(chmod.call_args_list, (self.out, self.csv)):
+            staged, mode = call.args
+            self.assertEqual(os.path.dirname(staged), self.dir)
+            self.assertTrue(os.path.basename(staged).startswith(".bvh_index-"))
+            self.assertTrue(staged.endswith(".tmp"))
+            self.assertEqual(mode, bvh_index.published_mode(dest))
+        with open(self.out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["streams"][0]["offset"], 16)
+        self.assertEqual(self.read(self.csv).splitlines()[1].split(",")[:2], ["a.rpf", "16"])
+        self.assertEqual(sorted(os.listdir(self.dir)), ["index.csv", "index.json"])
+
+    @unittest.skipUnless(os.name == "posix", "permission bits are POSIX")
+    def test_replaced_report_keeps_its_permission_bits(self):
+        os.chmod(self.out, 0o640)
+        bvh_index.write_outputs([], [{"streams": 0}], self.out, None)
+        self.assertEqual(os.stat(self.out).st_mode & 0o777, 0o640)
 
 
 def setUpModule():

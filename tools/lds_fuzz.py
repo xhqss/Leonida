@@ -85,7 +85,7 @@ WRITES = {  # name: (bytes, data bit offset)
 SHARED_ATOMICS = ("add", "sub", "min_i32", "max_i32", "min_u32", "max_u32", "and", "or", "xor")
 RTN_ATOMICS = SHARED_ATOMICS
 EXEC_KINDS = ("atomic", "atomic_rtn", "bpermute", "cmpst", "permute", "read", "read2", "swizzle", "write",
-              "write2", "wrxchg")
+              "write2", "wrxchg", "wrxchg2")
 ATOMIC_NAME = {"add": "ds_add%s_u32", "sub": "ds_sub%s_u32", "min_i32": "ds_min%s_i32", "max_i32": "ds_max%s_i32",
                "min_u32": "ds_min%s_u32", "max_u32": "ds_max%s_u32", "and": "ds_and%s_b32", "or": "ds_or%s_b32",
                "xor": "ds_xor%s_b32"}
@@ -103,11 +103,13 @@ PERTURBATIONS = {
     "b16_hi_shift_0": ("write_d16_hi", "ds_write_b16_d16_hi stores the low half"),
     "write2_swapped": ("write2", "ds_write2 stores its data registers swapped"),
     "st64_unit_4": ("read2", "the st64 forms scale their offsets by 4, not 256"),
+    "wrxchg2_swapped": ("wrxchg2", "ds_wrxchg2 stores data1 in its first element"),
     "bpermute_inactive_reads": ("bpermute", "ds_bpermute reads an inactive source lane's register, not 0"),
     "bpermute_wave64_cross": ("bpermute", "a wave64 ds_bpermute reaches all 64 lanes"),
     "swizzle_quad_reversed": ("swizzle", "the quad-permute selectors are taken in reverse lane order"),
     "swizzle_or_xor_swapped": ("swizzle", "the bit-mask or and xor fields are swapped"),
     "permute_no_zero": ("permute", "ds_permute_b32 leaves an unwritten lane's register alone instead of writing 0"),
+    "permute_lowest_wins": ("permute", "ds_permute_b32 lets the lowest active source lane win a collision"),
 }
 PERTURB = set()
 
@@ -297,7 +299,7 @@ class Program:
     def random_op(self):
         rng = self.rng
         kinds = ("read", "read", "write", "write", "read2", "write2", "atomic", "atomic_rtn",
-                 "wrxchg", "cmpst", "swizzle", "bpermute") + (("permute",) if self.permute else ())
+                 "wrxchg", "wrxchg2", "cmpst", "swizzle", "bpermute") + (("permute",) if self.permute else ())
         while True:
             op = self.make(rng.choice(kinds))
             if op:
@@ -348,6 +350,25 @@ class Program:
             else:
                 op["src0"], op["src1"] = rng.choice(POOL), rng.choice(POOL)
             return op
+        if kind == "wrxchg2":
+            st64 = rng.random() < 0.3
+            unit = 256 if st64 else 4
+            o0, o1 = rng.randrange(0, 4 if st64 else 64), rng.randrange(0, 4 if st64 else 64)
+            lo = min(o0, o1) * unit
+            extra = (max(o0, o1) * unit - lo,)
+            a = self.pick_addr(4, 4, distinct=True, extra=extra)
+            if not a:
+                return None
+            stride, base, _ = a
+            base = base + a[2]
+            if base - lo < 0:
+                return None
+            base -= lo
+            # the data pair is read before `vdst` is written, so `vdst` may alias it (measured on gfx1100)
+            srcs = rng.sample(POOL, 2)
+            dst = rng.randrange(POOL[0], POOL[-1])          # dst + 1 stays inside POOL
+            return {"kind": kind, "st64": st64, "o0": o0, "o1": o1, "addr": (stride, base, 0), "dst": dst,
+                    "src0": srcs[0], "src1": srcs[1], "exec": self.exec_mask()}
         if kind == "atomic":
             a = self.pick_addr(4, 4, distinct=False)
             if not a:
@@ -382,13 +403,13 @@ class Program:
                     "offset": rng.choice([0, 0, 4 * rng.randrange(0, 64)]), "src": rng.choice(POOL),
                     "dst": rng.choice(POOL), "exec": self.exec_mask()}
         if kind == "permute":
-            # an odd multiplier makes the lane -> lane map a bijection in a 32- and in a 64-lane group, so no two
-            # lanes send to the same lane and the result doesn't depend on which write wins
-            return {"kind": kind, "mul": rng.randrange(1, 64, 2), "add": rng.randrange(0, 64),
+            # allow both odd (bijective) and even (colliding) multipliers; RDNA2 hw (gfx1030, SHADER-133) and gfx1150
+            # confirm the highest active source lane wins a collision, unaddressed active lanes get 0, halves separate
+            return {"kind": kind, "mul": rng.randrange(0, 64), "add": rng.randrange(0, 64),
                     "offset": rng.choice([0, 0, 4 * rng.randrange(0, 64)]), "src": rng.choice(POOL),
                     "dst": rng.choice(POOL), "exec": self.exec_mask(),
-                    "hyp": "the ISA text: only active lanes send, a lane nobody sends to gets 0, each 32-lane half "
-                           "is separate"}
+                    "hyp": "only active lanes send, highest active sender wins collisions, a lane nobody sends to "
+                           "gets 0, each 32-lane half is separate (measured on gfx1030 SHADER-133 and gfx1150)"}
         raise ValueError(kind)
 
     # ---- the program text ----
@@ -467,7 +488,7 @@ class Program:
     def asm_op(self, op, w64, full):
         k = op["kind"]
         lines = []
-        if k in ("read", "write", "atomic", "atomic_rtn", "wrxchg", "cmpst", "read2", "write2"):
+        if k in ("read", "write", "atomic", "atomic_rtn", "wrxchg", "wrxchg2", "cmpst", "read2", "write2"):
             stride, base, off = op["addr"]
             lines += self.asm_addr(stride, base)
         if k == "cmpst" and op["cmp_hit"]:
@@ -499,6 +520,10 @@ class Program:
             lines.append(f"{ATOMIC_NAME[op['op']] % '_rtn'} v{op['dst']}, v{ADDR}, v{op['src']} offset:{op['addr'][2]}")
         elif k == "wrxchg":
             lines.append(f"ds_wrxchg_rtn_b32 v{op['dst']}, v{ADDR}, v{op['src']} offset:{op['addr'][2]}")
+        elif k == "wrxchg2":
+            nm = "ds_wrxchg2st64_rtn_b32" if op["st64"] else "ds_wrxchg2_rtn_b32"
+            lines.append(f"{nm} v[{op['dst']}:{op['dst'] + 1}], v{ADDR}, v{op['src0']}, v{op['src1']} "
+                         f"offset0:{op['o0']} offset1:{op['o1']}")
         elif k == "cmpst":
             lines.append(f"ds_cmpst_rtn_b32 v{op['dst']}, v{ADDR}, v{op['src']}, v{op['src2']} offset:{op['addr'][2]}")
         elif k == "swizzle":
@@ -538,7 +563,7 @@ class Program:
         if k == "read":
             size = READS[op["name"]][0]
             return range(op["dst"], op["dst"] + (size // 4 if size >= 4 else 1))
-        if k == "read2":
+        if k in ("read2", "wrxchg2"):
             return range(op["dst"], op["dst"] + 2)
         if k in ("atomic_rtn", "wrxchg", "cmpst", "swizzle", "bpermute", "permute"):
             return (op["dst"],)
@@ -658,6 +683,24 @@ class Program:
                 ret[t] = old
             for t, v in ret.items():
                 regs[t][op["dst"]] = v
+        elif k == "wrxchg2":
+            unit = 256 if op["st64"] else 4
+            if op["st64"] and "st64_unit_4" in PERTURB:
+                unit = 4
+            stride, base, _ = op["addr"]
+            for t in range(T):
+                if not act[t]:
+                    continue
+                a = t * stride + base
+                a0, a1 = a + op["o0"] * unit, a + op["o1"] * unit
+                d0, d1 = regs[t][op["src0"]], regs[t][op["src1"]]
+                if "wrxchg2_swapped" in PERTURB:
+                    d0, d1 = d1, d0
+                old0 = rd(a0)
+                struct.pack_into("<I", lds, a0, d0)
+                old1 = rd(a1)               # after the first store, so a repeated address returns data0
+                struct.pack_into("<I", lds, a1, d1)
+                regs[t][op["dst"]], regs[t][op["dst"] + 1] = old0, old1
         elif k == "swizzle":
             src = [regs[t][op["src"]] for t in range(T)]
             for t in range(T):
@@ -681,11 +724,12 @@ class Program:
             for t, v in new.items():
                 regs[t][op["dst"]] = v
         elif k == "permute":
-            # forward permute: an active lane sends its data to lane (addr + offset) / 4 of its 32-lane group, an
-            # active lane gets what was sent to it, or 0
+            # forward scatter within each 32-lane half: active lanes send to lane (addr + offset) / 4 of their 32-lane
+            # group; highest-numbered active source wins collisions; active destination lanes nobody targets get 0
             src = [regs[t][op["src"]] for t in range(T)]
             sent = {}
-            for t in range(T):
+            lanes = range(T - 1, -1, -1) if "permute_lowest_wins" in PERTURB else range(T)
+            for t in lanes:
                 if act[t]:
                     word = ((t * op["mul"] + op["add"]) * 4 + op["offset"]) >> 2
                     sent[(t & ~31) | (word & 31)] = src[t]
@@ -728,7 +772,12 @@ def compare(p, got_regs, got_lds):
 
 # ---- the translator oracle ----
 
-def translate(progs, work, emulate):
+def pc_tail_env():
+    """True when LEONIDA_PC_TAIL_UBO asks for rdna2spirv.py --pc-tail-ubo (128-byte push constants)."""
+    return (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def translate(progs, work, emulate, pc_tail=False):
     disasm, fssm, spirv = (work / d for d in ("disasm", "fssm", "spirv"))
     for d in (disasm, fssm, spirv):   # a reused --work must not leave an earlier run's listings or SPIR-V behind
         if d.exists():
@@ -739,7 +788,7 @@ def translate(progs, work, emulate):
     for p in progs:
         text = p.asm()
         asm_path = work / (p.name + ".asm")
-        asm_path.write_text(text, encoding="utf-8")
+        asm_path.write_text(text, encoding="utf-8", newline="\n")
         cmd = mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
         if p.wave == 64:
             cmd.append("-mattr=+wavefrontsize64,-wavefrontsize32")
@@ -747,11 +796,13 @@ def translate(progs, work, emulate):
         if r.returncode or "error:" in r.stderr:
             raise RuntimeError(f"{p.name} did not assemble:\n{r.stderr}")
         code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
-        (disasm / (p.name + ".s")).write_text(f"; {p.name}\n{code}", encoding="utf-8")
+        (disasm / (p.name + ".s")).write_text(f"; {p.name}\n{code}", encoding="utf-8", newline="\n")
         (fssm / (p.name + ".fssm")).write_bytes(compute_header(asm_path))
     cmd = [sys.executable, "-I", os.path.join(HERE, "rdna2spirv.py"), str(disasm), "--out", str(spirv)]
     if emulate:
         cmd.append("--wave64-emulate")
+    if pc_tail:
+        cmd.append("--pc-tail-ubo")
     r = subprocess.run(cmd, capture_output=True, text=True)
     index = spirv / "index.json"
     if not index.exists():
@@ -759,12 +810,14 @@ def translate(progs, work, emulate):
     return json.loads(index.read_text(encoding="utf-8")) if index.exists() else {}
 
 
-def run_gpu(p, spv, build, index_entry, emulate, dump):
+def run_gpu(p, spv, build, index_entry, emulate, dump, pc_tail=False):
     exe = os.path.join(build, "vk_compute_test" + (".exe" if os.name == "nt" else ""))
     if not os.path.isfile(exe):
         sys.exit(f"vk_compute_test not found in {build} or its RelWithDebInfo/Release folder; "
                  "build it first (cmake --build <build dir> --target vk_compute_test)")
     env = dict(os.environ, VKC_OUT_WORDS=str(p.out_words), VKC_DUMP=str(dump))
+    if pc_tail:
+        env["LEONIDA_PC_TAIL_UBO"] = "1"
     args = [exe, str(spv), "1", "dump"]
     if p.wave == 64 and not emulate:
         args.append("--require-wave64")
@@ -790,13 +843,17 @@ def show_cmd(p, no_exec, opts):
 def run_translator(progs, a, work, tally):
     """The translator oracle: translate every program with a whole number of waves and run it on the GPU. Returns the
     exit code of this oracle (0, 1, 2) and fills tally["translator"][name] with the verdict."""
+    pc_tail = bool(getattr(a, "pc_tail_ubo", False))
     try:
         todo = [p for p in progs if not p.partial_wave]
         for p in progs:
             if p.partial_wave:
                 print(f"SKIP {p.name}: translator: a wave64 group of {p.threads} threads is a partial wave "
                       "(the translator cannot launch one)")
-        index = translate(todo, work, a.emulate) if todo else {}
+        if todo:
+            index = translate(todo, work, a.emulate, pc_tail=True) if pc_tail else translate(todo, work, a.emulate)
+        else:
+            index = {}
     except RuntimeError as e:
         print(e)
         return 2
@@ -811,7 +868,8 @@ def run_translator(progs, a, work, tally):
             continue
         dump = work / (p.name + ".bin")
         dump.unlink(missing_ok=True)
-        rc, msg = run_gpu(p, spv, a.build, index[p.name], a.emulate, dump)
+        rc, msg = (run_gpu(p, spv, a.build, index[p.name], a.emulate, dump, pc_tail=True)
+                   if pc_tail else run_gpu(p, spv, a.build, index[p.name], a.emulate, dump))
         if rc == 77:
             skipped += 1
             print(f"SKIP {p.name}: {msg.splitlines()[-1] if msg else 'unsupported'}")
@@ -819,7 +877,7 @@ def run_translator(progs, a, work, tally):
             continue
         # A wave32 program needs 32-lane subgroups. Where vk_compute_test couldn't pin them, its words come from
         # another wave size and are no evidence either way. --wave64-emulate output uses no subgroup operations.
-        lanes = unpinned_subgroup(msg) if p.wave == 32 else None
+        lanes = unpinned_subgroup(msg) if rc == 0 and p.wave == 32 else None
         if lanes:
             skipped += 1
             print(f"SKIP {p.name}: the device can't run it at {lanes} lanes "
@@ -943,7 +1001,7 @@ def run_hw(oracle, progs, a, tally, results):
                 print(f"    {ops[i]}" + ("   ; hypothesis op" if ops[i].get("hyp") else ""))
         if a.keep:
             os.makedirs(a.keep, exist_ok=True)
-            Path(a.keep, f"{p.name}_hw.s").write_text("\n".join(p.hw_lines(oracle.arch)) + "\n", encoding="utf-8")
+            Path(a.keep, f"{p.name}_hw.s").write_text("\n".join(p.hw_lines(oracle.arch)) + "\n", encoding="utf-8", newline="\n")
     print("hardware summary:")
     for key, st in sorted(stats.items()):
         print(f"  {key}: " + ", ".join(f"{k} {v}" for k, v in st.items()))
@@ -1036,8 +1094,11 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--wave", choices=("64", "32", "both"), default="both")
     ap.add_argument("--emulate", action="store_true", help="translate with --wave64-emulate, run at subgroup 32")
+    ap.add_argument("--pc-tail-ubo", action="store_true",
+                    help="translate with --pc-tail-ubo and run vk_compute_test with LEONIDA_PC_TAIL_UBO=1 "
+                         "(128-byte push constants; also set by LEONIDA_PC_TAIL_UBO=1)")
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
-    ap.add_argument("--work", default=None, help="keep the generated .asm and SPIR-V here")
+    ap.add_argument("--work", default=None, help="keep each run's generated .asm and SPIR-V in a new subfolder here")
     ap.add_argument("--model-only", action="store_true")
     ap.add_argument("--show", default=None, metavar="SEED:INDEX[:WAVE]")
     ap.add_argument("--max-report", type=int, default=12)
@@ -1064,6 +1125,7 @@ def main():
                     help="after the hardware run, re-judge its words with every perturbed model; exit 1 if one is "
                          "not caught")
     a = ap.parse_args()
+    a.pc_tail_ubo = a.pc_tail_ubo or pc_tail_env()
     if a.programs < 1 or a.max_report < 1:
         ap.error("--programs and --max-report must be at least 1")
     if a.extended:
@@ -1132,8 +1194,11 @@ def main():
     try:
         if "translator" in backends:
             a.build = find_test_program(a.build, "vk_compute_test") or a.build   # a Visual Studio config subfolder
-            work = Path(a.work).resolve() if a.work else Path(tempfile.mkdtemp(prefix="lds_fuzz_"))
-            work.mkdir(parents=True, exist_ok=True)
+            parent = Path(a.work).resolve() if a.work else None
+            if parent is not None:
+                parent.mkdir(parents=True, exist_ok=True)
+            work = Path(tempfile.mkdtemp(prefix="lds_fuzz_", dir=parent))
+            print(f"work dir {work}")
             rcs.append(run_translator(progs, a, work, tally))
         if oracle:
             if a.perturb:

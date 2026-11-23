@@ -104,16 +104,18 @@ The offsets are relative to the header at `0x100`, not to the start of the paylo
 `offsetToNodes` therefore addresses `0x59580` and `offsetToElements` addresses `0x4380`. The node and element
 regions are not necessarily the simple `0x140` onward array that the first indexer assumed. `offsetToPrimRemap`
 is source type `int32_t`, so the indexer keeps it signed. `offsetToParents` is source type `uint32_t`, so the
-indexer keeps its raw value; its signed/relative interpretation is still **Open**.
+indexer keeps its raw value; it is a signed offset from the start of the structure (RT-151: rehydrated console BLASes
+have it negative), and only the entries from the header end to `offsetToElements` are stored.
 
 The `flags` word has version `6` in its low 16 bits. It also sets `0x80000000` (bottom level), `0x00020000`
 (offline) and `0x01000000` (dehydrated). It does not set `0x00010000` (compressed). The sample is therefore a
 bottom-level, offline, dehydrated BVH, not a ready-to-traverse runtime tree.
 
 The name "BVH4" is the builder's own: `XboxBvh4Header`, `ConstructBVH4`, `RefitBVH4`, `PT_ConstructBVH4` and
-`totalSizeIn64BNodes` appear in `XboxBvhBuilder.dll`. The measured field at `0x104` is a count of 64-byte units
-whose product plus `0x140` lands exactly on the end pointer in 271,627/271,627 complete streams. That agrees with
-the builder's naming.
+`totalSizeIn64BNodes` appear in `XboxBvhBuilder.dll`. The measured field at `0x104` is a count of 64-byte nodes
+that does not include the 64-byte header: a structure is `64 * (totalSizeIn64BNodes + 1)` bytes, which lands exactly on
+the end pointer in 271,627/271,627 complete streams (RT-151; the field was read as the whole size before). That agrees
+with the builder's naming.
 
 #### Node pointers and the runtime node records
 
@@ -160,8 +162,9 @@ The same file defines the packed records: `XboxBvh4NodePacked` at L2326, `XboxBv
 | `BVVDHeader` | 8 | `variantNodeIndex` plus a six-bit mask and two-bit child selector |
 
 The layouts above are source definitions. The dehydrated stream is not a contiguous array of runtime `Node16`
-records. Its record order, the `BVVDHeader` table and the exact traversal of `NodePacked`/`LeafPacked` remain
-**Open**. A decoder must not feed the sample root to the runtime traversal path until that packing is understood.
+records. Its element and box packing is measured in §4a: a CPU model that reads it reproduces the library's
+rehydrated output byte for byte. The `BVVDHeader` table is not used by the samples there and stays **Open**. A
+decoder must not feed the dehydrated root to the runtime traversal path; it has to rehydrate first.
 
 ### 3.2 Instance descriptor (208 bytes)
 
@@ -179,7 +182,7 @@ is fixed and was identical in all 269,106 records (and in all 1,233 records of t
 | `0x30` | `0x500000C0` |
 | `0x38` | `0x50000050` |
 | `0x40` | 64-bit object key (235,533 distinct values in core) |
-| `0x50` | 3x4 float transform (last column zero; identity in 178,867 of 269,106) |
+| `0x50` | 3x4 float transform (last column zero; identity in 178,867 of 269,106): the geometry transform the BLAS was built with, §4a |
 | `0x88` | `0x00000101` |
 | `0xA0` | 64-byte-aligned offset within the following chunk, equal to the declared node end plus 0, 64, 128 or 192 |
 | `0xA4` | two `u16` counts, high and low; multiples of 256 and 64 in the sample |
@@ -226,15 +229,87 @@ generic geometry container. The dominant bytes are 64-byte node units under a he
 matches the 64-byte-unit count; the DLL that builds the runtime structures exposes `XboxBvh4Header`,
 `ConstructBVH4`, `RefitBVH4`, `GetBVHCompactedSize` and the D3D12XBOX `DEHYDRATE`/`Rehydrate...` entry points.
 
-**Plausible but not proven:** these are the offline-built, dehydrated inputs for `XboxBvhBuilder`'s rehydrate
-path. The per-instance descriptor plus BVH buffer arrangement is consistent with a stream of build descriptors and
-their acceleration structures. Whether the runtime rehydrates them or rebuilds from source geometry is **Open**;
-`docs/d3d12_vulkan.md` §4.8/§7.2 already lists that call-path question.
+**Verified (§4a):** these are the offline-built, dehydrated inputs for `XboxBvhBuilder`'s rehydrate path. Fed with
+their source geometry, `RehydrateRaytracingAccelerationStructureX` returns `S_OK` on them, and an independent CPU
+model of the packing gives the same bytes. Whether the game's runtime calls that path or rebuilds from source
+geometry is still **Open**; `docs/d3d12_vulkan.md` §4.8/§7.2 lists that call-path question.
 
 **Not present as a whole:** source vertex/index meshes. The only geometry-like structure is the `u16` table at
 header `0x130`, whose size is even and which is often monotonic; it is a candidate remap/primitive table. No
-vertex-format header, index-format header or RSC resource container was found. If the runtime needs triangles, it
-must get them from the level geometry or rebuild them; the BVH packs alone do not obviously carry them.
+vertex-format header, index-format header or RSC resource container was found. The leaves carry primitive
+references only; the triangles come from the drawables in `levels.rpf`, in the frame of the instance descriptor's
+transform (§4a).
+
+## 4a. Rehydration and source geometry (measured)
+
+**Status: measured on 10 BLAS** of the first nested pack in `core_bvh4.rpf` (one interior cell), on Windows 11 with
+no GPU involved. The tools that did it live in a fork of another project (`americas-recomp`, GPL-2.0-only,
+`wildheathen/americas-recomp`, branch `feat/bvh-rehydrate-tools`); none of their code is in this repository. Only
+layouts, offsets and counts are reproduced here.
+
+**The library runs on a PC.** `RehydrateRaytracingAccelerationStructureX` in `XboxBvhBuilder.dll` reads the
+source, vertex, index, destination and scratch buffers as CPU pointers (console unified memory) and makes no device
+calls. Mapping memory at each buffer's GPU virtual address (`VirtualAlloc`) and copying the data there is enough for
+it to return `S_OK`. It decodes standard DXGI vertex and index formats only, and it needs one geometry descriptor per
+geometry index the leaves use; fewer makes it read past the array.
+
+**The packing (completes §3.1).** A CPU model that reads the dehydrated stream as below writes the same bytes as the
+library on the 8 samples whose geometry is identified (0 differing bytes; 384 to 2,512,512 bytes per structure, 2 to
+21,814 leaves).
+
+* *Elements* start at `offsetToElements`, in chunks of 2,048 leaves at a 128 KiB stride. A chunk is five arrays,
+  one entry per leaf: geometry index (3 bytes), flags (1 byte), base primitive (3 bytes), second primitive (3 bytes,
+  `0xffffff` for none) and a vertex-order byte. Rehydration writes one 64-byte `Leaf` per entry from the geometry:
+  the triangle's vertices in the slots the vertex-order byte selects, the fourth vertex for a paired second
+  primitive, `GeometryIndexAndFlags = index << 8 | flags`, and the two primitive indices.
+* *Boxes* start at `offsetToNodes` and are stored by level, bottom-up. The structure ends with the level table: the
+  last `u32` is the level count, preceded by one (BOX32 end, BOX16 end) pair per level. A level holds BOX32 groups
+  (8 KiB per 64 nodes), then BOX16 groups (4 KiB per 64). A group starts with one word per node, `child count << 24 |
+  24-bit override mask`, then every child pointer, then the override values (`f32` in BOX32, half in BOX16), one per
+  mask bit. Bit `6 * slot + c` covers component `c` of a slot (`min xyz`, then `max xyz`). Rehydration recomputes each
+  slot's box from the rehydrated child and then writes the stored values over the masked components. BOX16 rounds
+  min down and max up; a bound past the half range becomes `+-inf` (`0x7c00`/`0xfc00`), not `+-65504`.
+* *Leaf frame.* Leaf vertices are `(R * v - t) * s`, from `compressionParams`: bit 31 enables a per-axis scale
+  `2^(e - 127)` with `e` the bytes 0, 1 and 2; bit 30 enables a translation per axis, the centre of `sceneBounds`
+  where the bounds do not straddle zero; bits 24-29 select one of 64 rotations, `Rz * Ry * Rx` in steps of pi/8
+  about each axis (index 0, the identity, on every sample).
+
+**The instance transform.** The 3x4 at descriptor `+0x50` is applied to the geometry, `x' = M * x`, before the BLAS
+is built. The samples carry the identity or an axis-aligned 90-degree rotation. Without it, most leaves of the
+rotated samples fall outside `sceneBounds` (175 of 181 and 207 of 273); with it, none do. The transposed matrix does
+not fit.
+
+**Where the triangles come from.** A leaf's geometry index is a position in the geometry list of a drawable's
+primary-LOD model in `levels.rpf`, counting only the geometries whose shader the BVH keeps. On the 8 BLAS whose
+drawable is a single resource, a geometry is left out exactly when its shader is one of two shaders: 48 geometries,
+8 distinct shaders, no exception. The two name hashes stay out of this repository (§8). They are the shader-group
+hashes (first word of the shader record; shader group at drawable `+0x10`, pointer array at group `+0x10`, `u16`
+count at `+0x18`, shader index per geometry in the model's `u16` array at `+0x20`) that only skipped geometries
+carry, so any identified BLAS that skips a geometry lets a user recover them locally. The positions in the samples
+are the RAGE9 quantized-8 form: a 32-byte origin/axis/scale header at the vertex-format position offset minus 32,
+then one contiguous stream of 8-byte records; the other vertex attributes follow in their own streams, so the bytes
+per vertex of the whole block are not a position stride. The leaves address triangles in primitive order of the
+meshlet index buffer.
+
+**How a match is verified.** A byte-identical library result checks the packing, not the geometry: the model and
+the library agree on any input. These checks use what the dehydrated stream recorded from the true geometry:
+
+1. every rehydrated leaf lies inside `sceneBounds` mapped through the leaf frame, and the union of the leaves equals
+   it (error 0 to 2e-7 of the extent for the right geometry; 5.7e-4 to 0.5 for a wrong decode);
+2. every stored box override lies inside the range of its rehydrated slot and is no looser than it, within 4 float32
+   ulps (the bake rounds some overrides one or two ulps away from the rehydrated value);
+3. the internal box area, as a tie-break between candidates (3.6-7.4 % of a wrong decode's area);
+4. paired leaves: the builder pairs two primitives that share an edge, so in the true index buffer the two triangles
+   share two vertex indices. The true geometry scores 1.00, others 0.3-0.6 once an index has 30 or more pairs. This
+   test needs no positions.
+
+With these, 8 of the 10 BLAS each have exactly one matching drawable among all candidates of their triangle-count
+signature (up to 467), and the library output equals the model on all 8. The other two are interior rooms that
+aggregate props from several drawables in room-local coordinates: test 4 finds three of their pieces exactly, but
+placing them needs the interior's entity list (`CMloArchetypeDef`, see #1981), which the BLAS does not store.
+
+**Open:** what the two excluded shaders are; the placement of aggregated rooms; whether the runtime rehydrates
+these packs at all (above).
 
 ## 5. Cross-check of the small packs
 
@@ -261,13 +336,14 @@ into three 64 KiB/26 KiB chunks. These list the per-tile BVH packs; they are the
    269,106/269,106 cases. The other descriptor sizes account for 2,528 more BVH buffers; 3 more are preceded by
    other streams.
 4. **Parse the header, then stop guessing.** The exact header table, node pointer encoding and runtime
-   `Node16`/`Node32`/`Leaf` records are in section 3.1. The packed dehydrated stream (`NodePacked`, `LeafPacked`,
-   `BVVDHeader`) remains **Open**; do not infer a runtime child array from the `0x140` slot space.
+   `Node16`/`Node32`/`Leaf` records are in section 3.1, and the dehydrated element and box packing in §4a; do not
+   infer a runtime child array from the `0x140` slot space.
 5. **Skip fill.** Ignore all-zero nodes and the `0x81`/`0x94`/`0x29` repeated blocks; they are not primitives.
 6. **Do not feed these nodes to the AMD traversal.** The translator's `image_bvh_intersect_ray` path expects the
    AMD hardware node format (256-byte base units), while these payloads use the builder's 64-byte units. The
    sample is also dehydrated, so its root is not a runtime child array. A rehydrator, converter or rebuild is
-   required; see `docs/d3d12_vulkan.md` §4.8.
+   required; see `docs/d3d12_vulkan.md` §4.8. §4a has the rehydration inputs: the drawable geometry, the instance
+   transform and the packing.
 7. **Result format.** Any decoder should emit world-space bounds plus primitive references, and validate the
    wrapper (`0x140 + 64*n == end`, `u32@0x28 == end - 0x100`) and ordered AABB before use.
 
@@ -298,6 +374,77 @@ template, XML and XML fragments, the two-stream advance bug and CSV/JSON output.
 
 Measured with the tool on `shared_minigame000_bvh4.rpf`: 2,560 streams, 59,142,787 stored, 970,044,012 inflated,
 1,237 complete `bvh4`, 1,233 `instance208`, 85 descriptors, 5 XML. That matches the carver summary exactly.
+
+`tools/bvh_rehydrate.py` (standard library only) turns a dehydrated BLAS back into the runtime layout on the CPU,
+from float3 vertices, `uint16`/`uint32` or no indices and an optional 3x4 geometry transform, following the packing
+in §4a. On the 8 measured samples whose geometry is identified, its output is byte-identical to what
+`XboxBvhBuilder.dll`'s `RehydrateRaytracingAccelerationStructureX` writes (384 to 2,512,512 bytes per structure). It
+is the reference for checking the builder's `Box16Rehydration`, `Box32Rehydration` and `LeafRehydration` programs on
+a GPU ([embedded_shaders.md](embedded_shaders.md)). Its tests are synthetic.
+
+The output keeps the console's size convention: `64 * (totalSizeIn64BNodes + 1)` bytes from the header, which is the
+`0x140 + 64 * n` end of §3.1 with the header at `0x100`. `tools/xdxr_bvh.py validate` and the GPU builder use
+`64 * totalSizeIn64BNodes` for the whole structure instead, so `validate` reports a rehydrated console structure as
+not covering its buffer.
+
+```powershell
+python -I tools/bvh_rehydrate.py <dehydrated.bin> --geom <vertices.f32>[,<indices.u32>] --out <rehydrated.bin>
+python -I tools/bvh_rehydrate.py <bvh4 stream> --header-offset 256 --geom ... --transform m00,...,m23 --out ...
+python -I tests/test_bvh_rehydrate.py
+```
+
+`tools/bvh_geometry_check.py` says whether the geometry given to a rehydration is the geometry the BLAS was built
+from, using what the dehydrated stream stores (§4a): leaves inside and equal to `sceneBounds`, stored box overrides
+consistent with the rehydrated slots, and paired leaves sharing an edge in the index buffer, which needs no positions.
+On the 8 samples the right geometry passes every check and a wrong decode fails (175 of 181 leaves outside, or 11 of
+23 overrides inconsistent).
+
+```powershell
+python -I tools/bvh_geometry_check.py <dehydrated.bin> --geom <vertices.f32>[,<indices.u32>] [--json report.json]
+python -I tests/test_bvh_geometry_check.py
+```
+
+`tools/bvh_match.py` finds the drawable geometry a dehydrated BLAS was built from, on top of `rpf9dump`'s model
+export rather than a second decoder. It reads the leaf signature (triangles per geometry index, a leaf that holds two
+primitives counting as two), keeps every (drawable, model) of a `rpf9dump models` manifest whose per-geometry triangle
+counts contain that signature as an ordered subsequence, and checks the survivors with
+`tools/bvh_geometry_check.py` from the model's exported OBJ and the 3x4 at `+0x50` of the instance descriptor. The
+geometries of the two shaders the BVH leaves out are filtered with `--skip-shaders`: those name hashes are game data,
+as §4a says, so the rule is off unless the user passes them. A geometry whose shader index the manifest cannot resolve
+keeps its place and the checks decide. Measured on the ten BLAS of the sample pack, against the first 1 GiB window of
+`levels.rpf` cut at 3 GB (exported as a whole slice): 1,228 models, 1 to 374 candidates from the signature per BLAS,
+and exactly one consistent candidate each. A window holds one region's drawables, so a BLAS whose drawable is
+elsewhere in the archive finds no candidate in it at all, and the tool says so instead of reporting a rejection.
+
+`rpf9dump models` and `rpf9dump textures` take `--start`/`--length` to export a window of a file. A window need not be a
+valid archive - a slice of `levels.rpf` cut at an offset has no `9FPR` header - because both modes read every resource
+from its own compression blocks; a sub-range is never written to the index cache, which describes a whole file.
+
+```powershell
+dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
+dotnet tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll models <levels.rpf> <out> --start 3221225472 --length 1073741824
+python -I tools/bvh_match.py <dehydrated.bin> <out>/levels/models/manifest.json --descriptor <instance208.bin> [--skip-shaders H,H]
+python -I tests/test_bvh_match.py
+```
+
+The sample set §4a was measured on can be rebuilt from any copy of the package, and nothing of it enters this
+repository:
+
+1. `tools/bvh_index.py` on `core_bvh4.rpf` lists each `bvh4` stream and its descriptor row; the 3x4 at `+0x50` is
+   the transform the matching needs, and a carved stream is passed to the next tools with `--header-offset 256`
+   (or `0` when the structure was carved from its own header);
+2. export a window of `levels.rpf` that holds that region's drawables (`rpf9dump models`, `--start`/`--length`);
+3. `tools/bvh_match.py` identifies the drawable's geometries against it, and `--write <dir>` stores exactly those
+   geometries as the float3 and uint32 buffers the next step takes, with the transform recorded in `export.json`;
+4. `tools/bvh_rehydrate.py` on the same stream with those buffers and `--transform` gives the runtime layout,
+   byte-identical to what `XboxBvhBuilder.dll` writes on these samples (§4a).
+
+With the two excluded shader hashes the run answers with one consistent candidate per sample; without them every
+candidate is checked and the checks decide. Measured on the window above: 1,228 models in the export, 1 to 374
+candidates from the signature per sample, and a rehydrated structure of `64 * (totalSizeIn64BNodes + 1)` bytes from
+the header. Its root parent-table entry is `0xFFFFFFFF` in all eight identified samples (the entry at
+`offsetToParents` read signed, plus `4 * ((root - offsetToElements) / 64)`), which is what the GPU builder writes
+for a root and what `tools/xdxr_bvh.py validate` requires since #2625.
 
 ## 7a. Building runtime BVHs: `tools/xdxr_bvh.py`
 
@@ -339,11 +486,25 @@ the destination buffer:
 
 1. one thread per triangle (TRI0 leaves, remap `0x09`) or per instance (128-byte records, the world-to-object
    inverse, the BLAS root and identity-rotation flag);
-2. a 30-bit Morton key of each box centre, then a stable radix sort: 8 passes of 4-bit digits, 24 dispatches
-   whatever the count, with no padding to a power of two;
+2. a 30-bit Morton key of each box centre, then a stable sort: up to 1,024 keys in one workgroup's shared memory
+   (one dispatch), more with a radix sort of 8 passes of 4-bit digits over 256-element tiles (24 dispatches
+   whatever the count, no padding to a power of two);
 3. BOX32 nodes, built level by level from four consecutive sorted children, with the parent table and each
    instance's `ParentNode`;
 4. the header.
+
+The radix sort's scan writes the prefix sums of the digit counts to their own scratch array, not over the counts.
+No invocation of the builder stores to a word and then uses a value it loaded from that word earlier. SPIRV-Cross
+`6c09849f`, in MoltenVK 1.4.2, breaks that pattern for a pointer made by `OpBitcast` from a `uvec2`
+(`GL_EXT_buffer_reference_uvec2`): it moves the load to where the value is used, after the store, and the load
+returns the new value. MoltenVK `main` at `5189f8de` pins SPIRV-Cross `aa217aeb`, which has the same bug.
+SPIRV-Cross [`38abe362`](https://github.com/KhronosGroup/SPIRV-Cross/commit/38abe362c57311a77808b7ec4d1d0d9ceb8d9370)
+fixes it. With the old in-place scan, the radix path (more than 1,024 elements) lost and duplicated elements on
+MoltenVK: `xdxr_build_check` found about 130 of 200 rays wrong in `blas_three_sort_tiles` and 210 of 300 in
+`blas_refit_in_place`, which refits a radix-sorted tree. Measured on an Apple M3 Max, the separate arrays pass
+10 runs out of 10 on Homebrew MoltenVK 1.4.2, on MoltenVK `5189f8de` built with SPIRV-Cross `57e4efcc`, on
+KosmicKrisp and on llvmpipe. A pointer from `OpConvertUToPtr`, which the translator uses, kept its load before the
+store in the same test.
 
 The tree's shape depends only on the element count. `XdxrLayout` therefore computes the result and scratch sizes
 exactly when the build is recorded, and the same numbers can answer `GetRaytracingAccelerationStructurePrebuildInfo`.
@@ -360,8 +521,24 @@ them the same way.
 scene. `xdxr_bvh.py check-build <dir>` validates them and traces rays against brute force. `ctest` runs both as
 `xdxr_build` and `xdxr_build_check`.
 
-Not done yet: pairing triangles into TRI1 leaves, BOX16 nodes, updates, compaction and copies. A higher-quality
-build (SAH) would also come later.
+**Updates** (D3D12 `PERFORM_UPDATE`) refit: the source structure is copied to the destination unless it is the
+destination, the elements are rewritten at their slots, and each node's boxes are recomputed bottom-up from the
+children it already points to. The tree is kept, so a refit is valid for any motion and skips the Morton pass and
+the sort. It takes 0.07 ms for 1,000 triangles and 9.8 ms for 1,000,000 on an RTX 2050, against 0.19 ms and 22 ms for
+a build, but the tree traverses more slowly as the geometry moves away from where it was built.
+
+**Copies and postbuild info.** `CopyRaytracingAccelerationStructure` with `CLONE` or `COMPACT` copies the
+structure's bytes. The records are position-independent: node pointers count from the structure's start, and a TLAS
+names its BLASes by address, which a clone keeps. The size comes from the source header (`totalSizeIn64BNodes`), so
+a copy can follow a build in the same command list, and it is bounded by the destination resource. A build is
+already exactly its layout's size, so `COMPACTED_SIZE` and `CURRENT_SIZE` (from
+`EmitRaytracingAccelerationStructurePostbuildInfo` or the postbuild descs of a build) are both
+`64 * (totalSizeIn64BNodes + 1)`, and compaction saves nothing. Serialization, deserialization and the tools-visualization
+mode are refused at replay as unsupported, not faked. In `LEONIDA_RT_AS=khr` mode the postbuild descs stay ignored,
+as before.
+
+Not done yet: pairing triangles into TRI1 leaves, BOX16 nodes, serialization. A higher-quality build (SAH) would also
+come later.
 
 ```powershell
 python -I tools/xdxr_bvh.py selftest --seed 1 --rays 400   # build BLASes, compare closest hits with brute force

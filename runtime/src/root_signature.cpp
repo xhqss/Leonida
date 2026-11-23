@@ -13,6 +13,10 @@ PackResult pack(const RootSignature& sig) {
     }
     uint64_t cost = 0;  // 64-bit: a parameter of 0xFFFFFFFF constants must not wrap past the limits
     for (const RootParameter& p : sig.params) {
+        if (p.type != ParamType::Constants && p.type != ParamType::Descriptor && p.type != ParamType::Table) {
+            out.error = "unknown root parameter type";
+            return out;
+        }
         if (p.type == ParamType::Constants && p.num_values == 0) {
             out.error = "root constant parameter needs at least 1 dword";
             return out;

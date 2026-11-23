@@ -78,6 +78,8 @@ class TranslateFallbacksTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as spirv:
             self.shards_in(spirv, fallbacks=ALL_FLAGS)           # writes the plan
             for i in range(2):                                   # as if the shards had finished
+                with open(os.path.join(spirv, f"shard{i}.json"), "w", encoding="utf-8") as f:
+                    json.dump({"index": i, "count": 2}, f)
                 with open(os.path.join(spirv, f"index.part{i}.json"), "w", encoding="utf-8") as f:
                     json.dump({"old": True}, f)
             again = self.shards_in(spirv, fallbacks=ALL_FLAGS)
@@ -86,6 +88,24 @@ class TranslateFallbacksTest(unittest.TestCase):
     def test_changing_fallbacks_discards_finished_shards(self):
         again = self.shards(fallbacks=("--mesh-compute", "--bary-fallback"), pre_parts=2)
         self.assertEqual(len(again), 2, again)       # the parts were translated with other flags
+
+
+class FailedShardTest(unittest.TestCase):
+    def test_a_failed_shard_removes_the_previous_index(self):
+        with tempfile.TemporaryDirectory() as spirv:
+            index = os.path.join(spirv, "index.json")
+            with open(index, "w", encoding="utf-8") as f:
+                json.dump({"old": True}, f)
+
+            class FailingProc:
+                def wait(self):
+                    return 1
+
+            with mock.patch.object(make_game.subprocess, "Popen", lambda *a, **k: FailingProc()),                     mock.patch.object(make_game, "py"),                     mock.patch.object(make_game, "log", lambda *a: None),                     self.assertRaises(SystemExit) as cm:
+                make_game.translate("disasm", spirv, 2)
+            self.assertEqual(cm.exception.code, 1)
+            self.assertFalse(os.path.exists(index))
+            self.assertTrue(os.path.exists(os.path.join(spirv, make_game.SHARD_PLAN)))
 
 
 class RecordedFlagsTest(unittest.TestCase):
@@ -101,7 +121,13 @@ class RecordedFlagsTest(unittest.TestCase):
     def touch(self, *parts):
         p = os.path.join(*parts)
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        open(p, "w").close()
+        with open(p, "w", encoding="utf-8") as f:
+            if p == os.path.join(self.dxbc, "index.json"):
+                json.dump([{"file": "shader.dxbc"}], f)
+            elif p == os.path.join(self.dxbc, "fssm_index.json"):
+                json.dump([{"name": "shader"}], f)
+            elif p.endswith(".s"):
+                f.write("synthetic listing\n")
 
     def run_stage(self, fallbacks=()):
         ran = []
@@ -112,7 +138,7 @@ class RecordedFlagsTest(unittest.TestCase):
             elif tool == "fssm_unpack.py":
                 self.touch(self.dxbc, "fssm_index.json")
             elif tool == "shader_disasm.py":
-                os.makedirs(os.path.join(self.dxbc, "disasm"), exist_ok=True)
+                self.touch(self.dxbc, "disasm", "shader.s")
 
         def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
             ran.append("translate")
@@ -148,16 +174,21 @@ class RecordedFlagsTest(unittest.TestCase):
 
 
 class MainWiringTest(unittest.TestCase):
-    """main() parses the four flags and hands the same tuple to preflight() and shaders()."""
+    """main() parses the fallback flags and hands the same tuple to preflight() and shaders()."""
 
-    def run_main(self, *extra_argv, per_vertex=None):
-        argv = ["make_game.py", "--stages", "shaders", *extra_argv]
+    def run_main(self, *extra_argv, per_vertex=None, max_push_constants=None):
+        # An empty --out: main() reads the flags an existing translation was made with, and the default folder
+        # is the user's own.
+        out = tempfile.TemporaryDirectory()
+        self.addCleanup(out.cleanup)
+        argv = ["make_game.py", "--stages", "shaders", "--out", out.name, *extra_argv]
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch("make_game.below_normal"), \
                 mock.patch("make_game.choose_game", return_value=os.path.abspath("C:/dummy_game")), \
                 mock.patch("make_game.check", return_value={"expected_exe": "game.exe"}), \
-                mock.patch("make_game.wave64_emulate", return_value=False), \
+                mock.patch("make_game.wave64_settings", return_value=(False, True)), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
+                mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
                 mock.patch("make_game.log"):
@@ -180,6 +211,115 @@ class MainWiringTest(unittest.TestCase):
         self.assertEqual(self.run_main(per_vertex=False), (("--f16-interp-fallback",),) * 2)
         self.assertEqual(self.run_main(per_vertex=True), ((), ()))
         self.assertEqual(self.run_main("--f16-interp-fallback", per_vertex=True), (("--f16-interp-fallback",),) * 2)
+
+    def test_pc_tail_ubo_follows_the_device(self):
+        """On by itself where maxPushConstantsSize is below what the shaders need (144, or 152 with
+        --mesh-compute), not where it fits or can't be read; asked for explicitly, it is on everywhere."""
+        self.assertEqual(self.run_main(max_push_constants=128), (("--pc-tail-ubo",),) * 2)
+        self.assertEqual(self.run_main(max_push_constants=144), ((), ()))
+        self.assertEqual(self.run_main("--mesh-compute", max_push_constants=144),
+                         (("--mesh-compute", "--pc-tail-ubo"),) * 2)
+        self.assertEqual(self.run_main("--mesh-compute", max_push_constants=152), (("--mesh-compute",),) * 2)
+        self.assertEqual(self.run_main(max_push_constants=256), ((), ()))
+        self.assertEqual(self.run_main(max_push_constants=None), ((), ()))
+        self.assertEqual(self.run_main("--pc-tail-ubo", max_push_constants=256), (("--pc-tail-ubo",),) * 2)
+
+    def test_runtime_gpu_max_push_constants_parses_probe(self):
+        for raw, want in (({"max_push_constants_size": 128}, 128),
+                          ({"max_push_constants_size": 256}, 256),
+                          ({}, None),
+                          ({"max_push_constants_size": 0}, None),
+                          ({"max_push_constants_size": -1}, None),
+                          ({"max_push_constants_size": True}, None),
+                          ({"max_push_constants_size": "128"}, None)):
+            with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
+                self.assertEqual(make_game.runtime_gpu_max_push_constants(), want)
+
+
+class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
+    """A GPU probe that can't tell must not change the flags a finished translation was made with: one failed or
+    timed-out probe used to translate the whole corpus without the automatic flags, and the next run that could
+    ask translated it a third time. This runs the real main() and shaders() on one work folder."""
+
+    AUTOMATIC = ("--f16-interp-fallback", "--pc-tail-ubo")
+
+    def build(self, *extra_argv, per_vertex, max_push_constants):
+        """One `make_game.py --stages shaders` run: (the fallbacks of each translation it started, its log)."""
+        translations, lines = [], []
+
+        def fake_py(tool, *args):
+            if tool == "shader_carve.py":
+                self.touch(self.dxbc, "index.json")
+            elif tool == "fssm_unpack.py":
+                self.touch(self.dxbc, "fssm_index.json")
+            elif tool == "shader_disasm.py":
+                self.touch(self.dxbc, "disasm", "shader.s")
+
+        def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
+            translations.append(tuple(fallbacks))
+            self.touch(spirv, "index.json")
+
+        argv = ["make_game.py", "--stages", "shaders", "--out", os.path.join(self.work, "out"),
+                "--work", self.work, *extra_argv]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch("make_game.below_normal"), \
+                mock.patch("make_game.choose_game", return_value=os.path.join(self.work, "game")), \
+                mock.patch("make_game.check", return_value={"expected_exe": "game.exe"}), \
+                mock.patch("make_game.wave64_settings", return_value=(False, True)), \
+                mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
+                mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
+                mock.patch("make_game.preflight"), \
+                mock.patch.object(make_game, "py", fake_py), \
+                mock.patch.object(make_game, "need", lambda *a: None), \
+                mock.patch.object(make_game, "translate", fake_translate), \
+                mock.patch.object(make_game, "llvm_mc_signature", return_value="test llvm-mc 21"), \
+                mock.patch.object(make_game, "log", lambda *a: lines.append(" ".join(map(str, a)))):
+            self.assertEqual(make_game.main(), 0)
+        return translations, "\n".join(lines)
+
+    def recorded(self):
+        with open(os.path.join(self.spirv, "translator_flags.txt"), encoding="utf-8") as f:
+            return f.read().strip()
+
+    def test_a_probe_that_cannot_tell_keeps_both_automatic_flags(self):
+        self.assertEqual(self.build(per_vertex=False, max_push_constants=128)[0], [self.AUTOMATIC])
+        translations, log = self.build(per_vertex=None, max_push_constants=None)
+        self.assertEqual(translations, [])
+        self.assertEqual(self.recorded(), " ".join(self.AUTOMATIC))
+        for flag in self.AUTOMATIC:                # it says what it did, once per flag
+            self.assertIn(f"whether it needs {flag}; the shaders were translated with it and it stays on", log)
+        self.assertNotIn("translating again", log)
+        # The probe answers again: the same flags, so nothing is translated a third time.
+        self.assertEqual(self.build(per_vertex=False, max_push_constants=128)[0], [])
+
+    def test_each_probe_is_kept_on_its_own(self):
+        self.build(per_vertex=False, max_push_constants=128)
+        self.assertEqual(self.build(per_vertex=None, max_push_constants=128)[0], [])
+        self.assertEqual(self.build(per_vertex=False, max_push_constants=None)[0], [])
+        self.assertEqual(self.recorded(), " ".join(self.AUTOMATIC))
+
+    def test_a_probe_that_answers_still_decides(self):
+        # Another GPU, or a driver that now takes PerVertexKHR inputs and 144 bytes: translating again is right.
+        self.build(per_vertex=False, max_push_constants=128)
+        translations, log = self.build(per_vertex=True, max_push_constants=256)
+        self.assertEqual(translations, [()])
+        self.assertIn("the fallback flags are now none", log)
+        self.assertEqual(self.recorded(), "")
+
+    def test_a_failed_probe_adds_no_flag_to_a_folder_translated_without_it(self):
+        self.assertEqual(self.build(per_vertex=True, max_push_constants=256)[0], [()])
+        translations, log = self.build(per_vertex=None, max_push_constants=None)
+        self.assertEqual(translations, [])
+        self.assertNotIn("stays on", log)
+        # A first build with no probe answer and no folder: no automatic flag, as before.
+        self.assertEqual(make_game.recorded_fallback_flags(os.path.join(self.work, "elsewhere")), ())
+
+    def test_the_other_flags_are_not_kept_by_a_failed_probe(self):
+        # Only the two flags the probe decides are kept; one the user stops passing is dropped as before.
+        self.build("--no-float-controls", per_vertex=False, max_push_constants=256)
+        self.assertEqual(self.recorded(), "--no-float-controls --f16-interp-fallback")
+        translations, _ = self.build(per_vertex=None, max_push_constants=None)
+        self.assertEqual(translations, [("--f16-interp-fallback",)])
 
 
 if __name__ == "__main__":

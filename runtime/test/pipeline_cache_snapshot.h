@@ -17,8 +17,13 @@ std::vector<char> pipeline_cache_snapshot(GetData get) {
         if (size < sizeof(VkPipelineCacheHeaderVersionOne))
             throw std::runtime_error("cache size is smaller than its header");
 
+        // Workers keep adding pipelines between the size query and the read, so read into a buffer with room to
+        // spare: 1/16 of the queried size on the first attempt, doubling on each retry (1/8, 1/4, 1/2). A buffer
+        // larger than the data is fine; the driver writes the whole cache and reports the bytes it wrote.
+        const size_t capacity = size + (size >> (4 - attempt));
         // Destroy each incomplete snapshot before allocating its replacement.
-        std::vector<char> data(size);
+        std::vector<char> data(capacity);
+        size = capacity;
         result = get(&size, data.data());
         if (result == VK_INCOMPLETE) continue;
         if (result != VK_SUCCESS)

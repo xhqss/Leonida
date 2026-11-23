@@ -179,7 +179,7 @@ def verdict(results):
 def _translate(work, name, text, fssm=None):
     os.makedirs(os.path.join(work, "disasm"), exist_ok=True)
     src = os.path.join(work, "disasm", name + ".s")
-    with open(src, "w", encoding="utf-8") as f:
+    with open(src, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
     with open(os.path.join(work, name + ".dxbc"), "wb") as f:
         f.write(STUB_DXBC)
@@ -264,7 +264,7 @@ def run_vulkan(build, cases=CASES):
     with tempfile.TemporaryDirectory(prefix="fma_mix_probe_") as work:
         text = translate_cs(work, cases)
         sa, sv = os.path.join(work, "cs.spvasm"), os.path.join(work, "cs.spv")
-        with open(sa, "w", encoding="utf-8") as f:
+        with open(sa, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         try:
             r = subprocess.run(["spirv-as", sa, "-o", sv, "--target-env", "vulkan1.2"], capture_output=True, text=True)

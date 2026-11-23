@@ -467,6 +467,21 @@ section, truncated data, trailing bytes and the JSON CLI, and the `LSCH`/`LENM` 
 a count that fits nothing and both schema checks. It uses synthetic headers and joaat hashes of invented names
 only.
 
+### Viewing a container in ImHex
+
+[tools/imhex/psin.hexpat](../tools/imhex/psin.hexpat) is a pattern for the [ImHex](https://imhex.werwolv.net/) hex
+editor that lays out one container as this page describes it:
+- the header, the instance-data block table with its `pppppppp` end, and the blocks, as raw bytes;
+- the section chain;
+- the `LSCH` struct headers and members, and the `LENM` enums and values, with the header count found by the same
+  fill-exact rule as `psin_index.py`;
+- the `LSNS` block table and its opaque 16-byte records;
+- the `LRSC` `0DRP` version and root block, and the `CHKS` file size.
+
+A section that runs past the end of a truncated stream is shown as raw bytes. `tests/test_imhex_patterns.py` builds a
+synthetic container, checks it with `psin_index.py` and `psin_data.block_table`, and when ImHex is installed compares
+the pattern's output with both.
+
 ## Limits
 
 - The 64 KiB split is not joined automatically. A caller that has the archive order can join adjacent

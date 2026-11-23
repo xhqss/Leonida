@@ -29,9 +29,20 @@ measured natively on AMD GPUs (SHADER-116). The translator reads this field and 
   ([finding](https://github.com/ItsNotRexed/Leonida/issues/374#issuecomment-7072793165)). The RDNA2 result here
   agrees with it, plus the `soffset` rule.
 
-**Open:** the console target is gfx1013 (GFX10.1); gfx1036 is GFX10.3. Mesa uses one GFX10 column for both, and
-this measurement shows that column is wrong for GFX10.3. Whether GFX10.1 matches GFX10.3 here needs an RDNA1 card
-(gfx1010–1012, RX 5000 series).
+**RDNA1 measurement (SHADER-341):** the console target is gfx1013 (GFX10.1); gfx1036 is GFX10.3, and the
+RDNA2 measurement above shows Mesa's GFX10 column is wrong for GFX10.3. A second native measurement through
+`tools/hw_oracle` (Linux libdrm launcher, AMD clang 18) on an **AMD Radeon Pro V540, Navi 12 / gfx1011, RDNA1**
+(`1002:7360`, bare metal, RADV Mesa 25.2.8, Ubuntu 24.04) found the same: `tools/buffer_bounds_probe.py` ran 12
+one-lane cases for a 4-byte `buffer_load_dword` at wave32 and wave64 (24 groups, 0 wave32/64 differences, 0
+launcher errors). Every case followed the RDNA2 / Mesa GFX11 column and **8 of 24 disagreed with Mesa's GFX10
+column**. The witnesses include mode 0 stride 16 at offset 13 (out of range on hardware, in range by the GFX10
+column), mode 3 `NUM_RECORDS` 18 at offset 16 (out of range), mode 3 `NUM_RECORDS` 3 at offset 0 (out of range),
+and mode 3 offset 8 with `soffset` 8 and `NUM_RECORDS` 18 (out of range, confirming that `soffset` is part of the
+RAW check). Swizzled V#s and unaligned addresses were not covered. This makes GFX10.1 follow GFX10.3 here in the
+cases tried, but gfx1013 itself is still unmeasured: the card used was gfx1011 (Navi 12), not the console part.
+
+**Open:** measure the same table on gfx1013 (PS5) itself when a card with that ID is available, and extend the
+probe to swizzled V#s and unaligned accesses.
 
 ## How it was measured
 

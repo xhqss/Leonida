@@ -255,6 +255,46 @@ class TestSchema(unittest.TestCase):
         self.assertIn("LSCH", got["schema_error"])
         self.assertEqual(got["enums"], 0)
 
+    def test_lenm_error_before_valid_lsch_is_preserved(self):
+        got = P.parse(make_psin([("LENM", b"\x01\x02\x03"), ("LSCH", make_lsch(SCHEMA))]), schema=True)
+        self.assertTrue(got["complete"])
+        self.assertEqual(got["structs"], 2)
+        self.assertIsNone(got["enums"])
+        self.assertIn("LENM: no enum count", got["schema_error"])
+        self.assertEqual(P.summarize([got])["schema_errors"], 1)
+        self.assertTrue(got["schema"]["lsch"])
+        self.assertFalse(got["schema"]["lenm"])
+        self.assertIn("LENM: no enum count", got["schema"]["reason"])
+
+    def test_both_lsch_and_lenm_errors_are_preserved(self):
+        for sections in (
+            [("LSCH", b"\x01\x02\x03"), ("LENM", b"\x01\x02\x03")],
+            [("LENM", b"\x01\x02\x03"), ("LSCH", b"\x01\x02\x03")],
+        ):
+            with self.subTest(order=[t for t, _ in sections]):
+                got = P.parse(make_psin(sections), schema=True)
+                self.assertIn("LSCH: no struct count", got["schema_error"])
+                self.assertIn("LENM: no enum count", got["schema_error"])
+                self.assertIn("LSCH: no struct count", got["schema"]["reason"])
+                self.assertIn("LENM: no enum count", got["schema"]["reason"])
+
+    def test_lsch_check_schema_error_does_not_mask_lenm_decode_error(self):
+        bad_lsch = make_lsch([(joaat("Bad"), 0, 0x8, 2, [(joaat("x"), 8, 0x21, 0, 0, 0)])])
+        got = P.parse(make_psin([("LSCH", bad_lsch), ("LENM", b"\x01\x02\x03")]), schema=True)
+        self.assertIn("past size", got["schema_error"])
+        self.assertIn("LENM: no enum count", got["schema_error"])
+        self.assertTrue(got["schema"]["lsch"])
+        self.assertFalse(got["schema"]["lenm"])
+        self.assertEqual(got["schema"]["reason"], "LENM: no enum count fills 3 bytes")
+
+    def test_first_lsch_or_lenm_error_is_not_overwritten_by_duplicate_section(self):
+        got = P.parse(make_psin([("LSCH", b"\x01\x02\x03"), ("LSCH", make_lsch(SCHEMA)), ("LENM", b"")]), schema=True)
+        self.assertIsNone(got["structs"])
+        self.assertIn("LSCH: no struct count", got["schema_error"])
+        self.assertFalse(got["schema"]["lsch"])
+        self.assertIn("LSCH: no struct count", got["schema"]["reason"])
+
+
 
 class TestCli(unittest.TestCase):
     def test_schema_on_truncated_psin(self):

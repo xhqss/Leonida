@@ -68,24 +68,11 @@ MUTATIONS = [
      'self.emit(f"{arg} = OpFMul %float {t} {self.fconst(1.0)}")',
      "test_ps_ops4"),
     ("v_mul_legacy_f32 drops zero-times-anything guard", TRANSLATOR,
-     '        elif op == "v_mul_legacy_f32":\n'
-     '            # Legacy multiply treats 0 * anything (inf/NaN included) as 0.\n'
-     '            x, y = self.src_f(a[1]), self.src_f(a[2])\n'
-     '            m, zx, zy, either, r = (self.tmp() for _ in range(5))\n'
-     '            self.emit(f"{m} = OpFMul %float {x} {y}")\n'
-     '            self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")\n'
-     '            self.emit(f"{zy} = OpFOrdEqual %bool {y} %f0")\n'
+     # since SHADER-340 v_mul_legacy_f32 flushes its inputs and product; the guard is the OpSelect on either zero
      '            self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")\n'
-     '            self.emit(f"{r} = OpSelect %float {either} %f0 {m}")',
-     '        elif op == "v_mul_legacy_f32":\n'
-     '            # Legacy multiply treats 0 * anything (inf/NaN included) as 0.\n'
-     '            x, y = self.src_f(a[1]), self.src_f(a[2])\n'
-     '            m, zx, zy, either, r = (self.tmp() for _ in range(5))\n'
-     '            self.emit(f"{m} = OpFMul %float {x} {y}")\n'
-     '            self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")\n'
-     '            self.emit(f"{zy} = OpFOrdEqual %bool {y} %f0")\n'
+     '            self.emit(f"{r} = OpSelect %float {either} %f0 {self.flush_f32(m)}")',
      '            self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")\n'
-     '            self.emit(f"{r} = OpCopyObject %float {m}")',
+     '            self.emit(f"{r} = OpCopyObject %float {self.flush_f32(m)}")',
      "test_ps_legacy_mul"),
 ]
 
@@ -104,6 +91,24 @@ def failed_tests(output):
     return set(re.findall(r"^(?:FAIL|ERROR): (test_\w+)", output, re.M))
 
 
+def apply_mutation(path, old, new):
+    """Replace old with new in path exactly once, keeping the file's line endings.
+
+    A checkout made before .gitattributes pinned `eol=lf` (or a branch applied through a CRLF-translating
+    editor) stores tools/ with CRLF line endings, while every anchor here is written with LF. Matching the
+    anchors against the raw bytes reports the multiline anchors as missing, so normalize both sides to LF
+    and restore the file's original line-ending style on the way out.
+    """
+    with open(path, encoding="utf-8", newline="") as f:
+        raw = f.read()
+    sep = "\r\n" if "\r\n" in raw else "\n"
+    text = raw.replace("\r\n", "\n")
+    if text.count(old) != 1:
+        raise AssertionError(f"mutation anchor must occur exactly once: {old!r}")
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text.replace(old, new).replace("\n", sep))
+
+
 class MutationTests(unittest.TestCase):
     def make_copy(self, tmp):
         dst = os.path.join(tmp, "tools")
@@ -120,14 +125,34 @@ class MutationTests(unittest.TestCase):
             with self.subTest(mutation=label), tempfile.TemporaryDirectory() as tmp:
                 tools = self.make_copy(tmp)
                 path = os.path.join(tools, fname)
-                with open(path, encoding="utf-8", newline="") as f:
-                    text = f.read()
-                self.assertEqual(text.count(old), 1, f"mutation anchor must occur exactly once: {old!r}")
-                with open(path, "w", encoding="utf-8", newline="") as f:
-                    f.write(text.replace(old, new))
+                apply_mutation(path, old, new)
                 rc, out = run_semantics(tools)
                 self.assertNotEqual(rc, 0, f"mutation not detected: {label}\n{out}")
                 self.assertIn(expect, failed_tests(out), f"{label}: expected {expect} to fail\n{out}")
+
+    def test_anchors_match_crlf_translator_copies(self):
+        # Regression: on a CRLF checkout of tools/ the four multiline anchors (v_bfe_i32, v_subrev_co_ci_u32,
+        # v_cmpx_eq_u64, v_mul_legacy_f32) do not occur in the raw bytes and test_each_mutation_is_caught
+        # stops before any mutation runs. apply_mutation must find every anchor in a CRLF copy, mutate it
+        # once, keep the file on CRLF and leave it valid Python.
+        with open(os.path.join(ROOT, "tools", TRANSLATOR), encoding="utf-8", newline="") as f:
+            text = f.read().replace("\r\n", "\n")
+        crlf_text = text.replace("\n", "\r\n")
+        for label, fname, old, new, expect in MUTATIONS:
+            if fname != TRANSLATOR:
+                continue
+            with self.subTest(mutation=label), tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, TRANSLATOR)
+                with open(path, "w", encoding="utf-8", newline="") as f:
+                    f.write(crlf_text)
+                apply_mutation(path, old, new)
+                with open(path, encoding="utf-8", newline="") as f:
+                    mutated = f.read()
+                # the copy stays on CRLF: no bare LF survives, and the injected mutation text followed suit
+                self.assertNotIn("\n", mutated.replace("\r\n", ""))
+                self.assertIn(new.replace("\n", "\r\n"), mutated)
+                self.assertNotIn(old.replace("\n", "\r\n"), mutated)
+                compile(mutated, path, "exec")
 
 
 if __name__ == "__main__":

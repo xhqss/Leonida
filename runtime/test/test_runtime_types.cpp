@@ -525,18 +525,27 @@ void test_xmem_working_set_statistics_abi_layout() {
     check(ok != FALSE && pmc.WorkingSetSize > 0,
           "GetProcessMemoryInfo succeeds and returns non-zero WorkingSetSize");
 
-    // Verify FidelityFX / XMem layout contract:
-    // stats[0..7] = 0 (unknown/reserved), stats[8..15] = WorkingSetSize (uint64_t)
+    // Verify FidelityFX / XMem layout contract (RT-220):
+    // The measured FSR sites establish argument shape, kind and the +8 working-set read; +0's title-total memory
+    // limit is inferred from other Series implementations (xcl, xbox-emulator).
+    // stats[0..7] = TotalMemoryLimit (uint64_t), stats[8..15] = WorkingSetSize (uint64_t)
     alignas(64) uint8_t stats[64];
     std::memset(stats, 0xA5, sizeof(stats));
 
     std::memset(stats, 0, 16);
+    MEMORYSTATUSEX ms{sizeof(ms)};
+    uint64_t total_memory = 12ULL * 1024 * 1024 * 1024;
+    if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys != 0) {
+        total_memory = ms.ullTotalPhys;
+    }
+    std::memcpy(stats + 0, &total_memory, sizeof(total_memory));
     const uint64_t working_set = static_cast<uint64_t>(pmc.WorkingSetSize);
     std::memcpy(stats + 8, &working_set, sizeof(working_set));
 
     uint64_t prefix0 = 0;
     std::memcpy(&prefix0, stats, sizeof(prefix0));
-    check(prefix0 == 0, "Working set statistics prefix at +0 is 0");
+    check(prefix0 == total_memory && prefix0 >= working_set,
+          "Working set statistics total memory at +0 holds title memory limit >= working set");
 
     uint64_t extracted_ws = 0;
     std::memcpy(&extracted_ws, stats + 8, sizeof(extracted_ws));

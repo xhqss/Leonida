@@ -267,12 +267,14 @@ int main() {
             EXPECT(copy_list.close());
             const CommandList* ptr = &copy_list;
 
+            // The Signal comes first: a Wait with no submitted Signal holds the batch on the CPU (queue_holds.h) and
+            // never reaches vkQueueSubmit, so it could not fail there.
+            EXPECT(fence.signal(1));
             queue_a.wait(fence.semaphore(), 1);
             driver::fail_next_submit.store(VK_ERROR_OUT_OF_HOST_MEMORY);
             EXPECT(queue_a.execute({&ptr, 1}) == ReplayResult::unsupported);
 
             // Retry: the pending wait on (fence, 1) must still be attached to the next vkQueueSubmit.
-            EXPECT(fence.signal(1));
             driver::captured_wait_count.store(0);
             driver::captured_wait_sem.store(0);
             driver::captured_wait_val.store(0);

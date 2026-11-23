@@ -56,4 +56,13 @@ inline std::vector<std::uint32_t> memory_type_order(const VkPhysicalDeviceMemory
     return order;
 }
 
+// D3D-299: true when an allocation that preferred DEVICE_LOCAL without needing host access (a texture, a default-heap
+// buffer outside the arena) got a type without it, so the GPU now reads it from system memory. A host-visible
+// allocation (the arena, an upload heap) in system memory is the memory type policy without Resizable BAR, not this.
+inline bool spilled_to_host(VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred,
+                            VkMemoryPropertyFlags chosen) {
+    return (preferred & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && !(required & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+           !(chosen & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+}
+
 }  // namespace leonida

@@ -26,6 +26,9 @@ from __future__ import annotations
 import argparse
 import array
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import functools
+import hashlib
 import json
 import math
 import os
@@ -34,6 +37,16 @@ import shutil
 import statistics
 import sys
 import tempfile
+
+try:
+    import fcntl
+except ImportError:                       # Windows
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:                       # POSIX
+    msvcrt = None
+import tempfile
 import threading
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -41,6 +54,7 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
 from file_mode import published_mode  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
 
 try:
     import dds_png
@@ -286,8 +300,9 @@ def lod_bands(child_lod: dict, lod_dist: dict, present) -> tuple[dict, dict]:
     """Camera distance band [start, end) per tier, from the selected entities' medians.
 
     A parent's childLodDist is the distance inside which its children are drawn instead of it, so a tier starts
-    at its own median childLodDist (HD at 0) and ends where the next coarser tier present starts; the coarsest
-    tier ends at its median lodDist. ORPHAN_HD has no parent and is drawn from 0 to its median lodDist. Returns
+    at its own median childLodDist (the finest starts at 0) and ends where the next coarser tier starts.
+    A missing childLodDist uses the previous finer tier's median lodDist. The coarsest tier ends at its
+    median lodDist. ORPHAN_HD has no parent and is drawn from 0 to its median lodDist. Returns
     (bands by tier name, the measured medians by tier name)."""
     measured = {}
     for lvl in present:
@@ -297,8 +312,14 @@ def lod_bands(child_lod: dict, lod_dist: dict, present) -> tuple[dict, dict]:
     chain = [lvl for lvl in LOD_CHAIN if lvl in present]
     starts = []
     for i, lvl in enumerate(chain):
-        start = 0.0 if i == 0 else (measured[LOD_TIER_NAMES[lvl]]["child_lod_dist_median"] or 0.0)
-        starts.append(max(start, starts[-1] if starts else 0.0))
+        if i == 0:
+            starts.append(0.0)
+            continue
+        start = measured[LOD_TIER_NAMES[lvl]]["child_lod_dist_median"]
+        if start is None:
+            previous_tier = LOD_TIER_NAMES[chain[i - 1]]
+            start = measured[previous_tier]["lod_dist_median"]
+        starts.append(max(start or 0.0, starts[-1]))
     for i, lvl in enumerate(chain):
         if i + 1 < len(chain):
             end = starts[i + 1]
@@ -439,13 +460,13 @@ def _pack_model_job(job: tuple) -> tuple[int, dict | None]:
     }
 
 
-_PNG_CACHE: dict[str, bytes | None] = {}
+_PNG_CACHE: dict[tuple[str, str, int], bytes | None] = {}
 _PNG_CACHE_BUDGET = 256 * 1024 * 1024
 
 
-def _png_for(dds_path: str, max_tex_size: int) -> bytes | None:
-    """Decode a DDS to PNG once per worker, keeping at most about 256 MB of PNGs (oldest dropped first)."""
-    key = os.path.normcase(os.path.abspath(dds_path))
+def _png_for(staging_dir: str, dds_path: str, max_tex_size: int) -> bytes | None:
+    """Decode once per worker per build, keeping at most about 256 MB of PNGs (oldest dropped first)."""
+    key = (staging_dir, os.path.normcase(os.path.abspath(dds_path)), max_tex_size)
     if key in _PNG_CACHE:
         return _PNG_CACHE[key]
     dds_mod = _get_dds_png()
@@ -483,7 +504,7 @@ def _build_chunk_job(job: tuple) -> tuple[dict, int, int, int]:
         keys = sorted({p["material"] for m in meshes for p in m["primitives"] if p["material"]})
         for key in keys:
             dds = mat_to_dds.get(key)
-            png = _png_for(dds, max_tex_size) if dds else None
+            png = _png_for(staging_dir, dds, max_tex_size) if dds else None
             if png is None:
                 skipped += 1
                 continue
@@ -514,6 +535,7 @@ def _run_jobs(fn, jobs, workers: int):
         return
     import collections
     from concurrent.futures import ProcessPoolExecutor
+    workers = process_workers(workers)
     window = 4 * workers
     with ProcessPoolExecutor(max_workers=workers) as pool:
         pending = collections.deque()
@@ -1184,7 +1206,7 @@ def _write_json_atomic(path: str, data: dict, replace=None) -> None:
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=parent, prefix=".world-", suffix=".tmp", delete=False,
+            mode="w", encoding="utf-8", newline="\n", dir=parent, prefix=".world-", suffix=".tmp", delete=False,
         ) as f:
             tmp_path = f.name
             json.dump(data, f, indent=2, allow_nan=False)
@@ -1204,8 +1226,11 @@ def _write_json_atomic(path: str, data: dict, replace=None) -> None:
         raise
 
 
-# Cell coordinates are written as decimal integers, without leading zeros.
-_CHUNK_FILE_RE = re.compile(r"c_(?:0|-?[1-9][0-9]*)_(?:0|-?[1-9][0-9]*)\.glb(?:\.tmp)?")
+# Cell coordinates are written as decimal integers, without leading zeros; --lod-sets prefixes the tier name.
+_LOD_TIER_PATTERN = "|".join(re.escape(name) for name in LOD_TIER_NAMES.values())
+_CHUNK_FILE_RE = re.compile(
+    rf"c_(?:(?:{_LOD_TIER_PATTERN})_)?(?:0|-?[1-9][0-9]*)_(?:0|-?[1-9][0-9]*)\.glb(?:\.tmp)?"
+)
 
 
 def _prune_stale_chunks(chunks_dir: str, keep_filenames: set[str]) -> None:
@@ -1232,6 +1257,63 @@ def _prune_stale_chunks(chunks_dir: str, keep_filenames: set[str]) -> None:
 # world.json is committed.
 CHUNK_STAGING_PREFIX = ".chunks-staging-"
 _STAGING_BACKUP = "previous"
+_WORLD_BUILD_LOCK = "leonida-world-build-"
+
+
+@contextmanager
+def _exclusive_output(out_dir: str):
+    """Hold one exclusive build lock for ``out_dir``.
+
+    Staging cleanup, publication and stale-chunk pruning all work on the shared output
+    directory, so two builds must not run there at once.  A killed process releases the
+    OS file lock automatically.
+    """
+    # Keep the lock outside the output: a failed build must still leave no output directory,
+    # and a successful one must contain only chunks/ and world.json.
+    key = hashlib.sha256(
+        os.path.normcase(os.path.abspath(out_dir)).encode("utf-8", "surrogatepass")
+    ).hexdigest()[:20]
+    lock_path = os.path.join(tempfile.gettempdir(), _WORLD_BUILD_LOCK + key)
+    with open(lock_path, "a+b") as fh:
+        fd = fh.fileno()
+        locked = False
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            elif msvcrt is not None:
+                if os.fstat(fd).st_size == 0:
+                    fh.write(b"\0")
+                    fh.flush()
+                fh.seek(0)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                locked = True
+            else:
+                raise RuntimeError("no file-lock implementation available")
+        except OSError as exc:
+            raise RuntimeError(f"another world_build is using {out_dir}") from exc
+        try:
+            yield
+        finally:
+            if locked:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                else:
+                    fh.seek(0)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
+def _with_output_lock(fn):
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        out_dir = kwargs.get("out_dir")
+        if out_dir is None and len(args) > 1:
+            out_dir = args[1]
+        if out_dir is None:
+            raise TypeError("build_world requires an out_dir")
+        with _exclusive_output(os.path.abspath(out_dir)):
+            return fn(*args, **kwargs)
+    return wrapped
 
 
 def _holds_unrestored_chunks(staging_dir: str) -> bool:
@@ -1326,6 +1408,7 @@ def _publish_world(
         raise
 
 
+@_with_output_lock
 def build_world(
     assets_dir: str,
     out_dir: str,
@@ -1361,6 +1444,8 @@ def build_world(
     those renames can see old and new chunks mixed, and a hard kill there leaves them mixed
     under the old world.json. A staging directory whose previous/ still holds chunks is kept
     by later builds as a recovery copy; other leftover staging is removed by the next build.
+    One build at a time may use an output directory: a second build refuses with a clear error
+    instead of removing the first build's staging.
     """
     if chunk_size <= 0 or not math.isfinite(chunk_size):
         raise ValueError(f"chunk_size must be positive, got {chunk_size!r}")
@@ -1383,8 +1468,13 @@ def build_world(
             raise ValueError(f"region must be MINX,MINY,MAXX,MAXY with min < max, got {region!r}")
         if instancing not in INSTANCING_MODES:
             raise ValueError(f"instancing must be one of {INSTANCING_MODES}, got {instancing!r}")
-        if lod_sets and instancing == "bake":
-            raise ValueError("--lod-sets needs --instancing gpu or nodes")
+        if lod_sets:
+            if instancing == "bake":
+                raise ValueError("--lod-sets needs --instancing gpu or nodes")
+            lod_levels = tuple(lod_levels)
+            for level in lod_levels:
+                if level not in LOD_TIER_NAMES:
+                    raise ValueError(f"--lod-sets does not recognize lodLevel {level!r}; use levels 0..6")
     elif lod_sets:
         raise ValueError("--lod-sets needs --placements")
     workers = max(1, int(jobs))
@@ -1836,9 +1926,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--lod-sets",
         action="store_true",
-        help="With --placements: one chunk set per LOD tier (HD, LOD, SLOD1-4, ORPHAN_HD; all lodLevel values "
-        "unless --lod-levels is given), plus each tier's camera distance band in world.json, measured from the "
-        "entities' childLodDist/lodDist, so the viewer shows one tier per grid cell.",
+        help="With --placements: one chunk set per LOD tier (HD, LOD, SLOD1-4, ORPHAN_HD). "
+        "Use --lod-levels to select a subset of levels 0..6. The camera distance bands in world.json "
+        "come from the entities' childLodDist/lodDist so the viewer shows one tier per grid cell.",
     )
     args = ap.parse_args(argv)
     lod_levels = args.lod_levels

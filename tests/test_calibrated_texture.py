@@ -1,4 +1,5 @@
 """Build a synthetic TTPF and exercise the same calibrated CLI used on local pools."""
+from contextlib import closing
 import importlib.util
 import json
 from pathlib import Path
@@ -25,6 +26,31 @@ def synthetic_profile():
 
 @unittest.skipUnless(importlib.util.find_spec("numpy"), "install NumPy for calibrated export")
 class CalibratedExport(unittest.TestCase):
+    def test_mode1_array_dds_writes_slice_major_subresources(self) -> None:
+        import calibrated_texture as ct
+        import tex_headers
+
+        tile = 65536
+        # A two-slice BC5 array with a standalone top mip and one packed-tail mip.
+        # Each source tile has one distinct constant block, in mip-major order.
+        tail0, tail1 = bytes([51, 0] + [0] * 14), bytes([102, 0] + [0] * 14)
+        top0, top1 = bytes([153, 0] + [0] * 14), bytes([204, 0] + [0] * 14)
+        source = b"".join(block * (tile // 16) for block in (tail0, tail1, top0, top1))
+        expected_top = (top0 * (64 * 64), top1 * (64 * 64))
+        expected_full = (expected_top[0] + tail0 * (32 * 32)
+                         + expected_top[1] + tail1 * (32 * 32))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "array.ttpf"
+            desc = fixtures.pack_etpf_record(256, 256, 2, 0, 83, 2, 1, 1, 4096)
+            fixtures.write_rds5_pool(path, [desc], [source])
+            with closing(ct.ttpf.Pool(path)) as pool:
+                decoder = ct.LocalDecoder(pool, {"version": 1})
+                dds = decoder.dds(0)
+                header = tex_headers.parse_dds_header(dds)
+                self.assertEqual((header["array_size"], header["mips"]), (2, 2))
+                self.assertEqual(dds[148:], expected_full)
+                self.assertEqual(decoder.dds(0, mips=1)[148:], b"".join(expected_top))
+
     def test_bc1_export_and_existing_output(self):
         import calibrated_texture
         try:

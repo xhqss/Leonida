@@ -8,6 +8,9 @@
 // writes into `spirv/index.json`, next to `<name>.spv`. This header needs no Windows, Vulkan or third-party code:
 // it carries its own inflate (RFC 1950/1951), SHA-256 (FIPS 180-4) and a minimal JSON reader.
 
+#include "spirv_words.h"
+
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdint>
@@ -511,6 +514,96 @@ inline std::vector<std::uint8_t> fssm_program(std::span<const std::uint8_t> byte
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// FSPX payloads: the FidelityFX DLL's compute programs (docs/fspx.md)
+
+// The two entries of an FSPX payload the runtime reads: kind 0 (dispatch state) and kind 6 (the program).
+struct FspxParts {
+    std::span<const std::uint8_t> state, code;
+};
+
+// Kinds 0 and 6 of an FSPX payload, both empty when the payload is not one the DLL's reader accepts. Same rules as
+// that reader and tools/fspx_unpack.py's parse_fspx: the total is clamped to the buffer, the directory must fit it,
+// an entry whose range starts inside the directory or ends past the total is skipped, the last entry of a kind wins,
+// and kind 0 and kind 6 must both be there and non-empty.
+inline FspxParts fspx_parts(std::span<const std::uint8_t> payload) {
+    const auto u32 = [&](std::size_t at) {
+        std::uint32_t v;
+        std::memcpy(&v, payload.data() + at, 4);
+        return v;
+    };
+    if (payload.size() < 16 || std::memcmp(payload.data(), "FSPX", 4) != 0) return {};
+    const std::uint64_t total = std::min<std::uint64_t>(u32(12), payload.size());
+    const std::uint64_t end_dir = 16 + 16 * std::uint64_t(u32(8));
+    if (total < end_dir) return {};
+    std::uint64_t code_offset = 0, code_size = 0, state_offset = 0, state_size = 0;
+    for (std::uint64_t at = 16; at < end_dir; at += 16) {
+        const std::uint32_t kind = u32(std::size_t(at)), offset = u32(std::size_t(at) + 4),
+                            size = u32(std::size_t(at) + 8);
+        if (offset < end_dir || std::uint64_t(offset) + size > total) continue;  // the DLL skips it too
+        if (kind == 6) code_offset = offset, code_size = size;
+        if (kind == 0) state_offset = offset, state_size = size;
+    }
+    if (!state_size || !code_size) return {};
+    return {payload.subspan(std::size_t(state_offset), std::size_t(state_size)),
+            payload.subspan(std::size_t(code_offset), std::size_t(code_size))};
+}
+
+// The kind-6 program of an FSPX payload, or an empty span (fspx_parts).
+inline std::span<const std::uint8_t> fspx_program(std::span<const std::uint8_t> payload) {
+    return fspx_parts(payload).code;
+}
+
+// Whether `code` looks like a bare kind-6 program: the 36-byte prologue of three VOP3 words with opcode 0x180
+// (bits 31..16 = 0xD580) at words 0, 3 and 6, which all 29 programs of the 1.0.2.1 DLL have (docs/fspx.md).
+inline bool fspx_bare_program(std::span<const std::uint8_t> code) {
+    if (code.size() < 36 || code.size() % 4) return false;
+    for (const std::size_t word : {0u, 3u, 6u}) {
+        std::uint32_t v;
+        std::memcpy(&v, code.data() + 4 * word, 4);
+        if (v >> 16 != 0xD580) return false;
+    }
+    return true;
+}
+
+// What a compute shader's bytecode is looked up by in the translator's index.
+struct ComputeProgram {
+    enum class Kind { none, fssm, fspx } kind = Kind::none;
+    // The bytes whose SHA-256 is the index key (fssm_sha256 or fspx_code_sha256), and which the pipeline copies to
+    // the GPU address arena as its code base: the program's code offsets are into them.
+    std::vector<std::uint8_t> bytes;
+    // An FSPX program from a container or a bare payload: its kind-0 entry, whose SHA-256 (fspx_state_sha256) picks
+    // among translations of the same kind-6 bytes. Empty for a bare kind-6 program, which comes without it.
+    std::vector<std::uint8_t> state;
+};
+
+// The program in a compute shader's bytecode:
+//   - an FSSM blob, bare or in a DXBC container's DXIL part (fssm_program), the game's own shaders;
+//   - the kind-6 program of an FSPX payload in a DXBC container's ACCC part, what the FidelityFX DLL passes to device
+//     slot 62, or of a bare FSPX payload;
+//   - a bare kind-6 program, what the DLL passes in its slot-67 description at +0x28 (with its exact size at +0x30).
+// A DXBC container whose ACCC part is not a usable FSPX payload, and anything else, gives Kind::none.
+inline ComputeProgram compute_program(std::span<const std::uint8_t> bytecode) {
+    ComputeProgram out;
+    out.bytes = fssm_program(bytecode);
+    if (!out.bytes.empty()) {
+        out.kind = ComputeProgram::Kind::fssm;
+        return out;
+    }
+    FspxParts parts;
+    if (bytecode.size() >= 4 && std::memcmp(bytecode.data(), "DXBC", 4) == 0)
+        parts = fspx_parts(dxbc_part(bytecode, "ACCC"));
+    else if (bytecode.size() >= 4 && std::memcmp(bytecode.data(), "FSPX", 4) == 0)
+        parts = fspx_parts(bytecode);
+    else if (fspx_bare_program(bytecode))
+        parts.code = bytecode;
+    if (parts.code.empty()) return out;
+    out.kind = ComputeProgram::Kind::fspx;
+    out.bytes.assign(parts.code.begin(), parts.code.end());
+    out.state.assign(parts.state.begin(), parts.state.end());
+    return out;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // The translator's spirv/index.json
 
 // One element of a shader's DXBC input signature (ISG1), as tools/shader_meta.py records it. For a vertex shader
@@ -527,9 +620,14 @@ struct ShaderEntry {
     std::string name;
     std::string stage;  // "vs", "ps", "cs", "ms", "gs"
     std::string fssm_sha256;
+    std::string fspx_code_sha256;   // an FSPX program (docs/fspx.md): the SHA-256 of its kind-6 bytes
+    std::string fspx_state_sha256;  // and of its kind-0 entry (dispatch state)
     std::size_t binding_count = 0;  // set-0 bindings the module declares
     std::uint32_t push_constant_bytes = 0;
     std::array<std::uint32_t, 3> local_size{1, 1, 1};
+    // Workgroup memory the module declares: its LDS array plus what --wave64-emulate adds (SHADER-309). A compute
+    // pipeline needs it at or under the device's maxComputeSharedMemorySize (32768 on some drivers).
+    std::uint32_t lds_bytes = 0;
     bool uses_code_base = false;
     bool wave64 = false;
     // The subgroup size the translator assumed (64 for a wave64 shader, 32 otherwise); 0 when the entry says null,
@@ -540,12 +638,21 @@ struct ShaderEntry {
     std::string wave64_exchange;
     bool emulated() const { return !wave64_exchange.empty(); }
     std::vector<SignatureElement> input_signature;  // vertex shaders: what the input layout must feed
-    std::vector<std::uint32_t> outputs;             // pixel shaders: the render-target locations written
+    std::vector<std::uint32_t> inputs;              // pixel shaders: input locations declared
+    std::vector<std::uint32_t> outputs;             // pixel/vertex shaders: output locations written
+    // --f16-interp-fallback: param/attr index -> {low_half_location, high_half_location} (SHADER-378).
+    std::map<std::uint32_t, std::array<std::uint32_t, 2>> f16_halves;
+    // The S#s the shader builds from immediates (the index's literal_samplers): no heap slot names them, so a
+    // pipeline that uses the shader registers them in the bindless set itself (docs/design.md, Literal samplers).
+    std::vector<std::array<std::uint32_t, 4>> literal_samplers;
 };
 
 class ShaderLibrary {
 public:
-    // Reads <dir>/index.json. Entries without fssm_sha256 cannot be found by content and are skipped.
+    // Reads <dir>/index.json, then <dir>/fspx/index.json when it is there (make_game.py translates the FidelityFX
+    // DLL's FSPX programs into that folder; their entries are named "fspx/<name>"). Entries with neither
+    // fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. The fspx folder is optional: a
+    // missing or unreadable index there leaves the main one loaded.
     bool load(const std::string& dir, std::string* error = nullptr) {
         const auto fail = [&](const std::string& why) {
             if (error) *error = why;
@@ -553,14 +660,23 @@ public:
         };
         // Nothing here may throw into the D3D12 shim (only allocation can, and that is caught too).
         try {
-            return load_index(dir, fail);
+            if (!load_index(dir, "", fail)) return false;
         } catch (...) {
             return fail("index.json could not be read");
         }
+        try {
+            const auto ignore = [](const std::string&) { return false; };
+            if (std::ifstream(dir + "/fspx/index.json", std::ios::binary)) load_index(dir + "/fspx", "fspx/", ignore);
+        } catch (...) {
+        }
+        return true;
     }
 
     bool loaded() const { return !dir_.empty(); }
     std::size_t size() const { return count_; }
+    // Entries loaded from <dir>/fspx/index.json. A corpus of RPF containers never reaches these: their programs
+    // come from FidelityFX DLLs, so callers comparing reached entries with size() must leave them out.
+    std::size_t fspx_size() const { return fspx_count_; }
 
     // The first entry for this program. Two containers can hold the same FSSM program with different input
     // signatures; `candidates` returns all of them.
@@ -570,22 +686,50 @@ public:
     }
 
     std::vector<const ShaderEntry*> candidates(std::string_view stage, std::string_view fssm_sha256) const {
-        std::vector<const ShaderEntry*> out;
-        const auto it = entries_.find({std::string(stage), std::string(fssm_sha256)});
-        if (it != entries_.end())
-            for (const ShaderEntry& e : it->second) out.push_back(&e);
-        return out;
+        return lookup(entries_, stage, fssm_sha256);
+    }
+
+    // The entries of an FSPX program, by the SHA-256 of its kind-6 bytes (fspx_code_sha256).
+    std::vector<const ShaderEntry*> fspx_candidates(std::string_view stage, std::string_view fspx_code_sha256) const {
+        return lookup(fspx_entries_, stage, fspx_code_sha256);
+    }
+
+    // The entries for a program compute_program() found, by the key of its kind (docs/fspx.md, "Build and run-time
+    // lookup"):
+    //   - FSSM: by fssm_sha256, as before;
+    //   - FSPX with its kind-0 entry (a container or a bare payload): by fspx_code_sha256, then only the entries
+    //     whose fspx_state_sha256 is the SHA-256 of that kind-0 entry;
+    //   - a bare kind-6 program, which comes without kind 0: by fspx_code_sha256 when all those entries have the
+    //     same module; when their modules differ the program is ambiguous, the result is empty and `ambiguous` is
+    //     set, instead of picking one of them.
+    std::vector<const ShaderEntry*> program_candidates(std::string_view stage, const ComputeProgram& program,
+                                                       bool* ambiguous = nullptr) const {
+        if (ambiguous) *ambiguous = false;
+        if (program.kind == ComputeProgram::Kind::none) return {};
+        const std::string hash = sha256_hex(program.bytes);
+        if (program.kind == ComputeProgram::Kind::fssm) return candidates(stage, hash);
+        auto all = fspx_candidates(stage, hash);
+        if (!program.state.empty()) {
+            const std::string state = sha256_hex(program.state);
+            std::erase_if(all, [&](const ShaderEntry* e) { return e->fspx_state_sha256 != state; });
+            return all;
+        }
+        if (all.size() > 1) {
+            const auto first = spirv(*all.front());
+            for (std::size_t i = 1; i < all.size(); ++i) {
+                if (first.empty() || spirv(*all[i]) != first) {
+                    if (ambiguous) *ambiguous = true;
+                    return {};
+                }
+            }
+        }
+        return all;
     }
 
     // The module's words, or empty when <dir>/<name>.spv is missing or not SPIR-V.
     std::vector<std::uint32_t> spirv(const ShaderEntry& entry) const {
-        std::ifstream file(dir_ + "/" + entry.name + ".spv", std::ios::binary);
-        if (!file) return {};
-        const std::string bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        if (bytes.size() < 20 || bytes.size() % 4) return {};
-        std::vector<std::uint32_t> words(bytes.size() / 4);
-        std::memcpy(words.data(), bytes.data(), bytes.size());
-        return words[0] == 0x07230203 ? words : std::vector<std::uint32_t>{};
+        std::ifstream file(dir_ + "/" + entry.name + ".spv", std::ios::binary | std::ios::ate);
+        return read_spirv_words(file, file.tellg());
     }
 
 private:
@@ -596,26 +740,49 @@ private:
         return n >= 0 && n <= 4294967295.0 ? std::uint32_t(n) : 0;
     }
 
+    using Entries = std::map<std::pair<std::string, std::string>, std::vector<ShaderEntry>>;
+
+    static std::vector<const ShaderEntry*> lookup(const Entries& entries, std::string_view stage, std::string_view key) {
+        std::vector<const ShaderEntry*> out;
+        const auto it = entries.find({std::string(stage), std::string(key)});
+        if (it != entries.end())
+            for (const ShaderEntry& e : it->second) out.push_back(&e);
+        return out;
+    }
+
+    // Reads <dir>/index.json. With an empty prefix it replaces what was loaded (the main index); with a prefix it
+    // adds its entries under "<prefix><name>", the path of their modules relative to the main folder.
     template<typename Fail>
-    bool load_index(const std::string& dir, Fail&& fail) {
+    bool load_index(const std::string& dir, const std::string& prefix, Fail&& fail) {
         std::ifstream file(dir + "/index.json", std::ios::binary);
         if (!file) return fail("cannot open " + dir + "/index.json");
         const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
         Json root;
         if (!JsonReader(text).parse(root) || root.kind != Json::Kind::object) return fail("index.json is not a JSON object");
-        dir_ = dir;
-        entries_.clear();
-        count_ = 0;
+        if (prefix.empty()) {
+            dir_ = dir;
+            entries_.clear();
+            fspx_entries_.clear();
+            count_ = 0;
+            fspx_count_ = 0;
+        }
         for (const auto& [name, meta] : root.object) {
             const Json* hash = meta.find("fssm_sha256");
+            const Json* code_hash = meta.find("fspx_code_sha256");
             const Json* stage = meta.find("stage");
-            if (!hash || hash->kind != Json::Kind::string || !stage || stage->kind != Json::Kind::string) continue;
+            const bool by_fssm = hash && hash->kind == Json::Kind::string;
+            const bool by_fspx = code_hash && code_hash->kind == Json::Kind::string;
+            if ((!by_fssm && !by_fspx) || !stage || stage->kind != Json::Kind::string) continue;
             ShaderEntry e;
-            e.name = name;
+            e.name = prefix + name;
             e.stage = stage->string;
-            e.fssm_sha256 = hash->string;
+            if (by_fssm) e.fssm_sha256 = hash->string;
+            if (by_fspx) e.fspx_code_sha256 = code_hash->string;
+            if (const Json* s = meta.find("fspx_state_sha256"); s && s->kind == Json::Kind::string)
+                e.fspx_state_sha256 = s->string;
             if (const Json* b = meta.find("bindings"); b && b->kind == Json::Kind::array) e.binding_count = b->array.size();
             e.push_constant_bytes = u32(meta.find("push_constant_bytes"));
+            e.lds_bytes = u32(meta.find("lds_bytes"));
             if (const Json* l = meta.find("local_size"); l && l->kind == Json::Kind::array)
                 for (std::size_t i = 0; i < l->array.size() && i < 3; ++i) e.local_size[i] = u32(&l->array[i]);
             if (const Json* c = meta.find("uses_code_base"); c && c->kind == Json::Kind::boolean) e.uses_code_base = c->boolean;
@@ -636,9 +803,30 @@ private:
                     e.input_signature.push_back(std::move(element));
                 }
             }
+            if (const Json* in = meta.find("inputs"); in && in->kind == Json::Kind::array)
+                for (const Json& item : in->array) e.inputs.push_back(u32(&item));
             if (const Json* o = meta.find("outputs"); o && o->kind == Json::Kind::array)
                 for (const Json& item : o->array) e.outputs.push_back(u32(&item));
-            entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
+            if (const Json* fh = meta.find("f16_halves"); fh && fh->kind == Json::Kind::object) {
+                for (const auto& [key, val] : fh->object) {
+                    if (key.empty() || val.kind != Json::Kind::array || val.array.size() != 2) continue;
+                    char* end = nullptr;
+                    const unsigned long param = std::strtoul(key.c_str(), &end, 10);
+                    if (!end || *end != '\0') continue;
+                    e.f16_halves[std::uint32_t(param)] = {u32(&val.array[0]), u32(&val.array[1])};
+                }
+            }
+            if (const Json* l = meta.find("literal_samplers"); l && l->kind == Json::Kind::array) {
+                for (const Json& item : l->array) {
+                    if (item.kind != Json::Kind::array || item.array.size() != 4) continue;
+                    std::array<std::uint32_t, 4> words{};
+                    for (std::size_t i = 0; i < 4; ++i) words[i] = u32(&item.array[i]);
+                    e.literal_samplers.push_back(words);
+                }
+            }
+            if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
+            if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
+            if (by_fspx && prefix == "fspx/") ++fspx_count_;
             ++count_;
         }
         return true;
@@ -646,8 +834,10 @@ private:
 
     std::string dir_;
     std::size_t count_ = 0;
-    // Entries by (stage, fssm_sha256), in index order.
-    std::map<std::pair<std::string, std::string>, std::vector<ShaderEntry>> entries_;
+    std::size_t fspx_count_ = 0;
+    // Entries by (stage, fssm_sha256) and by (stage, fspx_code_sha256), in index order.
+    Entries entries_;
+    Entries fspx_entries_;
 };
 
 } // namespace leonida

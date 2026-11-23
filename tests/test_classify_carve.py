@@ -266,6 +266,24 @@ class MainTests(unittest.TestCase):
                 self.assertEqual(proc.stdout, "")
         self.assertEqual(sorted(os.listdir(self.root)), ["index.json"])      # no types.json was written
 
+    def test_types_json_directory_is_one_error_line(self):
+        self.archive("a", [{"head": RBF0_HEAD, "size": 1}])
+        report = os.path.join(self.root, "types.json")
+        os.mkdir(report)
+        proc = subprocess.run(
+            [sys.executable, "-I", os.path.join(ROOT, "tools", "classify_carve.py"), self.root],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("types.json", proc.stderr)
+        self.assertIn("is a directory", proc.stderr)
+        self.assertIn("remove or rename", proc.stderr)
+        self.assertIn("before rerun", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(os.listdir(report), [])
+        self.assertEqual([n for n in os.listdir(self.root) if n.startswith(".types-")], [])
+
     def test_help_prints_usage_and_writes_nothing(self):
         tool = os.path.join(ROOT, "tools", "classify_carve.py")
         for flag in ("-h", "--help"):

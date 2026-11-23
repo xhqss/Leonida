@@ -10,6 +10,7 @@ import io
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -177,6 +178,62 @@ class Cli(unittest.TestCase):
             code = fspx_unpack.main(list(argv))
         return code, out.getvalue(), err.getvalue()
 
+    def disassemble(self, body):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        src = os.path.join(tmp.name, "one.fspx")
+        with open(src, "wb") as f:
+            f.write(make_fspx([(0, kind0()), (6, program())]))
+        mc = os.path.join(tmp.name, "fake_mc.py")
+        with open(mc, "w", encoding="utf-8", newline="\n") as f:
+            f.write(body)
+        out = os.path.join(tmp.name, "out")
+        env = dict(os.environ, LLVM_MC=f'"{sys.executable}" "{mc}"')
+        result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "fspx_unpack.py"),
+                                 src, "--out", out, "--disasm"], capture_output=True, text=True, env=env)
+        return result, out
+
+    def test_disassembly_error_writes_no_listing(self):
+        result, out = self.disassemble("import sys\n"
+                                       "print('\\ts_endpgm')\n"
+                                       "sys.stderr.write('error: disassembly stopped\\nextra detail\\n')\n"
+                                       "sys.exit(23)\n")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stderr.splitlines(), ["one: error: disassembly stopped"])
+        self.assertIn("1 input(s) failed", result.stdout)
+        self.assertEqual(os.listdir(os.path.join(out, "disasm")), [])
+        self.assertEqual(os.listdir(os.path.join(out, "fspx")), [])
+        with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f), [])
+
+    def test_empty_disassembly_writes_no_listing(self):
+        result, out = self.disassemble("print('   ')\n")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stderr.splitlines(), ["one: no output"])
+        self.assertEqual(os.listdir(os.path.join(out, "disasm")), [])
+        self.assertEqual(os.listdir(os.path.join(out, "fspx")), [])
+
+    def test_disassembly_with_invalid_words_keeps_listing(self):
+        result, out = self.disassemble("import sys\n"
+                                       "print('\\ts_endpgm')\n"
+                                       "sys.stderr.write('warning: invalid instruction encoding\\n')\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        with open(os.path.join(out, "disasm", "one.s"), encoding="utf-8") as f:
+            listing = f.read()
+        self.assertIn("1 invalid words", listing)
+        self.assertIn("\ts_endpgm", listing)
+        self.assertIn("warning: invalid instruction encoding", listing)
+
+    def test_clean_disassembly_keeps_listing(self):
+        result, out = self.disassemble("print('\\ts_endpgm')\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        with open(os.path.join(out, "disasm", "one.s"), encoding="utf-8") as f:
+            listing = f.read()
+        self.assertIn("0 invalid words", listing)
+        self.assertIn("\ts_endpgm", listing)
+
     def test_dll_like_file(self):
         c = Containers().container()
         with tempfile.TemporaryDirectory() as t:
@@ -199,6 +256,26 @@ class Cli(unittest.TestCase):
                 self.assertEqual(f.read(), program())
             with open(os.path.join(out, "lib_01.dxbc"), "rb") as f:
                 self.assertEqual(f.read(), c)
+
+    def test_retains_programs_with_matching_input_stems(self):
+        container = Containers().container()
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a", "sample.dxbc")
+            b = os.path.join(tmp, "b", "sample.dll")
+            for path, data in ((a, container), (b, b"MZ" + bytes(62) + container)):
+                os.makedirs(os.path.dirname(path))
+                with open(path, "wb") as f:
+                    f.write(data)
+            out = os.path.join(tmp, "out")
+            code, _, err = self.run_tool(a, b, "--out", out)
+            self.assertEqual(code, 0, err)
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                index = json.load(f)
+            self.assertEqual([entry["file"] for entry in index], ["sample.dxbc", "sample_2.dxbc"])
+            for name, offset in (("sample", 0), ("sample_2", 64)):
+                with open(os.path.join(out, "fspx", name + ".json"), encoding="utf-8") as f:
+                    self.assertEqual(json.load(f)["source"]["offset"], offset)
+                self.assertTrue(os.path.isfile(os.path.join(out, name + ".dxbc")))
 
     def test_bare_payload_and_a_file_without_fspx(self):
         with tempfile.TemporaryDirectory() as t:
@@ -226,6 +303,48 @@ class Cli(unittest.TestCase):
             code, _, err = self.run_tool(src, "--out", os.path.join(t, "out"))
             self.assertEqual(code, 1)
             self.assertIn("FSPX status 5", err)
+
+    def test_short_kind0_unpacks_without_keyerror(self):
+        with tempfile.TemporaryDirectory() as t:
+            src = os.path.join(t, "short.fspx")
+            with open(src, "wb") as f:
+                f.write(make_fspx([(0, struct.pack("<2I", 1, 2)), (6, program())]))
+            out = os.path.join(t, "out")
+            code, _, err = self.run_tool(src, "--out", out)
+            self.assertEqual(code, 0)
+            self.assertEqual(err, "")
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                index = json.load(f)
+            self.assertEqual(len(index), 1)
+            self.assertNotIn("threads", index[0])
+            self.assertNotIn("wave32", index[0])
+            with open(os.path.join(out, "fspx", "short.json"), encoding="utf-8") as f:
+                meta = json.load(f)
+            self.assertEqual(meta["words"], [1, 2])
+
+    @unittest.skipUnless(sys.platform == "win32", "the exclusive-lock repro needs Windows")
+    def test_locked_input_is_counted_as_failed(self):
+        # An exclusively locked (share-none) existing file must be a counted failed input with a one-line
+        # message, not a raw PermissionError traceback after the os.path pass.
+        import ctypes
+        with tempfile.TemporaryDirectory() as t:
+            src = os.path.join(t, "locked.dll")
+            with open(src, "wb") as f:
+                f.write(b"\x00" * 16)
+            out = os.path.join(t, "out")
+            k32 = ctypes.windll.kernel32
+            handle = k32.CreateFileW(src, 0x80000000, 0, None, 3, 0x80, None)
+            self.assertNotIn(handle, (0, -1), "could not lock the probe file")
+            try:
+                code, _, err = self.run_tool(src, "--out", out)
+            finally:
+                k32.CloseHandle(handle)
+            self.assertEqual(code, 1)
+            self.assertIn("cannot read input", err)
+            self.assertIn("Permission denied", err)
+            self.assertNotIn("Traceback", err)
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                self.assertEqual(json.load(f), [])
 
 
 class TranslatorSidecars(unittest.TestCase):

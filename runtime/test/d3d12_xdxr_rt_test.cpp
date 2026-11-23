@@ -2,7 +2,10 @@
 // 4.8, src/xdxr_build.h), the layout the game's translated traversal shaders read. A BLAS of two geometries (an
 // unindexed triangle soup, and an R16-indexed grid with a 16-byte stride and a 3x4 transform) and a TLAS of three
 // instances are built through the D3D12 API, sized by GetRaytracingAccelerationStructurePrebuildInfo, copied to
-// readback buffers and written to <out dir> as <case>.bin + <case>.json at their console GPU virtual addresses.
+// readback buffers and written to <out dir>; the BLAS is then updated in place (PERFORM_UPDATE) after its soup moves,
+// and written again as d3d12_blas_update; then its postbuild COMPACTED_SIZE and a TLAS rebuild's CURRENT_SIZE are
+// checked against the prebuild sizes, and the BLAS is compacted (CopyRaytracingAccelerationStructure COMPACT) into a
+// buffer of exactly that size, written as d3d12_blas_compacted as <case>.bin + <case>.json at their console GPU virtual addresses.
 // `python -I tools/xdxr_bvh.py check-build <out dir>` validates them and traces rays against brute force (ctest:
 // d3d12_xdxr_rt + d3d12_xdxr_rt_check). Exit 77 without a Vulkan device, or with LEONIDA_RT_AS=khr. No game files.
 #include "../shims/d3d12_com.h"
@@ -153,6 +156,7 @@ int main(int argc, char** argv) {
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS blas_inputs{};
     blas_inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    blas_inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;   // updated below
     blas_inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     blas_inputs.NumDescs = 2;
     blas_inputs.pGeometryDescs = geometries;
@@ -239,7 +243,7 @@ int main(int argc, char** argv) {
     ID3D12CommandList* lists[] = {list.p};
     queue->ExecuteCommandLists(1, lists);
     if (FAILED(queue->Signal(fence.p, 1))) return fail("Signal");
-    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);   // reused for the update below
     const bool done = event && SUCCEEDED(fence->SetEventOnCompletion(1, event)) &&
                       WaitForSingleObject(event, 10000) == WAIT_OBJECT_0;
     if (event) CloseHandle(event);
@@ -252,37 +256,41 @@ int main(int argc, char** argv) {
         if (FAILED(rb->Map(0, nullptr, &p))) return false;
         std::uint32_t units = 0;
         std::memcpy(&units, static_cast<char*>(p) + 4, 4);    // header totalSizeIn64BNodes
-        const UINT64 used = UINT64(units) * 64;
+        const UINT64 used = (UINT64(units) + 1) * 64;   // the field does not count the 64-byte header
         const bool ok = used && used <= size && write_file(dir + "/" + name + ".bin", p, std::size_t(used)) &&
                         write_file(dir + "/" + name + ".json", json.data(), json.size());
         rb->Unmap(0, nullptr);
         return ok;
     };
-    std::string tris = "[";
-    bool first = true;
-    auto add_tri = [&](const float v[3][3], int geometry, UINT primitive) {
-        tris += first ? "\n  [" : ",\n  [";
-        first = false;
-        for (int k = 0; k < 3; ++k)
-            tris += (k ? ", [" : "[") + num(v[k][0]) + ", " + num(v[k][1]) + ", " + num(v[k][2]) + "]";
-        tris += ", " + std::to_string(geometry) + ", " + std::to_string(primitive) + "]";
-    };
-    for (UINT t = 0; t < soup_tris; ++t) {
-        float v[3][3];
-        for (int k = 0; k < 9; ++k) v[k / 3][k % 3] = soup[9 * t + k];
-        add_tri(v, 0, t);
-    }
-    for (UINT t = 0; t < indices.size() / 3; ++t) {
-        float v[3][3];
-        for (int k = 0; k < 3; ++k) {
-            const float* p = &grid[4 * indices[3 * t + k]];
-            for (int r = 0; r < 3; ++r)
-                v[k][r] = transform[4 * r] * p[0] + transform[4 * r + 1] * p[1] + transform[4 * r + 2] * p[2] +
-                          transform[4 * r + 3];
+    // The BLAS's triangles as the reference sees them, for the soup's current positions.
+    auto triangles_json = [&](const std::vector<float>& soup_now) {
+        std::string tris = "[";
+        bool first = true;
+        auto add_tri = [&](const float v[3][3], int geometry, UINT primitive) {
+            tris += first ? "\n  [" : ",\n  [";
+            first = false;
+            for (int k = 0; k < 3; ++k)
+                tris += (k ? ", [" : "[") + num(v[k][0]) + ", " + num(v[k][1]) + ", " + num(v[k][2]) + "]";
+            tris += ", " + std::to_string(geometry) + ", " + std::to_string(primitive) + "]";
+        };
+        for (UINT t = 0; t < soup_tris; ++t) {
+            float v[3][3];
+            for (int k = 0; k < 9; ++k) v[k / 3][k % 3] = soup_now[9 * t + k];
+            add_tri(v, 0, t);
         }
-        add_tri(v, 1, t);
-    }
-    tris += "]";
+        for (UINT t = 0; t < indices.size() / 3; ++t) {
+            float v[3][3];
+            for (int k = 0; k < 3; ++k) {
+                const float* p = &grid[4 * indices[3 * t + k]];
+                for (int r = 0; r < 3; ++r)
+                    v[k][r] = transform[4 * r] * p[0] + transform[4 * r + 1] * p[1] + transform[4 * r + 2] * p[2] +
+                              transform[4 * r + 3];
+            }
+            add_tri(v, 1, t);
+        }
+        return tris + "]";
+    };
+    const std::string tris = triangles_json(soup);
     if (!dump(blas_rb.p, blas_info.ResultDataMaxSizeInBytes, "d3d12_blas",
               "{\"kind\": \"blas\", \"address\": " + std::to_string(blas->GetGPUVirtualAddress()) +
                   ", \"triangles\": " + tris + "}\n"))
@@ -298,6 +306,103 @@ int main(int argc, char** argv) {
               "{\"kind\": \"tlas\", \"address\": " + std::to_string(tlas->GetGPUVirtualAddress()) +
                   ", \"bias\": 0, \"blas\": [\"d3d12_blas\"], \"instances\": " + inst + "}\n"))
         return fail("TLAS readback");
+
+    // ---- PERFORM_UPDATE in place: the soup moves (every vertex), the grid stays; the BLAS is refitted ----
+    std::vector<float> moved = soup;
+    std::uniform_real_distribution<float> nudge(-1.0f, 1.0f);
+    for (std::size_t v = 0; v < moved.size(); v += 3) {
+        moved[v] = moved[v] * 1.3f + nudge(rng);
+        moved[v + 1] = moved[v + 1] * 0.7f + nudge(rng);
+        moved[v + 2] += nudge(rng);
+    }
+    if (FAILED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped)))) return fail("Map upload for the update");
+    std::memcpy(mapped + (soup_va - upload->GetGPUVirtualAddress()), moved.data(), std::size_t(soup_bytes));
+    upload->Unmap(0, nullptr);
+    if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset for the update");
+    build.Inputs = blas_inputs;
+    build.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+    build.DestAccelerationStructureData = blas->GetGPUVirtualAddress();
+    build.SourceAccelerationStructureData = blas->GetGPUVirtualAddress();
+    list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+    list->ResourceBarrier(1, &barrier);
+    list->CopyBufferRegion(blas_rb.p, 0, blas.p, 0, blas_info.ResultDataMaxSizeInBytes);
+    if (FAILED(hr = list->Close())) return fail("Close (update)", hr);
+    queue->ExecuteCommandLists(1, lists);
+    if (FAILED(queue->Signal(fence.p, 2))) return fail("Signal (update)");
+    event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    const bool updated = event && SUCCEEDED(fence->SetEventOnCompletion(2, event)) &&
+                         WaitForSingleObject(event, 10000) == WAIT_OBJECT_0;
+    if (event) CloseHandle(event);
+    if (!updated) return fail("the update did not complete");
+    if (!dump(blas_rb.p, blas_info.ResultDataMaxSizeInBytes, "d3d12_blas_update",
+              "{\"kind\": \"blas\", \"address\": " + std::to_string(blas->GetGPUVirtualAddress()) +
+                  ", \"triangles\": " + triangles_json(moved) + "}\n"))
+        return fail("BLAS readback after the update");
+
+    // ---- postbuild info and compaction: EmitRaytracingAccelerationStructurePostbuildInfo for both structures, a
+    // TLAS rebuild with a CURRENT_SIZE postbuild desc, then COMPACT the BLAS into a buffer of exactly its size ----
+    auto submit = [&](UINT64 value) {
+        if (FAILED(list->Close())) return false;
+        queue->ExecuteCommandLists(1, lists);
+        if (FAILED(queue->Signal(fence.p, value))) return false;
+        HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        const bool ok = e && SUCCEEDED(fence->SetEventOnCompletion(value, e)) &&
+                        WaitForSingleObject(e, 10000) == WAIT_OBJECT_0;
+        if (e) CloseHandle(e);
+        return ok;
+    };
+    Ref<ID3D12Resource> info, info_rb;
+    if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, 24, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, uav, info.put())) ||
+        FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, 24, D3D12_RESOURCE_STATE_COPY_DEST,
+                           D3D12_RESOURCE_FLAG_NONE, info_rb.put())))
+        return fail("postbuild buffers", hr);
+    if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset for postbuild");
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC compacted_desc{
+        info->GetGPUVirtualAddress(), D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE};
+    const D3D12_GPU_VIRTUAL_ADDRESS both[2] = {blas->GetGPUVirtualAddress(), tlas->GetGPUVirtualAddress()};
+    list->EmitRaytracingAccelerationStructurePostbuildInfo(&compacted_desc, 2, both);
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC current_desc{
+        info->GetGPUVirtualAddress() + 16, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_CURRENT_SIZE};
+    build = {};
+    build.Inputs = tlas_inputs;
+    build.DestAccelerationStructureData = tlas->GetGPUVirtualAddress();
+    build.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+    list->BuildRaytracingAccelerationStructure(&build, 1, &current_desc);
+    list->ResourceBarrier(1, &barrier);
+    list->CopyBufferRegion(info_rb.p, 0, info.p, 0, 24);
+    if (!submit(3)) return fail("postbuild submission");
+    UINT64 sizes[3] = {};
+    {
+        void* p = nullptr;
+        if (FAILED(info_rb->Map(0, nullptr, &p))) return fail("Map postbuild");
+        std::memcpy(sizes, p, sizeof sizes);
+        info_rb->Unmap(0, nullptr);
+    }
+    // the builds are exactly their prebuild size, so the compacted size is that size
+    if (sizes[0] != blas_info.ResultDataMaxSizeInBytes || sizes[1] != tlas_info.ResultDataMaxSizeInBytes ||
+        sizes[2] != tlas_info.ResultDataMaxSizeInBytes) {
+        std::fprintf(stderr, "postbuild sizes %llu %llu %llu, prebuild %llu %llu\n",
+                     static_cast<unsigned long long>(sizes[0]), static_cast<unsigned long long>(sizes[1]),
+                     static_cast<unsigned long long>(sizes[2]),
+                     static_cast<unsigned long long>(blas_info.ResultDataMaxSizeInBytes),
+                     static_cast<unsigned long long>(tlas_info.ResultDataMaxSizeInBytes));
+        return fail("postbuild sizes");
+    }
+    Ref<ID3D12Resource> compacted, compacted_rb;
+    if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, sizes[0], as_state, uav, compacted.put())) ||
+        FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, sizes[0], D3D12_RESOURCE_STATE_COPY_DEST,
+                           D3D12_RESOURCE_FLAG_NONE, compacted_rb.put())))
+        return fail("compacted buffers", hr);
+    if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset for compaction");
+    list->CopyRaytracingAccelerationStructure(compacted->GetGPUVirtualAddress(), blas->GetGPUVirtualAddress(),
+                                              D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT);
+    list->ResourceBarrier(1, &barrier);
+    list->CopyBufferRegion(compacted_rb.p, 0, compacted.p, 0, sizes[0]);
+    if (!submit(4)) return fail("compaction submission");
+    if (!dump(compacted_rb.p, sizes[0], "d3d12_blas_compacted",
+              "{\"kind\": \"blas\", \"address\": " + std::to_string(compacted->GetGPUVirtualAddress()) +
+                  ", \"triangles\": " + triangles_json(moved) + "}\n"))
+        return fail("compacted BLAS readback");
     std::printf("d3d12_xdxr_rt: BLAS %llu bytes (prebuild %llu), TLAS (prebuild %llu), written to %s\n",
                 static_cast<unsigned long long>(blas_info.ResultDataMaxSizeInBytes),
                 static_cast<unsigned long long>(blas_info.ResultDataMaxSizeInBytes),

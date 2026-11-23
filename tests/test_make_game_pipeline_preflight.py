@@ -28,11 +28,17 @@ class PreflightEnv:
         os.makedirs(self.work)
         # Satisfy every other prerequisite so only the checker under test can make preflight fail.
         for patcher in (mock.patch("sys.version_info", (3, 12, 0)),
-                        mock.patch("make_game.tool_available", return_value=True),
+                        mock.patch.dict(os.environ, {"LLVM_MC": "llvm-mc"}),
                         mock.patch("shutil.which", return_value="/bin/tool"),
                         mock.patch("shutil.disk_usage", return_value=mock.Mock(free=500 * 2**30))):
             patcher.start()
             self.addCleanup(patcher.stop)
+
+    def write_shader_index(self):
+        spirv = os.path.join(self.work, "shaders", "spirv")
+        os.makedirs(spirv)
+        with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8") as f:
+            f.write('{"shader_0": {}}')   # a finished translation is never empty
 
     def assert_preflight_fails(self, stages, match):
         err = io.StringIO()
@@ -71,12 +77,19 @@ class PipelinePreflightTest(PreflightEnv, unittest.TestCase):
         shaders.assert_not_called()
         pipelines.assert_not_called()
 
+    def test_checker_already_built_still_requires_shaders(self):
+        with mock.patch("os.name", "nt"), \
+                mock.patch.object(make_game, "pipeline_check_exe", return_value="vk_pipeline_check.exe"):
+            self.assert_preflight_fails(["pipelines"], "No translated shaders yet")
+
     def test_checker_already_built_passes_preflight(self):
+        self.write_shader_index()
         with mock.patch.object(make_game, "pipeline_check_exe", return_value="/bin/vk_pipeline_check"):
             make_game.preflight(["pipelines"], self.work)
 
     def test_runtime_stage_builds_the_checker_so_it_is_not_required(self):
         # On Windows runtime produces vk_pipeline_check.exe when the Vulkan SDK is installed.
+        self.write_shader_index()
         with mock.patch("os.name", "nt"), \
                 mock.patch.dict(os.environ, {"VULKAN_SDK": r"C:\Vulkan"}), \
                 mock.patch.object(make_game, "visual_cpp_tools_ok", return_value=True), \
@@ -99,7 +112,8 @@ class PipelinePreflightTest(PreflightEnv, unittest.TestCase):
                 self.assertIn("vk_pipeline_check", err)
 
     def test_missing_checker_is_listed_with_other_missing_prerequisites(self):
-        with mock.patch("os.name", "nt"), mock.patch("make_game.tool_available", return_value=False), \
+        with mock.patch("os.name", "nt"), \
+                mock.patch("shutil.which", side_effect=lambda t: None if t == "llvm-mc" else "/bin/tool"), \
                 mock.patch.object(make_game, "pipeline_check_exe", return_value=None):
             err = self.assert_preflight_fails(["shaders", "pipelines"], "vk_pipeline_check")
         self.assertIn("llvm-mc (LLVM 21+ with the AMDGPU target)", err)
@@ -117,7 +131,14 @@ class LinuxPipelineCheckTest(PreflightEnv, unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
+    def test_missing_shader_index_stops_before_building_checker(self):
+        with mock.patch.object(make_game, "pipeline_check_exe", side_effect=[None, None, "/bin/vk_pipeline_check"]), \
+                mock.patch.object(make_game, "build_pipeline_check") as build:
+            self.assert_preflight_fails(["pipelines"], "No translated shaders yet")
+        build.assert_not_called()
+
     def test_builds_the_checker_after_the_checks(self):
+        self.write_shader_index()
         with mock.patch.object(make_game, "pipeline_check_exe", side_effect=[None, None, "/bin/vk_pipeline_check"]), \
                 mock.patch.object(make_game, "build_pipeline_check") as build:
             make_game.preflight(["pipelines"], self.work, jobs=3)
@@ -128,6 +149,14 @@ class LinuxPipelineCheckTest(PreflightEnv, unittest.TestCase):
             self.assert_preflight_fails(["shaders", "pipelines"], "delete runtime/build/linux")
         build.assert_called_once()
 
+    def test_missing_built_checker_does_not_initialize_asset_submodule(self):
+        with mock.patch.object(make_game, "dotnet_sdk_ok", return_value=True), \
+                mock.patch.object(make_game, "build_pipeline_check") as build, \
+                mock.patch.object(make_game, "ensure_submodule") as initialize:
+            self.assert_preflight_fails(["shaders", "assets", "pipelines"], "delete runtime/build/linux")
+        build.assert_called_once()
+        initialize.assert_not_called()
+
     def test_without_cmake_nothing_is_built(self):
         with mock.patch("shutil.which", side_effect=lambda t: None if t == "cmake" else "/bin/tool"), \
                 mock.patch.object(make_game, "build_pipeline_check") as build:
@@ -136,12 +165,13 @@ class LinuxPipelineCheckTest(PreflightEnv, unittest.TestCase):
         build.assert_not_called()
 
     def test_another_missing_prerequisite_stops_before_the_build(self):
-        with mock.patch("make_game.tool_available", return_value=False), \
+        with mock.patch("shutil.which", side_effect=lambda t: None if t == "llvm-mc" else "/bin/tool"), \
                 mock.patch.object(make_game, "build_pipeline_check") as build:
             self.assert_preflight_fails(["shaders", "pipelines"], "llvm-mc")
         build.assert_not_called()
 
     def test_a_built_checker_is_not_rebuilt(self):
+        self.write_shader_index()
         with mock.patch.object(make_game, "pipeline_check_exe", return_value="/bin/vk_pipeline_check"), \
                 mock.patch.object(make_game, "build_pipeline_check") as build:
             make_game.preflight(["pipelines"], self.work)

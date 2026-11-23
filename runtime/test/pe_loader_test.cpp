@@ -3,7 +3,8 @@
 // The fixtures are an ordinary DLL (tiny_dll) and an EXE that imports it (tiny_exe). The test maps both through the
 // public Loader API and checks the mapped headers, exports (by name and ordinal), import binding, recursive module
 // loading/dedupe, section protections and forced base relocation. Negative inputs must throw std::runtime_error
-// without leaving a module behind. The fixtures are passed as argv[1] and argv[2] by CTest.
+// without leaving a module behind. The fixtures are passed as argv[1] and argv[2] by CTest. It also checks how the
+// loader's reserved range is read back from LEONIDA_BASE_RESERVED (base_reservation.h).
 //
 // An optional final section reads LEONIDA_GAME_DIR and maps the 16 DLLs a retail package ships, without executing
 // any of them or copying any file. It skips when the variable is unset; see test_optional_package.
@@ -20,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "base_reservation.h"
 #include "pe_loader.h"
 
 namespace {
@@ -656,6 +658,29 @@ void test_optional_package() {
     }
 }
 
+// The child gta6rt relaunches reads its reserved range back from LEONIDA_BASE_RESERVED (base_reservation.h). Only
+// arm64 Wine relaunches, so this is the one place a Windows run parses it.
+void test_inherited_reservation() {
+    namespace br = rt::base_reservation;
+    wchar_t saved[64] = {};
+    const DWORD saved_length = GetEnvironmentVariableW(br::kVariable, saved, 64);
+
+    SetEnvironmentVariableW(br::kVariable, L"140000000:30000000");
+    const auto r = br::inherited();
+    check(r && r->base == 0x140000000ull && r->size == 0x30000000ull,
+          "LEONIDA_BASE_RESERVED=140000000:30000000 is base 0x140000000, size 0x30000000");
+    SetEnvironmentVariableW(br::kVariable, L"140000000:0");
+    check(!br::inherited(), "LEONIDA_BASE_RESERVED with size 0 is no reservation");
+    SetEnvironmentVariableW(br::kVariable, L"140000000");
+    check(!br::inherited(), "LEONIDA_BASE_RESERVED without a size is no reservation");
+    SetEnvironmentVariableW(br::kVariable, L"zz:30000000");
+    check(!br::inherited(), "LEONIDA_BASE_RESERVED with a non-hex base is no reservation");
+    SetEnvironmentVariableW(br::kVariable, nullptr);
+    check(!br::inherited(), "no LEONIDA_BASE_RESERVED is no reservation");
+
+    if (saved_length && saved_length < 64) SetEnvironmentVariableW(br::kVariable, saved);
+}
+
 void print_result() {
     if (g_failures == 0)
         std::printf("\npe_loader_test: OK (%d checks)\n", g_checks);
@@ -689,6 +714,7 @@ int main(int argc, char** argv) {
         test_forced_relocation(dll);
         test_rejections(dll, temp.path);
         test_unwind(dll);
+        test_inherited_reservation();
         test_optional_package();
         test_optional_package_unwind();
     } catch (const std::exception& e) {

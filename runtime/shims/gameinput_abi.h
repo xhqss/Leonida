@@ -131,6 +131,50 @@ enum GameInputRumbleMotors : uint32_t {
     GameInputRumbleRightTrigger = 0x00000008,
 };
 
+// Where a motor sits on the device. v0 carries it in the motor infos below.
+enum GameInputLocation : int32_t {
+    GameInputLocationUnknown = -1,
+    GameInputLocationChassis = 0,
+    GameInputLocationDisplay = 1,
+    GameInputLocationAxis = 2,
+    GameInputLocationButton = 3,
+    GameInputLocationSwitch = 4,
+    GameInputLocationKey = 5,
+    GameInputLocationTouchPad = 6,
+};
+
+// The axes a force-feedback motor can drive, and the kinds of effect it can play.
+enum GameInputFeedbackAxes : uint32_t {
+    GameInputFeedbackAxisNone = 0x00000000,
+    GameInputFeedbackAxisLinearX = 0x00000001,
+    GameInputFeedbackAxisLinearY = 0x00000002,
+    GameInputFeedbackAxisLinearZ = 0x00000004,
+    GameInputFeedbackAxisAngularX = 0x00000008,
+    GameInputFeedbackAxisAngularY = 0x00000010,
+    GameInputFeedbackAxisAngularZ = 0x00000020,
+    GameInputFeedbackAxisNormal = 0x00000040,
+};
+
+enum GameInputFeedbackEffectState : int32_t {
+    GameInputFeedbackStopped = 0,
+    GameInputFeedbackRunning = 1,
+    GameInputFeedbackPaused = 2,
+};
+
+enum GameInputForceFeedbackEffectKind : int32_t {
+    GameInputForceFeedbackConstant = 0,
+    GameInputForceFeedbackRamp = 1,
+    GameInputForceFeedbackSineWave = 2,
+    GameInputForceFeedbackSquareWave = 3,
+    GameInputForceFeedbackTriangleWave = 4,
+    GameInputForceFeedbackSawtoothUpWave = 5,
+    GameInputForceFeedbackSawtoothDownWave = 6,
+    GameInputForceFeedbackSpring = 7,
+    GameInputForceFeedbackFriction = 8,
+    GameInputForceFeedbackDamper = 9,
+    GameInputForceFeedbackInertia = 10,
+};
+
 enum GameInputSwitchPosition : int32_t { GameInputSwitchCenter = 0 };
 enum GameInputFocusPolicy : uint32_t { GameInputDefaultFocusPolicy = 0 };
 
@@ -171,11 +215,138 @@ struct GameInputBatteryState {
     GameInputBatteryStatus status;
 };
 
+struct GameInputUsage {
+    uint16_t page;
+    uint16_t id;
+};
+
 struct GameInputRumbleParams {
     float lowFrequency;
     float highFrequency;
     float leftTrigger;
     float rightTrigger;
+};
+
+// ---- force feedback and haptic motors ------------------------------------------------------------
+// One entry of GameInputDeviceInfo::forceFeedbackMotorInfo per motor.
+struct GameInputForceFeedbackMotorInfo {
+    GameInputFeedbackAxes supportedAxes;
+    GameInputLocation location;
+    uint32_t locationId;
+    uint32_t maxSimultaneousEffects;
+    bool isConstantEffectSupported;
+    bool isRampEffectSupported;
+    bool isSineWaveEffectSupported;
+    bool isSquareWaveEffectSupported;
+    bool isTriangleWaveEffectSupported;
+    bool isSawtoothUpWaveEffectSupported;
+    bool isSawtoothDownWaveEffectSupported;
+    bool isSpringEffectSupported;
+    bool isFrictionEffectSupported;
+    bool isDamperEffectSupported;
+    bool isInertiaEffectSupported;
+};
+
+// One entry of GameInputHapticFeedbackMotorInfo::waveformInfo per waveform the motor can play.
+struct GameInputHapticWaveformInfo {
+    GameInputUsage usage;  // the HID usage of the waveform
+    bool isDurationSupported;
+    bool isIntensitySupported;
+    bool isRepeatSupported;
+    bool isRepeatDelaySupported;
+    uint64_t defaultDuration;  // microseconds
+};
+
+// One entry of GameInputDeviceInfo::hapticFeedbackMotorInfo per haptic motor.
+struct GameInputHapticFeedbackMotorInfo {
+    GameInputRumbleMotors mappedRumbleMotors;  // the rumble motors this haptic motor sits on
+    GameInputLocation location;
+    uint32_t locationId;
+    uint32_t waveformCount;
+    const GameInputHapticWaveformInfo* waveformInfo;
+};
+
+// An effect's duration and gain over time. The durations are microseconds; 0 everywhere means the effect has no
+// envelope and lasts until it is stopped, and playCount 0 means the same.
+struct GameInputForceFeedbackEnvelope {
+    uint64_t attackDuration;
+    uint64_t sustainDuration;
+    uint64_t releaseDuration;
+    float attackGain;
+    float sustainGain;
+    float releaseGain;
+    uint32_t playCount;
+    uint64_t repeatDelay;
+};
+
+// An effect's strength per axis, -1..1 (the axis is chosen by the motor's supportedAxes).
+struct GameInputForceFeedbackMagnitude {
+    float linearX;
+    float linearY;
+    float linearZ;
+    float angularX;
+    float angularY;
+    float angularZ;
+    float normal;
+};
+
+struct GameInputForceFeedbackConditionParams {
+    GameInputForceFeedbackMagnitude magnitude;
+    float positiveCoefficient;
+    float negativeCoefficient;
+    float maxPositiveMagnitude;
+    float maxNegativeMagnitude;
+    float deadZone;
+    float bias;
+};
+
+struct GameInputForceFeedbackConstantParams {
+    GameInputForceFeedbackEnvelope envelope;
+    GameInputForceFeedbackMagnitude magnitude;
+};
+
+// Sine, square, triangle and both sawtooth waves. `frequency` is Hz and `phase` degrees (the shim's reading of the
+// GDK remarks: 0 is no displacement); SDL takes a period in ms and a phase in hundredths of a degree.
+struct GameInputForceFeedbackPeriodicParams {
+    GameInputForceFeedbackEnvelope envelope;
+    GameInputForceFeedbackMagnitude magnitude;
+    float frequency;
+    float phase;
+    float bias;
+};
+
+struct GameInputForceFeedbackRampParams {
+    GameInputForceFeedbackEnvelope envelope;
+    GameInputForceFeedbackMagnitude startMagnitude;
+    GameInputForceFeedbackMagnitude endMagnitude;
+};
+
+// What CreateForceFeedbackEffect and IGameInputForceFeedbackEffect::SetParams take: `kind` chooses the union member.
+struct GameInputForceFeedbackParams {
+    GameInputForceFeedbackEffectKind kind;
+    union {
+        GameInputForceFeedbackConstantParams constant;
+        GameInputForceFeedbackRampParams ramp;
+        GameInputForceFeedbackPeriodicParams sineWave;
+        GameInputForceFeedbackPeriodicParams squareWave;
+        GameInputForceFeedbackPeriodicParams triangleWave;
+        GameInputForceFeedbackPeriodicParams sawtoothUpWave;
+        GameInputForceFeedbackPeriodicParams sawtoothDownWave;
+        GameInputForceFeedbackConditionParams spring;
+        GameInputForceFeedbackConditionParams friction;
+        GameInputForceFeedbackConditionParams damper;
+        GameInputForceFeedbackConditionParams inertia;
+    } data;
+};
+
+// What SetHapticMotorState takes: one waveform of the motor's waveformInfo, played `playCount` times. `duration` and
+// `repeatDelay` are microseconds; playCount 0 plays until the state is set again.
+struct GameInputHapticFeedbackParams {
+    uint32_t waveformIndex;
+    uint64_t duration;
+    float intensity;
+    uint32_t playCount;
+    uint64_t repeatDelay;
 };
 
 struct GameInputString {
@@ -184,17 +355,58 @@ struct GameInputString {
     const char* data;  // UTF-8, zero-terminated
 };
 
-struct GameInputUsage {
-    uint16_t page;
-    uint16_t id;
-};
-
 struct GameInputVersion {
     uint16_t major, minor, build, revision;
 };
 
-struct GameInputRawDeviceReportInfo;
-struct GameInputRawDeviceReportItemInfo;
+// Raw HID reports (RT-175). Layouts and order match Microsoft's v0 header (NuGet Microsoft.GameInput
+// 0.2303.22621.3038), checked with offsetof against it (docs/gameinput.md, "ABI"); the shim fills reportInfo with
+// each report's kind, id and size and no items (itemCount 0, see docs/gameinput.md "Raw HID").
+enum GameInputRawDeviceReportKind : int32_t {
+    GameInputRawInputReport = 0,
+    GameInputRawOutputReport = 1,
+    GameInputRawFeatureReport = 2,
+};
+
+struct GameInputRawDeviceItemCollectionInfo {
+    int32_t kind;  // GameInputRawDeviceItemCollectionKind
+    uint32_t childCount;
+    uint32_t siblingCount;
+    uint32_t usageCount;
+    const GameInputUsage* usages;
+    const GameInputRawDeviceItemCollectionInfo* parent;
+    const GameInputRawDeviceItemCollectionInfo* firstSibling;
+    const GameInputRawDeviceItemCollectionInfo* previousSibling;
+    const GameInputRawDeviceItemCollectionInfo* nextSibling;
+    const GameInputRawDeviceItemCollectionInfo* lastSibling;
+    const GameInputRawDeviceItemCollectionInfo* firstChild;
+    const GameInputRawDeviceItemCollectionInfo* lastChild;
+};
+
+struct GameInputRawDeviceReportItemInfo {
+    uint32_t bitOffset;
+    uint32_t bitSize;
+    int64_t logicalMin;
+    int64_t logicalMax;
+    double physicalMin;
+    double physicalMax;
+    int32_t physicalUnits;  // GameInputRawDevicePhysicalUnitKind
+    uint32_t rawPhysicalUnits;
+    int32_t rawPhysicalUnitsExponent;
+    uint32_t flags;  // GameInputRawDeviceReportItemFlags
+    uint32_t usageCount;
+    const GameInputUsage* usages;
+    const GameInputRawDeviceItemCollectionInfo* collection;
+    const GameInputString* itemString;
+};
+
+struct GameInputRawDeviceReportInfo {
+    GameInputRawDeviceReportKind kind;
+    uint32_t id;
+    uint32_t size;
+    uint32_t itemCount;
+    const GameInputRawDeviceReportItemInfo* items;
+};
 
 struct GameInputControllerAxisInfo {
     uint32_t mappedInputKinds;  // GameInputKind
@@ -331,6 +543,37 @@ static_assert(offsetof(GameInputDeviceInfo, inputReportInfo) == 160);
 static_assert(offsetof(GameInputDeviceInfo, gamepadInfo) == 256);
 static_assert(offsetof(GameInputDeviceInfo, displayName) == 296);
 static_assert(sizeof(GameInputDeviceInfo) == 320);
+static_assert(sizeof(GameInputRawDeviceItemCollectionInfo) == 80);
+static_assert(offsetof(GameInputRawDeviceItemCollectionInfo, usages) == 16);
+static_assert(offsetof(GameInputRawDeviceReportItemInfo, physicalUnits) == 40);
+static_assert(offsetof(GameInputRawDeviceReportItemInfo, usages) == 64);
+static_assert(sizeof(GameInputRawDeviceReportItemInfo) == 88);
+static_assert(offsetof(GameInputRawDeviceReportInfo, items) == 16);
+static_assert(sizeof(GameInputRawDeviceReportInfo) == 24);
+
+// The force-feedback and haptic layouts, transcribed from the public v0 header (GameInput.h, the same GDK release
+// as the rest of this file). They were not compiled against that header here — it is not in the repository — so
+// the sizes and offsets below are the check: they are what x64 MSVC lays out for those declarations.
+static_assert(sizeof(GameInputForceFeedbackMotorInfo) == 28);
+static_assert(offsetof(GameInputForceFeedbackMotorInfo, location) == 4);
+static_assert(offsetof(GameInputForceFeedbackMotorInfo, maxSimultaneousEffects) == 12);
+static_assert(offsetof(GameInputForceFeedbackMotorInfo, isConstantEffectSupported) == 16);
+static_assert(sizeof(GameInputHapticWaveformInfo) == 16);
+static_assert(offsetof(GameInputHapticWaveformInfo, defaultDuration) == 8);
+static_assert(sizeof(GameInputHapticFeedbackMotorInfo) == 24);
+static_assert(offsetof(GameInputHapticFeedbackMotorInfo, waveformInfo) == 16);
+static_assert(sizeof(GameInputForceFeedbackEnvelope) == 48);
+static_assert(offsetof(GameInputForceFeedbackEnvelope, repeatDelay) == 40);
+static_assert(sizeof(GameInputForceFeedbackMagnitude) == 28);
+static_assert(sizeof(GameInputForceFeedbackConditionParams) == 52);
+static_assert(sizeof(GameInputForceFeedbackConstantParams) == 80);  // 76 rounded up to the envelope's 8-byte alignment
+static_assert(offsetof(GameInputForceFeedbackConstantParams, magnitude) == 48);
+static_assert(sizeof(GameInputForceFeedbackPeriodicParams) == 88);
+static_assert(sizeof(GameInputForceFeedbackRampParams) == 104);
+static_assert(sizeof(GameInputForceFeedbackParams) == 112);
+static_assert(offsetof(GameInputForceFeedbackParams, data) == 8);
+static_assert(sizeof(GameInputHapticFeedbackParams) == 32);
+static_assert(offsetof(GameInputHapticFeedbackParams, repeatDelay) == 24);
 
 struct IGameInputDevice;
 struct IGameInputReading;
@@ -352,8 +595,12 @@ constexpr GUID IID_IGameInput = {0x11BE2A7E, 0x4254, 0x445A, {0x9C, 0x09, 0xFF, 
 constexpr GUID IID_IGameInputReading = {0x2156947A, 0xE1FA, 0x4DE0, {0xA3, 0x0B, 0xD8, 0x12, 0x93, 0x1D, 0xBD, 0x8D}};
 // {31DD86FB-4C1B-408A-868F-439B3CD47125}
 constexpr GUID IID_IGameInputDevice = {0x31DD86FB, 0x4C1B, 0x408A, {0x86, 0x8F, 0x43, 0x9B, 0x3C, 0xD4, 0x71, 0x25}};
+// {61F08CF1-1FFC-40CA-A2B8-E1AB8BC5B6DC}
+constexpr GUID IID_IGameInputRawDeviceReport = {0x61F08CF1, 0x1FFC, 0x40CA, {0xA2, 0xB8, 0xE1, 0xAB, 0x8B, 0xC5, 0xB6, 0xDC}};
 // {415EED2E-98CB-42C2-8F28-B94601074E31}
 constexpr GUID IID_IGameInputDispatcher = {0x415EED2E, 0x98CB, 0x42C2, {0x8F, 0x28, 0xB9, 0x46, 0x01, 0x07, 0x4E, 0x31}};
+// {51BDA05E-F742-45D9-B085-9444AE48381D}
+constexpr GUID IID_IGameInputForceFeedbackEffect = {0x51BDA05E, 0xF742, 0x45D9, {0xB0, 0x85, 0x94, 0x44, 0xAE, 0x48, 0x38, 0x1D}};
 
 // Interfaces, methods in vtable order. Pointer types the shim never implements are void*.
 struct IGameInput : IUnknown {
@@ -443,6 +690,31 @@ struct IGameInputDevice : IUnknown {
                                                                 void* outputBuffer, size_t* outputSize) = 0;
     virtual bool STDMETHODCALLTYPE AcquireExclusiveRawDeviceAccess(uint64_t timeoutInMicroseconds) = 0;
     virtual void STDMETHODCALLTYPE ReleaseExclusiveRawDeviceAccess() = 0;
+};
+
+struct IGameInputRawDeviceReport : IUnknown {
+    virtual void STDMETHODCALLTYPE GetDevice(IGameInputDevice** device) = 0;
+    virtual const GameInputRawDeviceReportInfo* STDMETHODCALLTYPE GetReportInfo() = 0;
+    virtual size_t STDMETHODCALLTYPE GetRawDataSize() = 0;
+    virtual size_t STDMETHODCALLTYPE GetRawData(size_t bufferSize, void* buffer) = 0;
+    virtual bool STDMETHODCALLTYPE SetRawData(size_t bufferSize, const void* buffer) = 0;
+    virtual bool STDMETHODCALLTYPE GetItemValue(uint32_t itemIndex, int64_t* value) = 0;
+    virtual bool STDMETHODCALLTYPE SetItemValue(uint32_t itemIndex, int64_t value) = 0;
+    virtual bool STDMETHODCALLTYPE ResetItemValue(uint32_t itemIndex) = 0;
+    virtual bool STDMETHODCALLTYPE ResetAllItems() = 0;
+};
+
+// What CreateForceFeedbackEffect returns: the effect's parameters, gain and run state, and one reference on the
+// device it belongs to.
+struct IGameInputForceFeedbackEffect : IUnknown {
+    virtual void STDMETHODCALLTYPE GetDevice(IGameInputDevice** device) = 0;
+    virtual uint32_t STDMETHODCALLTYPE GetMotorIndex() = 0;
+    virtual float STDMETHODCALLTYPE GetGain() = 0;
+    virtual void STDMETHODCALLTYPE SetGain(float gain) = 0;
+    virtual void STDMETHODCALLTYPE GetParams(GameInputForceFeedbackParams* params) = 0;
+    virtual bool STDMETHODCALLTYPE SetParams(const GameInputForceFeedbackParams* params) = 0;
+    virtual GameInputFeedbackEffectState STDMETHODCALLTYPE GetState() = 0;
+    virtual void STDMETHODCALLTYPE SetState(GameInputFeedbackEffectState state) = 0;
 };
 
 struct IGameInputDispatcher : IUnknown {

@@ -4,8 +4,9 @@ awc_opus.py writes <out>/<bank>/<stream id>.ogg with an empty OpusTags header. T
 from two local work products:
 
 ``--names``     awc_names.py CSV (source, bank, stream_id, name, rule). A file is matched by its stream id (the file
-                name) and its bank (the folder path below the Opus folder; if that has no match, the path with its
-                leading folders removed one at a time, so the Opus folder may hold several archives' outputs).
+                name; awc_opus.py's ``<id>~2.ogg`` for a second stream with the same id gets the same name) and its
+                bank (the folder path below the Opus folder; if that has no match, the path with its leading folders
+                removed one at a time, so the Opus folder may hold several archives' outputs).
 ``--dialogue``  text_tables.py dialogue CSV (wave, key, label, speaker, text_<lang> ...). A named stream whose name is
                 a dialogue wave gets that line's label, speaker and subtitles.
 
@@ -18,8 +19,10 @@ Comments written (RFC 7845 section 5.2; empty values are left out):
 
 Subtitle markup (``~n~``, ``~sl:...~``, ``~COLOR_...~`` and other ``~...~`` tokens) becomes a space. Only the OpusTags
 page (page 1, which holds that packet alone) is replaced, so the audio pages are copied byte for byte and the page
-sequence numbers do not change. Streams without a name are left untouched; running the tool again replaces the
-tags it wrote. A tags packet larger than one Ogg page (65,024 bytes) is skipped and counted.
+sequence numbers do not change. Streams without a name are left untouched, and so is a stream whose id its bank names
+twice (counted as ``ambiguous name``): the archive stores only the low 29 bits of a name hash, so two names can claim
+one id, and writing either would put another stream's name and, through --dialogue, its subtitle in the file. Running
+the tool again replaces the tags it wrote. A tags packet larger than one Ogg page (65,024 bytes) is skipped and counted.
 
 Usage:
     python -I opus_tags.py <Opus folder> --names names.csv [--dialogue dialogue.csv] [--source LABEL] [--dry-run]
@@ -40,7 +43,7 @@ from awc_opus import ogg_page, write_file  # noqa: E402
 VENDOR = b"leonida "
 MARKUP = re.compile(r"~[^~]*~")
 SPACES = re.compile(r"\s+")
-STREAM_FILE = re.compile(r"^([0-9A-Fa-f]{8})\.ogg$")
+STREAM_FILE = re.compile(r"^([0-9A-Fa-f]{8})(?:~\d+)?\.ogg$")   # <id>~2 ...: a later stream with the same id
 MAX_PACKET = 255 * 255 - 1          # lacing values of one page: 254 full segments and a final short one
 
 
@@ -84,6 +87,8 @@ def retag(data: bytes, packet: bytes) -> bytes:
     segments = data[tags_at + 27:tags_at + 27 + data[tags_at + 26]]
     if not segments or segments[-1] == 255:
         raise ValueError("the OpusTags packet continues past page 1")
+    if any(segment != 255 for segment in segments[:-1]):
+        raise ValueError("the OpusTags page contains another packet")
     serial, seq = struct.unpack_from("<II", data, tags_at + 14)
     if seq != 1:
         raise ValueError("the OpusTags page is not page 1")
@@ -91,19 +96,34 @@ def retag(data: bytes, packet: bytes) -> bytes:
 
 
 def load_names(path, source=None):
-    """{bank label: {29-bit stream id: name}} from awc_names.py CSV."""
+    """({bank label: {29-bit stream id: name}}, {bank label: {ids a second name claims}}) from an awc_names.py CSV.
+
+    The archive stores only the low 29 bits of a name hash, so two names can claim one id: two sources over the same
+    archive (--source is optional) or a genuine collision. The last row used to win, which wrote an arbitrary name -
+    and, through --dialogue, another stream's subtitle - into the file. An id that two different names claim is left
+    out of the map and returned instead, so it is reported and not tagged.
+    """
     out = collections.defaultdict(dict)
-    with open(path, encoding="utf-8", newline="") as fh:
+    ambiguous = collections.defaultdict(set)
+    with open(path, encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
             if source and row.get("source") != source:
                 continue
-            out[row["bank"].replace("\\", "/")][int(row["stream_id"], 16) & 0x1FFFFFFF] = row["name"]
-    return dict(out)
-
+            bank = row["bank"].replace("\\", "/")
+            sid = int(row["stream_id"], 16) & 0x1FFFFFFF
+            if sid in out[bank]:
+                if out[bank][sid] != row["name"]:
+                    ambiguous[bank].add(sid)
+                continue
+            out[bank][sid] = row["name"]
+    for bank, ids in ambiguous.items():
+        for sid in ids:
+            del out[bank][sid]
+    return dict(out), {bank: ids for bank, ids in ambiguous.items()}
 
 def load_dialogue(path):
     """{wave: row} from text_tables.py dialogue CSV, and the language codes in column order."""
-    with open(path, encoding="utf-8", newline="") as fh:
+    with open(path, encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
         langs = [f[5:] for f in reader.fieldnames or [] if f.startswith("text_")]
         return {row["wave"].lower(): row for row in reader}, langs
@@ -112,7 +132,7 @@ def load_dialogue(path):
 def comments(name, line, langs):
     out = [("TITLE", name)]
     if line:
-        texts = [(lang, clean(line.get(f"text_{lang}", ""))) for lang in langs]
+        texts = [(lang, clean(line.get(f"text_{lang}") or "")) for lang in langs]
         texts = [(lang, t) for lang, t in texts if t]
         main = dict(texts).get("en") or (texts[0][1] if texts else "")
         out += [("LABEL", line.get("label", "")), ("SPEAKER", line.get("speaker", "")), ("SUBTITLE", main)]
@@ -120,31 +140,45 @@ def comments(name, line, langs):
     return out
 
 
-def bank_names(names, rel_dir):
-    """The stream names of the bank in `rel_dir`, trying shorter paths from the left when the full path is unknown."""
+def bank_label(names, rel_dir):
+    """The names-CSV label of the bank in `rel_dir`, trying shorter paths from the left when the full path is
+    unknown; None when no label matches. Each path is tried as is, then with ".awc": awc_names.py labels a bank read
+    from an audio_manifest.json with its archive path, extension included, while awc_opus.py's folder has none. A
+    label as is wins."""
     parts = rel_dir.split("/")
     for i in range(len(parts)):
-        found = names.get("/".join(parts[i:]))
-        if found is not None:
-            return found
+        path = "/".join(parts[i:])
+        for label in (path, path + ".awc"):
+            if names.get(label) is not None:
+                return label
     return None
 
+def bank_names(names, rel_dir):
+    """The stream names of the bank in `rel_dir`, trying shorter paths from the left when the full path is unknown."""
+    label = bank_label(names, rel_dir)
+    return None if label is None else names[label]
 
-def tag_folder(root, names, dialogue=None, langs=(), dry_run=False):
+
+def tag_folder(root, names, dialogue=None, langs=(), dry_run=False, ambiguous=None):
     stats = collections.Counter()
     dialogue = dialogue or {}
+    ambiguous = ambiguous or {}
     for folder, _dirs, files in os.walk(root):
         rel = os.path.relpath(folder, root).replace(os.sep, "/")
-        streams = None
+        streams, label = None, None
         for fname in sorted(files):
             m = STREAM_FILE.match(fname)
             if not m:
                 continue
             stats["ogg files"] += 1
             if streams is None:
-                streams = bank_names(names, rel) if rel != "." else None
-                streams = streams or {}
-            name = streams.get(int(m.group(1), 16) & 0x1FFFFFFF)
+                label = bank_label(names, rel) if rel != "." else None
+                streams = names[label] if label is not None else {}
+            sid = int(m.group(1), 16) & 0x1FFFFFFF
+            if sid in ambiguous.get(label, ()):
+                stats["ambiguous name"] += 1
+                continue
+            name = streams.get(sid)
             if not name:
                 stats["without a name"] += 1
                 continue
@@ -185,13 +219,13 @@ def main(argv=None) -> int:
         print(f"opus_tags: error: {a.opus}: not a folder", file=sys.stderr)
         return 2
     try:
-        names = load_names(a.names, a.source)
+        names, ambiguous = load_names(a.names, a.source)
         dialogue, langs = load_dialogue(a.dialogue) if a.dialogue else ({}, [])
     except (OSError, KeyError, ValueError) as e:
         print(f"opus_tags: error: cannot read a CSV: {e}", file=sys.stderr)
         return 2
     try:
-        stats = tag_folder(a.opus, names, dialogue, langs, a.dry_run)
+        stats = tag_folder(a.opus, names, dialogue, langs, a.dry_run, ambiguous)
     except OSError as e:
         print(f"opus_tags: error: {e}", file=sys.stderr)
         return 2

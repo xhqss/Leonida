@@ -302,8 +302,11 @@ Inferred:
 ## Reproduce
 
 ```powershell
-python -I tools/rpf9_carve.py audio.rpf <out> --limit 0x129B000
+python -I tools/rpf9_carve.py audio.rpf <out> --until-adat
 ```
+
+(`--until-adat` stops at the first AWC bank, `0x129B000` on the measured package; `--limit 0x129B000` gives the
+same window there.)
 
 The carve writes `000000762160.bin` and `0000000daeb0.bin`, both 65,536 bytes. The record table is
 `python -I tools/audio_config.py <out> --join --json`. The station scan is a u32 read of the two

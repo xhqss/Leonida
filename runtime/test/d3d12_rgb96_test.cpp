@@ -160,6 +160,33 @@ struct Footprints {
     }
 };
 
+bool host_reports_no_tiling(ID3D12Device* device, const char* device_name, DXGI_FORMAT format) {
+    const D3D12_RESOURCE_DESC desc = texture_desc(format, false, 256, 256, 1, 1);
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    Ref<ID3D12Resource> resource;
+    const HRESULT created = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&resource.p));
+    CHECK(SUCCEEDED(created));
+    UINT total = 0xdeadbeefu, count = 1;
+    D3D12_PACKED_MIP_INFO packed{0xdeu, 0xadu, 0xdeadbeefu, 0xdeadbeefu};
+    D3D12_TILE_SHAPE shape{0xdeadbeefu, 0xdeadbeefu, 0xdeadbeefu};
+    const D3D12_SUBRESOURCE_TILING untouched{0xdeadbeefu, 0xbeefu, 0xbeefu, 0xdeadbeefu};
+    D3D12_SUBRESOURCE_TILING subresource = untouched;
+    device->GetResourceTiling(resource.p, &total, &packed, &shape, &count, 0, &subresource);
+    if (total || shape.WidthInTexels || shape.HeightInTexels || shape.DepthInTexels ||
+        packed.NumStandardMips || packed.NumPackedMips || packed.NumTilesForPackedMips ||
+        packed.StartTileIndexInOverallResource || count ||
+        std::memcmp(&subresource, &untouched, sizeof(subresource)) != 0) {
+        std::fprintf(stderr, "%s format %d: unexpected tiling: total %u, shape %ux%ux%u, packed %u/%u/%u/%u, "
+                     "subresources %u\n", device_name, int(format), total, shape.WidthInTexels,
+                     shape.HeightInTexels, shape.DepthInTexels, packed.NumStandardMips, packed.NumPackedMips,
+                     packed.NumTilesForPackedMips, packed.StartTileIndexInOverallResource, count);
+        return false;
+    }
+    return true;
+}
+
 // What the copies below leave in the second texture, and in the box read back from it: three words a texel.
 struct Texels {
     std::vector<std::vector<std::uint32_t>> subresources;
@@ -552,10 +579,15 @@ int main() {
             std::fprintf(stderr, "WARP reference unavailable\n");
             return 77;  // Wine: ctest skips
         }
+        Ref<ID3D12Device> hardware;
+        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&hardware.p)))) return 77;
 
         constexpr DXGI_FORMAT formats[] = {DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32_UINT,
                                            DXGI_FORMAT_R32G32B32_SINT, DXGI_FORMAT_R32G32B32_TYPELESS};
         for (const DXGI_FORMAT format : formats) {
+            if (!host_reports_no_tiling(hardware.p, "hardware", format) ||
+                !host_reports_no_tiling(host.p, "WARP", format))
+                return 1;
             for (const bool volume : {false, true}) {
                 const Shape shape{format, volume};
                 Footprints ours_footprints, host_footprints;
@@ -645,7 +677,8 @@ int main() {
         }
     }
     if (vk.validation_errors()) return 1;
-    std::printf("rgb96: %u texture shapes matched WARP and the expected texels bit for bit; CPU copies with%s\n",
+    std::printf("rgb96: %u texture shapes matched WARP and the expected texels bit for bit; CPU copies with%s; "
+                "the hardware adapter and WARP report no tiling for all four formats\n",
                 compared, vk.host_image_copy ? " and without host image copies on the device" : "out host image copies");
     return 0;
 }

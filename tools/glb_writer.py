@@ -22,7 +22,7 @@ import struct
 import sys
 import tempfile
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
@@ -72,11 +72,15 @@ def _clean_zero(v: float) -> float:
 def _normalize3(nx: float, ny: float, nz: float) -> tuple[float, float, float]:
     if not (math.isfinite(nx) and math.isfinite(ny) and math.isfinite(nz)):
         return (0.0, 1.0, 0.0)
-    length = math.sqrt(nx * nx + ny * ny + nz * nz)
-    if length <= 0.0 or not math.isfinite(length):
+    length = math.hypot(nx, ny, nz)
+    if length == 0.0:
         return (0.0, 1.0, 0.0)
-    inv = 1.0 / length
-    return (_clean_zero(nx * inv), _clean_zero(ny * inv), _clean_zero(nz * inv))
+    if length < sys.float_info.min or not math.isfinite(length):
+        # Scaling first keeps an unrepresentable or subnormal length from changing the direction.
+        scale = max(abs(nx), abs(ny), abs(nz))
+        nx, ny, nz = nx / scale, ny / scale, nz / scale
+        length = math.hypot(nx, ny, nz)
+    return (_clean_zero(nx / length), _clean_zero(ny / length), _clean_zero(nz / length))
 
 
 def _compute_smooth_normals(
@@ -141,11 +145,10 @@ def _resolve_obj_index(token: str, count: int) -> int | None:
     return None
 
 
-def _concave_triangles(points: list[tuple[float, float, float]]) -> list[tuple[int, int, int]] | None:
-    """Return corner triples for a simple planar face whose first-corner fan folds over.
+def _triangulate_face(points: list[tuple[float, float, float]]) -> list[tuple[int, int, int]] | None:
+    """Return corner triples when the first-corner fan folds over or emits a zero-area triangle.
 
-    None keeps the original fan for convex faces, already valid fans, or
-    degenerate input for which we cannot find a triangulation.
+    None keeps an already valid fan or falls back to it if ear clipping cannot complete.
     """
     # Project onto the plane with the largest signed area. Work relative to one
     # corner so translating the mesh far from the origin does not affect the sum.
@@ -168,7 +171,7 @@ def _concave_triangles(points: list[tuple[float, float, float]]) -> list[tuple[i
         cx, cy = xy[c]
         return winding * ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax))
 
-    if all(turn(0, i, i + 1) >= 0 for i in range(1, len(points) - 1)):
+    if all(turn(0, i, i + 1) > 0 for i in range(1, len(points) - 1)):
         return None
 
     # Clip ears in boundary order. A point on the ear's edge blocks it too:
@@ -192,6 +195,28 @@ def _concave_triangles(points: list[tuple[float, float, float]]) -> list[tuple[i
     return triangles
 
 
+def _logical_obj_lines(text: str) -> Iterator[str]:
+    """Yield OBJ logical lines, joining trailing-backslash continuations with a space.
+
+    A '#' starts an inline comment. A backslash inside that comment does not continue the line;
+    a backslash in the code before the comment does.
+    """
+    pending = ""
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if not line or line.lstrip().startswith("#"):
+            continue
+        code, _, _comment = line.partition("#")
+        code = code.rstrip()
+        if code.endswith("\\"):
+            pending += code[:-1].rstrip() + " "
+            continue
+        yield pending + code
+        pending = ""
+    if pending:
+        yield pending
+
+
 def parse_obj(
     text_or_path: str,
     *,
@@ -205,7 +230,7 @@ def parse_obj(
     Groups primitives in order of appearance by (group_index, material_name),
     converts coordinates to glTF Y-up, flips V for top-left UV origin,
     deduplicates vertices per primitive, and synthesizes smooth area-weighted
-    normals when explicit normals are missing.
+    normals within the primitive and OBJ smoothing group when explicit normals are missing.
     """
     up = up_axis.lower()
     if up not in ("z", "y"):
@@ -238,11 +263,13 @@ def parse_obj(
     saw_g = False
     group_has_faces = False
     material_name = ""
+    smoothing_group: int | None = None
+    flat_face_id = 0
 
     # Preserve order of appearance for (group_index, material_name) primitives.
     builders: dict[tuple[int, str], dict] = {}
 
-    for raw_line in text.splitlines():
+    for raw_line in _logical_obj_lines(text.removeprefix("\ufeff")):
         line = raw_line.strip()
         if not line or line[0] == "#":
             continue
@@ -332,6 +359,15 @@ def parse_obj(
         elif cmd == "usemtl":
             material_name = line[len(cmd):].split("#", 1)[0].strip()
 
+        elif cmd == "s" and len(parts) > 1:
+            value = parts[1].split("#", 1)[0]
+            try:
+                group = 0 if value == "off" else int(value)
+            except ValueError:
+                continue
+            if group >= 0:
+                smoothing_group = group
+
         elif cmd == "f":
             if "#" in line:
                 parts = line.split("#", 1)[0].split()
@@ -379,7 +415,7 @@ def parse_obj(
             if len(corners) > 3:
                 indices = None
                 if len({c[0] for c in corners}) == len(corners):
-                    indices = _concave_triangles([raw_v[c[0]] for c in corners])
+                    indices = _triangulate_face([raw_v[c[0]] for c in corners])
                 if indices is None:
                     indices = ((0, i, i + 1) for i in range(1, len(corners) - 1))
             tris = []
@@ -410,7 +446,14 @@ def parse_obj(
                 }
                 builders[key] = builder
 
-            vert_map: dict[tuple[int, int | None, int | None], int] = builder["vert_map"]
+            normal_group = None
+            if smoothing_group is not None and any(vni is None for _, _, vni in corners):
+                normal_group = smoothing_group
+                if smoothing_group == 0:
+                    flat_face_id -= 1
+                    normal_group = flat_face_id
+
+            vert_map: dict[tuple[int, int | None, int | None, int | None], int] = builder["vert_map"]
             b_pos: list[tuple[float, float, float]] = builder["positions"]
             b_nrm: list[tuple[float, float, float] | None] = builder["normals"]
             b_uv: list[tuple[float, float] | None] = builder["uvs"]
@@ -418,10 +461,11 @@ def parse_obj(
 
             for tri in tris:
                 for corner in tri:
-                    local_idx = vert_map.get(corner)
+                    vertex_key = (*corner, normal_group)
+                    local_idx = vert_map.get(vertex_key)
                     if local_idx is None:
                         local_idx = len(b_pos)
-                        vert_map[corner] = local_idx
+                        vert_map[vertex_key] = local_idx
                         vi, vti, vni = corner
                         pos = raw_v[vi]
                         assert pos is not None
@@ -446,17 +490,26 @@ def parse_obj(
             continue
 
         if builder["has_missing_normal"]:
-            # UVs and explicit normals split render vertices, but generated normals
-            # share the first render vertex's accumulator for each OBJ position.
-            first_vertex: dict[int, int] = {}
+            # UVs and explicit normals split render vertices. Generated normals
+            # share an accumulator for each position within the same smoothing group.
+            first_vertex: dict[tuple[int, int | None], int] = {}
             normal_vertices = [
-                first_vertex.setdefault(corner[0], vertex)
-                for corner, vertex in builder["vert_map"].items()
+                first_vertex.setdefault((vi, normal_group), vertex)
+                for (vi, _, _, normal_group), vertex in builder["vert_map"].items()
             ]
-            computed = _compute_smooth_normals(positions, (normal_vertices[i] for i in indices))
+            raw_normals = builder["normals"]
+            index_iter = iter(indices)
+            # Fully explicit triangles should not smooth neighboring generated normals.
+            normal_indices = (
+                normal_vertices[i]
+                for a, b, c in zip(index_iter, index_iter, index_iter)
+                if None in (raw_normals[a], raw_normals[b], raw_normals[c])
+                for i in (a, b, c)
+            )
+            computed = _compute_smooth_normals(positions, normal_indices)
             normals = [
                 normal if normal is not None else computed[normal_vertex]
-                for normal, normal_vertex in zip(builder["normals"], normal_vertices)
+                for normal, normal_vertex in zip(raw_normals, normal_vertices)
             ]
         else:
             normals = builder["normals"]
@@ -523,10 +576,10 @@ def compute_bounds(primitives: list[dict]) -> list[float] | None:
 
 
 def _pack_f32(values: list[tuple[float, ...]], components: int) -> tuple[bytes, array.array]:
+    if any(len(item) != components for item in values):
+        raise GlbError(f"expected {components} floats per vertex")
     if _FLOAT32_CODE is not None:
         arr = array.array(_FLOAT32_CODE, itertools.chain.from_iterable(values))
-        if len(arr) != len(values) * components:
-            raise GlbError(f"expected {components} floats per vertex")
         if not all(map(math.isfinite, arr)):
             raise GlbError("non-finite float32 vertex attribute")
         raw = arr
@@ -538,8 +591,6 @@ def _pack_f32(values: list[tuple[float, ...]], components: int) -> tuple[bytes, 
 
     flat: list[float] = []
     for item in values:
-        if len(item) != components:
-            raise GlbError(f"expected {components} floats per vertex")
         for c in item:
             v = float(c)
             if not math.isfinite(v):
@@ -610,12 +661,15 @@ def pack_primitive(prim: dict) -> dict:
     """Packed little-endian glTF buffers for one primitive from ``parse_obj``.
 
     Returns ``positions``/``normals``/``uvs``/``indices`` as bytes (``uvs`` is b"" without UVs), the index
-    component type, the vertex and index counts, the POSITION ``min``/``max`` and the primitive's ``material``
-    key. The same packed primitive can be written into a GLB once and drawn by many instances.
+    component type, the vertex and index counts, the POSITION ``min``/``max``, and the primitive's
+    ``material`` key and optional ``material_index``. The same packed primitive can be written into
+    a GLB once and drawn by many instances.
     """
     positions = list(prim["positions"])
     indices = list(prim["indices"])
     vert_count = len(positions)
+    pos_bytes, pos_f32 = _pack_f32(positions, 3)
+    idx_bytes, idx_comp_type = _pack_indices(indices, vert_count)
     normals_in = prim.get("normals")
     if normals_in is None or len(normals_in) == 0:
         normals = _compute_smooth_normals(positions, indices)
@@ -628,7 +682,6 @@ def pack_primitive(prim: dict) -> dict:
         raise GlbError(
             f"normals length ({len(normals_in)}) does not match positions length ({vert_count})"
         )
-    pos_bytes, pos_f32 = _pack_f32(positions, 3)
     xs = pos_f32[0::3]
     ys = pos_f32[1::3]
     zs = pos_f32[2::3]
@@ -648,7 +701,6 @@ def pack_primitive(prim: dict) -> dict:
             for uv in uvs_in
         ]
         uv_bytes, _ = _pack_f32(clean_uvs, 2)
-    idx_bytes, idx_comp_type = _pack_indices(indices, vert_count)
     material = prim.get("material", "")
     return {
         "positions": pos_bytes,
@@ -661,6 +713,7 @@ def pack_primitive(prim: dict) -> dict:
         "min": [_clean_zero(min(xs)), _clean_zero(min(ys)), _clean_zero(min(zs))],
         "max": [_clean_zero(max(xs)), _clean_zero(max(ys)), _clean_zero(max(zs))],
         "material": material if isinstance(material, (str, int)) and not isinstance(material, bool) else "",
+        "material_index": prim.get("material_index"),
     }
 
 
@@ -1065,7 +1118,7 @@ def instance_bounds(box_min, box_max, translation, rotation, scale) -> list[floa
 
 def build_instanced_glb(
     meshes: list[dict],
-    materials: dict[str, dict] | None = None,
+    materials: dict[str | int, dict] | None = None,
     *,
     mode: str = "gpu",
     generator: str = "Leonida glb_writer",
@@ -1077,9 +1130,9 @@ def build_instanced_glb(
     determinant (no mirroring scale); give mirrored instances their own mirrored mesh instead, so the winding is
     right in every loader. ``mode`` "gpu" writes one node per mesh with ``EXT_mesh_gpu_instancing`` (listed in
     extensionsUsed and extensionsRequired); "nodes" writes one plain glTF node per instance, which every loader
-    reads but which costs a draw call per instance. ``materials`` takes the spec keys documented on
-    ``build_glb``, looked up by each packed primitive's ``material``. Returns (GLB bytes, stats) where stats
-    counts rendered triangles (each mesh's triangles times its instances) and the bounds of every instance.
+    reads but which costs a draw call per instance. ``materials`` uses the same lookup and spec keys as
+    ``build_glb``. Returns (GLB bytes, stats), including rendered triangles (each mesh's triangles times its
+    instances) and the bounds of every instance.
     """
     if mode not in INSTANCING_MODES:
         raise GlbError(f"instancing mode must be one of {INSTANCING_MODES}, got {mode!r}")
@@ -1134,23 +1187,24 @@ def build_instanced_glb(
                 raise GlbError("instance scale must have a positive determinant; mirror the mesh instead")
             if not all(math.isfinite(v) for v in t + sc):
                 raise GlbError("instance translation and scale must be finite")
-            b = instance_bounds(box_min, box_max, t, q, sc)
-            for k in range(3):
-                lo[k] = min(lo[k], b[k])
-                hi[k] = max(hi[k], b[k + 3])
             ts.append(t)
             rs.append(q)
             ss.append(sc)
         instances_total += len(insts)
         drawn_tris += mesh_tris * len(insts)
+        bounds_transforms = zip(ts, rs, ss)
         if mode == "gpu":
             attrs = {}
+            stored_transforms: list[Iterable[tuple[float, ...]]] = []
             for key, values, kind in (("TRANSLATION", ts, "VEC3"), ("ROTATION", rs, "VEC4"), ("SCALE", ss, "VEC3")):
-                data, _ = _pack_f32(values, 4 if kind == "VEC4" else 3)
+                components = 4 if kind == "VEC4" else 3
+                data, _ = _pack_f32(values, components)
+                stored_transforms.append(struct.iter_unpack(f"<{components}f", data))
                 bv = _append_buffer_view(bin_buf, buffer_views, data, target=None)
                 attrs[key] = len(accessors)
                 accessors.append({"bufferView": bv, "componentType": COMPONENT_FLOAT, "count": len(values), "type": kind})
             nodes.append({"mesh": mesh_idx, "extensions": {INSTANCING_EXTENSION: {"attributes": attrs}}})
+            bounds_transforms = zip(*stored_transforms)
         else:
             for t, q, sc in zip(ts, rs, ss):
                 node: dict = {"mesh": mesh_idx}
@@ -1161,6 +1215,11 @@ def build_instanced_glb(
                 if sc != [1.0, 1.0, 1.0]:
                     node["scale"] = [_clean_zero(v) for v in sc]
                 nodes.append(node)
+        for t, q, sc in bounds_transforms:
+            b = instance_bounds(box_min, box_max, t, q, sc)
+            for k in range(3):
+                lo[k] = min(lo[k], b[k])
+                hi[k] = max(hi[k], b[k + 3])
     if not nodes:
         raise GlbError("cannot build GLB: no mesh with primitives and instances")
     bin_pad = (-len(bin_buf)) % 4
@@ -1244,30 +1303,26 @@ def read_glb_summary(data: bytes) -> dict:
     if not isinstance(gltf, dict):
         raise GlbError("GLB JSON root must be a JSON object")
 
-    offset = 20 + json_len
+    after_json = 20 + json_len
+    offset = after_json
     bin_bytes = 0
-    if offset < total_length:
+    while offset < total_length:
         if offset + 8 > total_length:
-            raise GlbError("truncated BIN chunk header")
-        bin_len, bin_type = struct.unpack_from("<II", buf, offset)
-        if bin_type != CHUNK_TYPE_BIN:
-            raise GlbError(f"second GLB chunk must be BIN (0x{CHUNK_TYPE_BIN:08X}), got 0x{bin_type:08X}")
-        if bin_len % 4 != 0:
-            raise GlbError(f"BIN chunk length not 4-byte aligned: {bin_len}")
-        if offset + 8 + bin_len > total_length:
-            raise GlbError(f"BIN chunk length {bin_len} exceeds total length {total_length}")
-        bin_bytes = bin_len
-        offset += 8 + bin_len
-
-        while offset < total_length:
-            if offset + 8 > total_length:
-                raise GlbError("truncated trailing GLB chunk header")
-            chunk_len, _chunk_type = struct.unpack_from("<II", buf, offset)
-            if chunk_len % 4 != 0:
-                raise GlbError(f"trailing chunk length not 4-byte aligned: {chunk_len}")
-            if offset + 8 + chunk_len > total_length:
-                raise GlbError("trailing chunk exceeds GLB total length")
-            offset += 8 + chunk_len
+            raise GlbError("truncated GLB chunk header")
+        chunk_len, chunk_type = struct.unpack_from("<II", buf, offset)
+        if chunk_len % 4 != 0:
+            raise GlbError(f"GLB chunk length not 4-byte aligned: {chunk_len}")
+        chunk_end = offset + 8 + chunk_len
+        if chunk_end > total_length:
+            raise GlbError(f"GLB chunk length {chunk_len} exceeds GLB total length {total_length}")
+        if chunk_type == CHUNK_TYPE_JSON:
+            raise GlbError("duplicate GLB JSON chunk")
+        if chunk_type == CHUNK_TYPE_BIN:
+            if offset != after_json:
+                raise GlbError("GLB BIN chunk must be second")
+            bin_bytes = chunk_len
+        # Extension chunks are ignored after checking their framing.
+        offset = chunk_end
 
     buf0_limit = bin_bytes
     buffers = gltf.get("buffers")
@@ -1328,6 +1383,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        # write_glb replaces its target, so naming the OBJ as the output would silently destroy the model.
+        if os.path.exists(args.out_glb) and os.path.exists(args.in_obj) and os.path.samefile(
+                args.in_obj, args.out_glb):
+            raise GlbError(f"output must not overwrite the input OBJ: {args.in_obj}")
         primitives = parse_obj(args.in_obj, is_path=True, up_axis=args.up)
         stats = write_glb(args.out_glb, primitives)
     except (GlbError, OSError) as exc:

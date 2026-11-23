@@ -1,7 +1,7 @@
 """make_game.py: a resumed shaders stage keeps the translation shards that already finished.
 
 Standard library only; no GPU, no Vulkan SDK, no game data: the shard processes and the merge are mocked. A fake
-shard writes its index.part<i>.json the way rdna2spirv.py --shard does, as the last thing before it exits.
+shard writes its marker and then index.part<i>.json the way rdna2spirv.py --shard does.
 """
 import json
 import os
@@ -43,6 +43,8 @@ class ResumeShardsTest(unittest.TestCase):
             def wait(self):
                 if self.i in crash:
                     return 1
+                with open(os.path.join(spirv, f"shard{self.i}.json"), "w", encoding="utf-8") as f:
+                    json.dump({"index": self.i, "count": self.n}, f)
                 with open(os.path.join(spirv, f"index.part{self.i}.json"), "w", encoding="utf-8") as f:
                     json.dump({"tag": tag, "n": self.n}, f)
                 return 0
@@ -78,6 +80,12 @@ class ResumeShardsTest(unittest.TestCase):
             self.translate(3, tag="a", crash={1})
         self.assertFalse(os.path.exists(self.part(1)))
         self.assertEqual(self.translate(3, tag="b"), [1])
+
+    def test_a_shard_with_a_missing_marker_is_retried_alone(self) -> None:
+        self.translate(3, tag="a")
+        os.remove(os.path.join(self.spirv, "shard1.json"))
+        self.assertEqual(self.translate(3, tag="b"), [1])
+        self.assertEqual([self.tag(i) for i in range(3)], ["a", "b", "a"])
 
     def test_another_jobs_count_translates_everything_again(self):
         self.translate(3, tag="a")
@@ -123,9 +131,10 @@ class EarlierStepDropsThePlanTest(unittest.TestCase):
             spirv = os.path.join(work, "shaders", "spirv")
             os.makedirs(dxbc)
             os.makedirs(spirv)
-            for name in ("index.json", "fssm_index.json"):          # carve and unpack finished
+            for name, entries in (("index.json", [{"file": "shader.dxbc"}]),
+                                  ("fssm_index.json", [{"name": "shader"}])):
                 with open(os.path.join(dxbc, name), "w", encoding="utf-8") as f:
-                    f.write("{}")
+                    json.dump(entries, f)
             plan = os.path.join(spirv, make_game.SHARD_PLAN)
             with open(plan, "w", encoding="utf-8") as f:
                 json.dump({"jobs": 2, "wave64_emulate": False, "translator": "d1"}, f)
@@ -133,7 +142,13 @@ class EarlierStepDropsThePlanTest(unittest.TestCase):
 
             def fake_translate(disasm, out, jobs, emulate=False, fallbacks=()):
                 seen["plan"] = os.path.exists(plan)
-            with mock.patch.object(make_game, "py"), mock.patch.object(make_game, "need"), \
+            def fake_disassemble(*args):
+                disasm = os.path.join(dxbc, "disasm")
+                os.makedirs(disasm)
+                with open(os.path.join(disasm, "shader.s"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write("synthetic listing\n")
+
+            with mock.patch.object(make_game, "py", side_effect=fake_disassemble), mock.patch.object(make_game, "need"), \
                     mock.patch.object(make_game, "llvm_mc_signature", return_value="test llvm-mc 21"), \
                     mock.patch.object(make_game, "translate", side_effect=fake_translate), \
                     mock.patch.object(make_game, "log", lambda *a: None):

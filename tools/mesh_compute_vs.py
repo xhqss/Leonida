@@ -25,14 +25,51 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 
 SUFFIX = ".mesh_vs"   # <ms name>.mesh_vs.spvasm / .spv next to the mesh shader
 USER_SGPRS = 32       # push constants: s0..s31, heap base, code base, then the output address (rdna2spirv.py)
 
 
-def vs_spvasm(layout):
-    """SPIR-V assembly of the vertex shader for one --mesh-compute layout (index.json "mesh_compute")."""
+F16_HALF_TOP = 29
+
+
+def pair_f16_halves(layout, ps_f16_halves, ps_raw_inputs=(), top=F16_HALF_TOP):
+    """Choose non-colliding `f16_halves` ({str(param): [lo, hi]}) for a (--mesh-compute, PS) pair (SHADER-378).
+
+    Keeps the PS's own `[lo, hi]` locations whenever every requested param is exported by `layout["params"]` and no
+    half location collides with any producer param or exceeds `top`. Otherwise packs all requested pairs downward
+    from `top` into locations disjoint from `producer_params | ps_raw_inputs`.
+    """
+    producer_params = {int(k) for k in layout.get("params", {})}
+    ps_pairs = {int(k): [int(v[0]), int(v[1])] for k, v in ps_f16_halves.items()}
+    if not ps_pairs:
+        return {}
+    missing = sorted(p for p in ps_pairs if p not in producer_params)
+    if missing:
+        raise ValueError(f"mesh_compute_vs: producer does not export f16_halves param(s) {missing}")
+    if all(0 <= lo <= top and 0 <= hi <= top and lo != hi and lo not in producer_params and hi not in producer_params
+           for lo, hi in ps_pairs.values()):
+        used_halves = [loc for pair in ps_pairs.values() for loc in pair]
+        if len(set(used_halves)) == len(used_halves):
+            return {str(k): list(v) for k, v in sorted(ps_pairs.items())}
+    reserved = producer_params | {int(x) for x in ps_raw_inputs}
+    free = [loc for loc in range(top, -1, -1) if loc not in reserved]
+    need = 2 * len(ps_pairs)
+    if len(free) < need:
+        raise ValueError(f"mesh_compute_vs: need {need} decoded-half locations, only {len(free)} free in 0..{top}")
+    return {str(p): [free[2 * k + 1], free[2 * k]] for k, p in enumerate(sorted(ps_pairs))}
+
+
+def vs_spvasm(layout, f16_halves=None):
+    """SPIR-V assembly of the vertex shader for one --mesh-compute layout (index.json "mesh_compute").
+
+    Optional `f16_halves` ({param: [low_loc, high_loc]}) overrides `layout["f16_halves"]` for per-pipeline pairing
+    (SHADER-378), so a producer with many params only exports the decoded halves its paired PS actually reads.
+    """
     lay = dict(layout)
+    if f16_halves is not None:
+        lay["f16_halves"] = f16_halves
     params = sorted((int(k), int(v)) for k, v in lay["params"].items())
     maxv, maxp = int(lay["max_vertices"]), int(lay["max_primitives"])
     clip, cull = int(lay["clip_count"]), int(lay["cull_count"])
@@ -114,6 +151,16 @@ def vs_spvasm(layout):
         body += [f"%par{loc} = OpCompositeConstruct %v4float {' '.join(vals)}", f"OpStore %out{loc} %par{loc}"]
     halves = sorted((int(k), [int(x) for x in v]) for k, v in lay.get("f16_halves", {}).items())
     offsets = dict(params)
+    used_locs = set(offsets)
+    for loc, hlocs in halves:
+        if loc not in offsets:
+            raise ValueError(f"mesh_compute_vs: f16_halves param {loc} is not in layout params")
+        if len(hlocs) != 2 or hlocs[0] == hlocs[1] or hlocs[0] < 0 or hlocs[1] < 0:
+            raise ValueError(f"mesh_compute_vs: invalid f16_halves locations {hlocs} for param {loc}")
+        for hloc in hlocs:
+            if hloc in used_locs:
+                raise ValueError(f"mesh_compute_vs: f16_halves location {hloc} collides with another output")
+            used_locs.add(hloc)
     for loc, hlocs in halves:      # --f16-interp-fallback: each channel's two f16 halves decoded to f32
         parts = ([], [])
         for i in range(4):
@@ -211,12 +258,15 @@ def build_for_index(spirv_dir):
     built = []
     for asm in write_for_index(spirv_dir):
         spv = asm[: -len(".spvasm")] + ".spv"
-        for name, tool in steps:
-            args = [asm, "-o", spv] if name == "spirv-as" else [spv]
-            cmd = [tool, "--target-env", "vulkan1.2"] + args
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            if r.returncode:
-                raise RuntimeError(f"{name} failed for {asm}:\n{r.stdout}{r.stderr}")
+        with tempfile.TemporaryDirectory(prefix=".mesh-vs-", dir=os.path.dirname(spv)) as staging:
+            staged_spv = os.path.join(staging, os.path.basename(spv))
+            for name, tool in steps:
+                args = [asm, "-o", staged_spv] if name == "spirv-as" else [staged_spv]
+                cmd = [tool, "--target-env", "vulkan1.2"] + args
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode:
+                    raise RuntimeError(f"{name} failed for {asm}:\n{r.stdout}{r.stderr}")
+            os.replace(staged_spv, spv)
         built.append(spv)
     return built
 

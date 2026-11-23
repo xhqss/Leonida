@@ -23,6 +23,7 @@ corpus uses, so tools/rdna2spirv.py can read it:
     DIR/index.json           [{"file": "<name>.dxbc", "stage": "cs", ...}]
     DIR/fspx/<name>.json     the decoded kind-0 entry, the directory and the code range
     DIR/fspx/<name>.code     the kind-6 program
+    DIR/fspx/<name>.state    the kind-0 entry as it is (its SHA-256 is the index's fspx_state_sha256)
     DIR/disasm/<name>.s      with --disasm: tools/shader_disasm.py output for the code after the prologue
 """
 import argparse
@@ -170,17 +171,33 @@ def main(argv=None) -> int:
                     help="llvm-mc CPU for --disasm (default gfx1030: the programs use v_dot4 instructions, which "
                          "gfx1010 and gfx1013 do not decode)")
     a = ap.parse_args(argv)
-    os.makedirs(os.path.join(a.out, "fspx"), exist_ok=True)
+    fspx_dir = os.path.join(a.out, "fspx")
+    try:
+        os.makedirs(fspx_dir, exist_ok=True)
+    except OSError as error:
+        print(f"cannot create output directory {fspx_dir}: {error}", file=sys.stderr)
+        return 2
     disasm = None
     if a.disasm:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import shader_disasm  # noqa: E402  (resolves LLVM_MC at import)
         disasm = shader_disasm
-        os.makedirs(os.path.join(a.out, "disasm"), exist_ok=True)
+        disasm_dir = os.path.join(a.out, "disasm")
+        try:
+            os.makedirs(disasm_dir, exist_ok=True)
+        except OSError as error:
+            print(f"cannot create output directory {disasm_dir}: {error}", file=sys.stderr)
+            return 2
     index, bad = [], 0
+    used_names = set()
     for path in a.files:
-        with open(path, "rb") as f:
-            data = f.read()
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as error:
+            print(f"{path}: cannot read input: {error}", file=sys.stderr)
+            bad += 1
+            continue
         stem = os.path.splitext(os.path.basename(path))[0]
         if data[:4] == MAGIC:
             items = [(0, None, data)]
@@ -197,29 +214,48 @@ def main(argv=None) -> int:
                 print(f"{name}: FSPX status {status}", file=sys.stderr)
                 bad += 1
                 continue
+            base_name = name
+            number = 1
+            while name.casefold() in used_names:
+                number += 1
+                name = f"{base_name}_{number}"
+            used_names.add(name.casefold())
             meta, blob = got
             stage = psv_stage(dxbc_parts(container)) if container else None
             meta["source"] = {"file": os.path.basename(path), "offset": off}
             entry = {"file": name + ".dxbc", "stage": "cs" if stage in (None, STAGE_COMPUTE) else f"psv{stage}",
-                     "source_offset": off, "threads": meta["threads"], "wave32": meta["wave32"]}
+                     "source_offset": off}
+            if "threads" in meta:
+                entry["threads"] = meta["threads"]
+            if "wave32" in meta:
+                entry["wave32"] = meta["wave32"]
+            listing = None
+            if disasm and meta["code"]["end"]:
+                start, end = meta["code"]["start"], meta["code"]["end"]
+                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
+                if not asm.strip():
+                    reason = (err.strip().splitlines() or ["no output"])[0]
+                    print(f"{name}: {reason}", file=sys.stderr)
+                    bad += 1
+                    continue
+                entry["invalid_words"] = invalid
+                listing = f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n" + asm
+                if err.strip():
+                    listing += "\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n"
             if container:
                 with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
                     f.write(container)
             with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
                 f.write(blob[6])
-            with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8") as f:
+            with open(os.path.join(a.out, "fspx", name + ".state"), "wb") as f:
+                f.write(blob[0])
+            with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
                 json.dump(meta, f, indent=1)
-            if disasm and meta["code"]["end"]:
-                start, end = meta["code"]["start"], meta["code"]["end"]
-                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
-                entry["invalid_words"] = invalid
-                with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8") as f:
-                    f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")
-                    f.write(asm)
-                    if err.strip():
-                        f.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
+            if listing is not None:
+                with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write(listing)
             index.append(entry)
-    with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(index, f, indent=1)
     print(f"{len(index)} FSPX program(s) unpacked to {a.out}" + (f", {bad} input(s) failed" if bad else ""))
     return 1 if bad else 0

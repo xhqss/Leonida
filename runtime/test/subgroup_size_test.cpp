@@ -171,6 +171,12 @@ int main() {
         CHECK(r.outcome == SubgroupOutcome::required && r.size == 64);
         r = decide_subgroup_size(entry("cs", true, {16, 8, 8}), caps);  // 1024 invocations too
         CHECK(r.outcome == SubgroupOutcome::device_default);
+        // Large dimensions whose 3-way product wraps uint64_t must not bypass maxComputeWorkgroupSubgroups.
+        r = decide_subgroup_size(entry("cs", true, {0x1000000u, 0x1000000u, 0x10000u}), amd());
+        CHECK(r.outcome == SubgroupOutcome::device_default && r.size == 0 && r.flags == 0);
+        // Zero local_size X (malformed/unknown index entry) must not enable REQUIRE_FULL_SUBGROUPS_BIT.
+        r = decide_subgroup_size(entry("cs", true, {0, 1, 1}), amd());
+        CHECK(r.flags == 0);
         // The limit is for compute and mesh; a pixel shader is not subject to it.
         r = decide_subgroup_size(entry("ps", true), caps);
         CHECK(r.outcome == SubgroupOutcome::required);

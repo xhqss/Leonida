@@ -118,6 +118,55 @@ class NavmeshIndexTest(unittest.TestCase):
         self.assertIsNone(row["stored"])
         self.assertEqual(row["size"], 0x80)
 
+    def test_directory_with_glob_metacharacters_in_its_name(self):
+        # Before: os.path.join(root, "**", pattern) fed a root like "carve[1]" straight to glob, which read
+        # the "[1]" as a character class and matched nothing -- the index came back empty.
+        folder = os.path.join(self.root, "carve[1]")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "page.bin"), "wb") as f:
+            f.write(page(pages=6))
+        with open(os.path.join(folder, "other.bin"), "wb") as f:
+            f.write(b"plain" * 100)
+        out = os.path.join(self.root, "dir_bracket.json")
+        self.run_tool(folder, "--out", out, "--pattern", "*.bin")
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["streams"], 2)
+        self.assertEqual(doc["summary"]["matched"], 1)
+        self.assertEqual(doc["summary"]["page_counts"], {"6": 1})
+        self.assertEqual(doc["pages"][0]["source"], "page.bin")
+
+    def test_folder_name_with_glob_characters_is_a_path(self):
+        # glob read "[v1]" as a character class, so a folder named like this indexed nothing and exited 0.
+        folder = os.path.join(self.root, "carve [v1]")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "page.bin"), "wb") as f:
+            f.write(page(pages=2))
+        out = os.path.join(self.root, "glob.json")
+        self.run_tool(folder, "--out", out)
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["streams"], 1)
+        self.assertEqual(doc["summary"]["matched"], 1)
+
+    def test_hard_link_to_a_scanned_file_in_a_glob_named_input_is_refused(self):
+        folder = os.path.join(self.root, "carve [v1]")
+        os.makedirs(folder)
+        carved = os.path.join(folder, "page.bin")
+        with open(carved, "wb") as f:
+            f.write(page())
+        alias = os.path.join(folder, "alias.dat")   # not matched by *.bin: only the scan's own glob finds the file
+        try:
+            os.link(carved, alias)
+        except (OSError, NotImplementedError, AttributeError):
+            self.skipTest("hard links are not available here")
+        r = subprocess.run([sys.executable, "-I", TOOL, folder, "--out", alias], cwd=ROOT,
+                           capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("would overwrite the input", r.stderr)
+        with open(carved, "rb") as f:
+            self.assertEqual(f.read(), page())
+
     def test_out_and_csv_in_missing_folders_are_created(self):
         # Before: write_outputs opened both paths directly, so a missing folder ended a finished scan in a
         # FileNotFoundError traceback and lost the index.
@@ -226,7 +275,7 @@ class NavmeshIndexTest(unittest.TestCase):
         carved = os.path.join(folder, "page.bin")
         with open(carved, "wb") as f:
             f.write(page(pages=4))
-        linked = os.path.join(folder, "report.json")
+        linked = os.path.join(self.root, "report.json")
         try:
             os.link(carved, linked)
         except (OSError, NotImplementedError) as e:
@@ -366,7 +415,7 @@ class MissingInputTest(unittest.TestCase):
             out = os.path.join(tmp, "n.json")
             p = subprocess.run([sys.executable, "-I", TOOL, os.path.join(tmp, "missing.rpf"), "--out", out],
                                capture_output=True, text=True, timeout=60)
-            self.assertEqual(p.returncode, 1, p.stderr)
+            self.assertEqual(p.returncode, 2, p.stderr)
             self.assertIn("missing.rpf", p.stderr)
             self.assertNotIn("Traceback", p.stderr)
             self.assertFalse(os.path.exists(out))
@@ -409,6 +458,105 @@ class LimitWindowTest(unittest.TestCase):
         summary = self.summary(1)
         self.assertEqual(summary["streams"], 0)
         self.assertEqual(summary["span"], 1)
+
+
+class _Unprintable:
+    """A cell whose str() fails part-way through the CSV, standing in for a write that dies mid-report."""
+
+    def __str__(self):
+        raise OSError("simulated write failure")
+
+
+class PublishTest(unittest.TestCase):
+    """write_outputs stages each report next to its destination and swaps it in: a run that fails while writing
+    keeps the previous report instead of leaving it truncated (before: open(dest, "w") emptied it first)."""
+
+    OLD_JSON = '{"summary": {"previous": true}, "pages": []}'
+    OLD_CSV = "source,offset\nprevious.rpf,0\n"
+
+    def setUp(self):
+        self.tool = load_tool_module()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.out = os.path.join(self.dir, "index.json")
+        self.csv = os.path.join(self.dir, "index.csv")
+        with open(self.out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(self.OLD_JSON)
+        with open(self.csv, "w", encoding="utf-8", newline="") as f:
+            f.write(self.OLD_CSV)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def read(self, path):
+        with open(path, encoding="utf-8", newline="") as f:
+            return f.read()
+
+    def assert_previous_reports_kept(self):
+        self.assertEqual(self.read(self.out), self.OLD_JSON)
+        self.assertEqual(self.read(self.csv), self.OLD_CSV)
+        self.assertEqual(sorted(os.listdir(self.dir)), ["index.csv", "index.json"])
+
+    def test_json_serialization_failure_keeps_previous_reports(self):
+        rows = [{"source": "a.rpf", "offset": 0, "bad": object()}]
+        with self.assertRaises(TypeError):
+            self.tool.write_outputs(rows, {"streams": 1}, self.out, self.csv)
+        self.assert_previous_reports_kept()
+
+    def test_csv_write_failure_keeps_previous_csv(self):
+        good = os.path.join(self.dir, "new.json")
+        rows = [{"source": _Unprintable(), "offset": 0}]
+        with mock.patch.object(self.tool.json, "dump"):
+            with self.assertRaises(OSError):
+                self.tool.write_outputs(rows, {"streams": 1}, good, self.csv)
+        self.assertEqual(self.read(self.csv), self.OLD_CSV)
+        self.assertEqual(sorted(os.listdir(self.dir)), ["index.csv", "index.json", "new.json"])
+
+    def test_interrupted_write_keeps_previous_report(self):
+        with mock.patch.object(self.tool.json, "dump", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.tool.write_outputs([], {"streams": 0}, self.out, self.csv)
+        self.assert_previous_reports_kept()
+
+    def test_reports_replaced_with_published_mode(self):
+        rows = [{"source": "a.rpf", "offset": 16, "signature": "0DRP@16"}]
+        with mock.patch.object(self.tool, "published_mode", wraps=self.tool.published_mode) as published, \
+                mock.patch.object(self.tool.os, "chmod", wraps=os.chmod) as chmod:
+            written = self.tool.write_outputs(rows, {"streams": 1}, self.out, self.csv)
+        self.assertEqual(written, [self.csv])
+        self.assertEqual([c.args for c in published.call_args_list], [(self.out,), (self.csv,)])
+        self.assertEqual(len(chmod.call_args_list), 2)
+        for call, dest in zip(chmod.call_args_list, (self.out, self.csv)):
+            staged, mode = call.args
+            self.assertEqual(os.path.dirname(staged), self.dir)
+            self.assertTrue(os.path.basename(staged).startswith(".navmesh_index-"))
+            self.assertTrue(staged.endswith(".tmp"))
+            self.assertEqual(mode, self.tool.published_mode(dest))
+        with open(self.out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["pages"][0]["offset"], 16)
+        self.assertEqual(self.read(self.csv).splitlines()[1].split(",")[:2], ["a.rpf", "16"])
+        self.assertEqual(sorted(os.listdir(self.dir)), ["index.csv", "index.json"])
+
+    @unittest.skipUnless(os.name == "posix", "permission bits are POSIX")
+    def test_replaced_report_keeps_its_permission_bits(self):
+        os.chmod(self.out, 0o640)
+        self.tool.write_outputs([], {"streams": 0}, self.out, None)
+        self.assertEqual(os.stat(self.out).st_mode & 0o777, 0o640)
+
+
+class OutputPathTest(unittest.TestCase):
+    """A report path that is already a folder is a usage error, not a PermissionError traceback."""
+
+    def test_out_that_is_a_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, out = os.path.join(tmp, "carved"), os.path.join(tmp, "reports")
+            os.makedirs(source)
+            os.makedirs(out)
+            r = subprocess.run([sys.executable, "-I", TOOL, source, "--out", out],
+                               capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("--out is a directory", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
 
 
 if __name__ == "__main__":

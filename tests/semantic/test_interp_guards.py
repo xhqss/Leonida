@@ -7,7 +7,8 @@ so anything else is refused instead of silently translating wrong (docs/design.m
   p2 reads J = v1, per op — as the hardware register or a qualifying copy: anything else, including a
   swapped p1(v1)/p2(v0) pair or both-v0, -> Unsupported naming the register and the role (the corpus
   has none: 117,001 v0 and 116,997 v1 over 26,503 shaders);
-* v_interp_mov_f32 with p10/p20 -> Unsupported naming the select (all 6,926 in the corpus are p0);
+* v_interp_mov_f32 with p10/p20 was refused here; it is now modelled as P1 - P0 / P2 - P0
+  (test_interp_mov_delta.py; all 6,926 in the corpus are p0);
 * a plain v_mov_b32 copy of the op's coordinate (rooted at v0 for p1, at v1 for p2) is still accepted,
   including a chain of copies: its single write in the whole shader is the mov, and its source v0/v1
   is itself unwritten up to the copy (a copy of an already-overwritten v0/v1 carries a computed value —
@@ -62,14 +63,14 @@ class InterpPairGuards(unittest.TestCase):
                                                "s_endpgm"])
         self.assertIn("v_interp_p2_f16 J source v9", str(cm.exception))
 
-    def test_mov_vertex_select_refused(self):
+    def test_mov_vertex_select_translates(self):
+        # p10/p20 are modelled as P1 - P0 / P2 - P0 (test_interp_mov_delta.py); only an unknown select is refused.
         for sel in ("p10", "p20"):
             with self.subTest(sel=sel):
-                with self.assertRaises(rdna2spirv.Unsupported) as cm:
-                    support.translate_lines("ps_m", [f"v_interp_mov_f32_e32 v2, {sel}, attr1.x",
-                                                     "exp mrt0 v2, v2, v2, v2 done vm",
-                                                     "s_endpgm"])
-                self.assertIn(f"v_interp_mov_f32 vertex select {sel}: only p0", str(cm.exception))
+                spv = support.translate_lines("ps_m", [f"v_interp_mov_f32_e32 v2, {sel}, attr1.x",
+                                                       "exp mrt0 v2, v2, v2, v2 done vm",
+                                                       "s_endpgm"])
+                self.assertIn("OpDecorate %in_attr1 PerVertexKHR", spv)
 
     def test_copy_of_pair_translates_and_computes(self):
         for chain in (["v_mov_b32_e32 v6, v1"],                    # the corpus form: J read through a copy

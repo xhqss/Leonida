@@ -1,10 +1,11 @@
 // Compare what ID3D12Resource::GetHeapProperties, ID3D12DescriptorHeap::GetDesc and ID3D12CommandQueue::GetDesc
-// report on the Vulkan-backed device with Windows D3D12 (the default adapter and WARP). On a single adapter a node
+// report on the Vulkan-backed device with Windows D3D12 (the layer's own adapter and WARP). On a single adapter a node
 // mask of 0 reads back as the one node (1), and a committed resource reports the heap flags the runtime resolves:
 // the caller's, plus the DENY bits of the
 // resource classes it is not (a buffer 0xC0, a texture without render-target or depth use 0x44, the rest 0x84).
 // No game data or shaders. Run explicitly (needs Vulkan hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
 #include "vk_test_device.h"
+#include "host_adapter.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
@@ -253,9 +254,10 @@ int main() {
         for (const bool warp : {false, true}) {
             Ref<IDXGIAdapter> adapter;
             Ref<ID3D12Device> host;
-            if (warp && FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p)))) continue;
+            std::string adapter_name;
+            if (!hostadapter::reference(factory.p, vk, warp, &adapter.p, adapter_name)) continue;
             if (FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) continue;
-            const char* name = warp ? "WARP" : "the default adapter";
+            const char* name = adapter_name.c_str();
             const Totals heap_totals = compare_heaps(ours.p, host.p, name, heaps);
             const Totals desc_totals = compare_descriptor_heaps(ours.p, host.p, name, descriptors);
             const Totals queue_totals = compare_queues(ours.p, host.p, name);
@@ -277,7 +279,7 @@ int main() {
         }
     }
     if (!references) {
-        std::fprintf(stderr, "no D3D12 reference device (default adapter or WARP)\n");
+        std::fprintf(stderr, "no D3D12 reference device (hardware adapter or WARP)\n");
         return 1;
     }
     if (mismatched || !matched) return 1;

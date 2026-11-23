@@ -18,6 +18,7 @@
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
+#include "vk_pc_tail.h"
 #include "../src/gfx10_descriptors.h"
 
 #include <cmath>
@@ -321,9 +322,23 @@ int main(int argc, char** argv) {
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smi.codeSize = code.size(); smi.pCode = reinterpret_cast<const uint32_t*>(code.data());
     VkShaderModule sm; CHECK(vkCreateShaderModule(dev, &smi, nullptr, &sm));
-    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 144};
+    // LEONIDA_PC_TAIL_UBO=1 (rdna2spirv.py --pc-tail-ubo): s0..s31 only, 128 bytes; a module that reads the tail
+    // gets it, all zero as without the flag, from a uniform block at set 1 (vk_pc_tail.h).
+    const bool pc_tail = leonida::vk_test::pc_tail_requested();
+    const uint32_t pc_bytes = pc_tail ? 128u : 144u;
+    const bool tail_block = pc_tail &&
+        leonida::vk_test::spirv_declares_set(code.data(), code.size(), leonida::vk_test::pc_tail_set);
+    leonida::vk_test::PcTail tail;
+    if (tail_block && !tail.create(vkGetDeviceProcAddr, dev, mp, props.limits.minUniformBufferOffsetAlignment,
+                                   VK_SHADER_STAGE_COMPUTE_BIT, 1)) {
+        std::fprintf(stderr, "FAILED creating the --pc-tail-ubo block\n");
+        return 1;
+    }
+    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, pc_bytes};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1; pli.pSetLayouts = &dsl; pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
+    const VkDescriptorSetLayout set_layouts[] = {dsl, tail.set_layout};
+    if (tail_block) { pli.setLayoutCount = 2; pli.pSetLayouts = set_layouts; }
     VkPipelineLayout pl; CHECK(vkCreatePipelineLayout(dev, &pli, nullptr, &pl));
     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -420,7 +435,12 @@ int main(int argc, char** argv) {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &ds, 0, nullptr);
     uint32_t pc[36] = {};
-    vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 144, pc);
+    vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, pc_bytes, pc);
+    if (tail_block) {
+        const uint32_t offset = tail.offset(0);   // PcTail starts zeroed: the tail stays all zero, as pushed before
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, leonida::vk_test::pc_tail_set, 1, &tail.set,
+                                1, &offset);
+    }
     vkCmdDispatch(cmd, 1, 1, 1);
     for (int k = 0; k < 3; k++) {
         ib[k].oldLayout = VK_IMAGE_LAYOUT_GENERAL; ib[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -442,6 +462,12 @@ int main(int argc, char** argv) {
         bic.imageSubresource = vol_layers; bic.imageExtent = {VOL, VOL, VOL};
         vkCmdCopyImageToBuffer(cmd, vol, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vol_rb, 1, &bic);
     }
+    // Make every copy's readback writes visible to the host before it reads the mapped buffers.
+    VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 1, &host, 0, nullptr, 0, nullptr);
     CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));

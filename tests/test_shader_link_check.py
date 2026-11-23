@@ -167,6 +167,16 @@ class ReflectTest(unittest.TestCase):
         with self.assertRaisesRegex(spv.InterfaceError, "extends beyond its Location"):
             shader.reflect()
 
+    def test_rejects_64_bit_vec2_at_component_2(self):
+        shader = output(width=64, components=2, component=2)
+        with self.assertRaisesRegex(spv.InterfaceError, "Component 0"):
+            shader.reflect()
+
+    def test_allows_64_bit_scalar_at_component_2(self):
+        shader = output(width=64, components=1, component=2)
+        used = list(shader.reflect().outputs[0].varyings[0].occupied())
+        self.assertEqual(used, [spv.Address(0, 2), spv.Address(0, 3)])
+
     def test_rejects_unbounded_expansion(self):
         shader = output(array_count=spv.MAX_EXPANDED_LOCATIONS + 1)
         with self.assertRaisesRegex(spv.InterfaceError, "too many interface locations"):
@@ -324,6 +334,17 @@ class LinkingTest(unittest.TestCase):
         declarations = shader.reflect().outputs
         self.assertEqual([v.address.location for v in declarations[0].varyings], [5, 7])
 
+    def test_array_length_uses_literal_specialization_default(self) -> None:
+        producer = ModuleFixture("vs")
+        length = producer.allocate()
+        producer.emit(50, producer.uint, length, 2)  # OpSpecConstant with default length 2
+        producer.decorate(length, 1, 7)  # SpecId 7
+        shape = producer.emit_type(spv.OP_TYPE_ARRAY, producer.numeric(components=4), length)
+        producer.variable(spv.STORAGE_OUTPUT, shape, location=0)
+
+        self.assertEqual(kinds(producer, input(array_count=2)), [])
+        self.assertEqual(kinds(producer, input(array_count=3)), ["type-mismatch"])
+
     def test_matrix_and_array_of_columns_are_distinct_types(self):
         vertices = ModuleFixture("vs")
         column = vertices.numeric(32, 2)
@@ -412,6 +433,19 @@ class CommandLineTest(unittest.TestCase):
         result = self.run_batch()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_duplicate_manifest_key_is_rejected_with_path_and_key(self):
+        # The last stage value would produce a valid pipeline if the duplicate were ignored.
+        self.manifest.write_text(
+            '{"version": 1, "pipelines": ['
+            '{"name": "dup", "vs": "missing", "vs": "vertex", "ps": "pixel"}]}',
+            encoding="utf-8",
+        )
+        result = self.run_batch("--report", self.report)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(str(self.manifest), result.stderr)
+        self.assertIn("duplicate key 'vs'", result.stderr)
+        self.assertFalse(self.report.exists())
+
     def test_bad_manifest_fields_return_clean_error(self):
         cases = [
             {"version": True, "pipelines": []},
@@ -426,6 +460,23 @@ class CommandLineTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("shader_link_check: error:", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
+
+    def test_corpus_style_names_are_accepted_and_paths_are_not(self):
+        # make_game's corpus names (shader_carve stems) contain "~", "!", "&", "(", a leading "." and more: 21,043 of
+        # 26,503 on a 1.0.2.1 copy failed the old [a-zA-Z0-9_.-] rule. Only names that leave --shader-dir fail.
+        for stem in ("VS~1", "pixel!2&x", "a(b)c", "x y", "_~-.ok", ".dotted"):
+            with self.subTest(stem=stem):
+                (self.directory / (stem + ".spv")).write_bytes(self.vs.read_bytes())
+                self.write_manifest({"name": "n", "vs": stem, "ps": "pixel"})
+                result = self.run_batch()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for stem in ("../vertex", "..", ".", "sub/vertex", "sub\\vertex", "C:vertex", "a|b", "a\x00b",
+                     " vertex", ""):
+            with self.subTest(stem=stem):
+                self.write_manifest({"name": "n", "vs": stem, "ps": "pixel"})
+                result = self.run_batch()
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("expected a shader name without directories", result.stderr)
 
     def test_report_preserves_inputs(self):
         original = self.vs.read_bytes()

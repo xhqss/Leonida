@@ -151,19 +151,19 @@ int main() {
     unsigned slots = rt::d3d12_xs::device_proxy_slot_count(device.Get());
     std::printf("proxy forwards %u PC vtable slots (ID3D12Device..Device14 max is 83)\n", slots);
     check(slots >= 44, "proxy forwards at least the base ID3D12Device vtable");
-    check(!rt::d3d12_xs::device_slot_overridden(9), "device slot 9 is forwarded (PC CreateCommandAllocator)");
+    check(rt::d3d12_xs::device_slot_overridden(9), "device slot 9 is CreateCommandAllocator (allocator proxies)");
     check(!rt::d3d12_xs::device_slot_overridden(10), "device slot 10 is forwarded (PC CreateGraphicsPipelineState)");
     check(rt::d3d12_xs::device_slot_overridden(14), "device slot 14 is the descriptor-heap override");
     check(rt::d3d12_xs::device_slot_overridden(62), "device slot 62 is the compute-PSO override");
     check(rt::d3d12_xs::device_slot_overridden(76), "device slot 76 is the resource override");
     check(rt::d3d12_xs::device_slot_overridden(67),
-          "device slot 67 is refused (console DeserializeComputePipelineStateX, "
-          "not PC CreateProtectedResourceSession1)");
+          "device slot 67 is the DeserializeComputePipelineStateX override (console native-code compute pipeline, not PC CreateProtectedResourceSession1)");
 
     void** proxy_vtbl = *reinterpret_cast<void***>(device.Get());
     void** real_vtbl = real ? *reinterpret_cast<void***>(real) : nullptr;
     check(proxy_vtbl != nullptr && proxy_vtbl[14] != real_vtbl[14], "slot 14 thunk differs from the PC entry");
     if (slots > 62) check(proxy_vtbl[62] != real_vtbl[62], "slot 62 thunk differs from PC CreateStateObject");
+    if (slots > 67) check(proxy_vtbl[67] != real_vtbl[67], "slot 67 thunk differs from PC CreateProtectedResourceSession1");
     if (slots > 76) check(proxy_vtbl[76] != real_vtbl[76], "slot 76 thunk differs from PC CreateCommittedResource3");
 
     rt::d3d12_xs::reset_device_proxy_stats();
@@ -278,6 +278,8 @@ int main() {
     ComPtr<ID3D12CommandAllocator> allocator;
     hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.GetAddressOf()));
     check(SUCCEEDED(hr) && allocator != nullptr, "device slot 9 forwards CreateCommandAllocator");
+    // A PC runtime allocator is not wrapped: the PC runtime's lists could not resolve an allocator proxy.
+    check(!rt::d3d12_xs::is_allocator_proxy(allocator.Get()), "slot 9 hands out the PC allocator unwrapped");
     check(rt::d3d12_xs::device_slot_hits(9) == 1, "slot 9 hit counter is 1");
 
     // Slot 76: buffer resource with the measured Xbox layout word 0x101; PC committed resources take ROW_MAJOR.
@@ -342,6 +344,31 @@ int main() {
         check(SUCCEEDED(hr) && pso != nullptr, "slot 62 creates a compute PSO via CreateComputePipelineState");
         check(rt::d3d12_xs::device_slot_hits(62) == 1, "slot 62 hit counter is 1");
         check(rt::d3d12_xs::device_slot_first_call_seen(62), "slot 62 first-call flag is set");
+
+        // Slot 67: Xbox native compute pipeline creation. Maps the console descriptor (+0x00 root signature,
+        // +0x28 kind 6 code blob, +0x30 code size) to D3D12_COMPUTE_PIPELINE_STATE_DESC and calls CreateComputePipelineState.
+        struct XboxNativeComputeDesc {
+            ID3D12RootSignature* root_signature;
+            const void* kind0;
+            std::uint64_t kind0_size;
+            const void* kind1;
+            std::uint64_t kind1_size;
+            const void* kind6;
+            std::uint64_t kind6_size;
+            const void* kind7;
+            std::uint64_t kind7_size;
+        } xbox_desc{};
+        xbox_desc.root_signature = root_signature.Get();
+        xbox_desc.kind6 = bytecode->GetBufferPointer();
+        xbox_desc.kind6_size = bytecode->GetBufferSize();
+
+        using XboxCreateNativeComputePsoFn = HRESULT(WINAPI*)(void*, const void*, const IID*, void**);
+        auto create_native_pso = reinterpret_cast<XboxCreateNativeComputePsoFn>(proxy_vtbl[67]);
+        ComPtr<ID3D12PipelineState> pso67;
+        hr = create_native_pso(device.Get(), &xbox_desc, &iid_pso, reinterpret_cast<void**>(pso67.GetAddressOf()));
+        check(SUCCEEDED(hr) && pso67 != nullptr, "slot 67 creates a compute PSO via CreateComputePipelineState");
+        check(rt::d3d12_xs::device_slot_hits(67) == 1, "slot 67 hit counter is 1");
+        check(rt::d3d12_xs::device_slot_first_call_seen(67), "slot 67 first-call flag is set");
     }
 
     // _COM_Outptr_ (d3d12.h): a failed create leaves NULL in the output. WARP accepts invalid heap descriptions,
@@ -357,6 +384,14 @@ int main() {
         D3D12_COMPUTE_PIPELINE_STATE_DESC empty_pso{};
         hr = reinterpret_cast<Slot62Fn>(proxy_vtbl[62])(device.Get(), &empty_pso, 0, 0, nullptr, &proxy_out);
         check(FAILED(hr) && proxy_out == nullptr, "slot 62 nulls its output for a null IID");
+        using Slot67Fn = HRESULT(WINAPI*)(void*, const void*, const IID*, void**);
+        proxy_out = reinterpret_cast<void*>(0x1111);
+        const IID iid_pso = __uuidof(ID3D12PipelineState);
+        hr = reinterpret_cast<Slot67Fn>(proxy_vtbl[67])(device.Get(), nullptr, &iid_pso, &proxy_out);
+        check(FAILED(hr) && proxy_out == nullptr, "slot 67 nulls its output for a null description");
+        proxy_out = reinterpret_cast<void*>(0x1111);
+        hr = reinterpret_cast<Slot67Fn>(proxy_vtbl[67])(device.Get(), &root_desc, nullptr, &proxy_out);
+        check(FAILED(hr) && proxy_out == nullptr, "slot 67 nulls its output for a null IID");
         using Slot76Fn = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
                                           const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
                                           const D3D12_CLEAR_VALUE*, const IID*, void**);

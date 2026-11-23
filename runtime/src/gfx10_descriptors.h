@@ -223,6 +223,7 @@ inline constexpr Swizzle channels_rgb{select_x, select_y, select_z, select_one};
 inline constexpr Swizzle channels_rgba = identity_swizzle;
 inline constexpr Swizzle channels_bgr{select_z, select_y, select_x, select_one};
 inline constexpr Swizzle channels_bgra{select_z, select_y, select_x, select_w};
+inline constexpr Swizzle channels_abgr{select_w, select_z, select_y, select_x};
 
 inline constexpr FormatRow format_table[] = {
     {1, VK_FORMAT_R8_UNORM, channels_r},                          // GFX10_FORMAT_8_UNORM
@@ -299,6 +300,7 @@ inline constexpr FormatRow format_table[] = {
     {134, VK_FORMAT_A1R5G5B5_UNORM_PACK16, channels_bgra},        // GFX10_FORMAT_1_5_5_5_UNORM
     {136, VK_FORMAT_A4B4G4R4_UNORM_PACK16, channels_rgba},        // GFX10_FORMAT_4_4_4_4_UNORM
     {136, VK_FORMAT_A4R4G4B4_UNORM_PACK16, channels_bgra},        // GFX10_FORMAT_4_4_4_4_UNORM
+    {136, VK_FORMAT_R4G4B4A4_UNORM_PACK16, channels_abgr},        // GFX10_FORMAT_4_4_4_4_UNORM
     {141, VK_FORMAT_D24_UNORM_S8_UINT, channels_r},               // GFX10_FORMAT_8_24_UNORM
     {141, VK_FORMAT_X8_D24_UNORM_PACK32, channels_r},             // GFX10_FORMAT_8_24_UNORM
     {146, VK_FORMAT_D32_SFLOAT_S8_UINT, channels_r},              // GFX10_FORMAT_X24_8_32_FLOAT
@@ -350,19 +352,36 @@ inline constexpr Swizzle format_swizzle(VkFormat format) {
     return row ? row->channels : identity_swizzle;
 }
 
+inline constexpr bool is_depth_stencil_format(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_D16_UNORM:
+    case VK_FORMAT_X8_D24_UNORM_PACK32:
+    case VK_FORMAT_D32_SFLOAT:
+    case VK_FORMAT_S8_UINT:
+    case VK_FORMAT_D16_UNORM_S8_UINT:
+    case VK_FORMAT_D24_UNORM_S8_UINT:
+    case VK_FORMAT_D32_SFLOAT_S8_UINT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // The format to view an image of `image_format` in when a T# names `gfx10_format`: the image's own format when
 // the codes agree, else the format of that code with the image's channel order (the sRGB view of a UNORM image,
 // say). With `allow_channel_cast`, a listed same-size cross-family cast may use the code's first Vulkan format
-// when no channel-order match exists (R8G8B8A8_UINT viewed as R32_UINT, say). VK_FORMAT_UNDEFINED: the table has
-// no such format.
+// when no channel-order match exists (R8G8B8A8_UINT viewed as R32_UINT, say). Depth/stencil images are only
+// compatible with their own format in Vulkan (VUID-VkImageViewCreateInfo-image-01762 / 09594), and colour
+// images can never be viewed as depth/stencil. VK_FORMAT_UNDEFINED: no compatible format exists.
 inline constexpr VkFormat vulkan_view_format(VkFormat image_format, std::uint32_t gfx10_format,
                                              bool allow_channel_cast = false) {
     const FormatRow* image = format_row(image_format);
     if (!image) return VK_FORMAT_UNDEFINED;
     if (image->gfx10 == gfx10_format) return image_format;
+    if (is_depth_stencil_format(image_format)) return VK_FORMAT_UNDEFINED;
     const FormatRow* fallback = nullptr;
     for (const FormatRow& row : format_table) {
-        if (row.gfx10 != gfx10_format) continue;
+        if (row.gfx10 != gfx10_format || is_depth_stencil_format(row.vulkan)) continue;
         if (row.channels == image->channels) return row.vulkan;
         if (!fallback) fallback = &row;
     }
@@ -596,8 +615,8 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler, float max_lod_
         info.maxLod = 0.25f;
     }
     // An integer image sampled with a FLOAT border colour reads it as 0 on NVIDIA (Vonsek, #538), so the type follows
-    // integer_border. A table colour is not kept yet: transparent black.
-    const bool integer = sampler.integer_border && sampler.border_color != BorderColor::table;
+    // integer_border. A table colour falls back to transparent black matching integer_border.
+    const bool integer = sampler.integer_border;
     switch (sampler.border_color) {
     case BorderColor::opaque_black:
         info.borderColor = integer ? VK_BORDER_COLOR_INT_OPAQUE_BLACK : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
@@ -611,6 +630,15 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler, float max_lod_
     }
     if (sampler.unnormalized) {
         info.unnormalizedCoordinates = VK_TRUE;
+        // VUID-VkSamplerCreateInfo-unnormalizedCoordinates-01075: U and V clamp to the edge or the border (a
+        // repeating mode would wrap at a texel count the sampler cannot know); -01072: one filter for min and mag.
+        // The S# allows any address mode with FORCE_UNNORMALIZED, and WRAP is its default (word 0 = 0).
+        const auto clamp_or_border = [](VkSamplerAddressMode m) {
+            return m == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ? m : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        };
+        info.addressModeU = clamp_or_border(info.addressModeU);
+        info.addressModeV = clamp_or_border(info.addressModeV);
+        info.minFilter = info.magFilter;
         info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
         info.minLod = info.maxLod = 0.0f;
         info.anisotropyEnable = VK_FALSE;

@@ -101,7 +101,7 @@ def _mapped_source(archive, expected_id):
 def _staged_json(path, doc, **options):
     with tempfile.TemporaryDirectory(dir=os.path.dirname(path)) as directory:
         tmp = os.path.join(directory, os.path.basename(path))
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             json.dump(doc, f, **options)
         try:
             mode = os.lstat(path).st_mode
@@ -494,7 +494,12 @@ def classify_gaps(archive, intervals, raw_pages, raw_system, scan_start, scan_en
     segments = [(a, a + need, "raw_graphics") for a, need in raw_pages]
     segments += [(a, b, "raw_system") for a, b in raw_system if b > a]
     segments.sort()
-    starts = [s[0] for s in segments]
+    max_end = []
+    hi = 0
+    for _, s1, _ in segments:
+        if s1 > hi:
+            hi = s1
+        max_end.append(hi)
     covered = sum(b - a for a, b in merged)
     result = {"covered": covered, "raw_graphics": 0, "raw_system": 0, "zero_padding": 0, "unread": 0,
               "gaps": 0, "unread_sample": [], "raw_0drp": 0,
@@ -508,12 +513,16 @@ def classify_gaps(archive, intervals, raw_pages, raw_system, scan_start, scan_en
             if cursor < a:
                 result["gaps"] += 1
                 pos = cursor
-                idx = bisect.bisect_left(starts, cursor)
+                idx = bisect.bisect_right(max_end, cursor)
                 while idx < len(segments) and segments[idx][0] < a:
                     s0, s1, kind = segments[idx]
+                    if s1 <= pos or (cursor > scan_start and s0 < cursor):
+                        idx += 1
+                        continue
                     start = max(pos, s0)
                     if start > pos:
                         _count_gap(m, pos, start, result)
+                        _audit_gap(m, pos, start, result, allow_zlib=True)
                     take = max(0, min(s1, a) - start)
                     if take:
                         result[kind] += take
@@ -559,16 +568,20 @@ def _audit_gap(m, a, b, result, allow_zlib):
         return
     p = a
     while p < b:
-        piece = m[p:min(b, p + GAP_CHUNK)]
+        end = min(b, p + GAP_CHUNK)
+        # Keep 4 bytes of lookahead so a 5-byte 0DRPz or 2-byte zlib header starting before `end`
+        # never indexes past `piece` or splits unseen across a GAP_CHUNK boundary.
+        piece = m[p:min(b, end + 4)]
         if not piece:
             break
+        limit = end - p
         q = 0
-        while True:
+        while q < limit:
             i = piece.find(SIG, q)
-            if i < 0:
+            if i < 0 or i >= limit:
                 break
             at = p + i
-            if at + 5 <= b and piece[i + 4] == VERSION:
+            if i + 4 < len(piece) and piece[i + 4] == VERSION:
                 result["gap_0drp"] += 1
                 start = at - 0x10
                 if start >= 0:
@@ -590,9 +603,9 @@ def _audit_gap(m, a, b, result, allow_zlib):
             q = i + 1
         if allow_zlib:
             q = 0
-            while True:
+            while q < limit:
                 mt = ZHDR.search(piece, q)
-                if not mt:
+                if not mt or mt.start() >= limit:
                     break
                 at = p + mt.start()
                 if at % 16:
@@ -601,7 +614,7 @@ def _audit_gap(m, a, b, result, allow_zlib):
                         if len(result["missed_zlib_offsets"]) < 50:
                             result["missed_zlib_offsets"].append(at)
                 q = mt.start() + 1
-        p += len(piece)
+        p = end
 
 
 def _expected_shards(start, end, shard_size):
@@ -660,7 +673,7 @@ def _duplicates(rows):
     ngroups = [v for v in by_name.values() if len(v) > 1]
     return {"content_groups": len(groups), "content_extra_maps": extra,
             "content_extra_entities": extra_entities,
-            "content_group_sample": [[v[0]["map_name"], len(v)] for v in groups[:20]],
+            "content_group_sample": [[v[0].get("map_name"), len(v)] for v in groups[:20]],
             "name_groups": len(ngroups), "name_extra_maps": sum(len(v) - 1 for v in ngroups)}
 
 

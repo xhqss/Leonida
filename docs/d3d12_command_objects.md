@@ -112,6 +112,33 @@ texture-creation method at 76 where the PC interface has `CreateStateObject`/som
 by that work.** They are the four calls a game must make before it can have a queue, allocator,
 list or fence, so they are the first thing a trace must confirm.
 
+**They cannot be measured from the package either (D3D-350).** The package ships no D3D12 runtime:
+the 16 DLLs in [`game/xbox-1.0.2.1.json`](../game/xbox-1.0.2.1.json) do not include
+`d3d12_xs.dll`, which is part of the console OS, and the device clients that are shipped never call
+these four slots. Measured on 1.0.2.1 (counts only):
+
+| Image | `ID3D12*` IIDs it contains | Imports from `d3d12_xs.dll` | Calls at `0x40`/`0x48`/`0x60`/`0x120` on the device |
+|---|---|---|---|
+| `XboxBvhBuilder.dll` | `PipelineState`, `RootSignature` | `D3D12SerializeVersionedRootSignature` | none: no indirect call at any of the four offsets |
+| `amd_fidelityfx_upscaler_xbox.dll` | `CommandSignature`, `DescriptorHeap`, `Device`, `Heap`, `PipelineState`, `Resource`, `RootSignature`, `RootSignatureDeserializer` | `D3D12CreateRootSignatureDeserializer` | none: the 3 calls at `0x40` are `ID3D12Resource::Map` on a resource it has just created, the 29 at `0x48` are `Close`/`Unmap`-shaped calls with no `(type, &IID, &out)` arguments, the 4 at `0x60` are a function-pointer field in a plain struct (no vtable load), and there are none at `0x120` |
+| `amd_fidelityfx_loader_xbox.dll`, `Bink2Scarlett.dll` | none | none | — |
+
+Neither image contains the IID of `ID3D12CommandQueue`, `ID3D12CommandAllocator`,
+`ID3D12CommandList`, `ID3D12GraphicsCommandList`, `ID3D12Fence` or `ID3D12Fence1`, and neither
+can take one from `d3d12_xs.dll`: each imports one function there and no GUID data (ordinals
+23–115). A creator called through `IID_PPV_ARGS` needs that IID, so these clients do not create
+queues, allocators, lists or fences; they record into lists the game gives them. The interfaces
+that *are* present are the positive control: they are what each client is known to create
+(compute PSOs through slot 62, root signatures, descriptor heaps, and resources through slots 27
+and 76). The IID column is reproduced by `python -I tools/d3d12_iid_scan.py <package>/*.dll`
+(`tests/test_d3d12_iid_scan.py`); the call-site column comes from `dumpbin /disasm` listings,
+following each `0x40`/`0x48`/`0x60`/`0x120` call back to its receiver.
+
+So the four slots' callers are in the game executable, which the package does not contain (the
+same blocker as RT-5). Confidence for slots 8, 9, 12 and 36 stays **Open**: the table in §2.1 is
+still the SDK baseline. Once the executable is available, `tools/d3d12_iid_scan.py` run on it
+shows whether it carries these IIDs, and its call sites through them give the slots.
+
 ### 2.2 Queue, allocator and fence
 
 `ID3D12CommandQueue` is declared at `d3d12.h:8701`. It has 19 slots (0–18); its own methods start
@@ -260,7 +287,7 @@ paragraph). Every call below except the two barriers is the fallback branch of a
 
 | RVA | Vtable offset | Console slot → PC method | Observed arguments | Confidence |
 |---:|---:|---|---|---|
-| `0x2171e` | `+0xd0` | 26 → 26 `ResourceBarrier` | `NumBarriers=1`, `&{Type=2 (UAV), Flags=0, pResource=null}` | **Measured**: the shape is a global UAV barrier; slot 26 is the SDK `ResourceBarrier` |
+| `0x2171e` | `+0xd0` | 26 → 26 `ResourceBarrier` | `NumBarriers=1`, `&{Type=2 (UAV), Flags=0, pResource=null}` | **Measured**: the shape is a global UAV barrier; slot 26 is the SDK `ResourceBarrier`; the site is gated (section 3.3b), so the call never fires in the shipping DLL |
 | `0x1d9cb` | `+0x70` | 14 → 14 `Dispatch` | `(1, 1, 1)` | **Measured**: exact `Dispatch` shape |
 | `0x1d85e` | `+0xc8` | 25 → 25 `SetPipelineState` | `RCX=list`, `RDX=[rdi+8]`: loaded at `0x1d7fa` and not changed before the call; the inline branch (`0x1d822`–`0x1d850`) copies 28 bytes from that object's `+0x10` | **Measured**: RDX is the pipeline the inline branch reads |
 | `0x1d7f4` | `+0x108` | 33 → 29 `SetComputeRootSignature` | one argument, `RDX=[rcx]`: the pointer stored next to the pipeline (`[rdi]`; the pipeline is `[rdi+8]`) | **Measured** shape; agrees with slot 33 in section 3.5a |
@@ -303,7 +330,7 @@ of an inline write of the same values.
 | `0x1a3b0` | `+0x168` | 45 → 41 `SetComputeRootUnorderedAccessView` | `(0, VA)` (inline: header + a 64-bit value) | **Measured** shape |
 | `0x20ed6` | `+0x4a0` | 148 → none | `(list, count * 40, 16)` returns a pointer; on null the DLL prints `D3D12 XDXR Error: Failed to allocate upload buffer` and throws `E_FAIL` | **Measured**: an upload allocator `(size, alignment)` |
 | `0x20f99` | `+0x158` | 43 → 39 `SetComputeRootShaderResourceView` | `(0, p)`, `p` the pointer slot 148 returned at `0x20ed6`, unchanged | **Measured**: the CPU pointer is used as the GPU address |
-| `0x149ba` | `+0x280` | 80 → none | `(x, 1, 1, 0x8020)`: `EDX=EDI`, `R8D=R9D=1`, fifth argument `0x8020` (inline: a five-dword packet) | Inferred: a `Dispatch` with one extra word |
+| `0x149ba` | `+0x280` | 80 → none | `(x, 1, 1, 0x8020)`: `EDX=EDI`, `R8D=R9D=1`, fifth argument `0x8020` (inline: the five-dword packet `0x4003cc00, x, 1, 1, W` of section 3.5a; the calls at `0x1525d` and `0x153b4` pass `0x20`, the one at `0x1d047` `0x8020`) | Inferred: a `Dispatch` with one extra word |
 | `0xd6de` | `+0x238` | 71 → none | `(&label, counter, 0 or 0x1000, 0)`: the counter at `[rbx+0x9c]` is incremented first; `0x1000` on the last item of a batch | Inferred: a GPU write of a 32-bit value to memory |
 | `0xd679` | `+0x248` | 73 → none | `(&label, 3, reference, 0xffffffff, 0)` | Inferred: a GPU wait until the masked value compares (function 3) with the reference |
 | `0xd7b4` | `+0x490` | 146 → GCL7 80 `Barrier` | the same global UAV barrier as `0x1da02` | **Measured** |
@@ -322,6 +349,71 @@ That byte is one of seven bools at `0xd7738`–`0xd773e` in zero-initialised `.b
 `.text` are about 50 RIP-relative reads (`cmp`, `movzx`); there is no write and no export that points there. So in
 the shipping DLL the label path is unreachable unless something writes that byte through a computed pointer, and
 the barrier path is the one that runs.
+
+### 3.3b The batched build validates the geometry descriptors on the CPU first
+
+A logging-proxy harness (section 7, item 1) never reached the first list-vtable call: both runs of the
+batched export faulted at RVA `0x142d3`, before the object received in the command-list parameter was
+touched once. The reason is a CPU-side validation of the build items that the section 7 descriptor
+guidance did not cover. The batched entry (`0x216a0`) reaches it through `0xe6a0` (call at `0x216dc`),
+the packet processor `0xcc00` (call at `0xe781`) and a per-record validator at `0x14270` (call at
+`0xce18`; a second call site exists at `0x11c25`). The processor walks the batched descriptor's 80-byte
+build items (item `i` at descriptor `+ i*0x50`) and routes each by the dword at its `+0x08` — the
+pointer's `+0x00` at the validator: kind 1 reaches the validator, kind 0 goes through `0xc820`/`0xc780`
+instead, other values take an error path (`0xd52f`). The validator reads, from the pointer it receives
+(all **measured** in the static disassembly):
+
+| Offset | Field | Check |
+|---:|---|---|
+| `+0x08` | descriptor count | loop bound |
+| `+0x0c` | elements layout (`D3D12_ELEMENTS_LAYOUT`) | 0 = inline array of 0x38-byte records, 1 = array of pointers to records; other values print `D3D12 XDXR Error: Unexpected value for D3D12_ELEMENTS_LAYOUT` and throw `E_INVALIDARG` |
+| `+0x10` | descriptor base | mode 0: record `i` at `base + i*0x38`; mode 1: record `i` at `[base + i*8]` |
+| record `+0x00` | geometry type (`D3D12_RAYTRACING_GEOMETRY_TYPE`) | 0 = triangles, 1 = AABBs; others print `D3D12 XDXR Error: Unrecognized D3D12_RAYTRACING_GEOMETRY_TYPE` and throw `E_INVALIDARG` |
+| record `+0x08` | AABB count (type 1) | accumulated |
+| record `+0x10` | index format (type 0) | at most `0x39` and in the bitset `0x0220040000000000` — `DXGI_FORMAT_R32_UINT` (42), `DXGI_FORMAT_R16_TYPELESS` (53), `DXGI_FORMAT_R16_UINT` (57); others print `D3D12 XDXR Error: Unsupported index buffer format provided` and throw `E_NOTIMPL` |
+| record `+0x18` | index count (type 0, format ≠ 0) | exact multiple of 3; otherwise prints `D3D12 XDXR Error: Triangle index count must be a multiple of 3 when an index buffer is provided` and throws `E_INVALIDARG` |
+| record `+0x1c` | vertex count (type 0, format = 0) | checked instead of the index count, also an exact multiple of 3; otherwise prints `D3D12 XDXR Error: Triangle vertex count must be a multiple of 3 when no index buffer is provided` and throws `E_INVALIDARG` |
+
+The fault that stopped the dynamic runs is the base dereference itself: at `0x142d3` (`mov ecx,[rdx]`,
+`rdx = base + i*0x38` in the inline mode) the record's type word is read with a CPU load, so a descriptor
+whose base is a GPU address that is not CPU-readable faults there. For a replacement runtime this is a
+measured host-side contract: the geometry descriptors must be backed by CPU-readable memory, not only by
+the GPU arena. The validator returns the summed primitive count (the triangle counts ÷ 3 plus the AABB
+counts), which the packet processor stores (`0xce1d`). It reads nothing past record `+0x1f`; what the
+`+0x20..+0x37` tail of a record is used for is open — the dynamic runs stopped at the first record read.
+
+The same static pass settles what the first list calls would have been, and finds that three of the sites
+section 3.3 and 3.3a list or miss are gated by the zero-initialised bytes of section 3.3a, so in the
+shipping DLL they never run:
+
+- The `+0xd0` `ResourceBarrier` at `0x2171e` (section 3.3) needs a non-zero item count (`0x216e1`) and the
+  byte at `0xd773c` (`0x216e9`). Its shape stays as measured; in the shipping DLL the call never fires.
+- Slot 90 (`+0x2d0`, call at `0xe836`) is new — it is not in the section 3.3a tail list. Its shape is
+  `(list, p, 0, last)`: `RDX = [item+0x28] + [item+0x54]*4`, where `item` is one 160-byte element of the
+  processor's output array, selected through the dword array beside it, `R9 = 1` on the last iteration,
+  and the element's dword at `+0x9c` is cleared first. The loop is behind the same `0xd773c` byte
+  (`0xe7d0`) and the count check, so it does not run in the shipping DLL either.
+- The direct slot-146 barrier at `0xea99` is behind the adjacent byte `0xd773b` (`0xea41`, after the
+  per-item callback reports true); the wrapper calls at `0xebbb`, `0xec79`, `0xed37` and `0xee17` are not
+  gated by these bytes, and each ends in the measured slot-146 global UAV barrier (section 3.3a).
+
+The path also reads one byte past the seven bools of section 3.3a: `0xd773f` at `0xce3f` and `0x11c35`.
+A linear sweep of `.text` finds no writes to `0xd7738`–`0xd773f` (only `cmp`/`movzx` reads; the two `lea`
+sites take the address of `0xd7740`, one past the last byte), so the read-only range is eight bytes.
+
+With the gated sites removed, the shipping-DLL order for one item is (measured with a postbuild-info
+type of 2, which routes to the `0x1d7c0` worker): the validation above → slot 146 four times through
+the `0xd580` wrapper → the upload function `0x20ea0` (called at `0xee85`; a second site at `0xf0f9`):
+slot 148 for `count * 40` bytes at alignment 16 (`0x20ed6`; the size is
+`lea edx,[rsi+rsi*4]; shl edx,3`), root signature (33), pipeline (25, or its inline write), the
+slot-148 pointer as root SRV (43, or inline), the count as a 32-bit root constant (37), and
+`Dispatch((count+31)/32, 1, 1)` (`0x21054`, or its inline four-word packet) — then the per-entry
+worker `0x1d7c0` (called at `0x217d0`) whose sequence section 3.3 lists, ending in the slot-146
+barrier at `0x1da02`. Postbuild-info types 0 and 3 route to the mirrored worker `0x1d540` (called at
+`0x217e2`). Slot 148 is therefore asked before the per-entry dispatch, and the first dispatch on the
+path is the upload function's own — the two refinements to section 7's prediction. The `+0x490` barrier
+arguments (one global UAV group `{0x80, 0x80, 0x10, 0x10}`) and slot 148's `count * 40`/16 are confirmed
+by both passes (D3D-293's static disassembly and this section's independent iced-x86 re-check).
 
 ### 3.4 The object is wider than the public vtable
 
@@ -371,13 +463,18 @@ vtable pointer of a public object.
 - **Slot 67** (call at `0x56d9`) is **not** the PC `CreateProtectedResourceSession1`: it takes `(desc, riid, out)`
   with `IID_ID3D12PipelineState`. The DLL's own messages name it `DeserializeComputePipelineStateX`. Its desc is the
   root signature at `+0x00`, then pointer and size pairs for the shader's `FSPX` entries: kind 0 at `+0x08`, kind 1
-  at `+0x18`, a copy of the kind-6 program at `+0x28`, and kind 7 at `+0x38` ([fspx.md](fspx.md)). The proxy used to
-  forward it to the PC method at the same index; it now refuses it (`E_NOTIMPL`). When it fails, the DLL takes
-  slot 62; its message for that failure calls the fallback "NewBE".
+  at `+0x18`, a copy of the kind-6 program at `+0x28` with its exact size at `+0x30`, and kind 7 at `+0x38`
+  ([fspx.md](fspx.md)). The proxy maps the console desc to `D3D12_COMPUTE_PIPELINE_STATE_DESC` and routes it to
+  `CreateComputePipelineState` (PC slot 11). On a PC device that call fails (`E_FAIL`) because the code is not a PC
+  shader, so the DLL falls back to slot 62; its message for that failure calls the fallback "NewBE". The Vulkan
+  device takes the bare kind-6 program and finds its translated module by `fspx_code_sha256` ([fspx.md](fspx.md),
+  "Build and run-time lookup"), for the programs the build translated.
 - **Slot 62** (call at `0x5825`) takes the measured `(D3D12_COMPUTE_PIPELINE_STATE_DESC*, 0, 0, riid, out)`. The PC
   runtime refuses the DLL's code (`E_FAIL`): it is not a PC shader. The DLL's pipeline function then returns
   `0x8000000d` (`0x4b85`), but the dispatch goes on, records the null pipeline and faults (`0x65ff`), which is where a
-  PC device stops.
+  PC device stops. The Vulkan device (`LEONIDA_D3D12=vulkan`) takes the container: it hashes the kind-6 bytes of the
+  `ACCC` part and creates the pipeline from the translated module, for the programs the build translated; others,
+  and a malformed `FSPX` directory, are refused with `E_INVALIDARG`.
 - **Pipeline slot 11 sizes the compute scratch.** After either path succeeds (slot 67 jumps to `0x5833`), the DLL
   calls the new pipeline's slot 11 as `(0, 0, &obj)` (`0x586d`); the public `ID3D12PipelineState` ends at slot 8, so
   this is a console-only method. On success it reads a dword through `obj`'s slot 3 (`0x5881`), multiplies it by
@@ -391,8 +488,9 @@ vtable pointer of a public object.
 - The DLL's 29 shaders are `DXBC` containers with `SFI0`, `ISG1`, `OSG1`, `PSV0`, `RTS0`, `HASH` and `ACCC` parts
   and no `DXIL`. The `ACCC` payload starts with the tag `FSPX` in all 29; the game's own native shaders are `FSSM`
   inside `XBCH` ([design.md](design.md)). `FSPX` is a directory around an uncompressed RDNA2 program and its
-  dispatch state; `tools/fspx_unpack.py` unpacks it for the translator, which takes 13 of the 29 today. The 13 that
-  use `v_dot4` instructions are not translated yet ([fspx.md](fspx.md)).
+  dispatch state; `tools/fspx_unpack.py` unpacks it for the translator, which takes 17 of the 29 today, and
+  `make_game.py`'s `shaders` stage does both for the package's DLL. What stops the other 12 is listed in
+  [fspx.md](fspx.md), "Translation status".
 
 **Command list.** The console list is **not** the PC order past `ResourceBarrier`. Each row is backed by the
 argument shape at the call and, where marked "run", by the call seen in the run. Rows marked "inferred" fit the
@@ -426,6 +524,18 @@ call the DLL checks a write cursor at `+0x18` against a limit (`+0x30` for root 
 it writes the command into that buffer itself instead of calling: a root argument is a header word from the
 per-root-parameter table at `+0x344` and then the value (32 bits for a descriptor table, 64 for the slot-41 GPU VA),
 a dispatch four words (`0x4002c400`, or `(flag | 0x1000ba00) << 2`, then x, y, z).
+The BVH builder also writes a five-word dispatch, `0x4003cc00, x, 1, 1, W`.
+- **Sites:** `0x14972`, `0x15215`, `0x1536a` and `0x1d002`, each checked against the dispatch limit `+0x28`. The
+  cursor advances 20 bytes and the flag byte at `+0x140` is cleared.
+- **It is the inline form of console slot 80** (section 3.3a). When the buffer is full, each site calls slot 80
+  (`+0x280`) instead, as `(x, 1, 1, W)` with the same `W`.
+- **`W` is `0x8020`** at `0x14972` and `0x1d002`, and **`0x20`** at `0x15215` and `0x1536a`. What bit 15 selects is
+  open.
+
+The FSR DLL never writes this form.
+**Byte `+0x143` is console-runtime state:** the BVH builder reads it at 31 sites and the FSR DLL at one (all `cmp
+byte ptr [reg+143h]`), but neither DLL writes it. Every store into `+0x140`..`+0x143` in either DLL is a byte store to
+`+0x140` or `+0x141`, and no wider store reaches `+0x143`. A replacement list can leave it 0.
 It sets a flag byte at `+0x140`, stores a flag at `+0x141` from the
 pipeline, and copies 32 bytes of the pipeline object (from its `+0x10`) to `+0x544`. These are the fields
 section 3.4 measured in the BVH builder's helper without a meaning (`+0x18`, `+0x30`, `+0x140`, `+0x344`, `+0x544`).
@@ -433,6 +543,56 @@ section 3.4 measured in the BVH builder's helper without a meaning (`+0x18`, `+0
 them, and it is the simplest contract for a layer that does not want to decode these packets. Whether the game's
 executable makes the same check before writing is unknown until it is available; it is compiled against the same
 console headers.
+
+**Every inline write in the package's DLLs checks first.** `tools/inline_scan.py` finds each cursor store-back
+(`mov [list+18h],reg` after stores through the cursor) and looks for the compare in front of it. On the 1.0.2.1
+DLLs (dumpbin 14.44 listings):
+
+| Image | Inline writes | Checked | Not checked | Limit compared | Fallback slot (sites) |
+|---|---:|---:|---:|---|---|
+| `XboxBvhBuilder.dll` | 196 | 196 | 0 | `+0x30` ×165, `+0x28` ×30, a register loaded in another block ×1 | 45 ×71, 37 ×35, 25 ×34, 14 ×24, 39 ×16, 43 ×9, 80 ×4; 3 reach theirs through a shared jump the tool does not follow |
+| `amd_fidelityfx_upscaler_xbox.dll` | 9 | 9 | 0 | `+0x30` ×8, `+0x28` ×1 | 35 ×6, 25, 41, 14 |
+
+**Measured.** The packet headers it reads back are the two dispatch forms above: `0x4002c400` (26 four-word
+dispatches in the builder, one in FSR) and `0x4003cc00` (the builder's four five-word ones). The other 14 DLLs have
+no inline write, except one checked site in `libHttpClient.GDK.dll`, which imports nothing from D3D12: read a
+result as an upper bound of about one site per image. Removing the compare and branch in front of the builder's
+`0x14972` write turns exactly that site into "not checked", so a missing check is visible.
+
+On the executable, `python -I tools/inline_scan.py <exe> --sites` answers the question in one pass (see the day-one
+list in `docs/design.md`): no unchecked site means a cursor-at-limit layer sees every command the game records; each
+unchecked site is listed by RVA and is a write that layer never sees. Its fallback-slot line is the set of console
+list methods the game reaches through the vtable. Limit offsets other than `+0x28`/`+0x30` would be command kinds
+the DLLs never write (draws, input-assembler and output-merger state); read a few of those sites by hand.
+
+**The five-word dispatch.** The BVH builder also writes `0x4003cc00, x, 1, 1, W`:
+
+- **Sites:** `0x14972`, `0x15215`, `0x1536a` and `0x1d002`, each checked against the dispatch limit `+0x28`. The
+  cursor advances 20 bytes and the flag byte at `+0x140` is cleared.
+- **Its vtable fallback is console slot 80** (section 3.3a), read from the code: when the buffer is full, each site
+  calls slot 80 (`+0x280`) instead, as `(x, 1, 1, W)` with the same `W` (`0x149ba`, `0x1525d`, `0x153b4`, `0x1d047`).
+  So the packet is slot 80's inline form; that slot 80 is a `Dispatch` with one extra word stays inferred.
+- **`W` is `0x8020`** at `0x14972` and `0x1d002`, and **`0x20`** at `0x15215` and `0x1536a`. What bit 15 of `W`
+  selects is not known.
+
+The FSR DLL never writes this form.
+
+**Byte `+0x143` is console-runtime state:** the BVH builder reads it at 31 sites and the FSR DLL at one (all `cmp
+byte ptr [reg+143h]`), but neither DLL writes it. Every store into `+0x140`..`+0x143` in either DLL is a byte store to
+`+0x140` or `+0x141`, and no wider store reaches `+0x143`. A replacement list can leave it 0.
+
+**The root-argument header word** is the root parameter's table entry `table[root]` (`+0x344 + 4·root`), adjusted
+only for root constants:
+
+- **Several 32-bit constants at once:** `table[root] + ((count − 1) << 16)`, then `count` dwords. Examples:
+  `+ 0x120000` for 19 constants (`0x14e3b`), `+ 0x70000` for 8 (`0x1d324`), `+ 0x30000` for 4.
+- **One constant at a non-zero offset:** `table[root] + 4 · destOffset`. At `0x19fca` the builder adds `0xc` and its
+  vtable fallback is slot 37 `(2, value, 3)`; at `0x1a346` it adds `0x14` and the fallback is `(2, value, 5)`.
+- **Otherwise the entry is written unchanged:** one constant at offset 0, a descriptor table (then 4 bytes), a root
+  CBV/SRV/UAV (then the full 8-byte GPU address, e.g. `0x19fff`).
+
+No site combines both adjustments. Before writing, every reader tests the entry against `0xC0000000` (98 sites in the
+builder, 7 in the FSR DLL), and sets the flag byte at `+0x140` only when both of those bits are clear.
 
 ### 3.5 What the package does not measure
 
@@ -563,6 +723,31 @@ Queues and fences are wrapped the same way.
   and a heap proxy given to a list's `SetDescriptorHeaps` reaches the real list unchanged. The command-list
   proxy of §3.5a adds the unwrap at both places.
 
+Command allocators get the same kind of proxy: device slot 9 (`CreateCommandAllocator`) returns one.
+
+- **What is forwarded.** The public chain, 9 slots: the base chain and `Reset` at 8. A slot past it, up to the
+  end of a 64-slot table, is logged and refused, and a read past the table faults in its own guard region.
+  The console allocator's extra methods cannot be measured from the package (D3D-360). No shipped module creates,
+  receives or calls an allocator (§3.5). The package has no `d3d12_xs.dll` either, and no export of the three
+  D3D12 clients takes an allocator. `dumpbin /exports` (MSVC 19.52) lists the BVH builder's 12 exports, which take
+  an `ID3D12Device11` or a command list (`docs/d3d12_xs_surface.md`), and the FSR loader's and upscaler's
+  `ffxConfigure`, `ffxCreateContext`, `ffxDestroyContext`, `ffxDispatch` and `ffxQuery`. A call past slot 8 could
+  only show up in the game executable, which the package doesn't contain, so such a slot stays logged and refused.
+- **Where a list takes it.** A list takes an allocator from the title in `CreateCommandList` and `Reset`, so
+  the proxy is safe only where the list side resolves it. Slot 9 therefore wraps an allocator only when it
+  answers `kLeonidaCommandAllocatorTag` (`d3d12_xs_device.h`). That is the Vulkan layer's own allocator, whose
+  `CommandAllocator::from()` resolves the proxy for both list calls.
+- **On the host runtime.** A PC runtime allocator comes back unwrapped, logged once, because the PC runtime's
+  lists would take a proxy for their own allocator. A command-list proxy that unwraps at `Reset` (§3.5a) is
+  what lets the host backend wrap allocators too.
+- **Residency.** An allocator is a pageable, so `MakeResident`/`Evict`/`SetResidencyPriority`/
+  `EnqueueMakeResident` unwrap allocator proxies like heap, queue and fence proxies.
+
+`allocator_proxy_test` checks this on the Vulkan device and on the host runtime, and the mock test checks it
+over allocators with and without the tag. On the Vulkan device it checks forwarding, the refused tail, the guard
+region, identity, and D3D12's allocator rules through the proxy, and runs a list created and `Reset` on the
+proxy whose copies go through the queue and fence proxies and are read back.
+
 Which of this is measured: the slot numbers and signatures are the SDK's (public). That the console
 keeps the public queue and fence slots, and device slots 8/32/36/75, is an assumption the package cannot
 test, as above. The proxies make a wrong assumption visible in the log; they do not prove it right.
@@ -624,16 +809,22 @@ return has been measured.
 The executable is absent, so the next step should use the one shipped client that exists rather
 than invent slots.
 
-1. **Confirm sections 3.3 and 3.3a with a logging proxy.** Create a test-only command
+1. **Confirm sections 3.3, 3.3a and 3.3b with a logging proxy.** Create a test-only command
    list whose public GCL6/GCL8 vtable logs `(slot, raw arguments)` and whose tail is a page of
    logged unknown slots. Pass it to
    `XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X` with a minimal non-empty
-   descriptor. The `+0xd0` barrier and `+0x70` dispatch should be observed first; the `+0x490`
-   call should arrive with one global UAV barrier group (section 3.3), and slot 148 should be
-   asked for `count * 40` bytes. Keep the cursor at its limit so every call reaches the vtable. If the
-   builder validates its inputs before reaching the dispatch, use a descriptor shaped like the
-   one its own `GetRaytracingAccelerationStructurePrebuildInfo` accepts (prior art measured a
-   3,000-vertex triangle geometry; the prebuild answer is 204,800 bytes / 128,704 scratch).
+   descriptor. The proxy ran twice; both runs stopped one step short, at the CPU-side geometry
+   validation of section 3.3b (fault at `0x142d3`), before the first list call. The static pass
+   settled what the first calls will be: not the `+0xd0` barrier — it is gated and never fires
+   in the shipping DLL — but the wrapper's slot-146 barriers, then the upload function's slot
+   148 for `count * 40` bytes and its own `Dispatch((count+31)/32, 1, 1)`, and only then the
+   per-entry `Dispatch(1,1,1)` of section 3.3; the other new slot, 90, is gated too
+   (section 3.3b). Keep the cursor at its limit so every call reaches the vtable, and back the
+   geometry descriptors with CPU-readable memory holding valid 0x38-byte records per section 3.3b
+   (type 0, index format 0, vertex count a multiple of 3 — prior art measured a 3,000-vertex
+   triangle geometry; the prebuild answer is 204,800 bytes / 128,704 scratch). A descriptor shaped
+   like the one `GetRaytracingAccelerationStructurePrebuildInfo` accepts is not enough by itself,
+   because the validation reads the records with CPU loads.
 2. **GCL8 is now implemented** in PR #164 (public slot 81, recorded/reset, CTest 9/9); the
    builder's `+0x490` is `Barrier` (section 3.3), and its slot 148 needs an upload allocator (section 3.3a).
 3. **When the executable appears, trace the four creation calls first.** Per-slot counters on
@@ -681,6 +872,13 @@ the SDK; the console GUIDs are attributed to SCARAB in
   `call [reg+disp]` sites in the rest of `.text` whose object register holds the list pointer,
   each read with the argument registers set before it and the inline write it falls back from;
   the barrier constant is the 16 bytes at RVA `0xcdf60` (file offset from the section table).
+- Section 3.3b and the gated sites: a second, independent disassembly pass (iced-x86, run for the
+  D3D-293 measurement) of the batched entry, the validation chain (`0xe6a0`, `0xcc00`, `0x14270`),
+  the upload function `0x20ea0` and the wrapper call sites; the dynamic side is D3D-293's
+  logging-proxy harness, whose two runs faulted at `0x142d3` before the first list call. The
+  quoted validation messages are the DLL's own wide strings at the `.rdata` addresses the throw
+  paths load. The gate-byte sentence is a linear sweep of `.text` collecting memory operands
+  targeting `0xd7738`–`0xd773f`.
 - Public slots: parse the `MIDL_INTERFACE`/`virtual` declarations in `d3d12.h`; the counts in
   section 2 include the seven `IUnknown`+`ID3D12Object` slots. Cross-check selected values with
   `python tools/d3d12_xs_surface.py --check --sdk` (116 slots, 83 standard GUIDs) and

@@ -26,7 +26,6 @@ class BuildDestinationTest(unittest.TestCase):
         self.game = os.path.join(self.root, "game")
         os.mkdir(self.game)
         self.alias = os.path.join(self.root, "game-link")
-        self.link(self.game, self.alias)
 
     def link(self, target, path):
         if os.name == "nt":
@@ -42,14 +41,14 @@ class BuildDestinationTest(unittest.TestCase):
 
     def run_build(self, game, out, work, rejected):
         argv = ["make_game.py", "--game", game, "--out", out, "--work", work,
-                "--stages", "shaders"]
+                "--stages", "runtime"]
         with ExitStack() as stack:
             stack.enter_context(patch.object(sys, "argv", argv))
             stack.enter_context(patch("make_game.below_normal"))
             stack.enter_context(patch("make_game.check", return_value={}))
             stack.enter_context(patch("make_game.log"))
             preflight = stack.enter_context(patch("make_game.preflight"))
-            shaders = stack.enter_context(patch("make_game.shaders"))
+            build_runtime = stack.enter_context(patch("make_game.runtime"))
             stderr = stack.enter_context(patch("sys.stderr", new_callable=io.StringIO))
             if rejected:
                 with self.assertRaises(SystemExit) as error:
@@ -57,13 +56,14 @@ class BuildDestinationTest(unittest.TestCase):
                 self.assertEqual(error.exception.code, 1)
                 self.assertIn("--out and --work must be outside the game folder", stderr.getvalue())
                 preflight.assert_not_called()
-                shaders.assert_not_called()
+                build_runtime.assert_not_called()
             else:
                 self.assertEqual(make_game.main(), 0)
                 preflight.assert_called_once()
-                shaders.assert_called_once()
+                build_runtime.assert_called_once()
 
     def test_destinations_through_game_link_are_rejected(self):
+        self.link(self.game, self.alias)
         for option in ("out", "work"):
             for suffix in ("", "new", os.path.join("new", "nested")):
                 with self.subTest(option=option, suffix=suffix):
@@ -73,6 +73,7 @@ class BuildDestinationTest(unittest.TestCase):
                     self.assertFalse(os.path.exists(os.path.join(self.game, "new")))
 
     def test_game_link_cannot_hide_destinations_in_real_game_folder(self):
+        self.link(self.game, self.alias)
         for option in ("out", "work"):
             with self.subTest(option=option):
                 destinations = {name: os.path.join(self.root, name) for name in ("out", "work")}
@@ -100,6 +101,33 @@ class BuildDestinationTest(unittest.TestCase):
             self.run_build(drive, os.path.join(content_dir, "out"), os.path.join(self.root, "work"), rejected=True)
             # Rejected: destination is the drive root itself
             self.run_build(drive, drive, os.path.join(self.root, "work"), rejected=True)
+
+    def test_drive_root_checks_entries_on_each_volume(self):
+        if os.name != "nt":
+            self.skipTest("Windows drive root check")
+        root = os.path.splitdrive(self.root)[0] + "\\"
+        other_root = "Z:\\" if root.upper() != "Z:\\" else "Y:\\"
+        junction = os.path.join(root, "MountedContent")
+        mounted_content = os.path.join(other_root, "Package")
+
+        def realpath(path):
+            if os.path.normcase(path) == os.path.normcase(junction):
+                return mounted_content
+            return os.path.normpath(path)
+
+        # A junction target on a different volume must not end the search before the matching entry.
+        for entries, protected in (
+            (["MountedContent", "Content"], os.path.join(root, "Content")),
+            (["Content", "MountedContent"], mounted_content),
+        ):
+            with patch("os.listdir", return_value=entries), patch("os.path.realpath", side_effect=realpath):
+                for option in ("out", "work"):
+                    with self.subTest(protected=protected, option=option):
+                        destinations = {name: os.path.join(self.root, name) for name in ("out", "work")}
+                        destinations[option] = os.path.join(protected, "build")
+                        self.run_build(root, **destinations, rejected=True)
+                self.run_build(root, os.path.join(other_root, "Build"),
+                               os.path.join(other_root, "Scratch"), rejected=False)
 
 
 if __name__ == "__main__":

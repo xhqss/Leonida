@@ -12,6 +12,7 @@
 	v_mov_b32_e32 v1, 1.0
 	v_mov_b32_e32 v2, 0.25
 	v_cvt_pknorm_u16_f32 v4, v1, v2
+	v_cmpx_eq_u32_e32 0, v0
 	v_mov_b32_e32 v10, 0x20
 	v_mov_b32_e32 v11, 0x28
 	v_mov_b32_e32 v12, 0x34
@@ -29,7 +30,6 @@
 	v_mov_b32_e32 v7, 0x1234
 	ds_nop
 	v_clrexcp
-	v_cmpx_eq_u32_e32 0, v0
 	v_mov_b32_e32 v24, s8
 	v_mov_b32_e32 v25, 0
 	buffer_store_dword v24, v25, s[0:3], 0 offen

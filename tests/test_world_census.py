@@ -583,6 +583,81 @@ class ClassifyGapsTest(unittest.TestCase):
         self.assertEqual(r["missed_zlib_meta"], 1)
         self.assertEqual(r["missed_zlib_offsets"], [0x43])
 
+    def test_audit_gap_across_chunk_boundaries(self):
+        # 0DRP ending right on a GAP_CHUNK boundary crashed with IndexError on piece[i + 4],
+        # and 0DRPz / 2-byte zlib headers straddling a chunk boundary were silently skipped.
+        buf = bytearray(b"\x11" * (WC.GAP_CHUNK + 16))
+        buf[WC.GAP_CHUNK - 4:WC.GAP_CHUNK + 1] = b"0DRPz"
+        self.write(bytes(buf))
+        r = WC.classify_gaps(self.arc, [], [], [], 0, len(buf))
+        self.assertEqual((r["gap_0drp"], r["gap_0drp_other"]), (1, 1))
+
+        # Split 0DRPz (starts at chunk - 2) and split unaligned zlib header (starts at chunk - 1).
+        comp = zlib.compress(TWI.make_resource(True))
+        chunk = 64
+        small = bytearray(b"\x11" * (chunk * 3 + len(comp) + 16))
+        small[chunk - 2:chunk + 3] = b"0DRPz"
+        z_off = chunk * 2 - 1  # unaligned (odd) and straddles the 2nd chunk boundary
+        small[z_off:z_off + len(comp)] = comp
+        self.write(bytes(small))
+        with mock.patch.object(WC, "GAP_CHUNK", chunk):
+            r2 = WC.classify_gaps(self.arc, [], [], [], 0, len(small))
+        self.assertEqual(r2["gap_0drp"], 1)
+        self.assertEqual(r2["missed_zlib_meta"], 1)
+        self.assertEqual(r2["missed_zlib_offsets"], [z_off])
+
+    def test_gap_before_raw_segment_is_audited(self):
+        # A raw 0x7a map and an unaligned zlib 0x7a stream sitting before raw_graphics/raw_system
+        # segments in the same gap must still be audited so census_exact cannot falsely report True.
+        blob = bytearray(TWI.make_resource(True))
+        struct.pack_into("<Q", blob, 8, TWI.ptr(0))
+        comp = zlib.compress(TWI.make_resource(True))
+        # Layout: [0..0x40) covered, [0x40..0x40+len(blob)) raw map, raw_graphics at raw_off,
+        # then unaligned zlib at z_off before raw_system at sys_off.
+        raw_off = (0x40 + len(blob) + 0x1F) & ~0x0F
+        z_off = raw_off + 0x43
+        sys_off = (z_off + len(comp) + 0x1F) & ~0x0F
+        total = sys_off + 0x40
+        data = bytearray(b"\x33" * total)
+        data[0x40:0x40 + len(blob)] = blob
+        data[z_off:z_off + len(comp)] = comp
+        self.write(bytes(data))
+        r = WC.classify_gaps(self.arc, [[0, 0x40]], [[raw_off, 0x20]], [[sys_off, total]], 0x40, total)
+        self.assertEqual((r["gap_0drp"], r["raw_0drp"], r["raw_maps"]), (1, 1, 1))
+        self.assertEqual(r["missed_zlib_meta"], 1)
+        self.assertEqual(r["missed_zlib_offsets"], [z_off])
+        self.assertEqual(r["accounted"], r["span"])
+
+    def test_straddling_raw_segment_is_not_skipped(self):
+        # A raw_graphics segment that straddles scan_start (or overlaps an earlier raw segment in the
+        # same gap) must account for [pos, s1), whereas a raw_pages candidate whose start was covered
+        # by a compressed stream [0x200..0x240) must not spill its uncompressed tail into [0x240..0x300).
+        self.write(b"\x22" * 0x300)
+        r = WC.classify_gaps(
+            self.arc,
+            [[0x200, 0x240]],
+            [[0x080, 0x100], [0x0A0, 0x040], [0x200, 0x0C0]],
+            [],
+            0x100,
+            0x300,
+        )
+        self.assertEqual(r["covered"], 0x40)
+        self.assertEqual(r["raw_graphics"], 0x80)
+        self.assertEqual(r["unread"], 0x140)
+        self.assertEqual(r["accounted"], r["span"])
+
+    def test_duplicates_handles_rows_without_map_name(self):
+        rows = [
+            {"sha1": "aa" * 20, "entities": 2},
+            {"sha1": "aa" * 20, "entities": 2},
+        ]
+        dup = WC._duplicates(rows)
+        self.assertEqual(dup["content_groups"], 1)
+        self.assertEqual(dup["content_extra_maps"], 1)
+        self.assertEqual(dup["content_extra_entities"], 2)
+        self.assertEqual(dup["content_group_sample"], [[None, 2]])
+        self.assertEqual(dup["name_groups"], 0)
+
 
 class ShardFileTest(unittest.TestCase):
     def test_read_and_load_shards(self):

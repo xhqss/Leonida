@@ -263,11 +263,15 @@ def register_summary(reg_stage) -> dict:
     return out
 
 
+def carve_index_path(disasm_dir):
+    return os.path.join(os.path.dirname(os.path.realpath(disasm_dir)), "index.json")
+
+
 def stage_map(disasm_dir) -> dict:
     """{shader file stem: stage} from shader_carve.py's index.json next to the disasm folder (the stage comes from
     each container's program header), as rdna2spirv.stage_of reads it. Most corpus names carry no stage prefix,
     so the name is only a fallback for shaders the index doesn't list. Empty when there is no readable index."""
-    path = os.path.join(os.path.dirname(os.path.realpath(disasm_dir)), "index.json")
+    path = carve_index_path(disasm_dir)
     try:
         with open(path, encoding="utf-8") as f:
             entries = json.load(f)
@@ -299,6 +303,10 @@ def main():
         print(f"ERROR: {a.src} {what}. Give the folder of .s files shader_disasm.py writes.", file=sys.stderr)
         return 2
     path = a.out or os.path.join(a.src, "..", "profile.json")
+    index = carve_index_path(a.src)
+    if same_output_path(index, path):
+        print(f"ERROR: output would overwrite the shader carve index {index}", file=sys.stderr)
+        return 2
     if os.path.isdir(path):
         print(f"ERROR: cannot write {path}: destination is a directory, not a file", file=sys.stderr)
         return 2
@@ -328,8 +336,12 @@ def main():
         name = entry.name
         n += 1
         stage = stages.get(name[:-2]) or (name[:2].lower() if name[2:3] == "_" else "?")
-        with open(entry.path, encoding="utf-8", errors="replace") as f:
-            text = f.read()
+        try:
+            with open(entry.path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError as e:
+            print(f"ERROR: cannot read {entry.path}: {e.strerror or e}", file=sys.stderr)
+            return 2
         prof = profile_shader(text)
         regs = prof["registers"]
         reg_stage[stage].append((regs["vgpr_count"], regs["sgpr_count"]))
@@ -351,11 +363,13 @@ def main():
     ratios = compute_ratios(cats)
     if ratios["alu_to_memory"] == float("inf"):
         ratios["alu_to_memory"] = None
+    ranked_users = sorted(users.items(), key=lambda item: (-item[1], item[0]))
     out = {"shaders": n, "mnemonics": len(occ),
            "families": {k: {"mnemonics": v[0], "occurrences": v[1]} for k, v in sorted(fam.items())},
            "categories": cats,
            "ratios": ratios,
-           "by_mnemonic": [{"m": m, "shaders": users[m], "count": occ[m]} for m, _ in users.most_common()],
+           "by_mnemonic": [{"m": m, "shaders": shader_count, "count": occ[m]}
+                           for m, shader_count in ranked_users],
            "registers": register_summary(reg_stage),
            "undecoded": {"warnings": sum(word_occ.values()) + unresolved, "unresolved": unresolved,
                          "by_word": [{"word": w, "shaders": word_users[w], "count": word_occ[w]}
@@ -363,13 +377,13 @@ def main():
     if a.per_shader:
         out["per_shader"] = sorted(shaders, key=lambda e: e["name"])
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(out, f, indent=1, allow_nan=False)
     except OSError as e:
         print(f"ERROR: cannot write {path}: {e.strerror or e}", file=sys.stderr)
         return 2
     print(f"{n} shaders, {len(occ)} distinct mnemonics -> {os.path.abspath(path)}")
-    for k, v in sorted(fam.items(), key=lambda kv: -kv[1][1]):
+    for k, v in sorted(fam.items(), key=lambda item: (-item[1][1], item[0])):
         print(f"  {k:8} {v[0]:4} mnemonics {v[1]:>12,} uses")
     print(f"  ALU: {cats['alu']} ({ratios['alu_ratio'] * 100:.1f}%)  Memory: {cats['memory']} ({ratios['memory_ratio'] * 100:.1f}%)  Branch: {cats['branch']} ({ratios['branch_ratio'] * 100:.1f}%)")
     cum, total = 0, sum(occ.values())
@@ -381,7 +395,7 @@ def main():
     for st, r in out["registers"].items():
         print(f"  {st:2} registers: VGPR max {r['vgpr_max']} mean {r['vgpr_mean']}, "
               f"SGPR max {r['sgpr_max']} mean {r['sgpr_mean']} ({r['shaders']} shaders)")
-    print("  most widespread:", ", ".join(f"{m} ({users[m]})" for m, _ in users.most_common(12)))
+    print("  most widespread:", ", ".join(f"{m} ({count})" for m, count in ranked_users[:12]))
     print(f"  undecoded: {out['undecoded']['warnings']} LLVM warnings, {len(word_occ)} distinct words, "
           f"{unresolved} unresolved (words only in the JSON report)")
 

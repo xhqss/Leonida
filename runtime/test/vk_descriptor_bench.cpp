@@ -7,7 +7,7 @@
 // dispatch against CPU DescriptorTable::lookup() before timing.
 //
 // Usage:
-//   vk_descriptor_bench [--sizes 1000,10000,100000] [--groups 4096] [--iters 64] [--reps 25] [--warmup 5]
+//   vk_descriptor_bench [--sizes 1000,10000,100000] [--groups 4096] [--iters 64] [--reps 25] [--warmup 5] [--warmup-ms 300]
 //                       [--memory all|device|host|rebar] [--device N] [--list-devices] [--quick] [--csv]
 //                       [--dump-spv PREFIX] [--self-test]
 //   LEONIDA_VK_VALIDATION=1 enables VK_LAYER_KHRONOS_validation; any validation error fails the run.
@@ -969,6 +969,7 @@ struct Options {
     std::uint32_t reps = 25u;
     std::uint32_t warmup = 5u;
     double max_dispatch_ms = 120.0;
+    double warmup_ms = 300.0;   // keep running the timed dispatch until this much time has passed (0 = off)
     std::optional<std::uint32_t> device_index;
     MemoryFilter mem_filter = MemoryFilter::All;
     bool list_devices = false;
@@ -985,6 +986,8 @@ void print_usage() {
         "  --iters N            lookups per invocation per dispatch (default: 64)\n"
         "  --reps N             timed repetitions per scenario (default: 25)\n"
         "  --warmup N           warmup dispatches before timing (default: 5)\n"
+        "  --warmup-ms F        then keep dispatching until F ms have passed, so the GPU clocks are up before the\n"
+        "                       first timed run, 0=off (default: 300; --quick turns it off)\n"
         "  --max-dispatch-ms F  auto-scale slow dispatches to avoid OS TDR, 0=off (default: 120)\n"
         "  --memory MODE        all|device|host|rebar (default: all)\n"
         "  --device N           select physical device index from --list-devices\n"
@@ -1031,6 +1034,7 @@ bool parse_args(int argc, const char* const* argv, Options& opt, bool& show_help
             opt.groups = 16u;
             opt.iters = 4u;
             opt.warmup = 1u;
+            opt.warmup_ms = 0.0;
             opt.reps = 3u;
         } else if (arg == "--groups") {
             const char* v = nullptr;
@@ -1051,6 +1055,13 @@ bool parse_args(int argc, const char* const* argv, Options& opt, bool& show_help
             const double val = std::strtod(v, &end);
             if (*v == '\0' || *end != '\0' || !std::isfinite(val) || val < 0.0) return false;
             opt.max_dispatch_ms = val;
+        } else if (arg == "--warmup-ms") {
+            const char* v = nullptr;
+            if (!need_val(v)) return false;
+            char* end = nullptr;
+            const double val = std::strtod(v, &end);
+            if (*v == '\0' || *end != '\0' || !std::isfinite(val) || val < 0.0) return false;
+            opt.warmup_ms = val;
         } else if (arg == "--device") {
             const char* v = nullptr;
             std::uint32_t idx = 0u;
@@ -1162,6 +1173,19 @@ int run_self_test() {
         device_options.device_index != std::numeric_limits<std::uint32_t>::max()) {
         std::fprintf(stderr, "self-test: explicit device index became automatic selection\n");
         return 1;
+    }
+
+    {
+        const char* const ok_args[] = {"vk_descriptor_bench", "--warmup-ms", "0"};
+        const char* const bad_args[] = {"vk_descriptor_bench", "--warmup-ms", "-1"};
+        const char* const quick_args[] = {"vk_descriptor_bench", "--quick"};
+        Options o_ok, o_bad, o_quick, o_default;
+        bool h = false;
+        if (o_default.warmup_ms != 300.0 || !parse_args(3, ok_args, o_ok, h) || o_ok.warmup_ms != 0.0 ||
+            parse_args(3, bad_args, o_bad, h) || !parse_args(2, quick_args, o_quick, h) || o_quick.warmup_ms != 0.0) {
+            std::fprintf(stderr, "self-test: --warmup-ms parsing or its default is wrong\n");
+            return 1;
+        }
     }
 
     const struct {
@@ -2131,6 +2155,22 @@ int main(int argc, char** argv) {
                     if (vkEndCommandBuffer(bench_cmd) != VK_SUCCESS) {
                         cleanup_all(keys_buf, map_buf);
                         return 1;
+                    }
+                }
+
+                // A handful of dispatches is not enough to bring the clocks up on every GPU: with --warmup 5 an idle
+                // RX 7600 measured the first placement ~1.8x slower than with --warmup 200, and the RTX 4050 ~1.3x
+                // (TEST-277). Keep running the command that is about to be timed for --warmup-ms.
+                if (opt.warmup_ms > 0.0) {
+                    const auto w0 = std::chrono::steady_clock::now();
+                    for (;;) {
+                        if (!submit_and_wait(bench_cmd)) {
+                            cleanup_all(keys_buf, map_buf);
+                            return 1;
+                        }
+                        const double spent =
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+                        if (spent >= opt.warmup_ms) break;
                     }
                 }
 

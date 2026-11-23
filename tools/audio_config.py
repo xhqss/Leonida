@@ -60,9 +60,15 @@ JOIN_BLOCK_BYTES = 1 << 20   # --join read size; a typical carved part is one re
 
 
 def joaat(text):
-    """Jenkins one-at-a-time over the lowercased UTF-8 bytes, as used for the name hash."""
+    """Jenkins one-at-a-time over the lowercased latin-1 bytes, as the name hash is defined.
+
+    The same rule as ``tools/hashdict.py`` (the pinned name dictionary) and ``tools/awc_names.py``, which
+    recovers stream names: a name has to hash alike in every tool or the id never matches. Lowercased
+    UTF-8 gave a different hash for any non-ASCII character (``é`` is one byte 0xE9, not 0xC3 0xA9), so a
+    title with an accent produced a stream id no bank stores.
+    """
     h = 0
-    for c in text.lower().encode("utf-8", "ignore"):
+    for c in text.lower().encode("latin-1", "replace"):
         h = (h + c) & 0xFFFFFFFF
         h = (h + (h << 10)) & 0xFFFFFFFF
         h ^= h >> 6
@@ -257,7 +263,8 @@ def main():
         ap.error("require 1 <= min-ms <= max-ms")
 
     if not os.path.exists(a.src):
-        sys.exit(f"{a.src}: does not exist")
+        print(f"ERROR: {a.src}: does not exist", file=sys.stderr)
+        return 2
     if a.join and not os.path.isdir(a.src):
         ap.error("--join applies to a directory, not a single file")
     try:

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <mutex>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace leonida {
@@ -69,6 +70,8 @@ public:
     enum class InsertResult { added, unchanged, replaced, added_with_relocation };
 
     explicit DescriptorTable(std::uint32_t initial_capacity = 16) {
+        // Slots use nonnegative int indices internally. Larger powers also wrap the capacity counter.
+        if (initial_capacity > max_capacity) throw std::length_error("Descriptor table capacity exceeds slot range");
         std::uint32_t cap = 16;
         while (cap < initial_capacity) cap <<= 1;
         mask_ = cap - 1;
@@ -129,7 +132,10 @@ public:
     }
 
     // Erases a key from the table. Returns true if the key was found and erased, false otherwise.
-    // Backward-shifts downstream entries in the probe cluster so probe chains remain intact and compact.
+    // Only the key's own slot changes (it becomes empty): no other entry moves. Every lookup, here and in the
+    // shaders (rdna2spirv.py desc_probe), compares all kDescriptorProbes slots and never stops at an empty one, so
+    // a hole breaks no probe chain and inserts reuse it. Keeping the other entries in place is what lets the GPU
+    // copy of the table take an erase while shaders still probe it (BindlessSet::flush_needs_idle).
     bool erase(const std::uint32_t key[8]) {
         std::lock_guard lock(mutex_);
         return erase_locked(key);
@@ -288,6 +294,17 @@ private:
                 continue;
             }
 
+            // Nine distinct keys with the same full hash can never fit the shader's eight probes,
+            // regardless of capacity. Refuse before allocating ever larger tables.
+            if (empty_slot < 0) {
+                std::uint32_t same_hash = 0;
+                for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
+                    const auto& entry = entries_[(h + k) & mask_];
+                    if (hash_descriptor_key(entry.key) == h) ++same_hash;
+                }
+                if (same_hash == kDescriptorProbes)
+                    throw std::length_error("Descriptor hash collision exceeds shader probe limit");
+            }
             const bool relocate = empty_slot < 0;
             std::uint32_t moved_to = 0;
             if (relocate) empty_slot = make_probe_slot(entries_, h, &moved_to);
@@ -321,29 +338,15 @@ private:
         }
         if (!found) return false;
 
-        // Backward-shift entries in the probe cluster to maintain probe chains
-        std::uint32_t i = found_slot;
-        std::uint32_t j = i;
+        // No backward shift: see erase().
+        entries_[found_slot] = DescriptorEntry{};
         mark(found_slot);
-        while (true) {
-            j = (j + 1) & mask_;
-            if (entries_[j].pad != kSlotOccupiedMarker) break;
-            const std::uint32_t r = hash_descriptor_key(entries_[j].key);
-            const std::uint32_t dist_r_to_i = (i - r) & mask_;
-            const std::uint32_t dist_r_to_j = (j - r) & mask_;
-            if (dist_r_to_i < dist_r_to_j && dist_r_to_i < kDescriptorProbes) {
-                entries_[i] = entries_[j];
-                mark(i);
-                i = j;
-            }
-        }
-        entries_[i] = DescriptorEntry{};
-        mark(i);
         --occupied_count_;
         return true;
     }
 
     void grow_locked() {
+        if (entries_.size() >= max_capacity) throw std::length_error("Descriptor table capacity exhausted");
         std::uint32_t new_cap = static_cast<std::uint32_t>(entries_.size() * 2);
         while (true) {
             std::vector<DescriptorEntry> new_entries(new_cap);
@@ -376,10 +379,12 @@ private:
                 changed_slots_.clear();
                 break;
             }
+            if (new_cap >= max_capacity) throw std::length_error("Descriptor probe range exhausted");
             new_cap *= 2;
         }
     }
 
+    static constexpr std::uint32_t max_capacity = std::uint32_t{1} << 31;
     mutable std::mutex mutex_;
     std::uint32_t mask_ = 15;
     std::vector<DescriptorEntry> entries_;

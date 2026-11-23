@@ -3,10 +3,12 @@
     python -I tests/test_shader_stats.py
 """
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "scripts", "shader_stats.py")
@@ -37,7 +39,7 @@ NOTHING = "ps: 1 shaders, code growth n/a; VGPRs n/a; scratch n/a, spills n/a; w
 
 
 class ShaderStats(unittest.TestCase):
-    def run_stats(self, rows, details=True, listings=None, header="name,stage,statistic,value"):
+    def run_stats(self, rows, details=True, listings=None, header="name,stage,statistic,value", extra=()):
         with tempfile.TemporaryDirectory() as tmp:
             disasm = os.path.join(tmp, "disasm")
             os.makedirs(disasm)
@@ -47,7 +49,7 @@ class ShaderStats(unittest.TestCase):
             csv_path = os.path.join(tmp, "stats.csv")
             with open(csv_path, "w", encoding="utf-8") as f:
                 f.write(header + "\n" + "".join(f"{r}\n" for r in rows))
-            cmd = [sys.executable, "-I", SCRIPT, csv_path, disasm] + (["--details"] if details else [])
+            cmd = [sys.executable, "-I", SCRIPT, csv_path, disasm] + (["--details"] if details else []) + list(extra)
             return subprocess.run(cmd, capture_output=True, text=True)
 
     def detail(self, r, name="ps_flat"):
@@ -62,6 +64,35 @@ class ShaderStats(unittest.TestCase):
         self.assertEqual(line.split(), ["ps_flat", "ps", "8", "16", "2.00", "6", "8", "20", "1024", ">=2", "16"])
         self.assertIn("ps: 1 shaders, code growth median 2.00x", r.stdout)
         self.assertIn("scratch in 1, spills in 1", r.stdout)
+
+    def test_original_vgpr_count_includes_non_contiguous_image_addresses(self) -> None:
+        listing = ("\timage_sample v[6:9], [v1, v31, v2], s[0:7], s[8:11] dmask:0xf\n"
+                   "\ts_endpgm\n")
+        result = self.run_stats(["ps_nsa,ps,VGPRs,24"], listings={"ps_nsa": listing})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.detail(result, "ps_nsa")[5:7], ["32", "24"])
+        self.assertIn("VGPRs median 24 vs original 32", result.stdout)
+
+    def test_unreadable_listing_has_a_path_specific_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stats = os.path.join(tmp, "stats.csv")
+            listing = os.path.join(tmp, "ps_flat.s")
+            with open(stats, "w", encoding="utf-8", newline="\n") as f:
+                f.write("name,stage,statistic,value\n" + COMPLETE[0] + "\n")
+            with open(listing, "w", encoding="utf-8", newline="\n") as f:
+                f.write(PS_FLAT)
+            open_file = open
+
+            def locked(path, *args, **kwargs):
+                if path == listing:
+                    raise PermissionError(13, "Permission denied", path)
+                return open_file(path, *args, **kwargs)
+
+            with mock.patch("builtins.open", side_effect=locked), \
+                    mock.patch.object(sys, "argv", [SCRIPT, stats, tmp]), self.assertRaises(SystemExit) as caught:
+                runpy.run_path(SCRIPT, run_name="__main__")
+            self.assertIn(listing, str(caught.exception))
+            self.assertIn("Permission denied", str(caught.exception))
 
     def test_shaders_without_a_listing_are_left_out(self):
         r = self.run_stats(["ps_other,ps,Instructions,10"], details=False)
@@ -156,6 +187,40 @@ class ShaderStats(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         d = self.detail(r)
         self.assertEqual((d[3], d[6]), ("-", "8"))
+
+    def run_args(self, *args):
+        return subprocess.run([sys.executable, "-I", SCRIPT, *args], capture_output=True, text=True)
+
+    def test_help_goes_to_stdout_with_exit_code_0(self):
+        for flag in ("-h", "--help"):
+            r = self.run_args(flag)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("<stats.csv> <disasm dir> [--details]", r.stdout)
+            self.assertEqual(r.stderr, "")
+
+    def test_help_wins_over_other_arguments(self):
+        r = self.run_args("stats.csv", "disasm", "--help")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("--details", r.stdout)
+
+    def test_wrong_argument_count_is_a_usage_error(self):
+        for args in ((), ("stats.csv",), ("stats.csv", "disasm", "extra")):
+            r = self.run_args(*args)
+            self.assertEqual(r.returncode, 2, args)
+            self.assertIn("usage: shader_stats.py", r.stderr)
+            self.assertEqual(r.stdout, "")
+
+    def test_unknown_option_is_refused_not_ignored(self):
+        # --detail (a typo) used to print the summary with exit code 0, as if no option had been given.
+        r = self.run_stats(COMPLETE, details=False, extra=["--detail"])
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("unknown option --detail", r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_details_is_still_accepted_anywhere(self):
+        r = self.run_stats(COMPLETE, details=False, extra=["--details"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.detail(r)[0], "ps_flat")
 
     def test_header_only_report_is_a_valid_empty_report(self):
         r = self.run_stats([], details=False)

@@ -54,6 +54,7 @@ with every check. `--dump` prints the decoded tree of one container on stdout, h
 it writes no file. Unknown member types (0x5a, 0x76, 0x77, ...) are counted and skipped, never guessed.
 """
 import argparse
+import bisect
 import collections
 import json
 import os
@@ -212,6 +213,14 @@ class Walker:
         self.keep = keep
         self.cover = [bytearray(size) for _, _, size in container.blocks]
         self.seen = set()
+        self._block_bases = [base for _, base, _ in container.blocks]
+        self._block_ends = [base + size for _, base, size in container.blocks]
+
+    def _block_end(self, at):
+        i = bisect.bisect_right(self._block_bases, at) - 1
+        if i >= 0 and at <= self._block_ends[i]:
+            return self._block_ends[i]
+        return None
 
     def mark(self, number, absolute, n):
         btype, base, size = self.c.blocks[number - 1]
@@ -276,7 +285,13 @@ class Walker:
         if t == 0x05:
             return self.struct(m["ref"], at, depth + 1)
         if t == 0x07:
-            r = c.resolve(at, 1, st, "struct pointer")
+            number, _ = c.pointer(at)
+            need = 1
+            if 1 <= number <= len(c.blocks):
+                s = c.structs.get(c.blocks[number - 1][0])
+                if s is not None:
+                    need = max(1, s["size"])
+            r = c.resolve(at, need, st, "struct pointer")
             if r is None:
                 return None
             btype, absolute, number = r
@@ -302,6 +317,8 @@ class Walker:
             self.mark(number, absolute, end - absolute + 1)
             return blob[absolute:end].decode("utf-8", "replace") if self.keep else None
         if t == 0x40:
+            if at + m["ref"] > len(blob):
+                raise IndexError("char array past end of blob")
             st["char arrays"] += 1
             return blob[at:at + m["ref"]].split(b"\0")[0].decode("utf-8", "replace") if self.keep else None
         if t in (0x50, 0x53, 0x54, 0x5C, 0x52):
@@ -344,12 +361,22 @@ class Walker:
             return None
         if t in (0x50, 0x53):
             st["fixed arrays"] += 1
-            return self.elements(el, members, at, m["ref"] & 0xFFFF, depth)
+            n = m["ref"] & 0xFFFF
+            end = self._block_end(at)
+            if end is None or at + size * n > end:
+                st["fixed array out of bounds"] += 1
+                return None
+            return self.elements(el, members, at, n, depth)
         if t == 0x54:
             capacity, count = struct.unpack_from("<II", blob, at)
             st["inline arrays"] += 1
             st["count <= capacity" if count <= capacity else "count > capacity"] += 1
-            return self.elements(el, members, at + 8, min(count, capacity), depth)
+            n = min(count, capacity)
+            end = self._block_end(at)
+            if end is None or at + 8 + size * n > end:
+                st["inline array out of bounds"] += 1
+                return None
+            return self.elements(el, members, at + 8, n, depth)
         if t == 0x5C:
             count, capacity = struct.unpack_from("<II", blob, at)
             where = at + 8
@@ -412,7 +439,7 @@ class Walker:
                 return None
             _, absolute, number = r
             self.mark(number, absolute, groups * group)
-            power = groups & (groups - 1) == 0
+            power = groups > 0 and (groups & (groups - 1) == 0)
             st[f"{kind} groups a power of two" if power else f"{kind} groups not a power of two"] += 1
             slots = []
             for g in range(groups):
@@ -492,15 +519,15 @@ def main():
         if not os.path.isfile(a.src):
             print("ERROR: --dump takes one PSIN file", file=sys.stderr)
             return 2
-        with open(a.src, "rb") as f:
-            blob = f.read()
         try:
+            with open(a.src, "rb") as f:
+                blob = f.read()
             container = Container(blob)
-        except ValueError as e:
+            stats = collections.Counter()
+            tree = Walker(container, stats, keep=True).run()
+        except (OSError, ValueError, struct.error, IndexError) as e:
             print(f"ERROR: {a.src}: {e}", file=sys.stderr)
             return 2
-        stats = collections.Counter()
-        tree = Walker(container, stats, keep=True).run()
         root_type = container.blocks[container.root - 1][0] if 1 <= container.root <= len(container.blocks) else 0
         json.dump({f"{root_type:08x}": tree}, sys.stdout, indent=1, default=str)
         sys.stdout.write("\n")

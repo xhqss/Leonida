@@ -36,6 +36,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
 
 # ---- Ogg ----
 _CRC = []
@@ -95,25 +96,47 @@ OPUS_PRE_SKIP = 312
 
 def write_ogg_opus(path: str, packets: list, channels: int, serial: int, length: int = 0,
                    pre_skip: int = OPUS_PRE_SKIP) -> int:
-    """length: the stream's declared per-channel sample count at 48 kHz; the last page's granule position is
+    """length: the stream's declared per-channel sample count at 48 kHz; the EOS page's granule position is
     trimmed to pre_skip + length (Ogg Opus granules count the pre-skip too), so decoders drop the encoder priming
-    at the start and stop at the exact end instead of the padded last frame."""
+    at the start and stop at the exact end instead of the padded last frame.
+
+    The EOS page is emitted at the packet that first reaches pre_skip + length; any later packets are encoder
+    padding and are dropped. Clamping only the final page would make its granule smaller than the previous page's
+    when the trim point falls before that page starts, which is invalid Ogg and makes decoders keep the excess.
+    """
+    if not 0 <= pre_skip <= 0xFFFF:
+        raise ValueError(f"pre-skip must be 0..65535, got {pre_skip}")
+    if length < 0:
+        raise ValueError(f"length must be non-negative, got {length}")
+    total = sum(opus_samples(p) for p in packets)
+    if pre_skip > total:
+        pre_skip = total          # a granule below the pre-skip makes the stream undecodable
     head = b"OpusHead" + struct.pack("<BBHIhB", 1, channels, pre_skip, 48000, 0, 0)
     tags = b"OpusTags" + struct.pack("<I", 8) + b"leonida " + struct.pack("<I", 0)
     out = [ogg_page(serial, 0, 0, [head], 0x02), ogg_page(serial, 1, 0, [tags], 0x00)]
     seq, granule, pending, size = 2, 0, [], 0
+    target = pre_skip + length if length > 0 else None
+    written = 0
+    if not packets:
+        out.append(ogg_page(serial, 2, pre_skip, [], 0x04))
+        write_file(path, b"".join(out))
+        return pre_skip
     for i, p in enumerate(packets):
         pending.append(p)
         granule += opus_samples(p)
         size += len(p)
+        reach = target is not None and granule >= target
         last = i == len(packets) - 1
-        if size > 4000 or len(pending) >= 50 or last:
-            g = min(granule, pre_skip + length) if (last and 0 < length) else granule
-            out.append(ogg_page(serial, seq, g, pending, 0x04 if last else 0x00))
+        if reach or size > 4000 or len(pending) >= 50 or last:
+            g = target if reach else granule
+            out.append(ogg_page(serial, seq, g, pending, 0x04 if (reach or last) else 0x00))
+            written = g
             seq += 1
             pending, size = [], 0
+            if reach or last:
+                break
     write_file(path, b"".join(out))
-    return granule
+    return written
 
 
 def write_file(path: str, data: bytes) -> None:
@@ -142,9 +165,14 @@ def write_file(path: str, data: bytes) -> None:
 
 def write_wav(path: str, pcm: bytes, rate: int, channels: int, float32: bool = False) -> None:
     bits = 32 if float32 else 16
-    hdr = b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " + struct.pack(
-        "<IHHIIHH", 16, 3 if float32 else 1, channels, rate, rate * channels * bits // 8, channels * bits // 8, bits) +         b"data" + struct.pack("<I", len(pcm))
-    write_file(path, hdr + pcm)
+    block_align = channels * (bits // 8)
+    fmt = struct.pack("<HHIIHH", 3 if float32 else 1, channels, rate, rate * block_align, block_align, bits)
+    fact = b""
+    if float32:
+        fmt += struct.pack("<H", 0)  # WAVEFORMATEX.cbSize
+        fact = struct.pack("<4sII", b"fact", 4, len(pcm) // block_align)
+    header = b"WAVEfmt " + struct.pack("<I", len(fmt)) + fmt + fact + b"data" + struct.pack("<I", len(pcm))
+    write_file(path, b"RIFF" + struct.pack("<I", len(header) + len(pcm)) + header + pcm)
 
 
 # ---- AWC ----
@@ -153,16 +181,23 @@ def parse_awc(d: bytes):
         raise ValueError("not a little-endian AWC")
     flags, n, header_size = struct.unpack_from("<III", d, 4)
     p = 16 + (4 if flags & 0x400000 else 0)
-    if flags & 0x10000:
+    index_at = p if flags & 0x10000 else -1
+    if index_at >= 0:
         p += n * 2
     if flags & 0x200000:
         p += (n + 1) * 4
     info = p
     p += n * 4
     streams, music = [], []
+    tags = 0
     for i in range(n):
         v = struct.unpack_from("<I", d, info + 4 * i)[0]
         sid, ntags = v & 0x1FFFFFFF, v >> 29
+        if index_at >= 0:
+            index, = struct.unpack_from("<H", d, index_at + 2 * i)
+            if index != tags:
+                raise ValueError(f"AWC index entry {i} does not match the cumulative tag count")
+        tags += ntags
         data = fmt = mus = None
         for _ in range(ntags):
             t = struct.unpack_from("<Q", d, p)[0]
@@ -189,6 +224,18 @@ def parse_awc(d: bytes):
     return streams, music
 
 
+def repeated_prefix_packets(packets: list[bytes], previous: list[bytes], samples: int) -> int | None:
+    """Count whole leading packets that repeat the previous chunk's tail, or reject a bad skip."""
+    for count, packet in enumerate(packets, 1):
+        duration = opus_samples(packet)
+        if not 0 < duration <= samples:
+            return None
+        samples -= duration
+        if samples == 0:
+            return count if packets[:count] == previous[-count:] else None
+    return None
+
+
 def music_channels(d: bytes, mus, data, collect_packets: bool = True):
     """[(channel id, samples, rate, codec, [packets], packet channels)] for one streamed-music descriptor.
 
@@ -197,15 +244,16 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
     Opus TOC stereo bit (bit 2) and defaults to 1 when no packet is present.
 
     collect_packets=False keeps the packet lists empty for metadata-only callers (awc_manifest.py).
-    A descriptor whose declared blocks or subblock runs do not fit its data tag is rejected ([]), so a
-    corrupt descriptor cannot read past the tag into a sibling stream or past the end of the bank."""
+    The chunk size is the stride between blocks. The last block may be shorter, but each channel table and
+    subblock run must fit in its own block. A declared repeat must match whole packets from the same channel's
+    previous data. Reject malformed descriptors without hiding other bank streams."""
     (m_at, m_size), (d_at, d_size) = mus, data
+    if m_size < 12:
+        return []
     blocks, chunk, channels = struct.unpack_from("<III", d, m_at)
     if not (1 <= channels <= 32 and 1 <= blocks and chunk >= 2048 and m_size == 12 + 16 * channels):
         return []
-    # Every block must start inside the data tag. The last block is usually shorter than `chunk` (game banks
-    # hold e.g. 1 block of a 524,288-byte chunk in a 264,192-byte tag), so `blocks * chunk` is not a bound;
-    # each block's own record table and subblock run are checked against the bytes left below.
+    # Every block must start inside the data tag. The last block can be shorter than the chunk stride.
     if (blocks - 1) * chunk >= d_size:
         return []
     info = []
@@ -215,32 +263,34 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
         samples, = struct.unpack_from("<I", d, base + 4)
         rate, = struct.unpack_from("<H", d, base + 10)
         info.append([cid, samples, rate, d[base + 12], [], 0])
+    previous = [[] for _ in range(channels)]
     for b in range(blocks):
-        at = d_at + b * chunk
-        if channels * 24 > d_size - b * chunk:
+        offset = b * chunk
+        at = d_at + offset
+        block_size = min(chunk, d_size - offset)
+        if channels * 24 > block_size:
             return []
-        recs = [struct.unpack_from("<III", d, at + 24 * c + 4)[:2] for c in range(channels)]   # (count, skip)
+        recs = [struct.unpack_from("<II", d, at + 24 * c + 4) for c in range(channels)]   # (count, skip)
         total = sum(r[0] for r in recs)
         header = (channels * 24 + total * 4 + 2047) & ~2047
-        if header + total * 2048 > d_size - b * chunk:
+        if header + total * 2048 > block_size:
             return []
         before = 0
         for c, (count, skip) in enumerate(recs):
             start = at + header + before * 2048
             before += count
-            if info[c][3] != 0x0B or count == 0:
+            if info[c][3] != 0x0B:
                 continue
             packets = opus_packets(d, start, count * 2048)
+            repeated = repeated_prefix_packets(packets, previous[c], skip) if skip else 0
+            if repeated is None:
+                return []
+            if packets:
+                previous[c] = packets
             if packets and info[c][5] < 2:
                 info[c][5] = 2 if any(p[0] & 0x04 for p in packets) else 1
-            if not collect_packets:
-                continue
-            for pk in packets:
-                n = opus_samples(pk)
-                if skip >= n and skip > 0:
-                    skip -= n
-                    continue
-                info[c][4].append(pk)
+            if collect_packets:
+                info[c][4].extend(packets[repeated:] if repeated else packets)
     for x in info:
         if x[3] == 0x0B and x[5] > 1:
             x[1] //= x[5]
@@ -293,9 +343,12 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
             pk = opus_packets(d, at, size)
             if pk:
                 # +0x0C is the per-channel Opus frame count: equal to the +0 count for mono and
-                # half of it for stereo in all 7,451 measured streams. Fall back to dividing the
-                # interleaved count when a synthetic or malformed block leaves the field zero.
-                frames = s["frames"] or s["samples"] // max(1, s["channels"])
+                # half of it for stereo in all 7,451 measured streams. Use it only when it agrees
+                # with the interleaved +0 count; a synthetic or malformed block that disagrees
+                # must not silently truncate the real audio.
+                frames = s["frames"]
+                if not frames or frames * s["channels"] != s["samples"]:
+                    frames = s["samples"] // max(1, s["channels"])
                 write_ogg_opus(os.path.join(od, stem + ".ogg"), pk, s["channels"], s["id"], frames,
                                pre_skip=pre_skip)
                 counts["opus"] += 1
@@ -335,10 +388,18 @@ def main(argv=None) -> int:
         ap.error(f"{a.out} is a file, not a folder")
     if os.path.isdir(a.src):
         banks = []
-        for root, _, files in os.walk(a.src):
-            output_parent = os.path.join(a.out, os.path.relpath(root, a.src))
-            banks.extend((os.path.join(root, name), output_parent)
-                         for name in files if name.lower().endswith(".awc"))
+
+        def scan_failed(error):
+            raise error
+
+        try:
+            for root, _, files in os.walk(a.src, onerror=scan_failed):
+                output_parent = os.path.join(a.out, os.path.relpath(root, a.src))
+                banks.extend((os.path.join(root, name), output_parent)
+                             for name in files if name.lower().endswith(".awc"))
+        except OSError as error:
+            print(f"ERROR: cannot list {error.filename or a.src}: {error.strerror or error}", file=sys.stderr)
+            return 1
         banks.sort()
     else:
         banks = [(a.src, a.out)]
@@ -372,7 +433,7 @@ def main(argv=None) -> int:
             if (i + 1) % 200 == 0:
                 print(f"  {i + 1}/{len(banks)} banks: {tot}", flush=True)
     else:
-        with ProcessPoolExecutor(max_workers=jobs) as ex:
+        with ProcessPoolExecutor(max_workers=process_workers(jobs)) as ex:
             futures = {ex.submit(export_bank, b, output_parent, a.pre_skip): b for b, output_parent in banks}
             for i, fut in enumerate(as_completed(futures), 1):
                 b = futures[fut]

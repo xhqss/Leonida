@@ -249,7 +249,7 @@ def test_duplicate_shader_names_keep_file_stages():
                        capture_output=True, text=True, check=True)
         with open(out, encoding="utf-8") as f:
             ordered = json.load(f)["disasm"]["ordered_or_gws_shaders"]
-        assert ordered == {"gs": 1, "ms": 1}, f"ordered-count shaders keep their file stages: {ordered}"
+        check(ordered == {"gs": 1, "ms": 1}, f"ordered-count shaders keep their file stages: {ordered}")
 
 
 def test_v_perm_b32_selectors():
@@ -283,6 +283,17 @@ def test_v_perm_b32_selectors():
              "\tv_add_nc_u32 v8, v8, v1\n"
              "\tv_perm_b32 v9, v1, v2, v8\n"
              "\ts_endpgm\n"),
+            # The scalar carry is the second destination; wave64 writes both halves of its pair.
+            ("perm_carry_w32", "cs",
+             "\ts_mov_b32 s4, 0x08080808\n"
+             "\tv_add_co_u32 v8, s4, v1, v2\n"
+             "\tv_perm_b32 v9, v1, v2, s4\n"
+             "\ts_endpgm\n"),
+            ("perm_carry_w64", "vs",
+             "\ts_mov_b32 s5, 0x08080808\n"
+             "\tv_add_co_u32 v8, s[4:5], v1, v2\n"
+             "\tv_perm_b32 v9, v1, v2, s5\n"
+             "\ts_endpgm\n"),
         ]
         index = []
         for name, stage, listing in synthetic:
@@ -297,10 +308,10 @@ def test_v_perm_b32_selectors():
         stage_of = {e["name"]: e["stage"] for e in index}
         s = F.scan_disasm(dis, stage_of)
         vp = s["v_perm_b32"]
-        check(vp["shaders"] == {"ps": 2, "cs": 1, "vs": 1}, f"v_perm_b32 shader counts by stage: {vp['shaders']}")
-        check(vp["insns"] == 5, f"v_perm_b32 total instructions == 5 (got {vp['insns']})")
-        check((vp["immediate"], vp["const_reg"], vp["unresolved"]) == (1, 2, 2),
-              f"v_perm_b32 resolution split (1 imm, 2 const_reg, 2 unresolved), got {vp}")
+        check(vp["shaders"] == {"ps": 2, "cs": 2, "vs": 2}, f"v_perm_b32 shader counts by stage: {vp['shaders']}")
+        check(vp["insns"] == 7, f"v_perm_b32 total instructions == 7 (got {vp['insns']})")
+        check((vp["immediate"], vp["const_reg"], vp["unresolved"]) == (1, 2, 4),
+              f"v_perm_b32 resolution split (1 imm, 2 const_reg, 4 unresolved), got {vp}")
         check(vp["sign_extend_8_11_shaders"] == 2 and vp["sign_extend_8_11_insns"] == 2,
               f"v_perm_b32 8..11 sign-extend shader/insn counts == (2, 2), got {vp}")
         check(vp["selector_classes"] == {"0_7": 3, "8_11": 5, "12": 1, "13_plus": 3},
@@ -309,7 +320,7 @@ def test_v_perm_b32_selectors():
         out_json = os.path.join(tmp, "out.json")
         r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "feature_scan.py"), sh, "--out", out_json],
                            capture_output=True, text=True)
-        check(r.returncode == 0 and "v_perm_b32: 4 shaders" in r.stdout and "selectors 8-11: 2 shaders / 2 insns" in r.stdout,
+        check(r.returncode == 0 and "v_perm_b32: 6 shaders" in r.stdout and "selectors 8-11: 2 shaders / 2 insns" in r.stdout,
               f"CLI prints v_perm_b32 summary counts (rc={r.returncode})")
         raw_json = open(out_json, encoding="utf-8").read()
         for name, _, _ in synthetic:
@@ -318,16 +329,166 @@ def test_v_perm_b32_selectors():
     assert failures == 0, f"{failures} v_perm_b32 check(s) failed"
 
 
+def psv0(records, size=24, truncate=False):
+    """PSV0 payload: a 24-byte runtime info, then the resource count, record size and (type, kind) records."""
+    body = struct.pack("<I", 24) + bytes(24) + struct.pack("<II", len(records), size)
+    for t, k in records:
+        rec = struct.pack("<4I", t, 0, 0, 0) + (struct.pack("<II", k, 0) if size >= 24 else b"")
+        body += rec + bytes(size - len(rec))
+    return body[:-4] if truncate else body
+
+
+def listing(lines):
+    """A .s listing with `; encoding:` comments of the right length, so pcs and branch targets are real."""
+    return "".join(f"\t{code} ; encoding: [{','.join(['0x00'] * n)}]\n" for code, n in lines)
+
+
+def test_typed_buffers_and_psv0():
+    """§8.2 #16: PSV0 counter/typed-buffer bindings, MTBUF formats and where each MUBUF V# word 3 comes from."""
+    with tempfile.TemporaryDirectory() as tmp:
+        sh = os.path.join(tmp, "shaders")
+        dx = os.path.join(sh, "dxbc")
+        dis = os.path.join(dx, "disasm")
+        os.makedirs(dis)
+        cs = listing([
+            ("s_load_dwordx4 s[8:11], s[0:1], 0x0", 8),                         # pc 0
+            ("s_mov_b32 s15, 0x38000", 8),                                      # 8: format 56, 8_8_8_8_UNORM
+            ("s_mov_b32 s19, 0x24000", 8),                                      # 16: format 36, 10_11_11_FLOAT
+            ("s_or_b32 s23, s23, 0x1000", 8),                                   # 24: computed
+            ("s_cmp_eq_u32 s11, 0", 4),                                         # 32: reads s11, writes nothing
+            ("buffer_load_format_xyzw v[0:3], v4, s[8:11], 0 idxen", 8),        # 36: memory
+            ("buffer_load_format_x v5, v4, s[12:15], 0 idxen", 8),              # 44: literal
+            ("buffer_store_format_x v5, v4, s[16:19], 0 idxen", 8),             # 52: literal, not in the table
+            ("buffer_load_format_x v6, v4, s[20:23], 0 idxen", 8),              # 60: computed
+            ("buffer_load_format_x v7, v4, s[24:27], 0 idxen", 8),              # 68: never written: shader input
+            ("s_cbranch_scc0 1", 4),                                            # 76: to 84; 80 and 84 lead blocks
+            ("s_nop 0", 4),                                                     # 80
+            ("buffer_load_format_x v8, v4, s[8:11], 0 idxen", 8),               # 84: loaded in an earlier block
+            ("buffer_load_format_x v9, v4, s[12:15], 0 idxen", 8),              # 92: literal from an earlier block
+            ("tbuffer_load_format_xy v[0:1], v4, s[8:11], 0 format:[BUF_FMT_16_16_SNORM] idxen", 8),
+            ("tbuffer_load_format_x v2, v4, s[8:11], 0 idxen", 8),             # no format: GFX10 default 8_UNORM
+            ("tbuffer_store_format_x v2, v4, s[8:11], 0 format:[BUF_FMT_10_11_11_FLOAT] idxen", 8),
+            ("s_endpgm", 4)])
+        ps = listing([("s_mov_b32 s11, 0", 4),                                    # word 3 0: FORMAT INVALID
+                      ("buffer_load_format_x v0, v1, s[0:3], 0 idxen", 8),
+                      ("buffer_load_format_x v2, v1, s[8:11], 0 idxen", 8), ("s_endpgm", 4)])
+        vs = listing([("v_mov_b32_e32 v0, v1", 4), ("s_endpgm", 4)])
+        synthetic = [
+            ("tb_cs", "cs", cs, psv0([(9, 12), (3, 10), (6, 2)])),     # counter UAV, typed buffer SRV, typed 2D UAV
+            ("tb_ps", "ps", ps, psv0([(6, 10), (6, 10)])),             # two typed buffer UAVs
+            ("tb_vs", "vs", vs, psv0([(3, 10)], size=16)),             # v0 records carry no kind
+            ("tb_gs", "gs", None, psv0([(9, 12)], truncate=True)),     # records past the end of the part
+        ]
+        index = []
+        for name, stage, text, psv in synthetic:
+            with open(os.path.join(dx, name + ".dxbc"), "wb") as f:
+                f.write(dxbc([("SFI0", struct.pack("<Q", 0)), ("OSG1", signature([0])), ("PSV0", psv)]))
+            index.append({"name": name, "file": name + ".dxbc", "stage": stage})
+            if text:
+                with open(os.path.join(dis, name + ".s"), "w", encoding="utf-8") as f:
+                    f.write(f"; {name}\n" + text)
+        with open(os.path.join(dx, "index.json"), "w", encoding="utf-8") as f:
+            json.dump(index, f)
+
+        pv = F.scan_dxbc(dx, index)["psv0"]
+        check(pv["records"] == 6 and pv["unreadable"] == 1, f"PSV0: 6 records read, 1 truncated table ({pv})")
+        check(pv["shaders"] == {"uav_with_counter": 1, "typed_buffer_srv": 1, "typed_buffer_uav": 1},
+              f"PSV0 shaders with a counter UAV / typed buffer SRV / typed buffer UAV ({pv['shaders']})")
+        check(pv["records_of"] == {"uav_with_counter": 1, "typed_buffer_srv": 1, "typed_buffer_uav": 2},
+              "a typed UAV of a texture kind and a v0 record without a kind are not typed buffers")
+        check(pv["by_type"] == {"UAVStructuredWithCounter": 1, "SRVTyped": 2, "UAVTyped": 3}, f"by type {pv['by_type']}")
+
+        tb = F.scan_typed_buffers(dis, {e["name"]: e["stage"] for e in index})
+        check(tb["mtbuf"] == {"load 16_16_SNORM": 1, "load 8_UNORM": 1, "store 10_11_11_FLOAT": 1},
+              f"MTBUF formats from the instruction, 8_UNORM without format: ({tb['mtbuf']})")
+        check(tb["mubuf_word3"] == {"load computed": 1, "load earlier_literal": 1, "load earlier_memory": 1,
+                                    "load literal": 2, "load memory": 1, "load shader_input": 2,
+                                    "store literal": 1},
+              f"MUBUF word 3 by source, s_cmp is no write, a branch target starts a block ({tb['mubuf_word3']})")
+        check(tb["mubuf_literal_formats"] == {"load 8_8_8_8_UNORM": 2, "load INVALID": 1,
+                                              "store 10_11_11_FLOAT": 1}, f"literal word 3 formats ({tb['mubuf_literal_formats']})")
+        check(tb["not_in_translator"] == {"mtbuf store 10_11_11_FLOAT": 1, "mubuf_literal store 10_11_11_FLOAT": 1},
+              f"formats outside rdna2spirv.Gen.FORMATS are listed, INVALID (reads 0) is not ({tb['not_in_translator']})")
+        check(tb["shaders"] == {"mtbuf": {"cs": 1}, "mubuf": {"cs": 1, "ps": 1}, "mubuf_literal": {"cs": 1, "ps": 1},
+                                "mubuf_runtime_format": {"cs": 1, "ps": 1}}, f"shaders per stage ({tb['shaders']})")
+
+        out_json = os.path.join(tmp, "out.json")
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "feature_scan.py"), sh, "--out", out_json],
+                           capture_output=True, text=True)
+        check(r.returncode == 0 and "PSV0 bindings: 6 records" in r.stdout and "uav_with_counter 1" in r.stdout
+              and "10_11_11_FLOAT" in r.stdout, f"CLI prints the #16 summary (rc={r.returncode})")
+        raw_json = open(out_json, encoding="utf-8").read()
+        check(all(n not in r.stdout and n not in raw_json for n, *_ in synthetic), "no shader name in stdout or JSON")
+    assert failures == 0, f"{failures} typed-buffer check(s) failed"
+
+
+def test_a_test_that_raises_fails_the_run_and_the_rest_still_run():
+    """The plain-script run used to hold every test in one try block that swallowed AssertionError: a failing bare
+    assert (test_duplicate_shader_names_keep_file_stages has one) skipped the tests after it and printed OK, exit 0."""
+    ran, reported = [], []
+
+    def raises():
+        ran.append("raises")
+        raise AssertionError("a bare assert failed")
+
+    def passes():
+        ran.append("passes")
+
+    raised = run_tests([raises, passes], report=reported.append)
+    check(raised == ["raises"], f"a test that raises is reported as failed ({raised})")
+    check(ran == ["raises", "passes"], f"the tests after it still run ({ran})")
+    check(reported == ["FAIL raises: a bare assert failed"], f"its message is printed ({reported})")
+    assert failures == 0, f"{failures} script-runner check(s) failed"
+
+
+def test_a_failed_check_fails_only_its_own_test():
+    """Each test ends in `assert failures == 0` over the module-wide count, so one failed check used to fail every
+    test after it as well. run_tests gives each test its own count and adds it back to the run's total."""
+    global failures
+    reported = []
+
+    def fails_a_check():
+        global failures
+        failures += 1   # what check(False, ...) counts, without printing a FAIL line into this run's output
+        assert failures == 0, f"{failures} check(s) failed"
+
+    def passes():
+        assert failures == 0, f"{failures} check(s) failed"
+
+    before = failures
+    raised = run_tests([fails_a_check, passes], report=reported.append)
+    counted, failures = failures - before, before   # the failure above was staged: keep it out of this run's total
+    check(raised == ["fails_a_check"], f"only the test with the failed check fails ({raised})")
+    check(counted == 1, f"its failed check still counts toward the run's total ({counted})")
+    # first line only: under pytest the assert's message gets pytest's "assert 1 == 0" explanation appended
+    check([r.splitlines()[0] for r in reported] == ["FAIL fails_a_check: 1 check(s) failed"],
+          f"with its own count in the message ({reported})")
+    assert failures == 0, f"{failures} script-runner check(s) failed"
+
+
+def run_tests(tests, report=print):
+    """Run each test on its own, for the plain-script run (CI's standard-library job): one that raises
+    AssertionError is reported and the rest still run. Each test starts from a zero check count, so its closing
+    `assert failures == 0` sees only its own failed checks; the counts are added back to the run's total afterwards.
+    Returns the names of the tests that raised."""
+    global failures
+    raised = []
+    for test in tests:
+        before, failures = failures, 0
+        try:
+            test()
+        except AssertionError as error:
+            raised.append(test.__name__)
+            report(f"FAIL {test.__name__}: {error}")
+        finally:
+            failures += before
+    return raised
+
+
 if __name__ == "__main__":
-    try:
-        test_feature_scan()
-        test_short_signature()
-        test_part_payload_outside_container_is_unreadable()
-        test_bad_shaders_folder_is_one_line()
-        test_v_perm_b32_selectors()
-        test_duplicate_shader_names_keep_file_stages()
-        test_out_inside_corpus_is_a_usage_error()
-    except AssertionError:
-        pass
-    print(f"test_feature_scan: {'OK' if not failures else 'FAILED'} ({failures} failure{'s' if failures != 1 else ''})")
-    sys.exit(1 if failures else 0)
+    # Every test_* function in the file, in file order, so a new test can't be left out of the script run.
+    raised = run_tests([fn for name, fn in list(globals().items()) if name.startswith("test_") and callable(fn)])
+    ok = not failures and not raised
+    print(f"test_feature_scan: {'OK' if ok else 'FAILED'} ({failures} failed check{'s' if failures != 1 else ''}, "
+          f"{len(raised)} failed test{'s' if len(raised) != 1 else ''})")
+    sys.exit(0 if ok else 1)

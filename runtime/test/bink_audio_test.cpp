@@ -237,7 +237,7 @@ int main() {
                     header.flags[i]);
     if (!header.audio_tracks) {
         std::printf("SKIP (movie has no audio tracks)\n");
-        return 0;
+        return 77;  // nothing was checked: a ctest SKIP (SKIP_RETURN_CODE 77), not a pass
     }
 
     try {

@@ -21,7 +21,10 @@ counts, hashes, string storage/lengths, frame counts, durations and track types 
 
 Usage:
     python -I tools/rsc8_audio.py <archive.rpf | bank.awc | clip.rsc8 | dir> [out.json|out.csv]
-        [--start N] [--limit BYTES] [--max-banks N] [--no-deep] [--summary-only] [--quiet]
+        [--start N] [--limit BYTES] [--max-banks N] [--no-deep] [--curves] [--summary-only] [--quiet]
+
+`--curves` also decodes every clip's keyframes (the blocks are the sequence layout of
+tools/anim_clips.py) and counts the outcome; it reports counts only, never a value.
 """
 import argparse
 import csv
@@ -34,6 +37,8 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import anim_clips  # noqa: E402
 from file_mode import published_mode  # noqa: E402
 
 RSC8_MAGIC = b"RSC8"
@@ -44,7 +49,7 @@ RSC8_FLAGS = 1
 RSC8_VIRTUAL_BASE = 0x10
 RSC8_VPTR_BASE = 0x50000000
 RSC8_VPTR_LIMIT = 0x60000000
-TRACK_SCHEMA_HASH = 0x364D3BDB
+TRACK_SCHEMA_HASH = 0x364D3BDB  # joaat("facialtranslation"): the track type of every directory entry
 
 ADAT_MAGIC = b"ADAT"
 TAG_PEAK = 0x36
@@ -57,7 +62,12 @@ TAG_SEEKTABLE = 0xA3
 TAG_LOUDNESS = 0xB2
 TAG_MARKER = 0xBD
 TAG_INDEXRUN = 0xD9  # undocumented grouped index runs into the 0x5a entries; decode_index_runs()
-MARKER_MAGIC = 0xE5C74063
+# The most common cue-name hash of a `0xbd` record, not a magic: it is the first word of 88,082 of the
+# 420,168 `0xbd` tags in `audio.rpf` (decode_marker_records()). The old name is kept for callers.
+MARKER_NAME_COMMON = 0xE5C74063
+MARKER_MAGIC = MARKER_NAME_COMMON
+MARKER_RECORD_BYTES = 16
+MAX_MARKER_BYTES = 16 * 1024 * 1024
 
 ATTR_FLOAT = 0xFFFF0001
 ATTR_INT = 0xFFFF0002
@@ -335,7 +345,62 @@ def _has_embedded_audio_container(data):
     return False
 
 
-def decode_rsc8(data, *, stream_id=None, deep=True):
+def decode_facial_curves(virt, anim, anim_desc, stats=None):
+    """Decode the keyframes of one clip: `({track index: [value tuple per frame]}, frames, tracks)`.
+
+    `virt` is the resource from `RSC8_VIRTUAL_BASE` on; `anim` and `anim_desc` come from `decode_rsc8`.
+    A packed block is one sequence of tools/anim_clips.py (0x20-byte header, version 2, 11 channel
+    types) and the track directory is its 12-byte `{id hash, track-type hash, value format}` list, so
+    the block and track decoders are that tool's. `tracks` is the directory as stored. Raises
+    `anim_clips.DecodeError` when a block does not decode.
+    """
+    system = anim_clips.System(bytes(virt))
+    at, count = anim_desc["track_ptr"] or 0, anim_desc["track_count"] or 0
+    if count and at + 12 * count > len(system.d):
+        raise anim_clips.DecodeError("track directory runs past the resource")
+    tracks = [struct.unpack_from("<III", system.d, at + 12 * i) for i in range(count)]
+    clip = {"sequences": [b["voff"] for b in anim["blocks"]], "tracks": tracks, "frames": anim["frame_count"]}
+    try:
+        values, frames = anim_clips.decode_animation(system, clip, stats)
+    except (struct.error, IndexError, OverflowError, ZeroDivisionError) as e:
+        kind = type(e).__name__ if type(e).__module__ == "builtins" else f"{type(e).__module__}.{type(e).__name__}"
+        raise anim_clips.DecodeError(f"malformed block: {kind}") from e
+    return values, frames, tracks
+
+
+def facial_curve_summary(virt, anim, anim_desc):
+    """Counts from decoding one clip's keyframes; no value leaves this function.
+
+    `decoded` is False with the `error` text when a block does not decode. Otherwise: `channels` by
+    channel type, the type-10 chunk boundaries and how many close, `components` as
+    `"<value format>:<components per frame>"` per track, and whether the frame count and the header's
+    quantised-bit sum agree with the decoded data.
+    """
+    stats = anim_clips.new_stats()
+    try:
+        values, frames, tracks = decode_facial_curves(virt, anim, anim_desc, stats)
+    except anim_clips.DecodeError as e:
+        return {"decoded": False, "error": str(e)[:80]}
+    components = {}
+    for index, rows in values.items():
+        key = f"{tracks[index][2]}:{len(rows[0]) if rows else 0}"
+        components[key] = components.get(key, 0) + 1
+    blocks = len(anim["blocks"])
+    return {
+        "decoded": True,
+        "error": None,
+        "frames": frames,
+        "frames_match": frames == anim["frame_count"] and stats["frames_sum_matches"] == 1,
+        "quantize_bits_match": stats["quantize_bits_match"] == blocks,
+        "tracks_with_values": len(values),
+        "channels": {k[len("channel:"):]: v for k, v in sorted(stats.items()) if k.startswith("channel:")},
+        "delta2_boundaries": stats["delta2_boundaries"],
+        "delta2_boundaries_closed": stats["delta2_boundaries_closed"],
+        "components": components,
+    }
+
+
+def decode_rsc8(data, *, stream_id=None, deep=True, curves=False):
     """Decode one `RSC8` (version 8001) facial/lip-sync animation resource.
 
     Accepts `bytes`, `bytearray`, or `memoryview`. Returns a structured dict of decoded fields
@@ -395,6 +460,7 @@ def decode_rsc8(data, *, stream_id=None, deep=True):
         "anim_desc": None,
         "properties": None,
         "tracks": None,
+        "curves": None,
         "checks": checks,
         "valid": False,
     }
@@ -656,6 +722,14 @@ def decode_rsc8(data, *, stream_id=None, deep=True):
         "tracks_in_bounds",
         "no_embedded_audio_container",
     ]
+    if (
+        curves
+        and out["anim"]
+        and out["anim_desc"]
+        and checks["anim_blocks_in_bounds"]
+        and checks["tracks_in_bounds"]
+    ):
+        out["curves"] = facial_curve_summary(virt, out["anim"], out["anim_desc"])
     if deep:
         core_checks.extend(("clip_duration_matches_frames", "tracks_sorted", "tracks_schema_ok"))
     else:
@@ -772,56 +846,57 @@ MAX_INDEXRUN_GROUPS = 1 << 20
 def decode_grid20_table(blob):
     """Structurally decode the undocumented ``0x5a`` companion table.
 
-    Measured on every one of the 1,185 ``audio.rpf`` streams that carry the tag: a u32
-    ``12345678`` marker, a u32 of unknown meaning, then ``N`` 20-byte entries::
+    Measured on every one of the 1,185 ``audio.rpf`` streams that carry the tag (ASSET-256, framing
+    from @kotorvr's finding in #3232): a u32 ``12345678`` marker, ``N`` 20-byte entries, then an f32
+    trailer, so ``size == 8 + 20 * N``::
 
-        +0  f32  value
-        +4  u16  p (a multiple of 32 on every measured entry)
-        +6  u16  z (0..16 measured)
-        +8  u16  index_lo, +10 u16  index_hi
-        +12 u16  s, +14 u16  t
-        +16 u32  counter (strictly increasing across the entries)
+        +0  u32  position (a sample position at the stream's rate: strictly increasing, below the
+                 stream's 0x76 sample count)
+        +4  f32  value (3.66..146.8; (position[k+1] - position[k]) * value[k] / rate is within 1% of 1
+                 on 365,803 of the 386,048 entry pairs, so it reads as a pitch in Hz)
+        +8  u16  p (a multiple of 512 on every measured entry), +10 u16  z (0..16 measured)
+        +12 u16  index_lo, +14 u16  index_hi
+        +16 u16  s, +18 u16  t
+    trailer: f32 (2/3 on 1,182 of the 1,185 streams), returned as ``tail_f32``
 
-    Nothing is guessed about the meaning of ``value``, ``s``, ``t`` or the counter's unit; the
-    return value carries the structural facts and the invariant checks only.
+    Nothing is guessed about ``p``, ``z``, ``s``, ``t`` or the trailer; the return value carries the
+    structural facts and the invariant checks only.
     """
     out = {
         "size_ok": False,
         "magic_ok": None,
-        "unknown": None,
         "entries": None,
-        "counter_first": None,
-        "counter_last": None,
-        "counter_increasing": None,
+        "position_first": None,
+        "position_last": None,
+        "position_increasing": None,
+        "tail_f32": None,
         "p_multiple_of_32": None,
     }
     raw = bytes(blob)
     if len(raw) < 8 or len(raw) > MAX_GRID20_BYTES or (len(raw) - 8) % 20:
         return out
     out["size_ok"] = True
-    magic, unknown = struct.unpack_from("<II", raw, 0)
+    magic, = struct.unpack_from("<I", raw, 0)
     out["magic_ok"] = magic == GRID20_MAGIC
-    out["unknown"] = unknown
     n = (len(raw) - 8) // 20
     out["entries"] = n
+    out["tail_f32"], = struct.unpack_from("<f", raw, len(raw) - 4)
     prev = None
-    first = None
     p_ok = True
     increasing = True
     for i in range(n):
-        at = 8 + 20 * i
-        p, _z = struct.unpack_from("<HH", raw, at + 4)
-        counter, = struct.unpack_from("<I", raw, at + 16)
+        at = 4 + 20 * i
+        position, = struct.unpack_from("<I", raw, at)
+        p, = struct.unpack_from("<H", raw, at + 8)
         if p % 32:
             p_ok = False
-        if first is None:
-            first = counter
-        elif counter <= prev:
+        if prev is None:
+            out["position_first"] = position
+        elif position <= prev:
             increasing = False
-        prev = counter
-    out["counter_first"] = first
-    out["counter_last"] = prev
-    out["counter_increasing"] = increasing
+        prev = position
+    out["position_last"] = prev
+    out["position_increasing"] = increasing
     out["p_multiple_of_32"] = p_ok
     return out
 
@@ -855,7 +930,7 @@ def decode_index_runs(blob, grid_entries=None):
     groups = 0
     hashes = set()
     values = 0
-    index_max = 0
+    index_max = None
     ascending = True
     marker_ok = True
     while at < len(vals):
@@ -873,7 +948,8 @@ def decode_index_runs(blob, grid_entries=None):
         if any(run[i] >= run[i + 1] for i in range(len(run) - 1)):
             ascending = False
         if run:
-            index_max = max(index_max, run[-1])
+            run_max = max(run)
+            index_max = run_max if index_max is None else max(index_max, run_max)
         values += length
         at += 3 + length
         groups += 1
@@ -888,7 +964,60 @@ def decode_index_runs(blob, grid_entries=None):
     if grid_entries is None:
         out["indices_within_grid"] = None
     else:
-        out["indices_within_grid"] = index_max < grid_entries
+        out["indices_within_grid"] = True if index_max is None else index_max < grid_entries
+    return out
+
+
+def decode_marker_records(blob, sample_count=None):
+    """Structurally decode a ``0xbd`` (``markers``) tag: a list of 16-byte cue records.
+
+    Measured on all 420,168 ``0xbd`` tags of ``audio.rpf`` (781,350 records): the size is always a
+    multiple of 16, there is no header, and every record is::
+
+        +0  u32  name    joaat of the cue name (167 distinct values)
+        +4  u32  value   an f32 for most names, a second name hash for region cues
+        +8  u32  offset  sample position in the stream; never decreases from one record to the next
+        +12 u32  extra   0..6 measured
+
+    ``name`` and ``value`` are returned as stored. With ``sample_count`` (the stream's ``0x76`` count),
+    ``offsets_within_samples`` says whether every offset is at most that count.
+    """
+    out = {
+        "size_ok": False,
+        "records": None,
+        "names": None,
+        "first_name": None,
+        "offsets_ascending": None,
+        "offset_max": None,
+        "offsets_within_samples": None,
+        "extra_max": None,
+    }
+    raw = bytes(blob)
+    if not raw or len(raw) % MARKER_RECORD_BYTES or len(raw) > MAX_MARKER_BYTES:
+        return out
+    out["size_ok"] = True
+    n = len(raw) // MARKER_RECORD_BYTES
+    names = {}
+    ascending = True
+    prev = None
+    offset_max = 0
+    extra_max = 0
+    for i in range(n):
+        name, _value, offset, extra = struct.unpack_from("<IIII", raw, MARKER_RECORD_BYTES * i)
+        names[name] = names.get(name, 0) + 1
+        if prev is not None and offset < prev:
+            ascending = False
+        prev = offset
+        offset_max = max(offset_max, offset)
+        extra_max = max(extra_max, extra)
+    out["records"] = n
+    out["names"] = names
+    out["first_name"] = _u32(raw, 0)
+    out["offsets_ascending"] = ascending
+    out["offset_max"] = offset_max
+    out["extra_max"] = extra_max
+    if sample_count is not None:
+        out["offsets_within_samples"] = offset_max <= sample_count
     return out
 
 
@@ -905,7 +1034,7 @@ def _decode_companion_tags(read_slice, bank_offset, tag_map):
         "peak_entries": tag_map[TAG_PEAK][0][1] // 2 if TAG_PEAK in tag_map else 0,
         "seek_entries": tag_map[TAG_SEEKTABLE][0][1] // 4 if TAG_SEEKTABLE in tag_map else 0,
         "loudness_entries": tag_map[TAG_LOUDNESS][0][1] // 8 if TAG_LOUDNESS in tag_map else 0,
-        "marker_magic": None,
+        "markers": None,
     }
     if TAG_FORMAT in tag_map:
         fo, fs = tag_map[TAG_FORMAT][0]
@@ -924,10 +1053,8 @@ def _decode_companion_tags(read_slice, bank_offset, tag_map):
                     comp["audio_duration"] = round(samples / float(sr), 6)
     if TAG_MARKER in tag_map:
         mo, ms = tag_map[TAG_MARKER][0]
-        if ms >= 16:
-            mb = read_slice(bank_offset + mo, 16)
-            if len(mb) >= 16:
-                comp["marker_magic"] = _u32(mb, 0)
+        if 0 < ms <= MAX_MARKER_BYTES:
+            comp["markers"] = decode_marker_records(read_slice(bank_offset + mo, ms), comp["audio_samples"])
     grid = None
     if TAG_GRID20 in tag_map:
         go, gs = tag_map[TAG_GRID20][0]
@@ -973,6 +1100,7 @@ def _make_record(bank_offset, tag_offset, stream_id, decoded, comp):
         "track_count": tracks.get("count"),
         "track_types": tracks.get("type_counts") or {},
         "prop_count": props.get("count"),
+        "curves": decoded.get("curves"),
         "valid": decoded["valid"],
         "checks": decoded["checks"],
     }
@@ -983,15 +1111,31 @@ def _new_grid_tally():
         "grid20_streams": 0,
         "grid20_entries": 0,
         "grid20_invalid": 0,
+        # Streams with a 0x76 sample count whose last position is not below it (0 over audio.rpf, ASSET-256).
+        "grid20_position_past_samples": 0,
         "indexrun_streams": 0,
         "indexrun_groups": 0,
         "indexrun_invalid": 0,
         "indexrun_index_overruns": 0,
+        "marker_streams": 0,
+        "marker_records": 0,
+        "marker_invalid": 0,
+        "marker_first_names": {},
     }
 
 
+def _merge_grid_tally(dst, src):
+    """Add one bank's companion-table tally to a running summary (counts add, per-name maps merge)."""
+    for key, start in _new_grid_tally().items():
+        if isinstance(start, dict):
+            for name, count in src[key].items():
+                dst[key][name] = dst[key].get(name, 0) + count
+        else:
+            dst[key] += src[key]
+
+
 def _tally_undocumented_tables(read_slice, bank_base, tmap, tally):
-    """Decode the undocumented ``0x5a``/``0xd9`` tags on one stream into a running tally.
+    """Decode the ``0x5a``/``0xd9`` tables and the ``0xbd`` cue list on one stream into a running tally.
 
     A stream counts as invalid when one of the layout invariants measured over the whole ``audio.rpf``
     population fails, so the tally doubles as a package-wide validator.
@@ -1005,12 +1149,17 @@ def _tally_undocumented_tables(read_slice, bank_base, tmap, tally):
         if grid is None or not (
             grid["size_ok"]
             and grid["magic_ok"]
-            and grid["counter_increasing"]
+            and grid["position_increasing"]
             and grid["p_multiple_of_32"]
         ):
             tally["grid20_invalid"] += 1
         elif grid["entries"]:
             tally["grid20_entries"] += grid["entries"]
+            if TAG_FORMAT in tmap and grid["position_last"] is not None:
+                fo, fs = tmap[TAG_FORMAT][0]
+                fb = read_slice(bank_base + fo, 4) if fs >= 4 else b""
+                if len(fb) == 4 and grid["position_last"] >= _u32(fb, 0):
+                    tally["grid20_position_past_samples"] += 1
     if TAG_INDEXRUN in tmap:
         io, isz = tmap[TAG_INDEXRUN][0]
         runs = None
@@ -1032,9 +1181,22 @@ def _tally_undocumented_tables(read_slice, bank_base, tmap, tally):
             tally["indexrun_groups"] += runs["groups"]
             if runs["indices_within_grid"] is False:
                 tally["indexrun_index_overruns"] += 1
+    if TAG_MARKER in tmap:
+        mo, ms = tmap[TAG_MARKER][0]
+        marks = None
+        if 0 < ms <= MAX_MARKER_BYTES:
+            marks = decode_marker_records(read_slice(bank_base + mo, ms))
+        tally["marker_streams"] += 1
+        if marks is None or not (marks["size_ok"] and marks["offsets_ascending"]):
+            tally["marker_invalid"] += 1
+        else:
+            tally["marker_records"] += marks["records"]
+            key = f"0x{marks['first_name']:08x}"
+            firsts = tally["marker_first_names"]
+            firsts[key] = firsts.get(key, 0) + 1
 
 
-def decode_awc_bank(data, bank_offset=0, *, deep=True):
+def decode_awc_bank(data, bank_offset=0, *, deep=True, curves=False):
     """Decode all `0x5c` (`RSC8` v8001) entries in one in-memory AWC (`ADAT`) bank."""
     bank = parse_adat_header_bytes(data, 0, len(data))
     if bank is None:
@@ -1063,7 +1225,7 @@ def decode_awc_bank(data, bank_offset=0, *, deep=True):
                 if len(blob) < 4 or blob[:4] != RSC8_MAGIC:
                     non_rsc8_0x5c += 1
                     continue
-                dec = decode_rsc8(blob, stream_id=sid, deep=deep)
+                dec = decode_rsc8(blob, stream_id=sid, deep=deep, curves=curves)
                 comp = _decode_companion_tags(read_slice, 0, tmap)
                 records.append(_make_record(bank_offset, bank_offset + toff, sid, dec, comp))
 
@@ -1118,6 +1280,15 @@ def _new_summary(mode, source):
         "max_tag_size": None,
         "elapsed_seconds": 0.0,
         **_new_grid_tally(),
+        "curve_clips": 0,
+        "curve_clips_decoded": 0,
+        "curve_errors": {},
+        "curve_frames_mismatch": 0,
+        "curve_quantize_bits_mismatch": 0,
+        "curve_channels": {},
+        "curve_components": {},
+        "curve_delta2_boundaries": 0,
+        "curve_delta2_boundaries_closed": 0,
     }
 
 
@@ -1185,6 +1356,22 @@ def _accumulate_record(summary, rec, *, in_adat=True, has_audio=None):
         ck = f"codec={rec['audio_codec']},ch={rec['audio_channels']},sr={rec['audio_sample_rate']}"
         summary["audio_codecs"][ck] = summary["audio_codecs"].get(ck, 0) + 1
 
+    cv = rec.get("curves")
+    if cv is not None:
+        summary["curve_clips"] += 1
+        if not cv["decoded"]:
+            summary["curve_errors"][cv["error"]] = summary["curve_errors"].get(cv["error"], 0) + 1
+        else:
+            summary["curve_clips_decoded"] += 1
+            summary["curve_frames_mismatch"] += not cv["frames_match"]
+            summary["curve_quantize_bits_mismatch"] += not cv["quantize_bits_match"]
+            summary["curve_delta2_boundaries"] += cv["delta2_boundaries"]
+            summary["curve_delta2_boundaries_closed"] += cv["delta2_boundaries_closed"]
+            for key in ("channels", "components"):
+                into = summary["curve_" + key]
+                for name, n in cv[key].items():
+                    into[name] = into.get(name, 0) + n
+
 
 def _bank_covering(fh, start, file_size):
     """The `ADAT` bank that starts before `start` and runs past it, or `None`.
@@ -1208,7 +1395,8 @@ def _bank_covering(fh, start, file_size):
     return None
 
 
-def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_records=True, progress=None):
+def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_records=True, progress=None,
+             curves=False):
     """Scan an RPF9 archive sequentially for `ADAT` banks and `RSC8` v8001 resources.
 
     With a window (`start`/`limit`), `adat_bytes` counts the window's bytes that belong to a bank, so it never
@@ -1309,7 +1497,7 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
                                 summary["rsc8_non_rsc8_0x5c"] += 1
                                 continue
                             blob = bank_read_slice(aoff + toff, tsz)
-                            dec = decode_rsc8(blob, stream_id=sid, deep=deep)
+                            dec = decode_rsc8(blob, stream_id=sid, deep=deep, curves=curves)
                             comp = _decode_companion_tags(bank_read_slice, aoff, tmap)
                             rec = _make_record(aoff, aoff + toff, sid, dec, comp)
                             _accumulate_record(summary, rec, in_adat=True, has_audio=comp["has_audio_data"])
@@ -1359,7 +1547,7 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
     return records, summary
 
 
-def scan_dir(path, *, max_banks=None, deep=True, collect_records=True):
+def scan_dir(path, *, max_banks=None, deep=True, collect_records=True, curves=False):
     """Scan a directory of `.awc` banks and/or standalone `.rsc8` files."""
     t0 = time.time()
     summary = _new_summary("directory", path)
@@ -1387,15 +1575,14 @@ def scan_dir(path, *, max_banks=None, deep=True, collect_records=True):
                     raise ValueError(f"AWC bank exceeds {MAX_AWC_FILE_BYTES} bytes")
                 with open(fp, "rb") as f:
                     raw = f.read()
-                bank_res = decode_awc_bank(raw, 0, deep=deep)
+                bank_res = decode_awc_bank(raw, 0, deep=deep, curves=curves)
                 summary["adat_banks"] += 1
                 summary["adat_streams"] += bank_res["stream_count"]
                 summary["adat_bytes"] += bank_res["bank_size"]
                 summary["rsc8_non_rsc8_0x5c"] += bank_res["non_rsc8_0x5c"]
                 for tk, tv in bank_res["tag_counts"].items():
                     summary["adat_tag_counts"][tk] = summary["adat_tag_counts"].get(tk, 0) + tv
-                for gk in _new_grid_tally():
-                    summary[gk] += bank_res[gk]
+                _merge_grid_tally(summary, bank_res)
                 for rec in bank_res["records"]:
                     _accumulate_record(summary, rec, in_adat=True, has_audio=rec.get("has_audio_data"))
                     if collect_records:
@@ -1405,7 +1592,7 @@ def scan_dir(path, *, max_banks=None, deep=True, collect_records=True):
                     raise ValueError(f"RSC8 file exceeds {MAX_RSC8_BYTES} bytes")
                 with open(fp, "rb") as f:
                     raw = f.read()
-                dec = decode_rsc8(raw, deep=deep)
+                dec = decode_rsc8(raw, deep=deep, curves=curves)
                 rec = _make_record(0, 0, None, dec, None)
                 _accumulate_record(summary, rec, in_adat=False, has_audio=None)
                 if collect_records:
@@ -1420,7 +1607,8 @@ def scan_dir(path, *, max_banks=None, deep=True, collect_records=True):
     return records, summary
 
 
-def scan_single_file(path, *, start=0, limit=None, max_banks=None, deep=True, collect_records=True, progress=None):
+def scan_single_file(path, *, start=0, limit=None, max_banks=None, deep=True, collect_records=True, progress=None,
+                     curves=False):
     """Inspect a single `.rsc8`, `.awc`, or `.rpf` file."""
     fsize = os.path.getsize(path)
     with open(path, "rb") as f:
@@ -1431,7 +1619,7 @@ def scan_single_file(path, *, start=0, limit=None, max_banks=None, deep=True, co
         t0 = time.time()
         with open(path, "rb") as f:
             raw = f.read()
-        dec = decode_rsc8(raw, deep=deep)
+        dec = decode_rsc8(raw, deep=deep, curves=curves)
         rec = _make_record(0, 0, None, dec, None)
         summary = _new_summary("rsc8", path)
         _accumulate_record(summary, rec, in_adat=False, has_audio=None)
@@ -1441,12 +1629,11 @@ def scan_single_file(path, *, start=0, limit=None, max_banks=None, deep=True, co
         t0 = time.time()
         with open(path, "rb") as f:
             raw = f.read()
-        bank_res = decode_awc_bank(raw, 0, deep=deep)
+        bank_res = decode_awc_bank(raw, 0, deep=deep, curves=curves)
         summary = _new_summary("awc", path)
         summary["adat_banks"] = 1
         summary["adat_streams"] = bank_res["stream_count"]
-        for gk in _new_grid_tally():
-            summary[gk] += bank_res[gk]
+        _merge_grid_tally(summary, bank_res)
         summary["adat_bytes"] = bank_res["bank_size"]
         summary["adat_tag_counts"] = bank_res["tag_counts"]
         summary["rsc8_non_rsc8_0x5c"] = bank_res["non_rsc8_0x5c"]
@@ -1462,6 +1649,7 @@ def scan_single_file(path, *, start=0, limit=None, max_banks=None, deep=True, co
         deep=deep,
         collect_records=collect_records,
         progress=progress,
+        curves=curves,
     )
 
 
@@ -1548,6 +1736,8 @@ def main(argv=None):
     ap.add_argument("--limit", type=_parse_pos_int, default=None, help="maximum bytes to scan (single archive only)")
     ap.add_argument("--max-banks", type=_parse_pos_int, default=None, help="stop after N ADAT banks")
     ap.add_argument("--no-deep", action="store_true", help="skip per-track and property-attribute walks")
+    ap.add_argument("--curves", action="store_true",
+                    help="also decode every clip's keyframes and count the outcome (slower; counts only)")
     ap.add_argument("--summary-only", action="store_true", help="do not store per-clip records in memory/JSON")
     ap.add_argument("--quiet", action="store_true", help="suppress progress output")
     args = ap.parse_args(argv)
@@ -1574,6 +1764,7 @@ def main(argv=None):
                 max_banks=args.max_banks,
                 deep=not args.no_deep,
                 collect_records=collect,
+                curves=args.curves,
             )
         except (OSError, ValueError) as e:
             print(f"{args.source}: {e}", file=sys.stderr)
@@ -1595,6 +1786,7 @@ def main(argv=None):
                 deep=not args.no_deep,
                 collect_records=collect,
                 progress=progress,
+                curves=args.curves,
             )
         except (OSError, ValueError) as e:
             print(f"{args.source}: {e}", file=sys.stderr)

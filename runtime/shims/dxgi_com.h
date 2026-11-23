@@ -1,10 +1,10 @@
 #pragma once
 
-// COM wrappers for IDXGIFactory5, IDXGIAdapter3, and IDXGISwapChain3 backed by VulkanSwapchain (dxgi_swapchain.h).
+// COM wrappers for IDXGIFactory7, IDXGIAdapter3, and IDXGISwapChain3 backed by VulkanSwapchain (dxgi_swapchain.h).
 // Keeps the host dxgi.dll out of the Vulkan presentation path (docs/d3d12_vulkan.md section 3.1 & 4).
 
 #include <windows.h>
-#include <dxgi1_5.h>
+#include <dxgi1_6.h>
 #include <d3d12.h>
 
 #include "dxgi_swapchain.h"

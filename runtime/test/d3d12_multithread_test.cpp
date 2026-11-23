@@ -197,9 +197,11 @@ int main() {
             ID3D12CommandList* lists[1] = {cl.p};
             queues[tid]->ExecuteCommandLists(1, lists);
             const UINT64 target = ++fence_vals[tid];
+            // 60 s, not 15 s: under heavy parallel load (two full `ctest -j 6` suites sharing the GPU) a fence can
+            // take longer than 15 s to signal; sibling GPU tests already wait 15-60 s (TEST-514 follow-up).
             if (FAILED(queues[tid]->Signal(fences[tid].p, target)) ||
                 FAILED(fences[tid]->SetEventOnCompletion(target, ev.h)) ||
-                WaitForSingleObject(ev.h, 15000) != WAIT_OBJECT_0) {
+                WaitForSingleObject(ev.h, 60000) != WAIT_OBJECT_0) {
                 failures.fetch_add(1);
                 fail("Signal/SetEventOnCompletion/Wait", tid, it);
                 return;
@@ -365,7 +367,7 @@ int main() {
                 const UINT64 v1 = ++fence_vals[1];
                 if (FAILED(queues[1]->Signal(fences[1].p, v1)) ||
                     FAILED(fences[1]->SetEventOnCompletion(v1, handoff_ev.h)) ||
-                    WaitForSingleObject(handoff_ev.h, 15000) != WAIT_OBJECT_0)
+                    WaitForSingleObject(handoff_ev.h, 60000) != WAIT_OBJECT_0)
                     return fail("Signal/Wait q1 (handoff)");
 
                 void* mapped = nullptr;
@@ -400,7 +402,7 @@ int main() {
             return fail("SetEventOnMultipleFenceCompletion (ALL)");
         if (FAILED(queues[0]->Signal(fences[0].p, targets[0])) || FAILED(queues[1]->Signal(fences[1].p, targets[1])))
             return fail("Signal (multi ALL)");
-        if (WaitForSingleObject(multi_ev.h, 15000) != WAIT_OBJECT_0) return fail("WaitForSingleObject (multi ALL)");
+        if (WaitForSingleObject(multi_ev.h, 60000) != WAIT_OBJECT_0) return fail("WaitForSingleObject (multi ALL)");
 
         // Exercise SetEventOnMultipleFenceCompletion (ANY): signalling only fence 0 satisfies the wait while fence 1 stays below target.
         EventHandle any_ev;
@@ -410,7 +412,7 @@ int main() {
                                                              any_ev.h)))
             return fail("SetEventOnMultipleFenceCompletion (ANY)");
         if (FAILED(queues[0]->Signal(fences[0].p, any_targets[0]))) return fail("Signal (multi ANY)");
-        if (WaitForSingleObject(any_ev.h, 15000) != WAIT_OBJECT_0) return fail("WaitForSingleObject (multi ANY)");
+        if (WaitForSingleObject(any_ev.h, 60000) != WAIT_OBJECT_0) return fail("WaitForSingleObject (multi ANY)");
         }
     }  // vktest::Device::~Device() destroys VkDevice here so any leaked-object VUIDs are counted below.
 

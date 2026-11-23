@@ -70,6 +70,10 @@ int conversion_checks() {
     EXPECT((element(VK_FORMAT_B8G8R8A8_UNORM, true, floats(1.0f, 0.0f, 0.0f, 1.0f)) == V{0, 0, 0xff, 0xff}));
     EXPECT(word(element(VK_FORMAT_A2B10G10R10_UNORM_PACK32, true, floats(1.0f, 0.0f, 0.5f, 1.0f))) ==
            (1023u | 512u << 20 | 3u << 30));
+    // A4B4G4R4 (R4G4B4A4_PACK16): red in bits 12-15, alpha in 0-3, as the host's render-target clears give.
+    EXPECT((element(VK_FORMAT_R4G4B4A4_UNORM_PACK16, true, floats(1.0f, 0, 0, 0)) == V{0x00, 0xf0}));
+    EXPECT((element(VK_FORMAT_R4G4B4A4_UNORM_PACK16, true, floats(0, 0, 0, 1.0f)) == V{0x0f, 0x00}));
+    EXPECT((element(VK_FORMAT_R4G4B4A4_UNORM_PACK16, true, floats(0, 1.0f, 0.2f, 0)) == V{0x30, 0x0f}));
     // Half floats round to nearest even; too large is infinity; tiny values become subnormals.
     EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(1.0f, 0, 0, 0)) == V{0x00, 0x3c}));
     EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(-2.0f, 0, 0, 0)) == V{0x00, 0xc0}));
@@ -527,6 +531,21 @@ int main() {
             buffers.push_back(narrow);
         }
         {
+            for (UINT offset = 0; offset < 8; ++offset) {
+                BufferCase short_ranges{"short typed buffer ranges", 256, {whole(64)}};
+                for (UINT count = 1; count <= 8; ++count)
+                    short_ranges.clears.push_back(typed(VK_FORMAT_R8_UINT, false, {offset * 17 + count, 0, 0, 0},
+                                                       offset, count));
+                buffers.push_back(short_ranges);
+            }
+            BufferCase short_ranges{"short typed buffer boundary and rectangles", 256, {whole(64)}};
+            short_ranges.clears.push_back(typed(VK_FORMAT_R16_UINT, false, {0xbeef, 0, 0, 0}, 254, 1));
+            short_ranges.clears.push_back(typed(VK_FORMAT_R8_UINT, false, {0x7b, 0, 0, 0}, 255, 1));
+            short_ranges.clears.push_back(typed(VK_FORMAT_R16_UNORM, true, floats(1.0f, 0, 0, 0), 50, 4,
+                                                {{-1, 0, 1, 1}, {0, 0, 2, 1}, {3, 0, 8, 1}}));
+            buffers.push_back(short_ranges);
+        }
+        {
             // 16-byte elements over more than vkCmdUpdateBuffer's 64 KiB: written once, then doubled by copies.
             BufferCase wide{"typed buffer, 8- and 16-byte elements", 1 << 17, {whole((1 << 17) / 4)}};
             wide.clears.push_back(typed(VK_FORMAT_R32G32B32A32_UINT, false, {1, 2, 3, 4}, 16, 8000));
@@ -570,9 +589,47 @@ int main() {
             {"RGBA8_UNORM, Float and Uint", DXGI_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, 8, 8, 1, 1, false,
              {texture_clear(VK_FORMAT_R8G8B8A8_UNORM, true, floats(1.0f, 0.5f, 0.0f, 1.0f), 0, 0, 1),
               texture_clear(VK_FORMAT_R8G8B8A8_UNORM, false, {0x10, 0x20, 0x130, 0x40}, 0, 0, 1, {{1, 1, 3, 7}})}},
-            {"R32_TYPELESS through an R32_UINT view", DXGI_FORMAT_R32_TYPELESS, VK_FORMAT_R32_SFLOAT, 8, 4, 2, 1, false,
+            {"R32_TYPELESS through R32_UINT / R32_SINT / R32_SFLOAT (including NaN bits)", DXGI_FORMAT_R32_TYPELESS,
+             VK_FORMAT_R32_SFLOAT, 8, 4, 2, 1, false,
              {texture_clear(VK_FORMAT_R32_UINT, false, {0x40490fdb, 0, 0, 0}, 0, 0, 1),
-              texture_clear(VK_FORMAT_R32_SFLOAT, true, floats(-0.25f, 0, 0, 0), 1, 0, 1)}},
+              texture_clear(VK_FORMAT_R32_UINT, false, {0x7f800001u, 0, 0, 0}, 0, 0, 1),
+              texture_clear(VK_FORMAT_R32_UINT, false, {0xffffffffu, 0, 0, 0}, 0, 0, 1, {{1, 1, 6, 3}}),
+              texture_clear(VK_FORMAT_R32_SINT, false, {0xff800001u, 0, 0, 0}, 1, 0, 1),
+              texture_clear(VK_FORMAT_R32_SFLOAT, true, floats(-0.25f, 0, 0, 0), 1, 0, 1, {{0, 0, 2, 2}})}},
+            {"R32G32_TYPELESS through R32G32_UINT (NaN bit patterns)", DXGI_FORMAT_R32G32_TYPELESS,
+             VK_FORMAT_R32G32_SFLOAT, 8, 4, 1, 1, false,
+             {texture_clear(VK_FORMAT_R32G32_UINT, false, {0x7f800001u, 0xffffffffu, 0, 0}, 0, 0, 1),
+              texture_clear(VK_FORMAT_R32G32_SINT, false, {0xff800001u, 0x7fffffffu, 0, 0}, 0, 0, 1, {{2, 1, 6, 3}})}},
+            {"R32G32B32A32_TYPELESS through R32G32B32A32_UINT (NaN bit patterns)", DXGI_FORMAT_R32G32B32A32_TYPELESS,
+             VK_FORMAT_R32G32B32A32_SFLOAT, 4, 4, 1, 1, false,
+             {texture_clear(VK_FORMAT_R32G32B32A32_UINT, false, {0x7f800001u, 0xffffffffu, 0x7fffffffu, 0xff800001u},
+                            0, 0, 1)}},
+            {"R16G16_TYPELESS through UNORM, UINT, SINT and SNORM", DXGI_FORMAT_R16G16_TYPELESS,
+             VK_FORMAT_R16G16_SFLOAT, 8, 8, 2, 2, false,
+             {texture_clear(VK_FORMAT_R16G16_UNORM, true, floats(1.0f, 1.0f, 0.0f, 0.0f), 0, 0, 2),
+              texture_clear(VK_FORMAT_R16G16_UNORM, true, floats(0.5f, 1.0f, 0.0f, 0.0f), 0, 0, 1, {{1, 1, 5, 4}}),
+              texture_clear(VK_FORMAT_R16G16_UINT, false, {0xffffu, 0x7fffu, 0, 0}, 0, 1, 1),
+              texture_clear(VK_FORMAT_R16G16_UINT, false, {0x7c01u, 0xfc01u, 0, 0}, 0, 1, 1, {{2, 2, 6, 6}}),
+              texture_clear(VK_FORMAT_R16G16_SINT, false, {0xffffu, 0x8000u, 0, 0}, 1, 0, 1),
+              texture_clear(VK_FORMAT_R16G16_SNORM, true, floats(1.0f, -1.0f, 0.0f, 0.0f), 1, 1, 1)}},
+            {"R16G16B16A16_TYPELESS through UNORM, UINT, SINT and SNORM", DXGI_FORMAT_R16G16B16A16_TYPELESS,
+             VK_FORMAT_R16G16B16A16_SFLOAT, 8, 8, 2, 2, false,
+             {texture_clear(VK_FORMAT_R16G16B16A16_UNORM, true, floats(1.0f, 0.5f, 0.0f, 1.0f), 0, 0, 2),
+              texture_clear(VK_FORMAT_R16G16B16A16_UINT, false, {0xffffu, 0x7fffu, 0x7c01u, 0xfc01u}, 0, 1, 1),
+              texture_clear(VK_FORMAT_R16G16B16A16_SINT, true, floats(-1.0f, 32767.0f, -32768.0f, 0.0f), 0, 0, 1,
+                            {{1, 2, 6, 5}}),
+              texture_clear(VK_FORMAT_R16G16B16A16_SNORM, true, floats(1.0f, -1.0f, 0.5f, 0.0f), 1, 0, 2)}},
+            {"R8G8B8A8_TYPELESS through UINT, SINT and SNORM", DXGI_FORMAT_R8G8B8A8_TYPELESS,
+             VK_FORMAT_R8G8B8A8_UNORM, 8, 8, 2, 1, false,
+             {texture_clear(VK_FORMAT_R8G8B8A8_UINT, false, {0xffu, 0x80u, 0x7fu, 0x01u}, 0, 0, 1),
+              texture_clear(VK_FORMAT_R8G8B8A8_SINT, true, floats(-128.0f, -1.0f, 127.0f, 0.0f), 0, 0, 1,
+                            {{1, 1, 5, 6}}),
+              texture_clear(VK_FORMAT_R8G8B8A8_SNORM, true, floats(1.0f, -1.0f, 0.5f, -0.5f), 1, 0, 1)}},
+            {"R16_TYPELESS through UINT, SFLOAT and SNORM", DXGI_FORMAT_R16_TYPELESS,
+             VK_FORMAT_R16_UNORM, 8, 4, 2, 1, false,
+             {texture_clear(VK_FORMAT_R16_UINT, false, {0xffffu, 0, 0, 0}, 0, 0, 1),
+              texture_clear(VK_FORMAT_R16_SFLOAT, true, floats(1.0f, 0, 0, 0), 0, 0, 1, {{2, 1, 6, 3}}),
+              texture_clear(VK_FORMAT_R16_SNORM, true, floats(1.0f, 0, 0, 0), 1, 0, 1)}},
             {"RGBA16_FLOAT rectangles", DXGI_FORMAT_R16G16B16A16_FLOAT, VK_FORMAT_R16G16B16A16_SFLOAT, 16, 16, 2, 2,
              false,
              {texture_clear(VK_FORMAT_R16G16B16A16_SFLOAT, true, floats(0.25f, -8.0f, 1.0f, 0.0f), 1, 0, 2,
@@ -616,6 +673,21 @@ int main() {
                                                       {0x12345678u, 0x9abcdef0u, 0u, 0u}, 0, 0, 1, {{2, 3, 4, 5}}));
                 }
                 all_textures.push_back(std::move(e5));
+            }
+        }
+        {
+            // A4B4G4R4's typed UAV is the driver's call (WARP has it, AMD's D3D12 driver doesn't); where the layer
+            // reports one, its clears must work. The element layout itself is checked in conversion_checks.
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT a4_support{DXGI_FORMAT_A4B4G4R4_UNORM};
+            if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &a4_support, sizeof(a4_support))) &&
+                (a4_support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)) {
+                all_textures.push_back(
+                    {"A4B4G4R4_UNORM, Float and Uint", DXGI_FORMAT_A4B4G4R4_UNORM, VK_FORMAT_R4G4B4A4_UNORM_PACK16, 8, 8,
+                     1, 1, false,
+                     {texture_clear(VK_FORMAT_R4G4B4A4_UNORM_PACK16, true, floats(1.0f, 0.0f, 0.2f, 0.0f), 0, 0, 1),
+                      texture_clear(VK_FORMAT_R4G4B4A4_UNORM_PACK16, false, {1, 2, 3, 4}, 0, 0, 1)}});
+            } else {
+                std::printf("A4B4G4R4_UNORM: no typed UAV on this device, its clears skipped\n");
             }
         }
         for (const auto& test : all_textures)

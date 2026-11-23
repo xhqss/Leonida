@@ -66,12 +66,19 @@ def tearDownModule():
         _TMP_DIR = None
 
 
-def run_bit(x: int, y: int, line: str, mask: str = "vcc_lo", preset: int = 0) -> int:
+def run_bit(x: int, y: int, line: str, mask: str = "vcc_lo", preset: int = 0, *,
+            active: bool = True, restore_exec: bool = False) -> int | None:
     """v1 = x, v2 = y, the mask preset to all ones or zero, then ``line``; return lane 0's bit of ``mask``."""
     if _TMP_DIR is None:
         setUpModule()
     lines = [f"v_mov_b32 v1, {x:#x}", f"v_mov_b32 v2, {y:#x}", f"s_mov_b32 vcc_lo, {-1 if preset else 0}",
-             f"s_mov_b32 s10, {-1 if preset else 0}", line, f"v_cndmask_b32 v0, 0x40000000, 0x40000001, {mask}"]
+             f"s_mov_b32 s10, {-1 if preset else 0}"]
+    if not active:
+        lines.append("s_mov_b32 exec_lo, 0")
+    lines.append(line)
+    if restore_exec:
+        lines.append("s_mov_b32 exec_lo, -1")
+    lines.append(f"v_cndmask_b32 v0, 0x40000000, 0x40000001, {mask}")
     asm = "; test_vopc_const\n" + "".join(f"\t{ln}\n" for ln in lines) + "\texp mrt0 v0, v0, v0, v0 done vm\n\ts_endpgm\n"
     with open(_SRC_PATH, "w", encoding="utf-8") as f:
         f.write(asm)
@@ -109,6 +116,28 @@ class ConstOrderedCompareTests(unittest.TestCase):
                     with self.subTest(op=f"v_cmp_{cond}_{ty}", x=x, y=y):
                         want = ref(cond, False, False)
                         self.assertEqual(run_bit(x, y, f"v_cmp_{cond}_{ty} vcc_lo, v1, v2", preset=1 - want), want)
+
+    def test_64bit_constant_predicates(self) -> None:
+        with open(os.path.join(HERE, "fixtures", "vopc_constant_64.asm"), encoding="ascii") as fixture:
+            instructions = [line.strip() for line in fixture if line.startswith("v_cmp")]
+        self.assertEqual(len(instructions), 12)
+        for line in instructions:
+            cmpx = line.startswith("v_cmpx_")
+            want = "_f_" not in line
+            mask = "s10" if " s10," in line else "vcc_lo"
+            for active in (False, True):
+                with self.subTest(line=line, active=active):
+                    # v1 is the high word of the first source: a NaN for f64 cases.
+                    if cmpx:
+                        self.assertEqual(run_bit(0x7ff80000, 1, line, preset=1, active=active),
+                                         1 if active and want else None)
+                    else:
+                        self.assertEqual(run_bit(0x7ff80000, 1, line, mask=mask, preset=1 - int(active and want),
+                                                 active=active, restore_exec=True), int(active and want))
+            if cmpx or mask == "s10":
+                with self.subTest(line=line, destination="VCC unchanged"):
+                    preset = int(not want)
+                    self.assertEqual(run_bit(0x7ff80000, 1, line, preset=preset, restore_exec=True), preset)
 
     def test_vop3_form_writes_the_named_mask(self):
         self.assertEqual(run_bit(0x7FC00000, 0x3F800000, "v_cmp_u_f32_e64 s10, v1, v2", mask="s10"), 1)

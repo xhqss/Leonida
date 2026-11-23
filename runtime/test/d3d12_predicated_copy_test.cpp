@@ -44,7 +44,7 @@ void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
     list->ResourceBarrier(1, &barrier);
 }
 bool run(ID3D12Device* device, const Case& c, UINT64 predicate, D3D12_PREDICATION_OP op,
-         bool enabled, std::vector<unsigned char>& actual) {
+         bool enabled, std::vector<unsigned char>& actual, bool statistics_query = false) {
     Ref<ID3D12Resource> source, destination, seed, condition, readback;
     CHECK(buffer(device,c.source_bytes,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ,source));
     CHECK(buffer(device,c.destination_bytes,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COPY_DEST,destination));
@@ -72,14 +72,37 @@ bool run(ID3D12Device* device, const Case& c, UINT64 predicate, D3D12_PREDICATIO
     list->ResourceBarrier(1,&seed_barrier);
     std::swap(seed_barrier.Transition.StateBefore,seed_barrier.Transition.StateAfter);
     list->ResourceBarrier(1,&seed_barrier);
+    Ref<ID3D12QueryHeap> statistics;
+    Ref<ID3D12Resource> counters;
+    if (statistics_query) {
+        const D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,1,0};
+        CHECK(SUCCEEDED(device->CreateQueryHeap(&query_desc,IID_PPV_ARGS(&statistics.p))));
+        CHECK(buffer(device,88,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST,counters));
+        list->BeginQuery(statistics.p,D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0);
+    }
     if(enabled) list->SetPredication(condition.p,8,op);
     list->CopyBufferRegion(destination.p,c.destination_offset,source.p,c.source_offset,c.bytes);
     list->SetPredication(nullptr,0,D3D12_PREDICATION_OP_EQUAL_ZERO);
+    if (statistics_query) {
+        list->EndQuery(statistics.p,D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0);
+        list->ResolveQueryData(statistics.p,D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0,1,counters.p,0);
+    }
     D3D12_RESOURCE_BARRIER barrier{}; barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource=destination.p; barrier.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     barrier.Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_DEST; barrier.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;
     list->ResourceBarrier(1,&barrier); list->CopyBufferRegion(readback.p,0,destination.p,0,c.destination_bytes);
     CHECK(finish(list.p, queue.p, fence.p));
+    if (statistics_query) {
+        void* values=nullptr; const D3D12_RANGE range{0,88}, none{};
+        CHECK(SUCCEEDED(counters->Map(0,&range,&values)) && values);
+        bool zero=true;
+        for (unsigned word=0; word<11; ++word) {
+            UINT64 value=UINT64_MAX;
+            std::memcpy(&value,static_cast<const char*>(values)+8*word,8);
+            if (value) { std::fprintf(stderr,"statistics word %u: %llu, expected zero\n",word,value); zero=false; }
+        }
+        counters->Unmap(0,&none); CHECK(zero);
+    }
     void* mapped=nullptr; const D3D12_RANGE range{0,SIZE_T(c.destination_bytes)};
     CHECK(SUCCEEDED(readback->Map(0,&range,&mapped))&&mapped);
     actual.assign(static_cast<unsigned char*>(mapped),static_cast<unsigned char*>(mapped)+c.destination_bytes);
@@ -211,6 +234,7 @@ int main(int argc,char** argv) {
         info.conditional_rendering=vk.conditional_rendering;
         info.storage_buffer_8bit=vk.storage_buffer_8bit;
         info.occlusion_query_precise=vk.occlusion_query_precise;
+        info.pipeline_statistics_query=vk.pipeline_statistics_query;
         if(FAILED(rt::d3d12::create_vulkan_device(info,IID_PPV_ARGS(&ours.p))))return 1;
     }
     const Case cases[]={{1,1,0,0,1},{2,3,1,2,1},{7,11,1,3,5},{13,17,3,1,7},{33,35,0,3,32},
@@ -252,6 +276,15 @@ int main(int argc,char** argv) {
                     ++query_cases;
                 }
             }
+    // D3D-162: capture and byte-copy helpers are invisible in every statistics counter, whether executed or skipped.
+    if (!native_only && vk.pipeline_statistics_query) {
+        for (UINT64 value : {UINT64_C(0),UINT64_C(1)<<32})
+            for (auto op : {D3D12_PREDICATION_OP_EQUAL_ZERO,D3D12_PREDICATION_OP_NOT_EQUAL_ZERO}) {
+                std::vector<unsigned char> expected,actual;
+                if (!run(host.p,cases[3],value,op,true,expected,true) ||
+                    !run(ours.p,cases[3],value,op,true,actual,true) || actual!=expected) return 1;
+            }
+    }
     if(!native_only&&vk.validation_errors())return 1;
     std::printf("query-to-predicated-copy: %u exact cases, %u recapture controls; GPU overwrite and predicate guards exact\n",query_cases,recapture_controls);
     std::printf("predicated buffer copies: %u exact cases (%s)\n",count,native_only?"WARP + literal byte oracle":"Vulkan + WARP + literal byte oracle");

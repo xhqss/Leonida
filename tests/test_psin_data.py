@@ -168,6 +168,17 @@ class TestWalk(unittest.TestCase):
         self.assertEqual(self.tree[f"{joaat('short'):08x}"], "abc")
         self.assertEqual(self.stats["short strings in place"], 1)
 
+    def test_struct_pointer_past_block_end_is_rejected(self):
+        # ItemThing is 8 bytes; pointing at offset 6 of an 8-byte block leaves only 2 bytes inside the block.
+        root = bytearray(0x90)
+        struct.pack_into("<Q", root, 0x58, ptr(2, 6))
+        blob = make_container([(ROOT_T, bytes(root)), (ITEM_T, struct.pack("<fI", 3.5, 30))], SCHEMA, ENUMS)
+        st = __import__("collections").Counter()
+        out = D.Walker(D.Container(blob), st, keep=True).run()
+        self.assertEqual(st["struct pointer resolved"], 0)
+        self.assertEqual(st["struct pointer past block end"], 1)
+        self.assertIsNone(out[f"{joaat('child'):08x}"])
+
     def test_enum_and_undecoded_type(self):
         self.assertEqual(self.tree[f"{joaat('kind'):08x}"], 1)
         self.assertEqual(self.stats["enum value listed"], 1)
@@ -215,6 +226,42 @@ class TestMeasure(unittest.TestCase):
         self.assertTrue(D.measure(blob, stats))
         self.assertEqual(stats["root out of range"], 1)
 
+    def test_inline_and_fixed_arrays_are_bounded_to_enclosing_block(self):
+        # 16-byte block with 0x54 inline array of char[4] claiming count=capacity=50000:
+        # must be rejected as out of bounds rather than performing 50,000 OOB reads.
+        inline_schema = [(0xAAAA0002, 0, 16, 2, [
+            (0x22222222, 0, 0x54, 0, 1, 0),
+            (0x00000100, 0, 0x40, 0, 0, 4),
+        ])]
+        blob = make_container([(0xAAAA0002, struct.pack("<II", 50000, 50000) + bytes(8))], inline_schema, [])
+        stats = __import__("collections").Counter()
+        self.assertTrue(D.measure(blob, stats))
+        self.assertEqual(stats["inline array out of bounds"], 1)
+        self.assertEqual(stats["char arrays"], 0)
+
+        # 16-byte block with 0x50 fixed array of 100 char[4] elements (400 bytes > 16).
+        fixed_schema = [(0xAAAA0003, 0, 16, 2, [
+            (0x33333333, 0, 0x50, 0, 1, 100),
+            (0x00000100, 0, 0x40, 0, 0, 4),
+        ])]
+        blob2 = make_container([(0xAAAA0003, bytes(16))], fixed_schema, [])
+        stats2 = __import__("collections").Counter()
+        self.assertTrue(D.measure(blob2, stats2))
+        self.assertEqual(stats2["fixed array out of bounds"], 1)
+        self.assertEqual(stats2["char arrays"], 0)
+
+    def test_map_75_zero_groups_is_not_power_of_two(self):
+        map_schema = [(0xAAAA0001, 0, 16, 2, [
+            (0x11111111, 0, 0x75, 0, 0, (2 << 16) | 1),
+            (0x00000100, 0, 0x15, 0, 0, 0),
+            (0x00000100, 0, 0x15, 0, 0, 0),
+        ])]
+        blob = make_container([(0xAAAA0001, struct.pack("<IIQ", 0, 1, 1))], map_schema, [])
+        stats = __import__("collections").Counter()
+        self.assertTrue(D.measure(blob, stats))
+        self.assertEqual(stats["map 75 groups a power of two"], 0)
+        self.assertEqual(stats["map 75 groups not a power of two"], 1)
+
 
 class TestCli(unittest.TestCase):
     def run_tool(self, *args):
@@ -256,6 +303,33 @@ class TestCli(unittest.TestCase):
             r = self.run_tool(path, "--dump")
             self.assertEqual(r.returncode, 2)
             self.assertIn("incomplete", r.stderr)
+
+    def test_dump_missing_file_returns_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing.bin")
+            r = self.run_tool(missing, "--dump")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("ERROR:", r.stderr)
+            self.assertEqual(len(r.stderr.strip().splitlines()), 1)
+
+    def test_dump_oserror_returns_2_without_traceback(self):
+        import io
+        import unittest.mock
+        from contextlib import redirect_stderr
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "locked.bin")
+            with open(path, "wb") as f:
+                f.write(sample())
+            err = io.StringIO()
+            with unittest.mock.patch.object(sys, "argv", ["psin_data.py", path, "--dump"]), \
+                 unittest.mock.patch("builtins.open", side_effect=OSError("I/O error")), \
+                 redirect_stderr(err):
+                rc = D.main()
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR:", err.getvalue())
+            self.assertIn("I/O error", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
 
 
 if __name__ == "__main__":

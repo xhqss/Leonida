@@ -1,4 +1,4 @@
-// Compare depth/stencil ResolveSubresourceRegion with Windows D3D12 on the default adapter and on WARP, through
+// Compare depth/stencil ResolveSubresourceRegion with Windows D3D12 on the layer's own adapter and on WARP, through
 // clears, resolves, copies and Map on both sides: MIN and MAX of either plane, named by the depth format or the
 // plane's own format, and AVERAGE of the depth plane by its own format (R32_FLOAT, R24_UNORM_X8_TYPELESS).
 // Clears write whole pixels, so all samples of a pixel are equal and every mode returns that value: these cases
@@ -9,6 +9,7 @@
 // WARP, measured: a resolve with Format D32_FLOAT removes the device (DXGI_ERROR_DRIVER_INTERNAL_ERROR), and a
 // D24S8 resolve of one plane writes both. So WARP skips those and is compared on the plane resolved.
 #include "vk_test_device.h"
+#include "host_adapter.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
@@ -152,7 +153,9 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     Event event;
     CHECK(event.handle);
     CHECK(SUCCEEDED(fence->SetEventOnCompletion(1, event.handle)));
-    CHECK(WaitForSingleObject(event.handle, 5000) == WAIT_OBJECT_0);
+    // 30 s, not 5 s: under `ctest -j 6` other GPU tests share the device, and a fence can take longer
+    // than this test's idle runtime to signal (TEST-514 flake). Sibling tests already wait 15-60 s.
+    CHECK(WaitForSingleObject(event.handle, 30000) == WAIT_OBJECT_0);
     void* mapped = nullptr;
     const D3D12_RANGE range{0, SIZE_T(total)};
     CHECK(SUCCEEDED(readback->Map(0, &range, &mapped)) && mapped);
@@ -320,9 +323,10 @@ int main() {
             if (hostwine::host_is_wine()) break;  // checked against the clears above
             Ref<IDXGIAdapter> adapter;
             Ref<ID3D12Device> host;
-            if (warp && FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p)))) continue;
+            std::string adapter_name;
+            if (!hostadapter::reference(factory.p, vk, warp, &adapter.p, adapter_name)) continue;
             if (FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) continue;
-            const char* name = warp ? "WARP" : "the default adapter";
+            const char* name = adapter_name.c_str();
             unsigned same = 0, compared = 0, refused_alike = 0, quirks = 0;
             for (std::size_t i = 0; i < cases.size(); ++i) {
                 const Case& c = cases[i];
@@ -331,7 +335,9 @@ int main() {
                 if (!resolve_and_read(host.p, c, expected, false)) return 1;
                 ++compared;
                 // The layer's result was checked against the clears above. A host that differs from the clears is a
-                // host quirk (NVIDIA's D3D12 driver on D24S8 rectangle resolves), not a layer bug: report, don't fail.
+                // host quirk, not a layer bug: report, don't fail. Which D24S8 resolves is the driver's: with stencil
+                // MIN/MAX on both, an RTX 3070 (NVIDIA 610.74) adds "stencil as X24_G8" and "depth as R24_X8" AVERAGE,
+                // a Ryzen 7 9700X iGPU (AMD 32.0.21042.62) depth MIN/MAX; whole subresources and rectangles alike.
                 if (SUCCEEDED(expected.close) && !same_planes(expected, expected_planes(c), warp, c.plane)) {
                     std::printf("%s %s rect %d against %s: host quirk: the host differs from the clears; the layer "
                                 "matches them\n", c.name, mode_name(c.mode), int(c.rect), name);
@@ -372,7 +378,7 @@ int main() {
     if (validation_errors)
         std::fprintf(stderr, "d3d12_depth_resolve_test: %u new Vulkan validation error(s)\n", validation_errors);
     const bool need_host = !hostwine::host_is_wine();
-    if (need_host && !references) std::fprintf(stderr, "no D3D12 reference device (default adapter or WARP)\n");
+    if (need_host && !references) std::fprintf(stderr, "no D3D12 reference device (hardware adapter or WARP)\n");
     if (run_failed || failures || validation_errors || (need_host && (!references || !matched))) return 1;
     std::printf("depth/stencil resolves: %u host comparisons matched, %u refusals kept the destination, %u modes the "
                 "device lacks were refused\n", matched, refusals, lacking);

@@ -58,10 +58,79 @@ Check(ScanCounts.Candidates("App scan of the first 16 MiB") is null, "coverage w
 Check(ScanCounts.Candidates(null) is null, "no cache");
 Console.WriteLine("Scan count tests passed.");
 
+// Util.MeshKey reads the model/geometry pair the decoder puts in a mesh name; the geometry index of a dehydrated
+// BLAS leaf counts geometries inside one model, so the pair decides which list a signature is matched against.
+Check(Util.MeshKey("model_0_geometry_3") == (0, 3), "mesh key model 0 geometry 3");
+Check(Util.MeshKey("model_12_geometry_0") == (12, 0), "mesh key model 12 geometry 0");
+Check(Util.MeshKey("model_7_geometry_11") == (7, 11), "mesh key two-digit geometry");
+foreach (string other in new[] { "", "model", "model_0_geometry", "model_0_geometry_1_2", "Model_0_geometry_1",
+             "model_x_geometry_1", "model_0_geometry_1a", "model__geometry_1", "model_0_Geometry_1", "model_-1_geometry_1" })
+    Check(Util.MeshKey(other) == (-1, -1), "not a mesh key: " + other);
+Console.WriteLine("Mesh key tests passed.");
+
+// RecoveredResource.Read turns the recovery step's block list back into the resource's bytes: a window slice has no
+// archive document, so this is the only reader models and textures have there.
+{
+    byte[] system = System.Text.Encoding.ASCII.GetBytes("system segment, zlib");
+    var gfx = new byte[64];
+    for (int i = 0; i < gfx.Length; i++) gfx[i] = (byte)(0x40 + i);
+    using var compressed = new MemoryStream();
+    using (var deflate = new System.IO.Compression.ZLibStream(compressed, System.IO.Compression.CompressionLevel.SmallestSize, true))
+        deflate.Write(system);
+    byte[] zblock = compressed.ToArray();
+
+    string segmentDir = Directory.CreateTempSubdirectory("rpf9dump-segments").FullName;
+    try
+    {
+        string path = Path.Combine(segmentDir, "window.bin");
+        var file = new byte[32 + zblock.Length + 16 + gfx.Length];
+        Array.Fill(file, (byte)0xAA);
+        zblock.CopyTo(file, 32);
+        gfx.CopyTo(file, 32 + zblock.Length + 16);
+        File.WriteAllBytes(path, file);
+        ArchiveEntry Entry(params ArchiveSegment[] segments) => new("recovered/models/x_at_0.r9modeldata",
+            segments.Sum(s => s.StoredSize), segments.Sum(s => s.Size), 32, false, false, false, "Recovered model", 0) { Segments = segments };
+        var entry = Entry(new ArchiveSegment(32, zblock.Length, system.Length),
+                          new ArchiveSegment(32 + zblock.Length + 16, gfx.Length, gfx.Length) { IsRaw = true });
+        byte[] read = RecoveredResource.Read(path, entry);
+        Check(read.SequenceEqual(system.Concat(gfx)), "one compressed and one raw block, in stored order");
+
+        // A block that reaches past the file is an error, not a short read.
+        var pastEnd = Entry(new ArchiveSegment(32, file.Length, system.Length));
+        try { RecoveredResource.Read(path, pastEnd); Check(false, "block past the end is rejected"); }
+        catch (InvalidDataException) { }
+        // A raw block reads its own bytes; the 6-byte minimum is the smallest block the recovery step records.
+        var shortRaw = Entry(new ArchiveSegment(32 + zblock.Length + 16, 8, 8) { IsRaw = true });
+        Check(RecoveredResource.Read(path, shortRaw).SequenceEqual(gfx[..8]), "a raw block reads its own bytes");
+        var tooSmall = Entry(new ArchiveSegment(32 + zblock.Length + 16, 4, 4) { IsRaw = true });
+        try { RecoveredResource.Read(path, tooSmall); Check(false, "a block under six bytes is rejected"); }
+        catch (InvalidDataException) { }
+        // An entry that records no blocks is rejected rather than returning an empty resource.
+        var oversize = new ArchiveEntry("recovered/models/x.r9modeldata", 1, 1, 32, false, false, false, "Recovered model", 0);
+        try { RecoveredResource.Read(path, oversize); Check(false, "an entry without blocks is rejected"); }
+        catch (InvalidDataException) { }
+    }
+    finally { Directory.Delete(segmentDir, true); }
+}
+Console.WriteLine("Recovered segment tests passed.");
+
+// Only a full scan replaces rpf9dump's own: rpf9-explorer saves partial model indexes while indexing and on cancel.
+Check(!ScanCounts.IsFullScan(Index("Dictionary-aware model scan in progress \u00B7 1,001/183,801 containers validated.", false)), "GUI index saved while indexing");
+Check(!ScanCounts.IsFullScan(Index("Dictionary-aware model scan canceled. Validated models are retained; discovery will resume on reopen.", false)), "GUI index saved on cancel");
+Check(ScanCounts.IsFullScan(Index("Full 1,234,567-byte model-container scan \u00B7 149,811 supported models including drawable dictionary children.", true)), "GUI index marked complete");
+Check(ScanCounts.IsFullScan(Index(ScanCounts.Coverage(183801, 149811), true)), "rpf9dump index");
+Check(ScanCounts.IsFullScan(Index(ScanCounts.Coverage(183801, 149811), false)), "rpf9dump index saved without the complete mark");
+Check(ScanCounts.IsFullScan(Index(string.Format(System.Globalization.CultureInfo.GetCultureInfo("de-CH"), "rpf9dump full scan, {0:N0} candidates, {1:N0} recovered", 183801, 149811), false)), "culture-formatted rpf9dump index");
+Check(!ScanCounts.IsFullScan(null), "no cached index");
+Console.WriteLine("Cached index tests passed.");
+
 static void Check(bool ok, string what)
 {
     if (!ok) throw new Exception($"Failed: {what}");
 }
+
+static RecoveryIndexCache.CachedIndex Index(string coverage, bool complete) =>
+    new("rpfpreview-payload-index/models/4", "models", "levels.rpf", 0, 0, "", coverage, []) { IsComplete = complete };
 
 static void Expect(ReadOnlySpan<byte> system, int graphicsBytes, string expected)
 {

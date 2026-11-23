@@ -56,7 +56,7 @@ class Generator(unittest.TestCase):
                 if "addr" not in op:
                     continue
                 stride, base, off = op["addr"]
-                if op["kind"] in ("read2", "write2"):
+                if op["kind"] in ("read2", "write2", "wrxchg2"):
                     unit = 256 if op["st64"] else 4
                     spans = [[(t * stride + base + o * unit, 4) for o in (op["o0"], op["o1"])]
                              for t in range(f.THREADS)]
@@ -67,7 +67,7 @@ class Generator(unittest.TestCase):
                 for ss in spans:
                     for a, n in ss:
                         self.assertTrue(0 <= a and a + n <= f.LDS_BYTES, (p.name, op))
-                if op["kind"] in ("write", "write2", "atomic_rtn", "wrxchg", "cmpst"):
+                if op["kind"] in ("write", "write2", "wrxchg2", "atomic_rtn", "wrxchg", "cmpst"):
                     self.assertTrue(p.disjoint(spans), (p.name, op))
 
     def test_only_order_independent_atomics_share_addresses(self):
@@ -84,6 +84,93 @@ class Generator(unittest.TestCase):
                 self.assertIsNone(y["exec"])
             else:
                 self.assertEqual(x, y)
+
+    def test_permute_is_generated_and_no_exec_clears_only_permute(self):
+        self.assertIn("permute", f.EXEC_KINDS)
+        found = 0
+        for idx in range(40):
+            a = f.Program(1, idx, 64, permute=True)
+            b = f.Program(1, idx, 64, no_exec=("permute",), permute=True)
+            self.assertEqual(len(a.ops), len(b.ops))
+            for x, y in zip(a.ops, b.ops):
+                if x["kind"] == "permute":
+                    if x["exec"] is not None:
+                        found += 1
+                    self.assertIsNone(y["exec"])
+                    self.assertEqual({k: v for k, v in x.items() if k not in ("exec", "hyp")},
+                                     {k: v for k, v in y.items() if k not in ("exec", "hyp")})
+                else:
+                    self.assertEqual(x, y)
+        self.assertGreater(found, 0, "expected at least one permute op with non-None exec mask")
+
+
+    def test_wrxchg2_is_generated_and_may_alias_the_data(self):
+        self.assertIn("wrxchg2", f.EXEC_KINDS)
+        found = [op for idx in range(200) for op in f.Program(2, idx, 64).ops if op["kind"] == "wrxchg2"]
+        self.assertTrue(found, "expected the generator to emit ds_wrxchg2")
+        for op in found:
+            self.assertLessEqual(op["dst"] + 1, f.HW_VGPRS - 1)
+        self.assertTrue(any(op["dst"] in (op["src0"], op["src1"]) for op in found),
+                        "expected some ops to alias vdst with the data pair")
+
+
+class Wrxchg2(unittest.TestCase):
+    """The two-dword exchange: element-scaled offsets, a 64-element st64 step, and data0 back on a repeated offset."""
+
+    def model(self, threads=8, **op):
+        p = f.Program(1, 0, 32)
+        p.threads = threads
+        base = {"kind": "wrxchg2", "addr": (0, 0, 0), "dst": 20, "src0": 22, "src1": 23, "exec": None,
+                "st64": False, "o0": 0, "o1": 0}
+        base.update(op)
+        p.ops = [base]
+        return p, *p.model()
+
+    @staticmethod
+    def init_lds(p, dword):
+        return ((dword * p.lds_mul) & f.M32) ^ p.lds_xor
+
+    @staticmethod
+    def init_reg(p, t, r):
+        k, c = p.pool_init[r]
+        return ((t * k) & f.M32) ^ c
+
+    @staticmethod
+    def word(lds, dword):
+        return struct.unpack_from("<I", lds, 4 * dword)[0]
+
+    def test_offsets_are_elements_and_the_pair_is_returned(self):
+        p, regs, lds = self.model(addr=(24, 0, 0), o0=0, o1=4)        # second element 16 bytes on
+        for t in range(8):
+            a0, a1 = t * 24, t * 24 + 16
+            self.assertEqual(self.word(lds, a0 // 4), self.init_reg(p, t, 22))
+            self.assertEqual(self.word(lds, a1 // 4), self.init_reg(p, t, 23))
+            self.assertEqual(regs[t][20], self.init_lds(p, a0 // 4))
+            self.assertEqual(regs[t][21], self.init_lds(p, a1 // 4))
+
+    def test_a_repeated_offset_returns_data0(self):
+        p, regs, lds = self.model(addr=(8, 0, 0), o0=0, o1=0)
+        for t in range(8):
+            d = t * 8 // 4
+            self.assertEqual(self.word(lds, d), self.init_reg(p, t, 23))     # data1 wins the dword
+            self.assertEqual(regs[t][20], self.init_lds(p, d))               # the old word
+            self.assertEqual(regs[t][21], self.init_reg(p, t, 22))           # then data0
+
+    def test_aliasing_the_data_stores_it_and_returns_the_old_words(self):
+        p, regs, lds = self.model(addr=(24, 0, 0), o0=0, o1=4, dst=22, src0=22, src1=23)
+        for t in range(8):
+            a0, a1 = t * 24, t * 24 + 16
+            self.assertEqual(self.word(lds, a0 // 4), self.init_reg(p, t, 22))
+            self.assertEqual(self.word(lds, a1 // 4), self.init_reg(p, t, 23))
+            self.assertEqual(regs[t][22], self.init_lds(p, a0 // 4))
+            self.assertEqual(regs[t][23], self.init_lds(p, a1 // 4))
+
+    def test_st64_steps_64_elements(self):
+        p, regs, lds = self.model(addr=(264, 0, 0), o0=0, o1=1, st64=True)
+        for t in range(8):
+            a1 = t * 264 + 256
+            self.assertEqual(self.word(lds, a1 // 4), self.init_reg(p, t, 23))
+            self.assertEqual(regs[t][21], self.init_lds(p, a1 // 4))
 
 
 class Model(unittest.TestCase):
@@ -103,6 +190,48 @@ class Model(unittest.TestCase):
         keep = f.Program(1, 0, 32)
         keep.ops = []
         self.assertEqual(regs[9][21], keep.model()[0][9][21])  # lane 9 is off itself: keeps its value
+
+    def test_permute_collision_highest_active_wins_and_unaddressed_is_zero(self):
+        # All active lanes scatter to lane 5 in their own 32-lane half (mul=0, add=5, offset=0).
+        # EXEC: low half has lanes 0..7 active (highest active = 7); high half has lanes 32, 35, 40 active (highest = 40).
+        mask = 0xFF | (1 << 32) | (1 << 35) | (1 << 40)
+        p = f.Program(1, 0, 64)
+        p.ops = [{"kind": "permute", "mul": 0, "add": 5, "offset": 0, "src": 20, "dst": 21, "exec": mask}]
+        base = f.Program(1, 0, 64)
+        base.ops = []
+        init_regs, _ = base.model()
+        regs, _ = p.model()
+
+        # Low half: lane 5 is active and receives highest active source (lane 7).
+        self.assertEqual(regs[5][21], init_regs[7][20])
+        # Low half: active lanes != 5 receive nobody -> 0.
+        for t in (0, 1, 2, 3, 4, 6, 7):
+            self.assertEqual(regs[t][21], 0)
+        # Low half: inactive lanes keep their original v21.
+        for t in (8, 15, 31):
+            self.assertEqual(regs[t][21], init_regs[t][21])
+        # High half: target lane 32+5=37 is INACTIVE, so it keeps its original v21 even though 32,35,40 targeted it.
+        self.assertEqual(regs[37][21], init_regs[37][21])
+        # High half: active lanes 32, 35, 40 receive nobody -> 0.
+        for t in (32, 35, 40):
+            self.assertEqual(regs[t][21], 0)
+        self.assertIn("ds_permute_b32 v21, v6, v20 offset:0", p.asm())
+
+        with f.perturbed("permute_lowest_wins"):
+            bad_regs, _ = p.model()
+            self.assertEqual(bad_regs[5][21], init_regs[0][20])
+
+    def test_permute_half_isolation_and_offset(self):
+        # Identity + offset:8 (+2 lanes) mod 32 within each 32-lane half, all lanes active.
+        p = f.Program(2, 1, 64)
+        p.ops = [{"kind": "permute", "mul": 1, "add": 0, "offset": 8, "src": 20, "dst": 22, "exec": None}]
+        base = f.Program(2, 1, 64)
+        base.ops = []
+        init_regs, _ = base.model()
+        regs, _ = p.model()
+        for t in range(64):
+            src_lane = (t & ~31) | ((t - 2) & 31)
+            self.assertEqual(regs[t][22], init_regs[src_lane][20])
 
     def test_d16_hi_read_keeps_the_low_half(self):
         p = f.Program(1, 0, 64)
@@ -237,6 +366,23 @@ class Runner(unittest.TestCase):
         self.assertNotIn("MISMATCH", out)
         self.assertIn("2 skipped", out)
         self.assertIn("can't run it at 32 lanes", out)
+
+    def test_unpinned_wave32_warning_does_not_hide_a_later_harness_failure(self) -> None:
+        passing = iter((False, True))
+
+        def gpu(p: f.Program, _spv: Path, _build: str, _entry: dict[str, object],
+                _emulate: bool, dump: Path) -> tuple[int, str]:
+            if next(passing):
+                self.correct_dump(p, dump)
+                return 0, "compute subgroup size: 32"
+            return 1, self.UNPINNED + "\nFAILED vkQueueSubmit -> -4"
+
+        status, out = self.run_main(gpu, ("--wave", "32"))
+        self.assertEqual(status, 2, out)
+        self.assertIn("FAILED vkQueueSubmit", out)
+        self.assertIn("1/1 programs that ran match", out)
+        self.assertIn("1 harness errors", out)
+        self.assertIn("0 skipped", out)
 
     def test_pinned_wave32_is_still_compared(self):
         status, out = self.run_main(self.wrong_dump("compute subgroup size: 32"), ("--wave", "32"))

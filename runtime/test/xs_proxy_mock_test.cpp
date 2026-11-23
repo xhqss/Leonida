@@ -70,7 +70,7 @@ namespace xs = rt::d3d12_xs;
 
 // ---- Mocks ----
 
-enum class Kind { device, queue, fence, resource };
+enum class Kind { device, queue, fence, resource, allocator };
 
 constexpr unsigned kMockSlots = 128;
 constexpr std::uint64_t kFenceHandle = 0x1000, kResourceHandle = 0x2000;  // the handles the mock device opens
@@ -84,6 +84,7 @@ struct Mock {
     long refs;
     int device_level;        // device: highest ID3D12DeviceN it answers (0 = ID3D12Device only)
     bool fence1;             // fence: answers ID3D12Fence1; device: the fences it makes do
+    bool allocator_tag;      // allocator: answers kLeonidaCommandAllocatorTag; device: the allocators it makes do
     bool create_null;        // device: creation returns create_result with no object
     HRESULT create_result;   // device: what creation returns (S_OK makes the object)
     Mock* last_child;        // device: the object its last creation or open made
@@ -126,6 +127,9 @@ bool mock_has(const Mock* m, REFIID iid) {
         case Kind::fence:
             return IsEqualIID(iid, __uuidof(ID3D12Fence)) || (m->fence1 && IsEqualIID(iid, __uuidof(ID3D12Fence1)));
         case Kind::resource: return IsEqualIID(iid, __uuidof(ID3D12Resource));
+        case Kind::allocator:
+            return IsEqualIID(iid, __uuidof(ID3D12CommandAllocator)) ||
+                   (m->allocator_tag && IsEqualIID(iid, xs::kLeonidaCommandAllocatorTag));
         default: return false;
     }
 }
@@ -148,6 +152,7 @@ HRESULT mock_create(Mock* device, Kind kind, std::uint64_t riid, std::uint64_t o
     if (device->create_null || FAILED(device->create_result)) return device->create_result;
     Mock* child = new_mock(kind);
     child->fence1 = device->fence1;
+    child->allocator_tag = device->allocator_tag;
     device->last_child = child;
     return mock_query(child, reinterpret_cast<const IID*>(riid), out);
 }
@@ -163,6 +168,7 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
     if (m->kind == Kind::device) {
         switch (slot) {
             case 8: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));    // CreateCommandQueue
+            case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
             case 75: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a3, a4));   // CreateCommandQueue1
             case 36: return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a3, a4));   // CreateFence
             case 32:                                                                          // OpenSharedHandle
@@ -248,10 +254,11 @@ const IID kDevice1Iid = __uuidof(ID3D12Device1);
 const D3D12_COMMAND_QUEUE_DESC kQueueDesc{};
 
 // A device proxy over a new mock device. The proxy takes the mock's one reference.
-void* make_device(Mock*& mock, int level, bool fence1) {
+void* make_device(Mock*& mock, int level, bool fence1, bool allocator_tag = true) {
     mock = new_mock(Kind::device);
     mock->device_level = level;
     mock->fence1 = fence1;
+    mock->allocator_tag = allocator_tag;
     mock->refs = 1;
     void* device = nullptr;
     if (FAILED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(mock), __uuidof(ID3D12Device), &device)))
@@ -563,7 +570,85 @@ int check_alloc_failures() {
     return 0;
 }
 
-// ---- 6. The refused tail and the guard region ----
+// ---- 6. Command allocators (device slot 9) ----
+
+int check_allocators() {
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    // An allocator that answers Leonida's tag (its lists resolve a proxy) comes back wrapped.
+    {
+        Mock* mock = nullptr;
+        void* device = make_device(mock, 9, true, true);
+        EXPECT(device);
+        const unsigned long device_refs = xs::device_proxy_ref_count(device);
+        void* allocator = nullptr;
+        EXPECT(hr_of(raw(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, word(&allocator_iid), word(&allocator))) == S_OK);
+        Mock* const real = mock->last_child;
+        EXPECT(xs::is_allocator_proxy(allocator) && word(xs::allocator_proxy_real_allocator(allocator)) == word(real));
+        EXPECT(mock->args[9][0] == D3D12_COMMAND_LIST_TYPE_DIRECT && real->refs == 1);
+        EXPECT(xs::allocator_proxy_slot_count(allocator) == 9 && xs::device_proxy_ref_count(device) == device_refs + 1);
+        // Reset (slot 8) reaches the real allocator; every slot past it up to the table end is refused.
+        EXPECT(hr_of(raw(allocator, 8)) == S_OK && real->calls[8] == 1);
+        for (unsigned slot = 9; slot < xs::allocator_proxy_table_size(); ++slot)
+            EXPECT(hr_of(raw(allocator, slot)) == E_NOTIMPL && real->calls[slot] == 0);
+        // The tag and the real object stay hidden: QueryInterface answers only the modelled interfaces.
+        void* found = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(allocator, 0, word(&xs::kLeonidaCommandAllocatorTag), word(&found))) == E_NOINTERFACE &&
+               !found);
+        EXPECT(hr_of(raw(allocator, 0, word(&allocator_iid), word(&found))) == S_OK && found == allocator);
+        EXPECT(release(found) == 1);
+        // An allocator is a pageable: MakeResident gives the real runtime the real allocator.
+        const std::uint64_t objects[1] = {word(allocator)};
+        EXPECT(hr_of(raw(device, 34, 1, word(objects))) == S_OK && mock->array[34][0] == word(real));
+        EXPECT(release(allocator) == 0 && real->refs == 0);
+        EXPECT(xs::device_proxy_ref_count(device) == device_refs);
+        // Null IID, null output, a failing or empty creation, an IID the allocator lacks.
+        void* out = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(device, 9, 0, 0, word(&out))) == E_POINTER && !out);
+        EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), 0)) == S_FALSE);  // the device's own answer
+        mock->create_result = E_OUTOFMEMORY;
+        out = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&out))) == E_OUTOFMEMORY && !out);
+        mock->create_result = S_OK;
+        mock->create_null = true;
+        out = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&out))) == E_FAIL && !out);
+        mock->create_null = false;
+        const IID fence_iid = __uuidof(ID3D12Fence);
+        out = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(device, 9, 0, word(&fence_iid), word(&out))) == E_NOINTERFACE && !out);
+        EXPECT(mock->last_child->refs == 0);
+        // A refused allocation for the proxy: E_OUTOFMEMORY, and the real allocator is released.
+        g_fail_news = 1;
+        out = reinterpret_cast<void*>(1);
+        const HRESULT starved = hr_of(raw(device, 9, 0, word(&allocator_iid), word(&out)));
+        g_fail_news = 0;
+        EXPECT(starved == E_OUTOFMEMORY && !out && mock->last_child->refs == 0);
+        EXPECT(xs::device_proxy_ref_count(device) == device_refs);
+        EXPECT(release(device) == 0 && mock->refs == 0);
+    }
+    // An allocator without the tag (a PC runtime allocator, whose lists could not resolve a proxy) comes back as it
+    // is, as the interface asked for.
+    {
+        Mock* mock = nullptr;
+        void* device = make_device(mock, 9, true, false);
+        EXPECT(device);
+        void* allocator = nullptr;
+        EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&allocator))) == S_OK);
+        EXPECT(allocator == mock->last_child && !xs::is_allocator_proxy(allocator) && mock->last_child->refs == 1);
+        Mock* const real = mock->last_child;
+        EXPECT(release(allocator) == 0 && real->refs == 0);
+        const IID fence_iid = __uuidof(ID3D12Fence);
+        void* out = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(device, 9, 0, word(&fence_iid), word(&out))) == E_NOINTERFACE && !out);
+        EXPECT(mock->last_child->refs == 0);
+        EXPECT(release(device) == 0 && mock->refs == 0);
+    }
+    std::printf("%s: allocators answering Leonida's tag are wrapped (Reset forwarded, tail refused, residency "
+                "unwrapped, references balanced); others come back unwrapped; failures leave no reference\n", g_label);
+    return 0;
+}
+
+// ---- 7. The refused tail and the guard region ----
 
 int check_tail(bool want_guarded) {
     Mock* mock = nullptr;
@@ -686,7 +771,7 @@ int main(int argc, char** argv) {
     if (argc == 2) return run_fault_mode(argv[1]);
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures())
+        check_alloc_failures() || check_allocators())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

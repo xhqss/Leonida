@@ -5,9 +5,11 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import run_gpu_tests as rgt
+import check
 
 NAN = float("nan")
 
@@ -23,8 +25,28 @@ class PixelChecks(unittest.TestCase):
     def test_good_frames_pass(self):
         grad = b"".join(struct.pack("<4f", (i % 64 + 0.5) / 64, (i // 64 + 0.5) / 64, 0.5, 1.0) for i in range(4096))
         self.assertTrue(rgt.check_grad(self.raw(grad), 0.5, 1.0)[0])
-        bary = b"".join(struct.pack("<4f", 0.5, 0.25, 0.25, 0.125) for _ in range(4096))
-        self.assertTrue(rgt.check_bary(self.raw(bary))[0])
+
+    def test_bary_checks_both_interpolation_paths(self) -> None:
+        triangle = []
+        for y in range(64):
+            for x in range(64):
+                u, v = (x + 0.5) / 64, (y + 0.5) / 64
+                triangle.append((u, v, u / 2, v / 2))
+        wrong_raw = triangle.copy()
+        u, v, i, _ = wrong_raw[1337]
+        wrong_raw[1337] = (u, v, i, 0.0)
+        with tempfile.TemporaryDirectory() as work:
+            (Path(work) / "ps_bary.spv").touch()
+            for name, frame, expected in (
+                ("triangle gradient", triangle, True),
+                ("both paths return zero", [(0.0, 0.0, 0.0, 0.0)] * 4096, False),
+                ("one raw barycentric is wrong", wrong_raw, False),
+            ):
+                with self.subTest(frame=name):
+                    raw = self.raw(b"".join(struct.pack("<4f", *pixel) for pixel in frame))
+                    with patch.object(check, "pixels", return_value=(frame, "")):
+                        standalone = check.pixel_test(work, work, "ps_bary")
+                    self.assertEqual((rgt.check_bary(raw)[0], standalone == ""), (expected, expected))
 
     def test_d16_gradient_rejects_swapped_halves(self):
         # Binary16 encodings of UNORM8 texels 0, 32, ... 224.

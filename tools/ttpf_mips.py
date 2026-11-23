@@ -26,7 +26,7 @@ Read-only: no texture bytes are printed or committed. `scan` emits aggregate
 counters only (both the zlib/raw baseline and the BCPack-enabled projection).
 `layout` prints descriptor fields and offsets. `check` prints the BC
 block-average error against a 2x2 downsample of the parent mip (across all
-slices/faces for arrays and cubemaps; BC1, BC3, BC4_UNORM, BC5_UNORM, BC6H and
+slices/faces for arrays and cubemaps; BC1, BC2, BC3, BC4_UNORM, BC5_UNORM, BC6H and
 BC7) or 3D Z-continuity vs 2D control for float16 volumes. `export` writes a
 DX10 DDS when every source mip uses a supported codec.
 
@@ -614,8 +614,8 @@ def decode_pixels(fmt, data, blocks_w, blocks_h):
             at = (by * blocks_w + bx) * 16
             if fmt in (71, 72):
                 blk = decode_bc1_block(data, (by * blocks_w + bx) * 8)
-            elif fmt in (77, 78):
-                # BC3 colour uses four entries regardless of endpoint order.
+            elif fmt in (74, 75, 77, 78):
+                # BC2/BC3 use four RGB entries regardless of endpoint order.
                 blk = decode_bc1_block(data, at + 8, four_color=True)
             elif fmt in (80,):
                 blk = decode_bc4_block(data, (by * blocks_w + bx) * 8)
@@ -801,6 +801,7 @@ class Pool:
     """Read-only RDS5 texture pool, mirroring TtpfReader's catalog checks."""
 
     def __init__(self, path):
+        self._cache_token = object()
         # A pool that fails a check used to keep its file open and mapped (locked on Windows).
         self._fh = self.data = None
         try:
@@ -917,8 +918,8 @@ class Pool:
             id(bcpack_history) if isinstance(bcpack_history, dict) else os.fspath(bcpack_history)
         )
         for virt, csize, src, packed, codec, pad in self.chunks_for(start, size):
-            key = (src, packed, codec, bcpack_mode if codec not in (0, 8) else "raw",
-                   hist_key if codec in (6, 7) else None)
+            key = (self._cache_token, src, packed, codec, bcpack_mode if codec not in (0, 8) else "raw",
+                   hist_key if codec not in (0, 8) else None)
             if key not in cache:
                 raw = self.data[src:src + packed]
                 if codec == 0:
@@ -942,13 +943,22 @@ class Pool:
         return bytes(out)
 
     def span(self, index, base):
+        if _is_unmapped_base(base) or base >= self.virtual_size:
+            return None
         for j in range(index + 1, self.textures):
             cand = (u32(self.records, j * 16 + 8) & 0x1FFFFF) * 4096
+            if _is_unmapped_base(cand):
+                continue
             if cand < base:
                 return None
             if cand > base:
                 return cand - base
         return self.virtual_size - base
+
+
+def _is_unmapped_base(base):
+    """True for ETPF unmapped-allocation sentinel bases (0 or 0x1FFFFF pages)."""
+    return base == 0 or (base >> 12) == 0x1FFFFF
 
 
 def compact_row(desc):
@@ -1057,7 +1067,7 @@ def analyze(pool, index, *, allow_bcpack=True):
     """Descriptor + layout + per-mip codec availability for one texture."""
     d = pool.descriptor(index)
     out = dict(descriptor=d, tile_mode=tile_mode(d["mode"]), tile=tile_bytes(d["mode"]))
-    if d["base"] == 0 or (d["base"] >> 12) == 0x1FFFFF:
+    if _is_unmapped_base(d["base"]):
         out["blocked"] = "no mapped allocation"
         return out
     span = pool.span(index, d["base"])
@@ -1296,7 +1306,7 @@ def scan_pools(paths, as_json=None, include_tuples=False):
                 total["entries"] += 1
                 tm = str(tile_mode(d["mode"]))
                 total["tile_modes"][tm] = total["tile_modes"].get(tm, 0) + 1
-                span = pool.span(i, d["base"]) if d["base"] else None
+                span = pool.span(i, d["base"])
                 if span is not None:
                     meta_ok, _ = validate_chunk_metadata(pool, d, span)
                     if meta_ok:
@@ -1497,7 +1507,7 @@ def scan_pools(paths, as_json=None, include_tuples=False):
     if as_json:
         try:
             os.makedirs(os.path.dirname(os.path.abspath(as_json)), exist_ok=True)
-            with open(as_json, "w", encoding="utf-8") as f:
+            with open(as_json, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(report, f, indent=1)
         except OSError as exc:
             raise ValueError(f"cannot write {as_json}: {exc.strerror or exc}") from None
@@ -1683,7 +1693,7 @@ def _check_texture(pool, index, *, allow_provisional=False, history=None):
             if all(m is None for m in means):
                 print(json.dumps(dict(index=index, shape=shape, blocked=(
                     f"format {d['format']} is not one of the formats this tool decodes "
-                    "(BC 71/72/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
+                    "(BC 71/72/74/75/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
                 return 2
             per_slice_max.append(max((e for e in errs if e is not None), default=None))
             all_errs.extend(errs)
@@ -1722,7 +1732,7 @@ def _check_texture(pool, index, *, allow_provisional=False, history=None):
             if all(m is None for m in means):
                 print(json.dumps(dict(index=index, shape=shape, blocked=(
                     f"format {d['format']} is not one of the formats this tool decodes "
-                    "(BC 71/72/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
+                    "(BC 71/72/74/75/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
                 return 2
             if face == 0:
                 face0_preds = preds
@@ -1751,7 +1761,7 @@ def _check_texture(pool, index, *, allow_provisional=False, history=None):
     if all(m is None for m in means):
         print(json.dumps(dict(index=index, blocked=(
             f"format {d['format']} is not one of the formats this tool decodes "
-            "(BC 71/72/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
+            "(BC 71/72/74/75/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
         return 2
     control = None
     if 0 < layout["first_tail"] < d["mips"]:
@@ -1804,11 +1814,12 @@ def texture_dds(pool, a, mips=None, *, allow_provisional=False, history=None):
         raise ValueError(f"format {d['format']} is uncompressed and not validated for 2D export")
     if shape == "volume" and d["format"] not in VOLUME_FLOAT_FORMATS:
         raise ValueError(f"volume format {d['format']} is not validated for export")
-    if not a["full_chain"]:
-        raise ValueError("not every source mip uses a supported codec (zlib/raw/BCPack BC1/BC3/BC4/BC5/BC6H/BC7)")
     count = d["mips"] if mips is None else mips
     if count < 1 or count > d["mips"]:
         raise ValueError(f"--mips must be 1..{d['mips']}")
+    available = a["available"]
+    if len(available) < count or not all(available[:count]):
+        raise ValueError("not every requested mip uses a supported codec (zlib/raw/BCPack BC1/BC3/BC4/BC5/BC6H/BC7)")
     layout = a["layout"]
     block = 4 if d["format"] in BC_FORMATS else 1
     cache = {}
@@ -1868,8 +1879,12 @@ def export(pool, index, out_path, mips=None, force=False, *, allow_provisional=F
     d = a["descriptor"]
     count = d["mips"] if mips is None else mips
     shape = a.get("shape", "2d")
-    with open(out_path, "wb") as f:
-        f.write(blob)
+    try:
+        with open(out_path, "wb") as f:
+            f.write(blob)
+    except OSError as exc:
+        print(f"{out_path}: cannot write: {exc.strerror or exc}", file=sys.stderr)
+        return 1
     dims = (f"{d['width']}x{d['height']}x{d['depth']}" if shape in ("2d_array", "volume")
             else f"{d['width']}x{d['height']}")
     print(f"texture {index}: {shape} {dims} fmt {d['format']} {count} mips "
@@ -1894,7 +1909,7 @@ def main(argv=None):
     pc.add_argument("--allow-provisional", action="store_true",
                     help="allow unconfirmed built-in BCPack history entries")
     pc.add_argument("--history",
-                    help="local JSON file or directory supplying BC6H/BC7 initial history tables")
+                    help="local JSON file or directory supplying BC6H/BC7 (and optional BC1-BC5) initial history tables")
     pe = sub.add_parser("export", help="write the full chain as DDS")
     pe.add_argument("pool")
     pe.add_argument("index", type=int)
@@ -1905,7 +1920,7 @@ def main(argv=None):
     pe.add_argument("--allow-provisional", action="store_true",
                     help="allow unconfirmed built-in BCPack history entries")
     pe.add_argument("--history",
-                    help="local JSON file or directory supplying BC6H/BC7 initial history tables")
+                    help="local JSON file or directory supplying BC6H/BC7 (and optional BC1-BC5) initial history tables")
     a = ap.parse_args(argv)
     if a.cmd == "scan":
         pools = []
@@ -1931,6 +1946,20 @@ def main(argv=None):
             print(f"ERROR: {exc}", file=sys.stderr)
             return 2
         return 0
+    if a.cmd == "export":
+        # Refuse an output that aliases an input asset or metadata before the pool is
+        # opened (so its mmap can never be truncated on disk). --force may replace an
+        # ordinary DDS but never a pool, a calibration profile, or a supplied history file.
+        for asset, label in ((a.pool, "input pool"),
+                             (a.calibration, "--calibration profile"),
+                             (a.history, "--history file")):
+            if asset is None:
+                continue
+            if label == "--history file" and not os.path.isfile(asset):
+                continue
+            if same_output_path(a.out, asset):
+                print(f"ERROR: {a.out} would overwrite the {label} {asset}", file=sys.stderr)
+                return 2
     try:
         pool = Pool(a.pool)
     except (OSError, ValueError) as exc:

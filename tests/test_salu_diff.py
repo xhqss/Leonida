@@ -60,6 +60,27 @@ class Reference(unittest.TestCase):
     def test_scc_survives_ops_that_do_not_write_it(self):
         self.assertEqual(run("s_cmp_eq_u32 1, 1", "s_mov_b32 s4, 0", "s_bfm_b32 s5, 1, 1")[3], 1)
 
+    def test_absdiff_mul_hi_and_lshl_add(self):
+        self.assertEqual(run("s_absdiff_i32 s4, 0x7FFFFFFF, 0x80000000")[::3], [1, 1])
+        self.assertEqual(run("s_absdiff_i32 s4, 5, 5")[::3], [0, 0])
+        self.assertEqual(run("s_mul_hi_i32 s4, -1, 1")[::3], [0xFFFFFFFF, 0])
+        self.assertEqual(run("s_cmp_eq_u32 1, 1", "s_mul_hi_i32 s4, -1, 1")[::3], [0xFFFFFFFF, 1])
+        self.assertEqual(run("s_lshl1_add_u32 s4, 0x80000000, 0")[::3], [0, 1])
+        self.assertEqual(run("s_lshl2_add_u32 s4, 3, 4")[::3], [16, 0])
+        self.assertEqual(run("s_lshl4_add_u32 s4, 0x0FFFFFFF, 0x10")[::3], [0, 1])
+
+    def test_sext_flbit_and_pack(self):
+        self.assertEqual(run("s_sext_i32_i8 s4, 0x80")[0], 0xFFFFFF80)
+        self.assertEqual(run("s_sext_i32_i8 s4, 0x7F")[0], 0x7F)
+        self.assertEqual(run("s_sext_i32_i16 s4, 0x8000")[0], 0xFFFF8000)
+        self.assertEqual(run("s_sext_i32_i16 s4, 0x7FFF")[0], 0x7FFF)
+        self.assertEqual(run("s_flbit_i32 s4, 0")[0], 0xFFFFFFFF)
+        self.assertEqual(run("s_flbit_i32 s4, 1")[0], 31)
+        self.assertEqual(run("s_flbit_i32 s4, 0x80000000")[0], 1)
+        self.assertEqual(run("s_pack_ll_b32_b16 s4, 0x12345678, 0xABCDEF01")[0], 0xEF015678)
+        self.assertEqual(run("s_pack_lh_b32_b16 s4, 0x12345678, 0xABCDEF01")[0], 0xABCD5678)
+        self.assertEqual(run("s_pack_hh_b32_b16 s4, 0x12345678, 0xABCDEF01")[0], 0xABCD1234)
+
 
 class Translated(unittest.TestCase):
     def test_harness_canaries(self):
@@ -98,6 +119,19 @@ class Translated(unittest.TestCase):
             self.assertIn("word 0 (s4)", d.check(lines))
         finally:
             d.translated = real
+
+
+class Generator(unittest.TestCase):
+    def test_two_source_forms_share_one_literal_word(self) -> None:
+        for op in ("s_add_u32", "s_bfm_b64", "s_cmp_eq_u32"):
+            for operands in (("0x12345", "0x23456"), ("0x12345", "0x12345")):
+                with self.subTest(op=op, operands=operands):
+                    with unittest.mock.patch.object(d, "_src32", side_effect=operands):
+                        line = d.emit(d.random.Random(2), op)
+                    sources = line.split(" ", 1)[1].split(", ")[-2:]
+                    literals = [source for source in sources if source.startswith("0x")]
+                    self.assertEqual(len(set(literals)), 1, line)
+                    self.assertEqual(len(literals), 2 if operands[0] == operands[1] else 1, line)
 
 
 class Branches(unittest.TestCase):

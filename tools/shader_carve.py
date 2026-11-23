@@ -86,10 +86,17 @@ def main(argv=None) -> int:
         ap.error(f"{src} is empty")
     if os.path.isfile(out):
         ap.error(f"{out} is a file, not a folder")
-    os.makedirs(out, exist_ok=True)
+    try:
+        os.makedirs(out, exist_ok=True)
+    except OSError as e:  # a regular file where a parent folder is expected
+        ap.error(f"cannot create {out}: {e.strerror or e}")
     index, seen, used, bad = [], {}, set(), 0
     with open(src, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
-        for mt in ENTRY.finditer(m):
+        pos = 0
+        while (mt := ENTRY.search(m, pos)) is not None:
+            # A rejected header is rescanned past its name (a real entry can start inside it); a carved
+            # shader resumes after its stored bytes, so deflate output never becomes a name or a match.
+            pos = mt.end(1) + 1
             name = mt.group(1).decode("latin-1")
             stored = struct.unpack("<I", mt.group(3))[0]
             size = struct.unpack("<I", mt.group(5))[0]
@@ -111,15 +118,19 @@ def main(argv=None) -> int:
             except ValueError:
                 bad += 1
                 continue
+            pos = start + stored
             fname = file_name(name, seen, used)
             with open(os.path.join(out, fname), "wb") as f:
                 f.write(data)
             index.append({"name": name, "file": fname, "offset": mt.start(), "kind": mt.group(2)[0],
                           "stage": stage, "sm": sm, "size": size, "parts": {k: v[1] for k, v in p.items()}})
+    if not index:
+        print(f"ERROR: no shaders carved from {src} (rejected candidates: {bad}).", file=sys.stderr)
+        return 1
     # make_game.py takes index.json as proof the carve finished: write it last, under another name, then rename.
     with tempfile.TemporaryDirectory(dir=out, prefix=".shader-index-") as staging:
         tmp = os.path.join(staging, "index.json")
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             json.dump(index, f, indent=1)
             f.flush()
             os.fsync(f.fileno())

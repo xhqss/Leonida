@@ -2,7 +2,7 @@
 
 > [!NOTE]
 > 英文文档（[`README.md`](../../../README.md)、[`CONTRIBUTING.md`](../../../CONTRIBUTING.md) 和
-> [`docs/README.md`](../../README.md)）是**权威版本**。本文只汇总稳定的安装与构建说明（与 commit `e7584c5` 同步）。
+> [`docs/README.md`](../../README.md)）是**权威版本**。本文只汇总稳定的安装与构建说明（与 commit `003e7812` 同步）。
 > 项目每日进展请查看 [`README.md`](../../../README.md)。
 
 ## Leonida 是什么
@@ -48,14 +48,16 @@ Leonida 是一个把 Xbox Series 版 Grand Theft Auto VI **静态重编译**到 
 
 3. 双击 **`Build.bat`**。
 
-脚本会自动查找你的拷贝（Downloads、Desktop、Documents、Games、用户目录以及每个盘的根目录往下两层），
-检查前置条件和可用空间，结果写到 `Documents\Leonida`。构建中断后重新运行即可从断点继续。
+脚本会自动查找你的拷贝（Downloads、Desktop、Documents（也包括 OneDrive 等 Windows 实际存放它的位置）、Games、
+用户目录以及每个盘的根目录往下两层），检查前置条件和可用空间，结果写到 `Documents\Leonida`。构建中断后重新运行即可从断点继续。
 
 ### 命令行（`make_game.py`）
 
 ```powershell
 python -I make_game.py --find                             # 列出本机找到的拷贝
+python -I make_game.py --pick                             # 在文件夹对话框里选择游戏目录
 python -I make_game.py --check                            # 校验游戏文件，不构建
+python -I make_game.py --check --full-check               # 另外比对每个文件的 SHA-256（较慢）
 python -I make_game.py --game "D:\path\to\package" --out "D:\Games\Leonida" --work "E:\leonida-work"
 python -I make_game.py --stages shaders,assets            # 只跑指定阶段
 python -I make_game.py --game "D:\path\to\package" --wav  # 额外把 Ogg Opus 解码为 PCM WAV（很大）
@@ -64,11 +66,26 @@ python -I make_game.py --wave64-emulate auto              # auto（默认）、o
 
 阶段顺序：`check` → `shaders` → `assets` → `runtime` → `pipelines`。
 
-- **`--wave64-emulate`**：在 32 lane 子组的 GPU（NVIDIA、Intel）上模拟 compute/mesh 的 wave64。
-  默认 `auto` 会询问 `vulkaninfo`，需要时自动启用。
+- **`--wave64-emulate`**：决定是否把 wave64 compute/mesh 着色器翻译成在任意子组宽度下都精确的版本
+  （见 [`docs/design.md`](../../design.md) 中 Wave64 emulation 一行）。NVIDIA 和 Intel GPU 是 32 lane 子组，
+  需要它。默认 `auto` 会询问 `vulkaninfo`（属于 Vulkan SDK），除非所有 GPU 都报告 64 宽子组、或无法判断，
+  都会启用；运行时实际使用的 GPU 无法以 64 宽运行 compute/mesh 时也会启用。有一个例外会让它保持关闭：当运行时的
+  GPU 是 RDNA2 独显或核显（RX 6000、Ryzen 6000/7000/9000 的核显）、使用 AMD Windows 驱动并原生运行 wave64 时
+  ——该驱动的着色器编译器在模拟 LDS 代码上会崩溃（#857）；否则 Intel 核显搭配 RX 6000 卡时也会被启用。
+  该模式会保存在翻译后的着色器旁边，切换它会重新翻译。使用 `auto` 时，之前用过模拟的工作目录在后续翻译和重试中
+  会继续使用模拟，即使当前 GPU 支持原生 wave64；要用原生方式翻译，使用 `--wave64-emulate off`。
+- **四个 fallback 标志**：它们同样转发给翻译器、保存在翻译后的着色器旁边，切换会重新翻译：
+  `--no-float-controls`（去掉 `SignedZeroInfNanPreserve`，用于设备在缺少
+  `shaderSignedZeroInfNanPreserveFloat32` 时会跳过着色器；需要 PR #664 的翻译器标志）、
+  `--bary-fallback`（从插值输入读取原始重心坐标，用于没有 `VK_KHR_fragment_shader_barycentric` 的设备）、
+  `--texel-offset-fallback`（把 `image_sample*_o` 的偏移折叠进坐标，用于没有 `VK_KHR_maintenance8` 的设备）和
+  `--mesh-compute`（把 mesh 着色器当作 compute，用于没有 `VK_EXT_mesh_shader` 的设备）。每个标志的说明见
+  [`docs/design.md`](../../design.md)。
 - **`--work`**：建议指向至少有 350 GB 空闲的磁盘；`shaders` 阶段最慢，默认使用一半 CPU 线程（`--jobs` 可调）。
 - **Linux 与 Wine/Proton**：`make_game.py` 也能在 Linux 上运行。`runtime` 阶段会在 Linux 上用 clang-cl 和
-  lld-link（LLVM 19+）把 loader 交叉编译到 `runtime/build/windows`，依赖 `XWIN_DIR` 或
+  lld-link（LLVM 19+，但 22.1.7 和 22.1.8 有已知问题，见 [docs/testing.md](../../testing.md#known-problems)；
+  命令名用不带版本后缀的，或五个 LLVM 工具都用同一版本后缀，例如 `clang-cl-21`）把 loader 交叉编译到
+  `runtime/build/windows`，依赖 `XWIN_DIR` 或
   `~/.local/share/xwin-sdk` 里的 MSVC CRT 和 Windows SDK
   （[docs/testing.md](../../testing.md#the-windows-runtime-on-linux-under-wine-or-proton) 有一次性 `xwin` 命令）；
   缺少这些时该阶段不参与默认 stages，显式请求会先列出缺什么。

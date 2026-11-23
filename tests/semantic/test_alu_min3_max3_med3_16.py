@@ -53,7 +53,7 @@ INT_OPS = (
     "v_med3_i16",
     "v_med3_u16",
 )
-FLOAT_OPS = ("v_min3_f16", "v_max3_f16")
+FLOAT_OPS = ("v_min3_f16", "v_max3_f16", "v_med3_f16")
 ALL_OPS = INT_OPS + FLOAT_OPS
 
 # Hand-written multi-instruction RDNA2 pixel shader fixture covering all 8 opcodes into lo/hi VGPR halves.
@@ -164,9 +164,18 @@ def ref_f16(op: str, a_bits: int, b_bits: int, c_bits: int, mods: str = "") -> i
     non_nan = [v for v in vals if not math.isnan(v)]
     if not non_nan:
         return 0x7E00
-    pick = min if "min3" in op else max
-    # RDNA2 orders -0.0 below +0.0.
-    chosen = pick(non_nan, key=lambda v: (v, math.copysign(1.0, v)))
+    if "med3" in op:
+        if len(non_nan) < 3:
+            # With any NaN operand, RDNA2 hardware returns min3(x, y, z)
+            chosen = min(non_nan, key=lambda v: (v, math.copysign(1.0, v)))
+        else:
+            chosen = sorted(non_nan, key=lambda v: (v, math.copysign(1.0, v)))[1]
+    elif "min3" in op:
+        chosen = min(non_nan, key=lambda v: (v, math.copysign(1.0, v)))
+    elif "max3" in op:
+        chosen = max(non_nan, key=lambda v: (v, math.copysign(1.0, v)))
+    else:
+        raise ValueError(op)
     if "mul:2" in mods:
         chosen *= 2.0
     elif "mul:4" in mods:
@@ -274,6 +283,9 @@ class ReferenceTests(unittest.TestCase):
         self.assertEqual(ref_f16("v_min3_f16", 0x3C00, 0x8000, 0x7E00), 0x8000)
         self.assertEqual(ref_f16("v_max3_f16", 0xBC00, 0x0000, 0x8000), 0x0000)
         self.assertEqual(ref_f16("v_min3_f16", 0x0000, 0x8000, 0x3C00), 0x8000)
+        self.assertEqual(ref_f16("v_med3_f16", 0x3C00, 0x8000, 0xBC00), 0x8000)
+        self.assertEqual(ref_f16("v_med3_f16", 0x3C00, 0x7E00, 0xBC00), 0xBC00)
+        self.assertEqual(ref_f16("v_med3_f16", 0x3C00, 0x7E00, 0xBC00, mods="clamp"), 0x0000)
 
 
 class FixtureTests(unittest.TestCase):
@@ -476,20 +488,93 @@ class Float16SpecialsAndModsTests(unittest.TestCase):
         self.assertEqual(got_neg_clamp, merge_half(0x0000, 1))
 
 
-class UnsupportedTests(unittest.TestCase):
-    """Reject unmodelled integer clamp and non-VGPR op_sel destinations."""
+class ClampSupportTests(unittest.TestCase):
+    """Verify that integer and float min3/max3/med3 accept VOP3 clamp."""
 
-    def test_int_clamp_rejected(self):
+    def test_int_clamp_supported(self):
         for op in INT_OPS:
             with self.subTest(op=op):
-                asm = (
-                    "; test_unsupported_clamp\n"
-                    "\tv_mov_b32 v1, 1\n\tv_mov_b32 v2, 2\n\tv_mov_b32 v3, 3\n"
-                    f"\t{op} v0, v1, v2, v3 clamp\n"
-                    "\texp mrt0 v0, v0, v0, v0 done vm\n\ts_endpgm\n"
-                )
-                with self.assertRaises(rdna2spirv.Unsupported):
-                    translate_asm(asm)
+                w1, w2, w3 = (0x0005, 0x0010, 0xFFFF)
+                got_noclamp = run_insn(op, (w1, w2, w3))
+                got_clamp = run_insn(op, (w1, w2, w3), tail_mods="clamp")
+                self.assertEqual(got_noclamp, got_clamp)
+                got_dhi_clamp = run_insn(op, (w1, w2, w3), tail_mods="op_sel:[0,0,0,1] clamp")
+                self.assertEqual(got_dhi_clamp, merge_half(got_clamp & MASK16, 1))
+
+    def test_int_clamp_dirty_sentinels(self):
+        # Verify clamp range-invariance and destination half preservation with dirty sentinel values.
+        for op in INT_OPS:
+            with self.subTest(op=op):
+                w1, w2, w3 = (0xDEAD0005, 0xBEEF0010, 0x5A5AFFFF)
+                # Low half destination preserves 0xDEAD in high half
+                got_lo = run_insn(op, (w1, w2, w3), tail_mods="clamp", old=0xDEAD3800)
+                ref_lo = ref_word(op, w1, w2, w3, (0, 0, 0), dst_hi=0, old=0xDEAD3800)
+                self.assertEqual(got_lo, ref_lo)
+                self.assertEqual(got_lo >> 16, 0xDEAD)
+
+                # High half destination preserves 0x3800 in low half
+                got_hi = run_insn(op, (w1, w2, w3), tail_mods="op_sel:[0,0,0,1] clamp", old=0xDEAD3800)
+                ref_hi = ref_word(op, w1, w2, w3, (0, 0, 0), dst_hi=1, old=0xDEAD3800)
+                self.assertEqual(got_hi, ref_hi)
+                self.assertEqual(got_hi & MASK16, 0x3800)
+
+    def test_f16_clamp_all_ops(self):
+        # In-range [0.0, 1.0], upper saturation (> 1.0 -> 1.0), lower saturation (< 0.0 -> +0.0)
+        # across all three f16 opcodes.
+        for op in FLOAT_OPS:
+            with self.subTest(op=op):
+                # in-range: 0.25, 0.5, 0.75
+                w_mid = (float_to_f16_bits(0.25), float_to_f16_bits(0.5), float_to_f16_bits(0.75))
+                got_mid = run_insn(op, w_mid, tail_mods="clamp")
+                self.assertEqual(got_mid, ref_word(op, *w_mid, mods="clamp"))
+
+                # upper saturation: 1.5, 2.0, 3.0
+                w_hi = (float_to_f16_bits(1.5), float_to_f16_bits(2.0), float_to_f16_bits(3.0))
+                got_hi = run_insn(op, w_hi, tail_mods="clamp")
+                self.assertEqual(got_hi, ref_word(op, *w_hi, mods="clamp"))
+                self.assertEqual(got_hi & MASK16, float_to_f16_bits(1.0))
+
+                # lower saturation: -2.0, -1.0, -0.5
+                w_lo = (float_to_f16_bits(-2.0), float_to_f16_bits(-1.0), float_to_f16_bits(-0.5))
+                got_lo = run_insn(op, w_lo, tail_mods="clamp")
+                self.assertEqual(got_lo, ref_word(op, *w_lo, mods="clamp"))
+                self.assertEqual(got_lo & MASK16, 0x0000)
+
+                # negative zero clamps to +0.0
+                w_neg_zero = (0x8000, 0x8000, 0x8000)
+                got_nz = run_insn(op, w_neg_zero, tail_mods="clamp")
+                self.assertEqual(got_nz & MASK16, 0x0000)
+
+    def test_f16_clamp_nan_and_sentinels(self):
+        # NaN operands with DX10 clamp and dirty sentinel destination halves
+        w_nan = (0x7E00, float_to_f16_bits(2.0), float_to_f16_bits(-1.0))
+        # v_min3_f16: min(2.0, -1.0) = -1.0 -> clamp = +0.0
+        got_min = run_insn("v_min3_f16", w_nan, tail_mods="clamp", old=0xDEAD3800)
+        self.assertEqual(got_min, 0xDEAD0000)
+
+        # v_max3_f16: max(2.0, -1.0) = 2.0 -> clamp = 1.0 (0x3C00)
+        got_max = run_insn("v_max3_f16", w_nan, tail_mods="clamp", old=0xDEAD3800)
+        self.assertEqual(got_max, 0xDEAD3C00)
+
+        # v_med3_f16: NaN fallback to min3 = -1.0 -> clamp = +0.0
+        got_med = run_insn("v_med3_f16", w_nan, tail_mods="clamp", old=0xDEAD3800)
+        self.assertEqual(got_med, 0xDEAD0000)
+
+        # High half write with op_sel:[1,1,1,1] clamp leaves 0xBEEF in low half
+        w1_packed = float_to_f16_bits(0.5) << 16 | 0x7E00
+        w2_packed = float_to_f16_bits(-2.0) << 16 | 0x4000
+        w3_packed = float_to_f16_bits(0.5) << 16 | 0xBC00
+        # median of high halves (0.5, -2.0, 0.5) is 0.5, clamped to 0.5 (0x3800)
+        got_med_hi = run_insn(
+            "v_med3_f16",
+            (w1_packed, w2_packed, w3_packed),
+            tail_mods="op_sel:[1,1,1,1] clamp",
+            old=0x1234BEEF,
+        )
+        self.assertEqual(got_med_hi, (float_to_f16_bits(0.5) << 16) | 0xBEEF)
+
+class UnsupportedTests(unittest.TestCase):
+    """Reject non-VGPR op_sel destinations."""
 
     def test_non_vgpr_opsel_dst_rejected(self):
         for op in ALL_OPS:

@@ -27,6 +27,8 @@ import os
 import re
 import subprocess
 import sys
+from itertools import combinations
+from pathlib import Path
 
 LOCAL_SIZE = 64
 IN_VERTS = {"InputPoints": 1, "InputLines": 2, "InputLinesAdjacency": 4, "Triangles": 3,
@@ -110,7 +112,7 @@ def layout_of(text):
             "input_vars": inputs, "output_vars": outputs, "builtins": builtins}
 
 
-def rewrite(text):
+def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[str, int | str | list[str]]]:
     """Return (compute module text, layout dict for --layout)."""
     lay = layout_of(text)
     defs, _ = parse(text)
@@ -128,13 +130,15 @@ def rewrite(text):
     def k(v):
         return f"%gsc_k{v}"
 
+    # Before SPIR-V 1.3, storage buffers use Uniform with BufferBlock in core SPIR-V.
+    buffer_storage, buffer_block = ("StorageBuffer", "Block") if version >= (1, 3) else ("Uniform", "BufferBlock")
     decos = ["OpDecorate %gsc_gid BuiltIn GlobalInvocationId",
              "OpDecorate %gsc_rt_v4 ArrayStride 16", "OpDecorate %gsc_rt_u ArrayStride 4",
              "OpDecorate %gsc_pad ArrayStride 4",
-             "OpDecorate %gsc_in_t Block", "OpMemberDecorate %gsc_in_t 0 Offset 0",
+             f"OpDecorate %gsc_in_t {buffer_block}", "OpMemberDecorate %gsc_in_t 0 Offset 0",
              "OpMemberDecorate %gsc_in_t 1 Offset 4", "OpMemberDecorate %gsc_in_t 2 Offset 16",
-             "OpDecorate %gsc_rec_t Block", "OpMemberDecorate %gsc_rec_t 0 Offset 0",
-             "OpDecorate %gsc_meta_t Block", "OpMemberDecorate %gsc_meta_t 0 Offset 0",
+             f"OpDecorate %gsc_rec_t {buffer_block}", "OpMemberDecorate %gsc_rec_t 0 Offset 0",
+             f"OpDecorate %gsc_meta_t {buffer_block}", "OpMemberDecorate %gsc_meta_t 0 Offset 0",
              "OpDecorate %gsc_in DescriptorSet 1", "OpDecorate %gsc_in Binding 0", "OpDecorate %gsc_in NonWritable",
              "OpDecorate %gsc_rec DescriptorSet 1", "OpDecorate %gsc_rec Binding 1",
              "OpDecorate %gsc_meta DescriptorSet 1", "OpDecorate %gsc_meta Binding 2"]
@@ -147,24 +151,27 @@ def rewrite(text):
               f"%gsc_pad = OpTypeArray {uint} {k(3)}",
               f"%gsc_in_t = OpTypeStruct {uint} %gsc_pad %gsc_rt_v4",
               "%gsc_rec_t = OpTypeStruct %gsc_rt_v4", "%gsc_meta_t = OpTypeStruct %gsc_rt_u",
-              "%gsc_ptr_in_t = OpTypePointer StorageBuffer %gsc_in_t",
-              "%gsc_ptr_rec_t = OpTypePointer StorageBuffer %gsc_rec_t",
-              "%gsc_ptr_meta_t = OpTypePointer StorageBuffer %gsc_meta_t",
-              f"%gsc_ptr_sb_v4 = OpTypePointer StorageBuffer {v4}",
-              f"%gsc_ptr_sb_u = OpTypePointer StorageBuffer {uint}",
-              f"%gsc_ptr_sb_f = OpTypePointer StorageBuffer {f32}",
+              f"%gsc_ptr_in_t = OpTypePointer {buffer_storage} %gsc_in_t",
+              f"%gsc_ptr_rec_t = OpTypePointer {buffer_storage} %gsc_rec_t",
+              f"%gsc_ptr_meta_t = OpTypePointer {buffer_storage} %gsc_meta_t",
+              f"%gsc_ptr_sb_v4 = OpTypePointer {buffer_storage} {v4}",
+              f"%gsc_ptr_sb_u = OpTypePointer {buffer_storage} {uint}",
+              f"%gsc_ptr_sb_f = OpTypePointer {buffer_storage} {f32}",
               f"%gsc_ptr_pv_v4 = OpTypePointer Private {v4}", f"%gsc_ptr_pv_f = OpTypePointer Private {f32}",
               f"%gsc_ptr_pv_u = OpTypePointer Private {uint}",
               "%gsc_gid = OpVariable %gsc_ptr_in_v3u Input",
-              "%gsc_in = OpVariable %gsc_ptr_in_t StorageBuffer",
-              "%gsc_rec = OpVariable %gsc_ptr_rec_t StorageBuffer",
-              "%gsc_meta = OpVariable %gsc_ptr_meta_t StorageBuffer",
+              f"%gsc_in = OpVariable %gsc_ptr_in_t {buffer_storage}",
+              f"%gsc_rec = OpVariable %gsc_ptr_rec_t {buffer_storage}",
+              f"%gsc_meta = OpVariable %gsc_ptr_meta_t {buffer_storage}",
               f"%gsc_n = OpVariable %gsc_ptr_pv_u Private {k(0)}"]
     out_vars = {v: f"%gsc_out{i}" for i, v in enumerate(outs)}
     types += [f"{nv} = OpVariable %gsc_ptr_pv_v4 Private" for nv in out_vars.values()]
     in_slot = {v: i for i, v in enumerate(ins)}
     gone = set(ins) | set(outs) | {v for v, b in builtins.items() if b in ("PrimitiveId", "InvocationId")}
-    new_globals = ["%gsc_gid", "%gsc_in", "%gsc_rec", "%gsc_meta", "%gsc_n"] + list(out_vars.values())
+    capture_interface = ["%gsc_gid"]
+    # Before SPIR-V 1.4, the interface only lists Input and Output variables.
+    if version >= (1, 4):
+        capture_interface += ["%gsc_in", "%gsc_rec", "%gsc_meta", "%gsc_n"] + list(out_vars.values())
 
     count = 0
 
@@ -175,14 +182,17 @@ def rewrite(text):
 
     out = []
     entry_label = None
-    state = "header"        # header -> body (in main, entry block) -> after the entry check
+    cur_block = None
+    block_tail = {}
+    main_start = None
+    state = "header"        # header -> main_entry -> main_vars -> main -> other
     for ln in text.splitlines():
         s = ln.strip()
         if s == "OpCapability Geometry":
             continue
         m = re.match(r"OpEntryPoint Geometry (%\w+) (\"[^\"]*\")(.*)$", s)
         if m:
-            iface = [v for v in m.group(3).split() if v not in gone] + new_globals
+            iface = [v for v in m.group(3).split() if v not in gone] + capture_interface
             out += [f"OpEntryPoint GLCompute {m.group(1)} {m.group(2)} {' '.join(iface)}",
                     f"OpExecutionMode {m.group(1)} LocalSize {LOCAL_SIZE} 1 1"]
             continue
@@ -203,13 +213,25 @@ def rewrite(text):
                 types = []
             if m.group(1) == main:
                 state = "main_entry"
+                main_start = len(out)
             out.append(ln)
             continue
         if s == "OpFunctionEnd":
+            if state in ("main", "main_vars") and main_start is not None and block_tail:
+                # Any block split by the primitive-count check or by OpEmitVertex now terminates in its final
+                # merge label; update every OpPhi predecessor (including loop-header back-edges) to that label.
+                for idx in range(main_start, len(out)):
+                    m_phi = re.match(r"^(\s*%\w+\s*=\s*OpPhi\s+%\w+)\s+(.*)$", out[idx])
+                    if m_phi:
+                        ops = m_phi.group(2).split()
+                        ops[1::2] = [block_tail.get(lbl, lbl) for lbl in ops[1::2]]
+                        out[idx] = f"{m_phi.group(1)} {' '.join(ops)}"
             state = "other"
+            cur_block = None
         if state == "main_entry" and re.match(r"%\w+ = OpLabel$", s):
             state = "main_vars"
             entry_label = s.split()[0]
+            cur_block = entry_label
             out.append(ln)
             continue
         if state == "main_vars" and not re.match(r"%\w+ = OpVariable ", s):
@@ -223,19 +245,17 @@ def rewrite(text):
                     f"%gsc_inbase = OpIMul {uint} %gsc_prim {k(vin)}",
                     f"%gsc_recbase = OpIMul {uint} %gsc_prim {k(mv)}",
                     f"%gsc_metabase = OpIMul {uint} %gsc_prim {k(mv + 1)}"]
+            block_tail[entry_label] = "%gsc_body"
         if state not in ("main", "main_vars"):
             out.append(ln)
             continue
         # ---- the body of main ----
-        # The primitive-count check splits the entry block: what followed its variables now sits in %gsc_body, so
-        # an OpPhi naming the entry label as a predecessor names %gsc_body instead.
-        m = re.match(r"(%\w+ = OpPhi %\w+) (.*)$", s)
-        if m:
-            ops = m.group(2).split()
-            ops[1::2] = ["%gsc_body" if lbl == entry_label else lbl for lbl in ops[1::2]]
-            s = f"{m.group(1)} {' '.join(ops)}"
-            ln = s
-        m = re.match(r"(%\w+) = OpAccessChain (%\w+) (%\w+) (.*)$", s)
+        m_lbl = re.match(r"(%\w+) = OpLabel$", s)
+        if m_lbl:
+            cur_block = m_lbl.group(1)
+            out.append(ln)
+            continue
+        m = re.match(r"(%\w+) = Op(?:InBounds)?AccessChain (%\w+) (%\w+) (.*)$", s)
         if m and m.group(3) in in_slot:
             idx = m.group(4).split()
             vtx = idx[0]
@@ -252,31 +272,45 @@ def rewrite(text):
             ptr = "%gsc_ptr_pv_f" if m.group(2) in float_ptrs else "%gsc_ptr_pv_v4"
             out.append(f"{m.group(1)} = OpAccessChain {ptr} {out_vars[m.group(3)]} {m.group(4)}")
             continue
-        m = re.match(r"(%\w+) = OpLoad (%\w+) (%\w+)$", s)
+        m = re.match(r"(%\w+) = OpLoad (%\w+) (%\w+)(?:\s+.*)?$", s)
         if m and builtins.get(m.group(3)) in ("PrimitiveId", "InvocationId"):
             val = "%gsc_prim" if builtins[m.group(3)] == "PrimitiveId" else k(0)
             out.append(f"{m.group(1)} = OpBitcast {m.group(2)} {val}" if m.group(2) != uint
                        else f"{m.group(1)} = OpCopyObject {uint} {val}")
             continue
-        for v in list(in_slot) + list(out_vars):
+        for v in list(in_slot) + list(out_vars) + sorted(gone - set(in_slot) - set(out_vars)):
             if re.search(rf"{re.escape(v)}\b", s):
-                m2 = re.match(rf"OpStore {re.escape(v)} (%\w+)$", s)
+                m2 = re.match(rf"OpStore {re.escape(v)} (%\w+)(?:\s+.*)?$", s)
                 if v in out_vars and m2:
                     s = f"OpStore {out_vars[v]} {m2.group(1)}"
                     break
                 raise Unsupported(f"unhandled use of {v}: {s}")
         if s == "OpEmitVertex":
-            n, a = tmp(), tmp()
-            out += [f"{n} = OpLoad {uint} %gsc_n", f"{a} = OpIAdd {uint} %gsc_recbase {n}"]
-            for i, nv in enumerate(out_vars.values()):
-                b, c, val, p = tmp(), tmp(), tmp(), tmp()
-                out += [f"{b} = OpIMul {uint} {a} {k(nout)}", f"{c} = OpIAdd {uint} {b} {k(i)}",
-                        f"{val} = OpLoad {v4} {nv}", f"{p} = OpAccessChain %gsc_ptr_sb_v4 %gsc_rec {k(0)} {c}",
-                        f"OpStore {p} {val}"]
+            # Guard stores and counter increment on n < OutputVertices so over-emitting drops extra vertices
+            # instead of overflowing into primitive p+1's record/meta slots; %gsc_n stays <= mv for OpEndPrimitive
+            # and OpReturn as well (SHADER-617).
+            n, ok, lbl_do, lbl_end = tmp(), tmp(), tmp(), tmp()
+            out += [f"{n} = OpLoad {uint} %gsc_n",
+                    f"{ok} = OpULessThan {boolt} {n} {k(mv)}",
+                    f"OpSelectionMerge {lbl_end} None",
+                    f"OpBranchConditional {ok} {lbl_do} {lbl_end}",
+                    f"{lbl_do} = OpLabel"]
+            if out_vars:
+                a = tmp()
+                out.append(f"{a} = OpIAdd {uint} %gsc_recbase {n}")
+                for i, nv in enumerate(out_vars.values()):
+                    b, c, val, p = tmp(), tmp(), tmp(), tmp()
+                    out += [f"{b} = OpIMul {uint} {a} {k(nout)}", f"{c} = OpIAdd {uint} {b} {k(i)}",
+                            f"{val} = OpLoad {v4} {nv}", f"{p} = OpAccessChain %gsc_ptr_sb_v4 %gsc_rec {k(0)} {c}",
+                            f"OpStore {p} {val}"]
             d, e, q, n1 = tmp(), tmp(), tmp(), tmp()
             out += [f"{d} = OpIAdd {uint} %gsc_metabase {n}", f"{e} = OpIAdd {uint} {d} {k(1)}",
                     f"{q} = OpAccessChain %gsc_ptr_sb_u %gsc_meta {k(0)} {e}", f"OpStore {q} {k(0)}",
-                    f"{n1} = OpIAdd {uint} {n} {k(1)}", f"OpStore %gsc_n {n1}"]
+                    f"{n1} = OpIAdd {uint} {n} {k(1)}", f"OpStore %gsc_n {n1}",
+                    f"OpBranch {lbl_end}",
+                    f"{lbl_end} = OpLabel"]
+            if cur_block is not None:
+                block_tail[cur_block] = lbl_end
             continue
         if s == "OpEndPrimitive":
             # flag the last emitted vertex: meta[base + 1 + (n - 1)]; with none emitted this writes the count slot,
@@ -313,19 +347,32 @@ def main(argv):
     if len(args) != 2:
         print(USAGE, file=sys.stderr)
         return 2
+    paths = [("input", args[0]), ("SPIR-V output", args[1])]
+    if lay_path:
+        paths.append(("--layout output", lay_path))
+    try:
+        resolved = [(name, Path(path).resolve()) for name, path in paths]
+        for (left_name, left), (right_name, right) in combinations(resolved, 2):
+            if left == right or (left.exists() and right.exists() and left.samefile(right)):
+                print(f"{left_name} and {right_name} refer to the same file: {left}", file=sys.stderr)
+                return 2
+    except (OSError, RuntimeError, ValueError) as e:
+        print(f"cannot check input/output paths: {e}", file=sys.stderr)
+        return 2
     dis = os.environ.get("SPIRV_DIS", "spirv-dis")
     asm = os.environ.get("SPIRV_AS", "spirv-as")
     text = subprocess.run([dis, "--raw-id", args[0]], check=True, capture_output=True, text=True).stdout
+    ver = re.search(r"; Version: (\d+)\.(\d+)", text)
+    version = (int(ver[1]), int(ver[2])) if ver else (1, 5)
     try:
-        new, lay = rewrite(text)
+        new, lay = rewrite(text, version=version)
     except Unsupported as e:
         print(f"{args[0]}: not supported: {e}", file=sys.stderr)
         return 1
-    ver = re.search(r"; Version: (\d+)\.(\d+)", text)
-    target = f"spv{ver.group(1)}.{ver.group(2)}" if ver else "vulkan1.2"
+    target = f"spv{version[0]}.{version[1]}" if ver else "vulkan1.2"
     subprocess.run([asm, "--target-env", target, "-", "-o", args[1]], input=new, check=True, text=True)
     if lay_path:
-        with open(lay_path, "w") as f:
+        with open(lay_path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(lay, f, indent=1)
     print(json.dumps(lay))
     return 0

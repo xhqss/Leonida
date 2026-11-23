@@ -1,4 +1,4 @@
-"""Bad-input errors for the index/carve/audio tools: a message, not a traceback.
+"""Bad-input errors for the index/carve/audio/coverage tools: a message, not a traceback.
 
     python -I tests/test_bad_input_errors.py
 
@@ -13,6 +13,24 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# A machine-readable ISA spec of our own making, small enough to hand-write: one RDNA 2 instruction,
+# enough for isa_coverage to reach its report with no game data involved.
+MINIMAL_ISA_XML = """<?xml version="1.0"?>
+<isa>
+  <ISA>
+    <Architecture><ArchitectureName>AMD RDNA 2</ArchitectureName></Architecture>
+    <Instructions>
+      <Instruction>
+        <InstructionName>V_ADD_F32</InstructionName>
+        <InstructionEncodings>
+          <InstructionEncoding><EncodingName>ENC_VOP3_INST</EncodingName></InstructionEncoding>
+        </InstructionEncodings>
+      </Instruction>
+    </Instructions>
+  </ISA>
+</isa>
+"""
+
 
 def run(tool, *args):
     return subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", tool), *args],
@@ -24,6 +42,11 @@ class BadInputTest(unittest.TestCase):
         self.assertNotEqual(p.returncode, 0, p.stdout)
         self.assertIn(text.lower(), p.stderr.lower())
         self.assertNotIn("traceback", p.stderr.lower())
+
+    def assert_error_exit_2(self, p, path):
+        """An argparse rejection: exit 2, the path and a reason on stderr, no traceback."""
+        self.assert_error(p, path)
+        self.assertEqual(p.returncode, 2, p.stderr)
 
     def test_empty_archive_in_scan_tools(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -72,6 +95,53 @@ class BadInputTest(unittest.TestCase):
             with open(bank, "wb") as f:
                 f.write(bytes(64))
             self.assert_error(run("audio_config.py", bank), "no audio-config records")
+
+    def test_isa_coverage_isa_file_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "no-such.xml")
+            self.assert_error_exit_2(run("isa_coverage.py", "--isa", missing), missing)
+
+    def test_isa_coverage_isa_path_is_a_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assert_error_exit_2(run("isa_coverage.py", "--isa", tmp), tmp)
+
+    def test_isa_coverage_isa_xml_malformed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = os.path.join(tmp, "bad.xml")
+            with open(bad, "w", encoding="utf-8", newline="\n") as f:
+                f.write("nope")
+            self.assert_error_exit_2(run("isa_coverage.py", "--isa", bad), bad)
+
+    def test_isa_coverage_isa_xml_with_no_instructions(self):
+        """Well-formed XML that is not the ISA spec: zero instructions is one error line, not a ZeroDivisionError."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for i, content in enumerate(("<a/>", "<isa><ISA/></isa>",
+                                         "<isa><Document><SchemaVersion>1</SchemaVersion></Document></isa>")):
+                with self.subTest(content=content):
+                    xml = os.path.join(tmp, f"no-instructions-{i}.xml")
+                    with open(xml, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(content)
+                    p = run("isa_coverage.py", "--isa", xml)
+                    self.assert_error_exit_2(p, xml)
+                    self.assertIn("no instructions", p.stderr.lower())
+
+    def test_isa_coverage_translator_file_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            isa = os.path.join(tmp, "isa.xml")
+            with open(isa, "w", encoding="utf-8", newline="\n") as f:
+                f.write(MINIMAL_ISA_XML)
+            missing = os.path.join(tmp, "no-such-translator.py")
+            self.assert_error_exit_2(run("isa_coverage.py", "--isa", isa, "--translator", missing), missing)
+
+    def test_isa_coverage_translator_not_utf8(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            isa = os.path.join(tmp, "isa.xml")
+            with open(isa, "w", encoding="utf-8", newline="\n") as f:
+                f.write(MINIMAL_ISA_XML)
+            latin = os.path.join(tmp, "latin1.py")
+            with open(latin, "wb") as f:
+                f.write(b"# caf\xe9: 0xff is never a UTF-8 lead byte\n\xff\n")
+            self.assert_error_exit_2(run("isa_coverage.py", "--isa", isa, "--translator", latin), latin)
 
 
 if __name__ == "__main__":

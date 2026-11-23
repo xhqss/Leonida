@@ -30,8 +30,18 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import time
 import zlib
+from contextlib import suppress
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+from zero_span import gap_split  # noqa: E402
 
 CHUNK = 1 << 20
 HEAD = 0x80
@@ -51,7 +61,14 @@ ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 def below_normal():
     if os.name == "nt":
         import ctypes
+        from ctypes import wintypes
+
         k = ctypes.windll.kernel32
+        # The current-process pseudo-handle is pointer-sized on 64-bit Windows.
+        k.GetCurrentProcess.argtypes = ()
+        k.GetCurrentProcess.restype = wintypes.HANDLE
+        k.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        k.SetPriorityClass.restype = wintypes.BOOL
         k.SetPriorityClass(k.GetCurrentProcess(), 0x00004000)
 
 
@@ -120,11 +137,9 @@ def scan_archive(path, start=None, limit=None):
                     pos = s + 1
                     continue
                 used = p - s - len(d.unused_data)
-                gap = m[last:s]
-                if gap.count(0) == len(gap):
-                    zero += len(gap)
-                else:
-                    unread += len(gap)
+                gap_zero, gap_unread = gap_split(m, last, s)
+                zero += gap_zero
+                unread += gap_unread
                 fields = page_fields(head)
                 total += 1
                 total_stored += used
@@ -132,11 +147,9 @@ def scan_archive(path, start=None, limit=None):
                 if fields:
                     rows.append({"source": path, "offset": s, "stored": used, "size": total_out, **fields})
                 last = pos = s + used
-            tail = m[last:end]
-            if tail.count(0) == len(tail):
-                zero += len(tail)
-            else:
-                unread += len(tail)
+            gap_zero, gap_unread = gap_split(m, last, end)
+            zero += gap_zero
+            unread += gap_unread
     span = end - start
     summary = {
         "input": path, "mode": "rpf", "start": start, "span": span, "streams": total,
@@ -155,7 +168,9 @@ def scan_directory(root, pattern=None):
     pattern = pattern or "*.bin"
     rows, files, total_size = [], 0, 0
     t0 = time.time()
-    for path in sorted(glob.glob(os.path.join(root, "**", pattern), recursive=True)):
+    # Escape only the caller's root: a folder named "carve[1]" would otherwise be read as a character
+    # class by glob and match nothing. The pattern (and "**") stays as the caller's glob.
+    for path in sorted(glob.glob(os.path.join(glob.escape(os.fspath(root)), "**", pattern), recursive=True)):
         if not os.path.isfile(path):
             continue
         size = os.path.getsize(path)
@@ -196,17 +211,38 @@ def _make_parent(path):
         os.makedirs(parent, exist_ok=True)
 
 
+def _publish(dest, write, newline):
+    """Write a report next to `dest` and swap it in, so a run that fails or is interrupted while writing (a
+    serialization error, a full disk, Ctrl+C) leaves the previous report as it was instead of a truncated one.
+    The result keeps the previous report's permission bits, or gets the usual ones for a new file."""
+    _make_parent(dest)
+    directory = os.path.dirname(os.path.abspath(dest))
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline=newline, dir=directory,
+                                         prefix=".navmesh_index-", suffix=".tmp", delete=False) as f:
+            temp = f.name
+            write(f)
+        os.chmod(temp, published_mode(dest))
+        os.replace(temp, dest)
+    except BaseException:
+        if temp is not None:
+            with suppress(OSError):
+                os.unlink(temp)
+        raise
+
+
 def write_outputs(rows, summary, out_path, csv_path):
-    _make_parent(out_path)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump({"summary": summary, "pages": rows}, f, indent=1)
+    _publish(out_path, lambda f: json.dump({"summary": summary, "pages": rows}, f, indent=1), "\n")
     written = []
     if csv_path:
-        _make_parent(csv_path)
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+
+        def write_csv(f):
             w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore", lineterminator="\n")
             w.writeheader()
             w.writerows(rows)
+
+        _publish(csv_path, write_csv, "")
         written.append(csv_path)
     return written
 
@@ -233,21 +269,13 @@ def offset(text):
     return value
 
 
-def same_report_path(first, second):
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def is_scanned_input(path, input_path, pattern):
     """True when a report path is one of the files the scan reads: writing it would destroy the input."""
     if same_report_path(path, input_path):
         return True
     if not os.path.isdir(input_path) or not os.path.isfile(path):
         return False
+    pattern = pattern or "*.bin"
     # Walk up from the report path and compare each folder like same_report_path does (normcase, realpath,
     # samefile), so a spelling that differs only in case, or goes through a link, is still inside the input.
     target = os.path.abspath(path)
@@ -255,17 +283,16 @@ def is_scanned_input(path, input_path, pattern):
     while not same_report_path(root, input_path):
         parent = os.path.dirname(root)
         if parent == root:
-            return False
+            break
         root = parent
-    pattern = pattern or "*.bin"
-    if (fnmatch.fnmatch(os.path.relpath(target, root), pattern)
-            or fnmatch.fnmatch(os.path.basename(target), pattern)):
-        return True
-    # The spelling may not match while the file is still one the scan reads: fnmatch folds case only on Windows,
-    # so CARVE/PAGE.BIN on a case-insensitive macOS or Linux volume, or a hard link, slips past the pattern. Ask
-    # the scan's own glob whether any file it reads is this one.
+    else:
+        if (fnmatch.fnmatch(os.path.relpath(target, root), pattern)
+                or fnmatch.fnmatch(os.path.basename(target), pattern)):
+            return True
+    # A different spelling or a hard link anywhere can still refer to a scanned file.
     return any(same_report_path(target, scanned)
-               for scanned in glob.iglob(os.path.join(input_path, "**", pattern), recursive=True))
+               for scanned in glob.iglob(
+                   os.path.join(glob.escape(os.fspath(input_path)), "**", pattern), recursive=True))
 
 
 def main() -> int:
@@ -287,8 +314,13 @@ def main() -> int:
     if a.csv and same_report_path(out_path, a.csv):
         ap.error("--out and --csv must refer to different files")
     for flag, path in (("--out", out_path), ("--csv", a.csv)):
+        if path and os.path.isdir(path):     # open() on a folder ends the run in a PermissionError traceback
+            ap.error(f"{flag} is a directory: {path}")
         if path and is_scanned_input(path, a.input, a.pattern):
             ap.error(f"{flag} would overwrite the input {path}")
+    if not os.path.exists(a.input):
+        print(f"ERROR: {a.input}: does not exist", file=sys.stderr)
+        return 2
     below_normal()
 
     if is_dir:

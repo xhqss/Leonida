@@ -2,8 +2,8 @@
 
 v_pk_add/sub_u16/i16, v_pk_mul_lo_u16, v_pk_mad_u16/i16 and v_pk_max/min_u16/i16. Result half 0 takes each source's
 half from op_sel[i], result half 1 from op_sel_hi[i] (defaults [0,..], [1,..]); each half wraps to 16 bits, and clamp
-(add, sub, mad) saturates it to the type's range. A constant reads as its low 16 bits; a constant whose high half
-op_sel would read is rejected. Each case translates a synthetic pixel shader with tools/rdna2spirv.py and runs it in
+(add, sub, mad) saturates it to the type's range. A constant operand reads as a 32-bit dword under op_sel/op_sel_hi
+(op_sel=0 selects bits [15:0], op_sel=1 selects bits [31:16], measured on gfx1036). Each case translates a synthetic pixel shader with tools/rdna2spirv.py and runs it in
 tests/semantic/spirv_mini_interp.py; D leaves through exp as 16-bit halves ORed into 0x40000000. Standard library
 only; no GPU, no game files.
 """
@@ -136,14 +136,35 @@ class PkInt16Tests(unittest.TestCase):
             with self.subTest(op=op):
                 self.assertEqual(run(f"{op} v0, v1, v2, v3 clamp", srcs), ref(op, srcs, clamp=True))
 
-    def test_constants_read_their_low_half(self):
-        # op_sel_hi:[1,0]: both result halves read the constant's low 16 bits.
+    def test_constant_operands_op_sel(self):
+        # Integer constants are treated as 32-bit dwords: op_sel selects bits [15:0] (0) or [31:16] (1).
+        # Positive inline constants zero-extend (5 -> 0x00000005: lo=5, hi=0).
+        # Default op_sel:[0,0] op_sel_hi:[1,1]: half 0 adds 5, half 1 adds 0.
+        self.assertEqual(run("v_pk_add_u16 v0, v1, 5", [0x00100020]), 0x00100025)
+        # Explicit op_sel_hi:[1,0]: both halves add 5.
         self.assertEqual(run("v_pk_add_u16 v0, v1, 5 op_sel_hi:[1,0]", [0x00100020]), 0x00150025)
-        self.assertEqual(run("v_pk_sub_i16 v0, v1, -1 op_sel_hi:[1,0]", [0x00100020]), 0x00110021)
+        # Positive inline constant 64 (0x00000040: lo=64, hi=0)
+        self.assertEqual(run("v_pk_add_u16 v0, v1, 64", [0x00100020]), 0x00100060)
+        # Negative inline constant -1 sign-extends to 0xFFFFFFFF (lo=0xFFFF, hi=0xFFFF).
+        self.assertEqual(run("v_pk_sub_i16 v0, v1, -1", [0x00100020]), 0x00110021)
+        self.assertEqual(run("v_pk_add_i16 v0, v1, -1", [0x00100020]), 0x000F001F)
+        # Negative inline constant -16 sign-extends to 0xFFFFFFF0 (lo=0xFFF0, hi=0xFFFF).
+        # op_sel:[0,0] op_sel_hi:[1,1]: half 0 subtracts 0xFFF0 (-16, adds 16 -> 0x0030), half 1 subtracts 0xFFFF (-1, adds 1 -> 0x0011).
+        self.assertEqual(run("v_pk_sub_i16 v0, v1, -16", [0x00100020]), 0x00110030)
+        # 32-bit literal 0x12345678: lo=0x5678, hi=0x1234.
+        self.assertEqual(run("v_pk_add_u16 v0, v1, 0x12345678", [0x00100020]), 0x12445698)
+        # 32-bit literal with op_sel permutation
+        self.assertEqual(run("v_pk_add_u16 v0, v1, 0x12345678 op_sel:[1,0] op_sel_hi:[1,0]", [0x00100020]), 0x56885688)
+        # 32-bit literal 0x80017fff: lo=0x7fff, hi=0x8001
+        self.assertEqual(run("v_pk_add_i16 v0, v1, 0x80017fff", [0x00100020]), 0x8011801f)
+        # clamp with constant operand
+        self.assertEqual(run("v_pk_add_u16 v0, v1, 5 clamp", [0xFFFF0001]), 0xFFFF0006)
+        self.assertEqual(run("v_pk_sub_u16 v0, v1, 5 clamp", [0x00040010]), 0x0004000b)
+        self.assertEqual(run("v_pk_sub_u16 v0, v1, 5 op_sel_hi:[1,0] clamp", [0x00040010]), 0x0000000b)
+        self.assertEqual(run("v_pk_mad_u16 v0, v1, 5, v2 clamp", [0x00100020, 0x00010002]), 0x000100a2)
 
     def test_rejected_forms(self):
-        for line in ("v_pk_add_u16 v0, v1, 5",                        # default op_sel_hi reads the high half
-                     "v_pk_add_u16 v0, v1, v2 neg_lo:[1,0]",
+        for line in ("v_pk_add_u16 v0, v1, v2 neg_lo:[1,0]",
                      "v_pk_max_u16 v0, v1, v2 clamp", "v_pk_mul_lo_u16 v0, v1, v2 clamp"):
             with self.subTest(line=line):
                 with self.assertRaises(rdna2spirv.Unsupported):

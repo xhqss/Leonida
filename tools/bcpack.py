@@ -364,12 +364,32 @@ def _unknown_blocks(e_roots, i_roots, unknown_e, unknown_i):
     return sum(1 for e, i in zip(e_roots, i_roots) if e in unknown_e or i in unknown_i)
 
 
-def _bc1_blocks(lanes, nblocks, provisional):
+def _resolve_bc_history(codec, default_confirmed, default_provisional, history):
+    """Merge or replace BC1/BC3/BC4/BC5 history tables when external `history` is provided."""
+    loaded = _bptc.load_bc_history(codec, history)
+    if loaded is None:
+        return default_confirmed, default_provisional
+    ext_conf, ext_prov, replace = loaded
+    if replace:
+        confirmed = dict(ext_conf)
+        loose = {k: v for k, v in ext_prov.items() if k not in confirmed}
+        return confirmed, loose
+    confirmed = dict(default_confirmed)
+    confirmed.update(ext_conf)
+    loose = {k: v for k, v in default_provisional.items() if k not in confirmed}
+    for k, v in ext_prov.items():
+        if k not in confirmed:
+            loose[k] = v
+    return confirmed, loose
+
+
+def _bc1_blocks(lanes, nblocks, provisional, *, history=None):
     if any(lanes[1]):
         raise BcpackError("BC1 lane 1 is non-zero (unexpected)")
     quad = _tables.BC1_QUADRANT
-    confirmed = _tables.BC1_HISTORY_CONFIRMED
-    loose = _tables.BC1_HISTORY_PROVISIONAL
+    confirmed, loose = _resolve_bc_history(
+        1, _tables.BC1_HISTORY_CONFIRMED, _tables.BC1_HISTORY_PROVISIONAL, history
+    )
     out = bytearray(nblocks * 8)
     hist = [None] * nblocks
     mods = (32, 64, 32, 32, 64, 32)
@@ -424,13 +444,14 @@ _BC3_MODS = (256, 256, 32, 64, 32, 32, 64, 32)
 _BC3_NONE = (128, 128, 0, 0, 0, 0, 0, 0)
 
 
-def _bc3_blocks(lanes, nblocks, provisional):
+def _bc3_blocks(lanes, nblocks, provisional, *, history=None):
     if any(lanes[1]):
         raise BcpackError("BC3 lane 1 is non-zero (unexpected)")
     pairs = _tables.BC3_ALPHA_PAIR
     quads = _tables.BC3_COLOUR_QUADRANT
-    confirmed = _tables.BC3_HISTORY_CONFIRMED
-    loose = _tables.BC3_HISTORY_PROVISIONAL
+    confirmed, loose = _resolve_bc_history(
+        3, _tables.BC3_HISTORY_CONFIRMED, _tables.BC3_HISTORY_PROVISIONAL, history
+    )
     out = bytearray(nblocks * 16)
     hist = [None] * nblocks
     lost = [False] * nblocks
@@ -502,12 +523,13 @@ def _bc3_blocks(lanes, nblocks, provisional):
     return bytes(out)
 
 
-def _bc4_blocks(lanes, nblocks, provisional):
+def _bc4_blocks(lanes, nblocks, provisional, *, history=None):
     if any(lanes[1]):
         raise BcpackError("BC4 lane 1 is non-zero (unexpected)")
     pairs = _tables.BC4_PAIR
-    confirmed = _tables.BC4_HISTORY_CONFIRMED
-    loose = _tables.BC4_HISTORY_PROVISIONAL
+    confirmed, loose = _resolve_bc_history(
+        4, _tables.BC4_HISTORY_CONFIRMED, _tables.BC4_HISTORY_PROVISIONAL, history
+    )
     out = bytearray(nblocks * 8)
     hist = [None] * nblocks
     l0, l2, l3 = lanes[0], lanes[2], lanes[3]
@@ -545,12 +567,13 @@ def _bc4_blocks(lanes, nblocks, provisional):
     return bytes(out)
 
 
-def _bc5_blocks(lanes, nblocks, provisional):
+def _bc5_blocks(lanes, nblocks, provisional, *, history=None):
     if any(lanes[1]):
         raise BcpackError("BC5 lane 1 is non-zero (unexpected)")
     pairs = _tables.BC5_PAIR
-    confirmed = _tables.BC5_HISTORY_CONFIRMED
-    loose = _tables.BC5_HISTORY_PROVISIONAL
+    confirmed, loose = _resolve_bc_history(
+        5, _tables.BC5_HISTORY_CONFIRMED, _tables.BC5_HISTORY_PROVISIONAL, history
+    )
     out = bytearray(nblocks * 16)
     hist = [None] * nblocks
     lost = [False] * nblocks
@@ -731,7 +754,7 @@ def _bc6h_blocks(lanes, nblocks, provisional, *, history=None):
     """
     if len(lanes[0]) != 2 * nblocks:
         raise BcpackError("BC6H lane length does not match the block count")
-    eh_table, ih_table, eclass, iclass = _bptc.load_bc6h(history)
+    eh_table, ih_table, eclass, iclass, ep_cb, ix_cb = _bptc.load_bc6h(history, with_confirmed_bits=True)
     anchor2 = _bptc.BC7_ANCHOR2
     out = bytearray(nblocks * 16)
     st_e = [None] * nblocks
@@ -740,6 +763,8 @@ def _bc6h_blocks(lanes, nblocks, provisional, *, history=None):
     iroot = [-1] * nblocks
     ends = {}
     idxs = {}
+    weak_e = set()
+    weak_i = set()
     violations = 0
     l0, l1, l15 = lanes[0], lanes[1], lanes[15]
     deint0, deint1 = _DEINT
@@ -765,6 +790,14 @@ def _bc6h_blocks(lanes, nblocks, provisional, *, history=None):
             entry = 256 + i - de
             eref = eh_table[entry]
             eroot[i] = entry
+            # Only direct initial-history reads consume the calibrated bits.
+            # Later blocks read the reconstructed state, whose truncation and
+            # zero padding are determined by this block's mode and deltas.
+            for c in range(3):
+                dc = deltas[c]
+                need = (base, dc, dc, dc) if reg == 2 else (base, dc, 0, 0)
+                if any(ep_cb[entry][c][q] < n for q, n in enumerate(need)):
+                    weak_e.add(entry)
         if eroot[i] >= 0:
             r = eroot[i]
             ends[r] = ends.get(r, 0) + 1
@@ -778,6 +811,8 @@ def _bc6h_blocks(lanes, nblocks, provisional, *, history=None):
             entry = 256 + i - di
             iref = ih_table[entry]
             iroot[i] = entry
+            if any(b < (3 if reg == 2 else 4) for b in ix_cb[entry]):
+                weak_i.add(entry)
         if iroot[i] >= 0:
             r = iroot[i]
             idxs[r] = idxs.get(r, 0) + 1
@@ -854,8 +889,8 @@ def _bc6h_blocks(lanes, nblocks, provisional, *, history=None):
         out[16 * i:16 * i + 16] = acc.to_bytes(16, "little")
 
     if provisional is None:
-        unconf_e = [k for k in ends if eclass[k] != 3]
-        unconf_i = [k for k in idxs if iclass[k] != 3]
+        unconf_e = [k for k in ends if eclass[k] != 3 or k in weak_e]
+        unconf_i = [k for k in idxs if iclass[k] != 3 or k in weak_i]
         if unconf_e or unconf_i:
             k = unconf_e[0] if unconf_e else unconf_i[0]
             kind = "endpoint" if unconf_e else "index"
@@ -890,6 +925,10 @@ def _bc6h_blocks(lanes, nblocks, provisional, *, history=None):
         provisional.add(f"BC6H unknown history {', '.join(missing)} ({lost} blocks)")
     if violations:
         provisional.add(f"BC6H anchor index inconsistent in {violations} pixels")
+    for kind, entries, cls in (("endpoint", weak_e, eclass), ("index", weak_i, iclass)):
+        for k in sorted(entries):
+            if cls[k] == 3:
+                provisional.add(f"BC6H {kind} history {k} (unconfirmed bits)")
     for name, entries, cls in (("endpoint", ends, eclass), ("index", idxs, iclass)):
         fitted = sorted(k for k in entries if cls[k] == 1)
         rough = sorted(k for k in entries if cls[k] == 2)
@@ -1289,9 +1328,9 @@ def decode_with_info(raw, codec, out_size, *, allow_provisional=False, history=N
 
     When `allow_provisional` is False (strict mode), any unconfirmed or unknown
     built-in history reference raises `BcpackProvisionalError` and the returned
-    set is always empty. For BC6H (`codec 6`) and BC7 (`codec 7`), `history`
-    may point to a locally generated JSON file, directory, or dict supplying
-    the built-in initial history tables.
+    set is always empty. `history` may point to a locally generated JSON file,
+    directory, or dict supplying initial history tables for BC6H/BC7 (and
+    optional overrides for BC1-BC5).
     """
     rebuilder = _REBUILDERS.get(codec)
     if rebuilder is None:
@@ -1300,10 +1339,7 @@ def decode_with_info(raw, codec, out_size, *, allow_provisional=False, history=N
     lanes, _ = decode_lanes(raw, codec, out_size)
     nblocks = out_size // BLOCK_BYTES[codec]
     prov = set() if allow_provisional else None
-    if codec in (6, 7):
-        data = rebuilder(lanes, nblocks, prov, history=history)
-    else:
-        data = rebuilder(lanes, nblocks, prov)
+    data = rebuilder(lanes, nblocks, prov, history=history)
     return data, (prov if prov is not None else set())
 
 

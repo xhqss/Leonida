@@ -1,8 +1,8 @@
-// GetResourceTiling's arithmetic (src/resource_tiling.h), without a GPU. The expected tile shapes, standard mip
-// counts, per-mip tile counts and start indices are what the PC D3D12 runtime reported for the same reserved
-// resources on an RTX 5070; packed-tile counts are this layer's own rule (tight linear size in whole tiles), and
-// where the PC runtime chose differently the comment says so. d3d12_vulkan_device_test makes the same comparison
-// against the host runtime on the machine it runs on.
+// GetResourceTiling's arithmetic (src/resource_tiling.h), without a GPU. The expected tile shapes, per-mip tile
+// counts and start indices are what the PC D3D12 runtime reported for the same reserved resources on an RTX 5070.
+// Where the packed tail starts and how many tiles it takes follow AMD's PC runtime (D3D-65): the AmdCase table holds
+// AMD's values, and where another runtime chose differently the comment says so. d3d12_vulkan_device_test makes the
+// same comparison against the host runtime on the machine it runs on.
 #include "../src/resource_tiling.h"
 
 #include <cstdio>
@@ -111,8 +111,8 @@ int main() {
     // AMD's split (D3D-65). Every layout below was measured on the AMD PC runtime and is identical on an RX 9070 XT
     // (RDNA4, driver 32.0.31041.1004) and a Ryzen 7 9800X3D iGPU (RDNA2, 32.0.21045.5002): compare_tiling's 17 texture
     // layouts, then 30 edge cases (a mip exactly at or just past half a tile, thin and tall textures, non-square 2D and
-    // volume tiles). The standard and packed mip counts and the packed start are AMD's. The packed tiles are this
-    // layer's tight count, which is AMD's except for the two deep volumes packed from mip 0, where AMD reserves 2.
+    // volume tiles), then 32 volumes whose packed tail is deeper than a tile. Every field is AMD's: the standard and
+    // packed mip counts, the packed start, and the packed tiles, one per tile-depth slice the tail spans.
     struct AmdCase {
         const char* name;
         TilingDesc desc;
@@ -159,13 +159,46 @@ int main() {
         {"132x4 BC7", {TiledKind::texture2d, 132, 4, 1, 8, 16, 4}, 1, 7, 1, 1},
         {"32^3 R8 vol", {TiledKind::texture3d, 32, 32, 32, 6, 1, 1}, 0, 6, 1, 0},
         {"33x4x4 R8 vol", {TiledKind::texture3d, 33, 4, 4, 6, 1, 1}, 1, 5, 1, 1},
-        {"8x8x64 R8 vol", {TiledKind::texture3d, 8, 8, 64, 7, 1, 1}, 0, 7, 1, 0},  // AMD reserves 2
+        {"8x8x64 R8 vol", {TiledKind::texture3d, 8, 8, 64, 7, 1, 1}, 0, 7, 2, 0},
         {"32x17x17 R8 vol", {TiledKind::texture3d, 32, 17, 17, 6, 1, 1}, 0, 6, 1, 0},
         {"16^3 RGBA8 vol", {TiledKind::texture3d, 16, 16, 16, 5, 4, 1}, 0, 5, 1, 0},
-        {"16x16x17 RGBA8 vol", {TiledKind::texture3d, 16, 16, 17, 5, 4, 1}, 0, 5, 1, 0},  // AMD reserves 2
+        {"16x16x17 RGBA8 vol", {TiledKind::texture3d, 16, 16, 17, 5, 4, 1}, 0, 5, 2, 0},
         {"16x9x9 RGBA8 vol", {TiledKind::texture3d, 16, 9, 9, 5, 4, 1}, 0, 5, 1, 0},
         {"8^3 RGBA32F vol", {TiledKind::texture3d, 8, 8, 8, 4, 16, 1}, 0, 4, 1, 0},
         {"9x1x1 RGBA32F vol", {TiledKind::texture3d, 9, 1, 1, 4, 16, 1}, 1, 3, 1, 1},
+        // Packed tails deeper than one tile: one packed tile per tile-depth slice.
+        {"8x8x16 R8 vol", {TiledKind::texture3d, 8, 8, 16, 5, 1, 1}, 0, 5, 1, 0},
+        {"8x8x32 R8 vol", {TiledKind::texture3d, 8, 8, 32, 6, 1, 1}, 0, 6, 1, 0},
+        {"8x8x33 R8 vol", {TiledKind::texture3d, 8, 8, 33, 6, 1, 1}, 0, 6, 2, 0},
+        {"8x8x48 R8 vol", {TiledKind::texture3d, 8, 8, 48, 6, 1, 1}, 0, 6, 2, 0},
+        {"8x8x65 R8 vol", {TiledKind::texture3d, 8, 8, 65, 7, 1, 1}, 0, 7, 3, 0},
+        {"8x8x96 R8 vol", {TiledKind::texture3d, 8, 8, 96, 7, 1, 1}, 0, 7, 3, 0},
+        {"8x8x128 R8 vol", {TiledKind::texture3d, 8, 8, 128, 8, 1, 1}, 0, 8, 4, 0},
+        {"8x8x129 R8 vol", {TiledKind::texture3d, 8, 8, 129, 8, 1, 1}, 0, 8, 5, 0},
+        {"8x8x256 R8 vol", {TiledKind::texture3d, 8, 8, 256, 9, 1, 1}, 0, 9, 8, 0},
+        {"16x16x32 RGBA8 vol", {TiledKind::texture3d, 16, 16, 32, 6, 4, 1}, 0, 6, 2, 0},
+        {"16x16x33 RGBA8 vol", {TiledKind::texture3d, 16, 16, 33, 6, 4, 1}, 0, 6, 3, 0},
+        {"16x16x48 RGBA8 vol", {TiledKind::texture3d, 16, 16, 48, 6, 4, 1}, 0, 6, 3, 0},
+        {"16x16x64 RGBA8 vol", {TiledKind::texture3d, 16, 16, 64, 7, 4, 1}, 0, 7, 4, 0},
+        {"16x16x128 RGBA8 vol", {TiledKind::texture3d, 16, 16, 128, 8, 4, 1}, 0, 8, 8, 0},
+        {"16x16x32 R16F vol", {TiledKind::texture3d, 16, 16, 32, 6, 2, 1}, 0, 6, 1, 0},
+        {"16x16x33 R16F vol", {TiledKind::texture3d, 16, 16, 33, 6, 2, 1}, 0, 6, 2, 0},
+        {"16x16x64 R16F vol", {TiledKind::texture3d, 16, 16, 64, 7, 2, 1}, 0, 7, 2, 0},
+        {"16x16x100 R16F vol", {TiledKind::texture3d, 16, 16, 100, 7, 2, 1}, 0, 7, 4, 0},
+        {"16x16x16 RGBA16F vol", {TiledKind::texture3d, 16, 16, 16, 5, 8, 1}, 0, 5, 1, 0},
+        {"16x16x17 RGBA16F vol", {TiledKind::texture3d, 16, 16, 17, 5, 8, 1}, 0, 5, 2, 0},
+        {"16x16x64 RGBA16F vol", {TiledKind::texture3d, 16, 16, 64, 7, 8, 1}, 0, 7, 4, 0},
+        {"8x8x16 RGBA32F vol", {TiledKind::texture3d, 8, 8, 16, 5, 16, 1}, 0, 5, 1, 0},
+        {"8x8x17 RGBA32F vol", {TiledKind::texture3d, 8, 8, 17, 5, 16, 1}, 0, 5, 2, 0},
+        {"8x8x64 RGBA32F vol", {TiledKind::texture3d, 8, 8, 64, 7, 16, 1}, 0, 7, 4, 0},
+        {"32x32x64 R8 vol", {TiledKind::texture3d, 32, 32, 64, 7, 1, 1}, 0, 7, 2, 0},
+        {"1x1x256 R8 vol", {TiledKind::texture3d, 1, 1, 256, 9, 1, 1}, 0, 9, 8, 0},
+        {"16x4x100 RGBA8 vol", {TiledKind::texture3d, 16, 4, 100, 7, 4, 1}, 0, 7, 7, 0},
+        {"64x8x256 R8 vol", {TiledKind::texture3d, 64, 8, 256, 9, 1, 1}, 1, 8, 4, 8},
+        {"32x8x64 RGBA8 vol", {TiledKind::texture3d, 32, 8, 64, 7, 4, 1}, 1, 6, 2, 4},
+        {"128x16x128 RGBA8 vol", {TiledKind::texture3d, 128, 16, 128, 8, 4, 1}, 3, 5, 1, 42},
+        {"64x64x256 R8 vol", {TiledKind::texture3d, 64, 64, 256, 9, 1, 1}, 1, 8, 4, 16},
+        {"32x16x64 RGBA16F vol", {TiledKind::texture3d, 32, 16, 64, 7, 8, 1}, 1, 6, 2, 4},
     };
     for (const AmdCase& c : amd) {
         if (!resource_tiling(c.desc, t) || t.standard_mips != c.standard || t.packed_mips != c.packed ||
@@ -195,6 +228,17 @@ int main() {
     CHECK(!resource_tiling({TiledKind::texture2d, 64, 64, 1, 1, 12, 1}, t));
     CHECK(!resource_tiling({TiledKind::texture2d, 64, 64, 1, 0, 4, 1}, t));
     CHECK(!resource_tiling({TiledKind::texture2d, 0, 64, 1, 1, 4, 1}, t));
+
+    // Overflows and shift edge cases must fail cleanly instead of wrapping or crashing.
+    // 2^25 * 2^25 * 2^14 = 2^64 wraps per_slice * layers to 0 in unchecked uint64_t arithmetic.
+    CHECK(!resource_tiling({TiledKind::texture2d, 1ULL << 31, 1u << 31, 16384, 1, 16, 1}, t));
+    // block * elements.width overflowing uint32_t must not produce shape.width == 0 (divide by zero).
+    CHECK(!resource_tiling({TiledKind::texture2d, 128, 128, 1, 1, 16, 1u << 26}, t));
+    // Buffer width near UINT64_MAX must not wrap in up().
+    CHECK(!resource_tiling({TiledKind::buffer, ~std::uint64_t{0}}, t));
+    // mip >= 32 must clamp height/depth to 1 without shifting uint32_t by >= 32.
+    CHECK(resource_tiling({TiledKind::texture2d, 1024, 1024, 1, 33, 4, 1}, t));
+    CHECK(t.standard_mips == 4 && t.packed_mips == 29 && t.packed_tiles == 1 && t.total_tiles == 86);
     std::printf("resource tiling: buffer, 2D, array, block-compressed and volume layouts match\n");
     return 0;
 }

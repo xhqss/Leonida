@@ -2,13 +2,15 @@
 ; is 11 dwords: node, ray extent (t max), origin xyz, direction xyz, inverse direction xyz. The 64-bit form has the
 ; node's high dword after the low one, so read with that layout every operand here would be one register off.
 ; Same scene and ray as cs_bvh.asm: vk_compute_test writes an AMD-format BVH into the heap (box32 root at 0x100 ->
-; triangle z=10 node 0x40, triangle z=5 node 0x48, a box the ray misses, a NaN box). Ray origin (0.25, 0.25, 0),
-; direction +z, t max 100. Run: vk_compute_test cs_bvh32.spv 1 bvh
-; Expected, from the "Ray tracing" row of docs/design.md (one traversal step, RADV's software box and triangle tests):
+; triangle z=10 node 0x40, triangle z=5 node 0x48, a box the ray misses, a box with a NaN min.x). Ray origin
+; (0.25, 0.25, 0), direction +z, t max 100. Run: vk_compute_test cs_bvh32.spv 1 bvh
+; Expected, from the "Ray tracing" row of docs/design.md (one traversal step; the box test as measured on RDNA2,
+; SHADER-650, and RADV's software triangle test):
 ;   box node 0x25 (address 0x100 >> 3 | type 5): along +z the ray enters a box that contains its x and y at the
 ;   box's near z, so child 0x40 (z = 10) at 10 and child 0x48 (z = 5) at 5. The third box lies at x in [5, 6], which
-;   the ray never reaches, and the fourth has a NaN corner: both give 0xffffffff. box_sort_enable (descriptor bit 63,
-;   set in s5) orders the children by entry distance: out[0..3] = 0x48 0x40 0xffffffff 0xffffffff.
+;   the ray never reaches: 0xffffffff. The fourth (0x68) has min.x = NaN; the hardware skips a NaN plane, so the box
+;   is x <= 1, y and z in [0, 1], which the ray is in at t = 0. box_sort_enable (descriptor bit 63, set in s5) orders
+;   the children by entry distance clamped to 0: out[0..3] = 0x68 0x48 0x40 0xffffffff (native gfx1030 gives the same).
 ;   triangle node 0x40 (address 0x200, vertices (0,0,10) (1,0,10) (0,1,10)): the ray runs along z, so the vertices
 ;   relative to the origin project onto xy unsheared: A = (-0.25, -0.25), B = (0.75, -0.25), C = (-0.25, 0.75). The
 ;   edge functions are u = Cx By - Cy Bx = -0.5, v = Ax Cy - Ay Cx = -0.25 and w = Bx Ay - By Ax = -0.25, all of one

@@ -22,11 +22,9 @@ static scan does not decide:
   `branch_condition` paths. Mask *arithmetic* (`s_and_saveexec_b64` and friends) is per-lane and exact; only
   the branch taken from it splits.
 
-Wave64 classification is the translator's own rule applied to parsed instructions (rdna2spirv.py, `g.wave64`:
-`WAVE64_RE` over op and operand text, or any `_b64` op with an exec/vcc operand), plus mesh unconditionally,
-and stages come from its `stage_of` (the carve index, not the file name) — so the scan classifies exactly what
-the translator classifies. Opcodes are counted from parsed instructions only, never from comments or operand
-text.
+Wave64 classification reads the adjacent FSSM wave-size flag, as the translator does. Without a usable
+header it falls back to mesh shader defaults and instruction markers. Stages come from the translator's
+stage lookup. Opcodes are counted from parsed instructions only, never from comments or operand text.
 
 Quad ops and `ds_swizzle`/`ds_bpermute` are left out on purpose: quads never cross the 32/32 half and the
 translator models the permute ops per 32-lane half, matching hardware.
@@ -41,6 +39,7 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import fssm_header  # noqa: E402
 import rdna2spirv  # noqa: E402  (same directory; WAVE64_RE, stage_of, base_op)
 from shader_ir import parse_file  # noqa: E402
 
@@ -63,8 +62,7 @@ GRAPHICS = ("vs", "ps", "gs")
 
 
 def wave64_rule(stage, insns):
-    """The translator's g.wave64, verbatim: a WAVE64_RE marker in op or operand text, or any _b64 op with an
-    exec/vcc operand; mesh shaders are wave64 regardless (rdna2spirv.py)."""
+    """The translator's fallback when a shader has no FSSM wave-size flag."""
     if stage == "ms":
         return True
     return any(rdna2spirv.WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]])) or
@@ -90,19 +88,44 @@ def scan_shader(stage, insns):
             "mask_word_source": {"exec_vcc": exec_vcc, "other": other}}
 
 
+def scanned_paths(disasm):
+    """The one enumeration the scanner and the overwrite guard share: regular files named *.s (symlinks followed)."""
+    with os.scandir(disasm) as entries:
+        return sorted(entry.path for entry in entries
+                      if entry.name.endswith(".s") and entry.is_file())
+
+
+def metadata_indexes(disasm):
+    """The carve index each scanned listing's stage_of opens (<disasm>/../index.json), deduplicated.
+
+    stage_of (rdna2spirv.py) reads os.path.dirname(os.path.dirname(os.path.realpath(path)))/index.json,
+    so --out must not overwrite any of those either; guard each distinct one for simplicity.
+    """
+    seen = set()
+    for path in scanned_paths(disasm):
+        meta = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "index.json")
+        if meta not in seen:
+            seen.add(meta)
+            yield meta
+
+
 def scan_directory(disasm):
     """Aggregate selected-opcode counts over one carve disasm directory. Returns per-stage dicts; no names."""
     per_stage = {stage: {"shaders": 0, "wave64": 0, "with_selected_op": 0, "occurrences": Counter(),
                          "mask_word_source": {"exec_vcc": Counter(), "other": Counter()}}
                  for stage in GRAPHICS}
     other = {"shaders": 0, "wave64": 0}
-    for name in sorted(os.listdir(disasm)):
-        if not name.endswith(".s"):
-            continue
-        path = os.path.join(disasm, name)
+    paths = scanned_paths(disasm)
+    for path in paths:
         info = parse_file(path)
         stage = rdna2spirv.stage_of(info["name"], path)
-        wave64 = wave64_rule(stage, info["insns"])
+        fssm_path = rdna2spirv.native_paths(path, info["name"])[0]
+        try:
+            with open(fssm_path, "rb") as f:
+                wave_size = fssm_header.wave_size(f.read(fssm_header.WAVE_FLAGS_OFFSET + 4))
+        except OSError:
+            wave_size = None
+        wave64 = wave_size == 64 if wave_size is not None else wave64_rule(stage, info["insns"])
         if stage in per_stage:
             bucket = per_stage[stage]
             bucket["shaders"] += 1
@@ -140,11 +163,24 @@ def main(argv=None) -> int:
         out_dir = os.path.dirname(os.path.abspath(args.out))
         if not os.path.isdir(out_dir):
             ap.error(f"output directory does not exist: {out_dir}")
-        try:
-            if os.path.samefile(os.path.abspath(args.src), os.path.abspath(args.out)):
-                ap.error("output must not overwrite the source directory")
-        except (FileNotFoundError, OSError):
-            pass
+        # --out must not replace the source directory or any input the scan reads (each scanned listing,
+        # and the carve index each listing's stage_of opens), even through a hardlink or symlink alias the
+        # name check alone would miss. samefile also catches a case-only spelling on Windows and macOS's
+        # default volume, so only when the report already exists does it compare --out against each input
+        # rather than statting N listings for nothing.
+        if os.path.exists(args.out):
+            out_abs = os.path.abspath(args.out)
+            try:
+                if os.path.samefile(os.path.abspath(args.src), out_abs):
+                    ap.error("output must not overwrite the source directory")
+            except OSError:
+                pass
+            for path in [*scanned_paths(args.src), *metadata_indexes(args.src)]:
+                try:
+                    if os.path.isfile(path) and os.path.samefile(out_abs, path):
+                        ap.error(f"output must not overwrite an input it scans: {path}")
+                except OSError:
+                    pass
     report = scan_directory(args.src)
     for stage, b in report["per_stage"].items():
         occ = ", ".join("%s x%d" % (op, n) for op, n in b["occurrences"].items()) or "none"
@@ -158,7 +194,7 @@ def main(argv=None) -> int:
     o = report["other_stages"]
     print("other stages: %d shaders, %d wave64 (not counted)" % (o["shaders"], o["wave64"]))
     if args.out:
-        with open(args.out, "w", encoding="utf-8") as f:
+        with open(args.out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(report, f, indent=1)
         print("wrote %s" % args.out)
     return 0

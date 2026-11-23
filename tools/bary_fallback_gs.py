@@ -16,10 +16,13 @@ The paired helper forwards a VS ClipDistance or CullDistance array. The suffix i
 Mixed clip/cull layouts are rejected. Standard library only; build_for_index assembles and validates with spirv-as / spirv-val from PATH.
 """
 import argparse
+from collections.abc import Iterator
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 SUFFIX = ".bary_gs"   # <ps name>.bary_gs.spvasm / .spv next to the pixel shader
 
@@ -107,13 +110,14 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0
     return "\n".join(lines) + "\n"
 
 
-def write_for_index(spirv_dir, pair: tuple[str, str] | None = None):
-    """Write helpers for all fallback PS entries, or one distance-layout-specific helper for an explicit (VS, PS) pair."""
+def _helpers_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | None) -> Iterator[tuple[str, str]]:
     index_path = os.path.join(spirv_dir, "index.json")
     if pair is None and not os.path.isfile(index_path):
-        return []
+        return
     with open(index_path, encoding="utf-8") as f:
         index = json.load(f)
+    if not isinstance(index, dict):
+        raise ValueError(f"{index_path}: translation index must be a JSON object")
     clip_count = cull_count = 0
     names = sorted(index)
     suffix = ""
@@ -121,6 +125,9 @@ def write_for_index(spirv_dir, pair: tuple[str, str] | None = None):
         vertex, pixel = pair
         producer = index.get(vertex, {})
         consumer = index.get(pixel, {})
+        for name, entry in ((vertex, producer), (pixel, consumer)):
+            if not isinstance(entry, dict):
+                raise ValueError(f"{index_path}: index entry {name!r} must be a JSON object")
         if producer.get("stage") != "vs" or consumer.get("stage") != "ps" or not consumer.get("bary_fallback_input"):
             raise ValueError("--pair requires a translated VS and a barycentric-fallback PS from the index")
         caps = set(producer.get("capabilities", []))
@@ -140,7 +147,6 @@ def write_for_index(spirv_dir, pair: tuple[str, str] | None = None):
         cull_count = distance_count("cull")
         suffix = f".cull{cull_count}" if cull_count else f".clip{clip_count}"
         names = [pixel]
-    written = []
     for name in names:
         meta = index[name]
         fb = meta.get("bary_fallback_input") if isinstance(meta, dict) else None
@@ -148,23 +154,35 @@ def write_for_index(spirv_dir, pair: tuple[str, str] | None = None):
             continue
         path = os.path.join(spirv_dir, name + SUFFIX + suffix + ".spvasm")
         shader = gs_spvasm(meta.get("inputs", []), fb["location"], clip_count, cull_count)
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(shader)
+        yield path, shader
+
+
+def write_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | None = None) -> list[str]:
+    """Write helpers for all fallback PS entries, or one distance-layout-specific helper for an explicit (VS, PS) pair."""
+    written = []
+    for path, shader in _helpers_for_index(spirv_dir, pair):
+        Path(path).write_text(shader, encoding="utf-8", newline="\n")
         written.append(path)
     return written
 
 
-def build_for_index(spirv_dir, pair: tuple[str, str] | None = None):
-    """write_for_index, then assemble each file to <name>.bary_gs.spv and validate it (spirv-as / spirv-val on PATH,
-    Vulkan 1.2 as for the translator). Returns the .spv paths; raises RuntimeError with the tool output on failure."""
+def build_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | None = None) -> list[str]:
+    """Assemble and validate each helper with SPIRV-Tools for Vulkan 1.2 before publishing its text and binary.
+    Returns the .spv paths; raises RuntimeError with the tool output on failure."""
     built = []
-    for asm in write_for_index(spirv_dir, pair):
+    for asm, shader in _helpers_for_index(spirv_dir, pair):
         spv = asm[: -len(".spvasm")] + ".spv"
-        for cmd in (["spirv-as", "--target-env", "vulkan1.2", asm, "-o", spv],
-                    ["spirv-val", "--target-env", "vulkan1.2", spv]):
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            if r.returncode:
-                raise RuntimeError(f"{cmd[0]} failed for {asm}:\n{r.stdout}{r.stderr}")
+        with tempfile.TemporaryDirectory(prefix=".bary-gs-", dir=os.path.dirname(spv)) as staging:
+            staged_asm = os.path.join(staging, os.path.basename(asm))
+            staged_spv = os.path.join(staging, os.path.basename(spv))
+            Path(staged_asm).write_text(shader, encoding="utf-8", newline="\n")
+            for cmd in (["spirv-as", "--target-env", "vulkan1.2", staged_asm, "-o", staged_spv],
+                        ["spirv-val", "--target-env", "vulkan1.2", staged_spv]):
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode:
+                    raise RuntimeError(f"{cmd[0]} failed for {asm}:\n{r.stdout}{r.stderr}")
+            os.replace(staged_asm, asm)
+            os.replace(staged_spv, spv)
         built.append(spv)
     return built
 
@@ -174,6 +192,8 @@ def main(argv):
     parser.add_argument("spirv_dir")
     parser.add_argument("--pair", nargs=2, metavar=("VS", "PS"), help="build for these index entries")
     args = parser.parse_args(argv[1:])
+    if not os.path.exists(args.spirv_dir):
+        parser.exit(2, f"ERROR: {args.spirv_dir}: does not exist\n")
     if not os.path.isdir(args.spirv_dir):
         parser.exit(1, f"{args.spirv_dir}: not a directory\n")
     try:

@@ -67,7 +67,9 @@ formula is proven by every resolved entry.
 
 The windows above use only names that were already exported locally. The names of almost all the other
 archetypes are in `levels.rpf` itself: `tools/rpf9_names.py` lists the `name.#dr` and `name.#ft` strings of every
-stream, and with that list as the dictionary nearly every placement resolves. Whole `levels.rpf`, one
+stream. A full pass over the data area (76.15 GB, 5,255 s) inflates 1,116,073 zlib streams (98.32% of
+compressed bytes) and finds 235,814 named streams / 318,266 unique names (267,463 `.#dr`, 50,803 `.#ft`);
+with that list as the dictionary nearly every placement resolves. Whole `levels.rpf`, one
 `world_index.py --archetypes-out` run (23,532 placement maps and 1,670,435 entities: 3 maps and 7 entities fewer
 than the census in [world.md](world.md#how-many-are-there), which also joins the raw continuation page that 3
 placement maps use and `world_index.py` does not; 228,681 distinct `archetypeName` hashes, one 64-bit key per hash, no conflicting keys,

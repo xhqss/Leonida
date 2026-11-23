@@ -5,6 +5,7 @@ oracle it compares with is right, so a mismatch is the translator's and not the 
 """
 import json
 import os
+from pathlib import Path
 import random
 import signal
 import struct
@@ -17,6 +18,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import image_fuzz as imf  # noqa: E402
+
+
+def test_empty_format_selection_is_a_usage_error(tmp_path):
+    work = tmp_path / "work"
+    result = subprocess.run([sys.executable, "-I", imf.__file__, "--formats", " , ", "--work", str(work)],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 2, result.stderr
+    assert "--formats must select at least one format" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not work.exists()
 
 
 def test_format_codes_match_the_translator_table():
@@ -153,6 +164,67 @@ def test_compare_distinguishes_signed_zero():
     assert [(p[0], p[1]) for p in problems] == [(5, 7)]
 
 
+def f32_add_ulps(value, n):
+    return struct.unpack("<f", struct.pack("<I", struct.unpack("<I", struct.pack("<f", value))[0] + n))[0]
+
+
+def drawn(texel_values, width, height, dmask=0xf):
+    """The 64x64 RGBA32F readback for per-texel component lists, packed by dmask over the sentinels."""
+    got = []
+    for y in range(imf.DRAW):
+        for x in range(imf.DRAW):
+            tx, ty = imf.texel_of_pixel(x, y, width, height)
+            got.extend(imf.masked_components(texel_values[ty * width + tx], dmask))
+    return got
+
+
+def every_unorm8_byte():
+    """An 8x8 R8G8B8A8_UNORM texture holding each of the 256 byte values once."""
+    return bytes(range(256)), 8, 8
+
+
+def test_compare_accepts_the_drivers_one_ulp_unorm8_conversion(monkeypatch):
+    """llvmpipe converts UNORM8 as c * f32(1/255): one ulp above the exact c / 255 for 126 of the 256 values (27 gives
+    0x3dd8d8da, not 0x3dd8d8d9). The conversion is the driver's, so it matches, and the summary counts it."""
+    monkeypatch.setattr(imf, "unorm8_near", 0, raising=False)
+    texels, width, height = every_unorm8_byte()
+    recip = imf.f32(1 / 255.0)
+    product = [[imf.f32(texels[i * 4 + c] * recip) for c in range(4)] for i in range(width * height)]
+    exact = imf.oracle("R8G8B8A8_UNORM", texels, width, height)
+    off = sum(p != e for pv, ev in zip(product, exact) for p, e in zip(pv, ev))
+    assert off == 126
+    assert struct.pack("<f", product[27 // 4][27 % 4]) == struct.pack("<I", 0x3DD8D8DA)
+    assert imf.compare("R8G8B8A8_UNORM", texels, width, height, drawn(product, width, height)) == []
+    assert imf.unorm8_near == 126 * (imf.DRAW // width) * (imf.DRAW // height)   # every texel is drawn 64 times
+
+
+@pytest.mark.parametrize("wrong", ["two_ulps", "divide_by_256", "negative_zero"])
+def test_compare_still_rejects_unorm8_values_that_are_not_the_quotient(wrong):
+    texels, width, height = every_unorm8_byte()
+    values = imf.oracle("R8G8B8A8_UNORM", texels, width, height)
+    if wrong == "two_ulps":
+        values = [[f32_add_ulps(v, 2) for v in texel] for texel in values]
+    elif wrong == "divide_by_256":
+        values = [[imf.f32(texels[i * 4 + c] / 256.0) for c in range(4)] for i in range(width * height)]
+    else:   # byte 0 comes back as -0.0
+        values[0] = [-0.0] + values[0][1:]
+    assert imf.compare("R8G8B8A8_UNORM", texels, width, height, drawn(values, width, height))
+
+
+def test_the_one_ulp_allowance_is_only_for_unorm8_texel_components():
+    """Float formats stay bit exact, and so do the sentinels in the registers a UNORM8 dmask leaves unwritten."""
+    width = height = 8
+    texels = b"".join(struct.pack("<4f", 0.1, 0.25, 0.5, 1.0) for _ in range(width * height))
+    values = [[f32_add_ulps(v, 1) for v in texel] for texel in imf.oracle("R32G32B32A32_SFLOAT", texels, width, height)]
+    assert imf.compare("R32G32B32A32_SFLOAT", texels, width, height, drawn(values, width, height))
+
+    texels, width, height = every_unorm8_byte()
+    got = drawn(imf.oracle("R8G8B8A8_UNORM", texels, width, height), width, height, dmask=0x1)
+    assert imf.compare("R8G8B8A8_UNORM", texels, width, height, got, 0x1) == []
+    got[1] = f32_add_ulps(got[1], 1)   # pixel (0, 0): the sentinel 2.0 in the second register, one ulp off
+    assert [(p[0], p[1]) for p in imf.compare("R8G8B8A8_UNORM", texels, width, height, got, 0x1)] == [(0, 0)]
+
+
 def test_compare_treats_any_nan_as_equal():
     """The bit comparison keeps the old policy: NaN payloads are not modelled."""
     width = height = 8
@@ -187,6 +259,30 @@ def test_unsupported_device_skips_with_the_harness_reason(monkeypatch, tmp_path,
         monkeypatch, tmp_path, 77, "device: X\nunsupported: need 144 push constant bytes, device has 128\n")
     assert result is None
     assert "SKIP (unsupported: need 144 push constant bytes, device has 128)" in capsys.readouterr().out
+
+
+def test_rejected_fragment_translation_is_reported_before_the_harness(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    build = tmp_path / "build"
+    build.mkdir()
+    harness = build / (imf.HARNESS + (".exe" if os.name == "nt" else ""))
+    harness.touch()
+    monkeypatch.setattr(imf, "assemble", lambda *_args: None)
+
+    def run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if cmd[0] == str(harness):
+            return subprocess.CompletedProcess(cmd, 77, "unsupported: no Vulkan 1.2 device", "")
+        out = work / "spirv"
+        out.mkdir()
+        (out / "vs_ids.spv").touch()
+        return subprocess.CompletedProcess(cmd, 0, "2 shaders: 1 translated, 1 pass spirv-val\n  1 s_trap", "")
+
+    monkeypatch.setattr(imf.subprocess, "run", run)
+    with pytest.raises(SystemExit, match=r"(?s)ps_image_load\.spv.*s_trap"):
+        imf.run_case("R8G8B8A8_UNORM", 4, 4, random.Random(1), str(work), str(build), False, False)
 
 
 def test_unsupported_without_a_reason_line_still_skips(monkeypatch, tmp_path, capsys):
@@ -267,3 +363,56 @@ def test_visual_studio_config_subfolder_is_found(monkeypatch, tmp_path):
     (build / "RelWithDebInfo" / (imf.HARNESS + (".exe" if os.name == "nt" else ""))).touch()
     got = build_dir_main_uses(monkeypatch, ["--build", str(build), "--work", str(tmp_path / "w")])
     assert got == str(build / "RelWithDebInfo")
+
+
+def test_translate_forwards_pc_tail_ubo(monkeypatch, tmp_path):
+    cmds = []
+
+    def fake_run(cmd, **_kw):
+        cmds.append(list(cmd))
+        out = cmd[cmd.index("--out") + 1]           # translate() now checks the two programs were emitted
+        os.makedirs(out, exist_ok=True)
+        for name in ("vs_ids.spv", "ps_image_load.spv"):
+            open(os.path.join(out, name), "wb").close()
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(imf.subprocess, "run", fake_run)
+    imf.translate(str(tmp_path))
+    imf.translate(str(tmp_path), pc_tail=True)
+    assert "--pc-tail-ubo" not in cmds[0]
+    assert "--pc-tail-ubo" in cmds[1]
+
+
+def test_run_case_passes_pc_tail_to_translator_and_harness(monkeypatch, tmp_path):
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / (imf.HARNESS + (".exe" if os.name == "nt" else ""))).touch()
+    seen_translate = []
+    seen_env = []
+    monkeypatch.setattr(imf, "assemble", lambda *_args: None)
+    monkeypatch.setattr(imf, "translate", lambda work, pc_tail=False: seen_translate.append(pc_tail) or str(tmp_path / "spirv"))
+
+    def fake_run(cmd, **kw):
+        seen_env.append(kw.get("env"))
+        return subprocess.CompletedProcess(cmd, 77, "unsupported: test\n", "")
+
+    monkeypatch.setattr(imf.subprocess, "run", fake_run)
+    imf.run_case("R8G8B8A8_UNORM", 4, 4, random.Random(1), str(tmp_path), str(build), False, False, pc_tail=True)
+    assert seen_translate == [True]
+    assert seen_env[0]["LEONIDA_PC_TAIL_UBO"] == "1"
+
+
+def test_main_enables_pc_tail_ubo_from_flag_or_env(monkeypatch, tmp_path):
+    for argv, env_val, want in (
+        ([], "", False),
+        (["--pc-tail-ubo"], "", True),
+        ([], "1", True),
+        ([], "true", True),
+        ([], "0", False),
+    ):
+        seen = []
+        monkeypatch.setenv("LEONIDA_PC_TAIL_UBO", env_val)
+        monkeypatch.setattr(imf, "run_case", lambda *args, **kw: seen.append(kw.get("pc_tail", False)) or True)
+        monkeypatch.setattr(sys, "argv", ["image_fuzz.py", "--programs", "1", "--work", str(tmp_path)] + argv)
+        assert imf.main() == 0
+        assert seen == [want], (argv, env_val)

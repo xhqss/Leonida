@@ -22,8 +22,10 @@
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
+#include "vk_pc_tail.h"
 #include "../src/vulkan_bindless.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -105,7 +107,7 @@ std::uint32_t probe_depth(std::span<const std::uint32_t> table, const Descriptor
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: vk_bindless_test <vs_ids.spv> <ps_tex.spv>\n");
+        std::fprintf(stderr, "usage: vk_bindless_test <vs_ids.spv> <ps_tex.spv | ps_imgatomic.spv>\n");
         return 2;
     }
     // A bad readback in a single channel must still fail when all three others match.
@@ -117,8 +119,14 @@ int main(int argc, char** argv) {
     }
     constexpr std::uint32_t W = 64, H = 64, TW = 8;
     constexpr std::uint32_t table_va = 256;  // console VA of the descriptor table: T# at +0, S# at +32
-    const DescriptorKey tsharp{0x11111111, 0x22222222, 0x33333333, 0x44444444,
-                               0x55555555, 0x66666666, 0x77777777, 0x88888888};  // any 8 dwords: only the key matters
+    // Any 8 dwords as the lookup key, except FORMAT (word 1 [28:20]): the translator picks the float, uint or sint
+    // view of the image from it, and every view this test binds is R8G8B8A8_UNORM, so it is 56 (8_8_8_8_UNORM).
+    // 0x22222222 had 34 (10_11_11_UINT): every sample went through the uint alias of a UNORM view, which Vulkan
+    // leaves undefined (VUID-vkCmdDraw-format-07753, reported by GPU-assisted validation).
+    constexpr std::uint32_t tsharp_word1 = (0x22222222u & ~(0x1FFu << 20)) | (56u << 20);
+    static_assert(((tsharp_word1 >> 20) & 0x1FF) == 56, "the T#'s FORMAT must be 8_8_8_8_UNORM");
+    const DescriptorKey tsharp{0x11111111, tsharp_word1, 0x33333333, 0x44444444,
+                               0x55555555, 0x66666666, 0x77777777, 0x88888888};
     const std::array<std::uint32_t, 4> ssharp{0x5a5a0001, 0x00000002, 0x00000003, 0x00000004};
 
     const PFN_vkGetInstanceProcAddr gipa = load_vulkan();
@@ -191,7 +199,10 @@ int main(int argc, char** argv) {
     std::printf("device: %s%s\n", props.properties.deviceName, validation ? " (validation on)" : "");
     // The pipeline layout pushes the 144-byte translated user-data block. A device with fewer push constant bytes
     // (128 on Intel Arc and some AMD drivers) can't create it: a device limit, not a wrong result (TEST-149).
-    constexpr std::uint32_t push_bytes = 144;
+    // LEONIDA_PC_TAIL_UBO=1 (rdna2spirv.py --pc-tail-ubo): s0..s31 only, 128 bytes; the heap base, if a stage reads
+    // it, is in a uniform block at set 1 (vk_pc_tail.h).
+    const bool pc_tail = leonida::vk_test::pc_tail_requested();
+    const std::uint32_t push_bytes = pc_tail ? 128u : 144u;
     if (props.properties.limits.maxPushConstantsSize < push_bytes) {
         std::printf("unsupported: need %u push constant bytes, device has %u\n", push_bytes,
                     props.properties.limits.maxPushConstantsSize);
@@ -200,7 +211,8 @@ int main(int argc, char** argv) {
 
     // The features ps_tex's metadata names (bufferDeviceAddress, runtimeDescriptorArray, shaderInt64), dynamic
     // indexing of the image array, and whichever descriptor-indexing flags the set can use.
-    VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan11Features have11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &have11};
     VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have12};
     vkGetPhysicalDeviceFeatures2(pd, &have);
     if (!have12.bufferDeviceAddress || !have12.runtimeDescriptorArray || !have.features.shaderInt64 ||
@@ -214,7 +226,10 @@ int main(int argc, char** argv) {
                                      have12.descriptorBindingStorageImageUpdateAfterBind &&
                                      have12.descriptorBindingStorageBufferUpdateAfterBind;
     device_flags.partially_bound = have12.descriptorBindingPartiallyBound == VK_TRUE;
-    VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    // Translated vertex shaders read BaseVertex / BaseInstance (DrawParameters) for the zero-based v0 / v3.
+    VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    enable11.shaderDrawParameters = have11.shaderDrawParameters;
+    VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
     enable12.bufferDeviceAddress = VK_TRUE;
     enable12.runtimeDescriptorArray = VK_TRUE;
     enable12.descriptorIndexing = have12.descriptorIndexing;
@@ -225,6 +240,15 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceFeatures2 enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &enable12};
     enable.features.shaderInt64 = VK_TRUE;
     enable.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+    // ps_imgatomic: image atomics in a pixel shader need fragment stores and atomics.
+    const bool atomic_mode = std::strstr(argv[2], "imgatomic") != nullptr;
+    if (atomic_mode) {
+        if (!have.features.fragmentStoresAndAtomics) {
+            std::printf("unsupported: fragmentStoresAndAtomics (image atomics in a pixel shader)\n");
+            return unsupported;
+        }
+        enable.features.fragmentStoresAndAtomics = VK_TRUE;
+    }
 
     std::uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
@@ -260,7 +284,7 @@ int main(int argc, char** argv) {
     LD(vkDeviceWaitIdle); LD(vkDestroyPipeline); LD(vkDestroyPipelineLayout);
     LD(vkDestroyCommandPool); LD(vkDestroyShaderModule); LD(vkDestroyFramebuffer); LD(vkDestroyRenderPass);
     LD(vkDestroySampler); LD(vkDestroyImageView); LD(vkDestroyImage); LD(vkDestroyBuffer);
-    LD(vkFreeMemory); LD(vkDestroyDevice);
+    LD(vkFreeMemory); LD(vkDestroyDevice); LD(vkCmdClearColorImage);
     VkQueue queue = VK_NULL_HANDLE;
     vkGetDeviceQueue(dev, qi, 0, &queue);
     VkPhysicalDeviceMemoryProperties mp;
@@ -409,17 +433,34 @@ int main(int argc, char** argv) {
     CHECK(make_buffer(VkDeviceSize(W) * H * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &readback, &readback_map));
 
     VkShaderModule vs, fs;
+    bool tail_block = false;
     for (int stage = 0; stage < 2; ++stage) {
         const auto code = read_spv(argv[1 + stage]);
         if (code.empty()) {
             std::fprintf(stderr, "cannot read %s\n", argv[1 + stage]);
             return 1;
         }
+        if (pc_tail && leonida::vk_test::spirv_declares_set(code.data(), code.size() * 4, leonida::vk_test::pc_tail_set))
+            tail_block = true;
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         smi.codeSize = code.size() * 4;
         smi.pCode = code.data();
         CHECK(vkCreateShaderModule(dev, &smi, nullptr, stage ? &fs : &vs));
     }
+    // One tail block for every variant below: each draw's tail is the same heap base.
+    leonida::vk_test::PcTail tail;
+    if (tail_block && !tail.create(vkGetDeviceProcAddr, dev, mp, props.properties.limits.minUniformBufferOffsetAlignment,
+                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1)) {
+        std::fprintf(stderr, "FAILED creating the --pc-tail-ubo block\n");
+        return 1;
+    }
+    auto bind_tail = [&](VkCommandBuffer cb, VkPipelineLayout layout, const std::uint32_t* block) {
+        if (!tail_block) return;
+        tail.write(0, block, 4);
+        const std::uint32_t offset = tail.offset(0);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, leonida::vk_test::pc_tail_set, 1, &tail.set,
+                                1, &offset);
+    };
     VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     cpi.queueFamilyIndex = qi;
@@ -556,6 +597,8 @@ int main(int argc, char** argv) {
         pli.pSetLayouts = &set_layout;
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &push;
+        const VkDescriptorSetLayout set_layouts[] = {set_layout, tail.set_layout};
+        if (tail_block) { pli.setLayoutCount = 2; pli.pSetLayouts = set_layouts; }
         VkPipelineLayout pipeline_layout;
         CHECK(vkCreatePipelineLayout(dev, &pli, nullptr, &pipeline_layout));
         VkPipelineShaderStageCreateInfo stages[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
@@ -622,7 +665,8 @@ int main(int argc, char** argv) {
             block[2] = table_va;  // s2:s3 = console VA of the descriptor table
             block[32] = std::uint32_t(heap_base);
             block[33] = std::uint32_t(heap_base >> 32);
-            vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(block), block);
+            vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, push_bytes, block);
+            bind_tail(cmd, pipeline_layout, block);
             vkCmdDraw(cmd, 3, 1, 0, 0);
             vkCmdEndRenderPass(cmd);
             VkBufferImageCopy rc{};
@@ -655,13 +699,182 @@ int main(int argc, char** argv) {
         for (std::uint32_t i = 1; i < set.image_capacity(ImageDimension::dim_1d); ++i)
             filled.push_back(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL));
         EXPECT(filled.front() == 1 && filled.back() == set.image_capacity(ImageDimension::dim_1d) - 1);
+        EXPECT(set.free_images(ImageDimension::dim_1d) == 0);
         EXPECT(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL) == 0);
         set.remove_image(ImageDimension::dim_1d, 7);
         EXPECT(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL) == 7);
         for (const std::uint32_t index : filled) set.remove_image(ImageDimension::dim_1d, index);
+        EXPECT(set.free_images(ImageDimension::dim_1d) == set.image_capacity(ImageDimension::dim_1d) - 1);
+        EXPECT(set.free_samplers() == set.sampler_capacity() - 1);
         const std::uint32_t decoy_sampler = set.add_sampler(nearest);
         const std::uint32_t sampler_index = set.add_sampler(nearest);
-        EXPECT(decoy_sampler == 1 && sampler_index == 2);
+        EXPECT(decoy_sampler == 1 && sampler_index == 2 && set.free_samplers() == set.sampler_capacity() - 3);
+
+        if (atomic_mode) {
+            // ps_imgatomic.asm: image_atomic_umax/umin/or on three 8x8 r32ui images and umax on a 4x4x4 one, from
+            // every pixel of the 64x64 draw (64 pixels per 2D texel), each found through its own T# key. Odd
+            // pixels are discarded after their atomics, which still count.
+            constexpr std::uint32_t atomic_va = 1024, AW = 8, A3 = 4;
+            const std::array<DescriptorKey, 4> keys{{{0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8},
+                                                     {0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8},
+                                                     {0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8},
+                                                     {0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8}}};
+            for (std::uint32_t k = 0; k < 4; ++k)
+                std::memcpy(static_cast<char*>(heap_map) + atomic_va + 32 * k, keys[k].data(), 32);
+            const VkImageUsageFlags atomic_usage =
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            VkImage images[4];
+            VkImageView views[4];
+            for (int k = 0; k < 3; ++k) CHECK(make_image(VK_FORMAT_R32_UINT, AW, AW, atomic_usage, &images[k], &views[k]));
+            {   // the 3D image
+                VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+                ii.imageType = VK_IMAGE_TYPE_3D;
+                ii.format = VK_FORMAT_R32_UINT;
+                ii.extent = {A3, A3, A3};
+                ii.mipLevels = 1;
+                ii.arrayLayers = 1;
+                ii.samples = VK_SAMPLE_COUNT_1_BIT;
+                ii.usage = atomic_usage;
+                CHECK(vkCreateImage(dev, &ii, nullptr, &images[3]));
+                VkMemoryRequirements mr;
+                vkGetImageMemoryRequirements(dev, images[3], &mr);
+                VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                ai.allocationSize = mr.size;
+                ai.memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                VkDeviceMemory m;
+                CHECK(vkAllocateMemory(dev, &ai, nullptr, &m));
+                allocations.push_back(m);
+                CHECK(vkBindImageMemory(dev, images[3], m, 0));
+                VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                vi.image = images[3];
+                vi.viewType = VK_IMAGE_VIEW_TYPE_3D;
+                vi.format = VK_FORMAT_R32_UINT;
+                vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                CHECK(vkCreateImageView(dev, &vi, nullptr, &views[3]));
+            }
+            std::uint32_t indices[4];
+            for (int k = 0; k < 4; ++k) {
+                StorageViews storage;
+                storage.as_uint = views[k];
+                storage.r32ui = views[k];
+                indices[k] = set.add_image(k == 3 ? ImageDimension::dim_3d : ImageDimension::dim_2d, views[k],
+                                           VK_IMAGE_LAYOUT_GENERAL, storage);
+                EXPECT(indices[k] != 0);
+                EXPECT(set.insert_key(keys[k], indices[k]));
+            }
+            EXPECT(flush());
+
+            // Clear: umax and or start at 0, umin at all ones; then GENERAL for the shader's atomics.
+            CHECK(vkResetCommandBuffer(cmd, 0));
+            CHECK(vkBeginCommandBuffer(cmd, &begin));
+            if (!set.fallbacks_ready()) set.record_fallback_init(cmd);
+            for (int k = 0; k < 4; ++k) {
+                VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.image = images[k];
+                b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                                     nullptr, 0, nullptr, 1, &b);
+                VkClearColorValue value{};
+                for (auto& c : value.uint32) c = k == 1 ? 0xFFFFFFFFu : 0u;
+                vkCmdClearColorImage(cmd, images[k], VK_IMAGE_LAYOUT_GENERAL, &value, 1, &b.subresourceRange);
+                b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                                     nullptr, 0, nullptr, 1, &b);
+            }
+            CHECK(submit());
+
+            // The draw, then the images and the render target read back.
+            const VkDeviceSize image_bytes = 3 * AW * AW * 4 + A3 * A3 * A3 * 4;
+            VkBuffer atomic_readback;
+            void* atomic_map;
+            CHECK(make_buffer(image_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &atomic_readback, &atomic_map));
+            CHECK(vkResetCommandBuffer(cmd, 0));
+            CHECK(vkBeginCommandBuffer(cmd, &begin));
+            VkClearValue clear{};
+            for (float& channel : clear.color.float32) channel = 0.25f;
+            VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+            rbi.renderPass = pass;
+            rbi.framebuffer = framebuffer;
+            rbi.renderArea = scissor;
+            rbi.clearValueCount = 1;
+            rbi.pClearValues = &clear;
+            vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            const VkDescriptorSet bound = set.set();
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1, &bound, 0, nullptr);
+            std::uint32_t block[36] = {};
+            block[2] = atomic_va;
+            block[32] = std::uint32_t(heap_base);
+            block[33] = std::uint32_t(heap_base >> 32);
+            vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               push_bytes, block);
+            bind_tail(cmd, pipeline_layout, block);
+            vkCmdDraw(cmd, 3, 1, 0, 0);
+            vkCmdEndRenderPass(cmd);
+            VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            after.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            after.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &after,
+                                 0, nullptr, 0, nullptr);
+            VkDeviceSize offset = 0;
+            for (int k = 0; k < 4; ++k) {
+                VkBufferImageCopy rc{};
+                rc.bufferOffset = offset;
+                rc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                rc.imageExtent = k == 3 ? VkExtent3D{A3, A3, A3} : VkExtent3D{AW, AW, 1};
+                vkCmdCopyImageToBuffer(cmd, images[k], VK_IMAGE_LAYOUT_GENERAL, atomic_readback, 1, &rc);
+                offset += k == 3 ? A3 * A3 * A3 * 4 : AW * AW * 4;
+            }
+            VkBufferImageCopy tc{};
+            tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            tc.imageExtent = {W, H, 1};
+            vkCmdCopyImageToBuffer(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &tc);
+            CHECK(submit());
+
+            // The model: every pixel's atomics, discarded or not.
+            std::vector<std::uint32_t> want(3 * AW * AW + A3 * A3 * A3, 0);
+            for (std::uint32_t t = 0; t < AW * AW; ++t) want[AW * AW + t] = 0xFFFFFFFFu;
+            for (std::uint32_t py = 0; py < H; ++py)
+                for (std::uint32_t px = 0; px < W; ++px) {
+                    const std::uint32_t id = px + 64 * py, t = (py >> 3) * AW + (px >> 3);
+                    want[t] = std::max(want[t], id);
+                    want[AW * AW + t] = std::min(want[AW * AW + t], id);
+                    want[2 * AW * AW + t] |= 1u << (id & 31);
+                    const std::uint32_t v = ((px & 3) * A3 + (py >> 4)) * A3 + (px >> 4);
+                    want[3 * AW * AW + v] = std::max(want[3 * AW * AW + v], id);
+                }
+            const auto* got = static_cast<const std::uint32_t*>(atomic_map);
+            const char* names[] = {"2D umax", "2D umin", "2D or", "3D umax"};
+            unsigned wrong = 0;
+            for (std::size_t i = 0; i < want.size(); ++i) {
+                if (got[i] == want[i]) continue;
+                const int k = i < 3 * AW * AW ? int(i / (AW * AW)) : 3;
+                if (wrong++ < 8)
+                    std::printf("  %s texel %zu: got 0x%08x, want 0x%08x\n", names[k],
+                                k == 3 ? i - 3 * AW * AW : i % (AW * AW), got[i], want[i]);
+            }
+            const float* rt = static_cast<const float*>(readback_map);
+            unsigned bad_rt = 0;
+            for (std::uint32_t py = 0; py < H; ++py)
+                for (std::uint32_t px = 0; px < W; ++px)
+                    bad_rt += rt[(py * W + px) * 4] != ((px & 1) ? 0.25f : 1.0f);
+            std::printf("ps_imgatomic: %u of %zu texels wrong (2D umax/umin/or 8x8 each, 3D umax 4x4x4); "
+                        "%u of %u render-target pixels wrong (odd columns discarded)\n",
+                        wrong, want.size(), bad_rt, W * H);
+            vkDeviceWaitIdle(dev);
+            if (g_validation_errors) {
+                std::printf("ps_imgatomic: %u validation errors\n", g_validation_errors);
+                return 1;
+            }
+            return wrong || bad_rt ? 1 : 0;
+        }
 
         // A view that comes and goes before the set is flushed is never written: a texture created and destroyed
         // between two submissions. Its slots are written once, with the fallback; a write of the destroyed view
@@ -727,7 +940,7 @@ int main(int argc, char** argv) {
         // 2. Without its key the T# is a miss: index 0, the fallback image of zeros.
         const float zeros[4] = {0, 0, 0, 0};
         EXPECT(set.erase_key(tsharp) && !set.erase_key(tsharp));
-        EXPECT(set.flush_needs_idle());  // erasing may move the keys behind it; nothing is running here
+        EXPECT(!set.flush_needs_idle());  // erasing empties its slot only: the three keys ahead stay where they are
         EXPECT(flush() && !set.flush_needs_idle());
         CHECK(draw());
         compare("2 miss", zeros);

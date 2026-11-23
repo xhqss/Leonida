@@ -155,16 +155,17 @@ def _read_history_section(history, codec_key, marker_key):
             return None
         path = candidate
     abspath = os.path.abspath(path)
-    mtime = os.path.getmtime(abspath)
+    st = os.stat(abspath)
+    cache_key = (st.st_mtime_ns, st.st_size)
     cached = _FILE_CACHE.get(abspath)
-    if cached is not None and cached[0] == mtime:
+    if cached is not None and cached[0] == cache_key:
         data = cached[1]
     else:
         with open(abspath, "r", encoding="utf-8") as fh:
             data = json.load(fh)
         if not isinstance(data, dict):
             raise ValueError(f"{path}: expected a JSON object")
-        _FILE_CACHE[abspath] = (mtime, data)
+        _FILE_CACHE[abspath] = (cache_key, data)
     if codec_key in data:
         return data[codec_key]
     return data if marker_key in data else None
@@ -206,17 +207,21 @@ def _flatten_bc7_entry(val, expected_len):
     return tuple(out)
 
 
-def load_bc6h(history=None):
+def load_bc6h(history=None, *, with_confirmed_bits=False):
     """Return `(endpoint_history, index_history, endpoint_class, index_class)`.
 
     With `history=None`, returns empty/unknown tables (class `0` for all 256
     entries) so self-contained BC6H chunks still decode strictly without any
     external file. When `history` is a local JSON file, directory containing
     `bc6h.json`, or dict, populates the BC6H initial history tables from it.
+    With `with_confirmed_bits=True`, append endpoint `[256][3][4]` and index
+    `[256][16]` leading-bit confirmation depths. Legacy documents without the
+    optional depth tables retain full precision for class-3 entries.
     """
     sec = _read_history_section(history, "bc6h", "endpointHistory")
     if sec is None:
-        return _EMPTY_BC6H_EH, _EMPTY_BC6H_IH, _EMPTY_BC6H_CLS, _EMPTY_BC6H_CLS
+        result = (_EMPTY_BC6H_EH, _EMPTY_BC6H_IH, _EMPTY_BC6H_CLS, _EMPTY_BC6H_CLS)
+        return result + (_EMPTY_BC6H_EH, _EMPTY_BC6H_IH) if with_confirmed_bits else result
     eh = list(_EMPTY_BC6H_EH)
     ih = list(_EMPTY_BC6H_IH)
     ec = list(_EMPTY_BC6H_CLS)
@@ -233,7 +238,32 @@ def load_bc6h(history=None):
         ec[i] = int(cls)
     for i, cls in _iter_entries(sec.get("indexClass")):
         ic[i] = int(cls)
-    return tuple(eh), tuple(ih), tuple(ec), tuple(ic)
+    ep_cb = [tuple((16, 10, 6, 6) for _ in range(3)) if c == 3 else _EMPTY_BC6H_EH[0] for c in ec]
+    ix_cb = [(4,) * 16 if c == 3 else _EMPTY_BC6H_IH[0] for c in ic]
+    for key, target, empty, widths in (
+        ("endpointConfirmedBits", ep_cb, _EMPTY_BC6H_EH, (16, 10, 6, 6)),
+        ("indexConfirmedBits", ix_cb, _EMPTY_BC6H_IH, (4,) * 16),
+    ):
+        if key not in sec:
+            continue
+        # In an explicit sparse depth table, omitted rows confirm no bits.
+        target[:] = empty
+        for i, row in _iter_entries(sec[key]):
+            if key == "endpointConfirmedBits":
+                if len(row) != 3 or any(len(ch) != 4 for ch in row):
+                    raise ValueError(f"BC6H {key}[{i}] must be 3x4 integers")
+                value = tuple(tuple(int(v) for v in ch) for ch in row)
+                valid = all(0 <= v <= widths[q] for ch in value for q, v in enumerate(ch))
+            else:
+                if len(row) != 16:
+                    raise ValueError(f"BC6H {key}[{i}] must have 16 integers")
+                value = tuple(int(v) for v in row)
+                valid = all(0 <= v <= 4 for v in value)
+            if not valid:
+                raise ValueError(f"BC6H {key}[{i}] bit depth out of bounds")
+            target[i] = value
+    result = (tuple(eh), tuple(ih), tuple(ec), tuple(ic))
+    return result + (tuple(ep_cb), tuple(ix_cb)) if with_confirmed_bits else result
 
 
 def load_bc7(history=None):
@@ -305,3 +335,84 @@ def load_bc7(history=None):
         "history_index_confirmed_bits": tuple(ix_cb),
         "last_resort": frozenset(last_resort),
     }
+
+
+_BC_HISTORY_SPEC = {
+    1: ("bc1", (32, 64, 32, 32, 64, 32)),
+    3: ("bc3", (256, 256, 32, 64, 32, 32, 64, 32)),
+    4: ("bc4", (256, 256)),
+    5: ("bc5", (256, 256, 256, 256)),
+}
+
+
+def load_bc_history(codec, history=None):
+    """Load optional BC1/BC3/BC4/BC5 initial history overrides from `history`.
+
+    Returns `None` when `history` is `None` or does not contain a section for
+    `codec`. Otherwise returns `(confirmed, provisional, replace)` where
+    `confirmed` and `provisional` map `0..255` entry indices to validated
+    endpoint tuples and `replace` is a bool (default False: overlay onto the
+    built-in `bcpack_tables.py` defaults).
+    """
+    if history is None:
+        return None
+    spec = _BC_HISTORY_SPEC.get(codec)
+    if spec is None:
+        raise ValueError(f"unsupported BC history codec: {codec}")
+    codec_key, mods = spec
+    if isinstance(history, dict):
+        if codec_key in history:
+            sec = history[codec_key]
+        elif history.get("codec") == codec_key:
+            sec = history
+        else:
+            return None
+    else:
+        path = os.fspath(history)
+        if os.path.isdir(path):
+            candidate = os.path.join(path, f"{codec_key}.json")
+            if not os.path.isfile(candidate):
+                return None
+            path = candidate
+        abspath = os.path.abspath(path)
+        st = os.stat(abspath)
+        cache_key = (st.st_mtime_ns, st.st_size)
+        cached = _FILE_CACHE.get(abspath)
+        if cached is not None and cached[0] == cache_key:
+            data = cached[1]
+        else:
+            with open(abspath, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                raise ValueError(f"{path}: expected a JSON object")
+            _FILE_CACHE[abspath] = (cache_key, data)
+        if codec_key in data:
+            sec = data[codec_key]
+        elif data.get("codec") == codec_key:
+            sec = data
+        else:
+            return None
+    if not isinstance(sec, dict):
+        raise ValueError(f"{codec_key} history section must be a JSON object")
+    if "codec" in sec and sec["codec"] != codec_key:
+        raise ValueError(f"expected codec {codec_key!r}, got {sec['codec']!r}")
+    ncols = len(mods)
+
+    def _parse_map(obj, label):
+        out = {}
+        for i, vals in _iter_entries(obj):
+            if not isinstance(vals, (list, tuple)) or len(vals) != ncols:
+                raise ValueError(f"{codec_key} {label}[{i}] must have {ncols} integers")
+            row = []
+            for v, mod in zip(vals, mods):
+                iv = int(v)
+                if not 0 <= iv < mod:
+                    raise ValueError(f"{codec_key} {label}[{i}] value {iv} outside 0..{mod - 1}")
+                row.append(iv)
+            out[i] = tuple(row)
+        return out
+
+    confirmed = _parse_map(sec.get("confirmed"), "confirmed")
+    provisional = _parse_map(sec.get("provisional"), "provisional")
+    replace = bool(sec.get("replace", False))
+    return confirmed, provisional, replace

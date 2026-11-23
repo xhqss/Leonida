@@ -4,6 +4,7 @@
 #include <intrin.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +15,8 @@
 #include <vector>
 
 #include "../shims/shims.h"
+#include "../shims/startup_trace.h"
+#include "base_reservation.h"
 
 namespace rt {
 
@@ -62,7 +65,8 @@ uint64_t rva_in(const Module& m, uint64_t va, const char* what) {
 
 IMAGE_TLS_DIRECTORY64* tls_directory(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
-    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    // Through directory(), as every other directory: an entry past NumberOfRvaAndSizes is not a TLS directory.
+    const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_TLS);
     if (!dir.Size || !dir.VirtualAddress) return nullptr;
     require_range(m.name, dir.VirtualAddress, sizeof(IMAGE_TLS_DIRECTORY64), m.size, "the TLS directory");
     return at<IMAGE_TLS_DIRECTORY64>(m.base, dir.VirtualAddress);
@@ -72,8 +76,11 @@ IMAGE_TLS_DIRECTORY64* tls_directory(Module& m) {
 // loader-assigned per-module TLS index and is a different index space from TlsAlloc/TlsGetValue (TlsSlots). Only the OS
 // loader can allocate a module index, so the runtime ships a minimal DLL whose only content is a TLS anchor
 // (src/tls_host.cpp). Loading it makes the OS reserve an index and give every thread a block for it; the native loader
-// reuses that index for the mapped image. One helper means one mapped TLS module at a time.
+// reuses that index for the mapped image. When more than one manually mapped module uses static TLS at once, the loader
+// clones gta6rt_tls_host.dll to a per-process temporary path on demand and loads it, so the OS assigns an independent
+// module TLS index for each simultaneous module (up to kMaxMappedTlsModules).
 constexpr DWORD kMaxModuleTlsSlots = 64;
+constexpr size_t kMaxMappedTlsModules = 16;
 void** module_tls_slots() { return reinterpret_cast<void**>(__readgsqword(0x58)); }
 
 void __cdecl on_host_thread_event(DWORD reason);
@@ -83,22 +90,107 @@ struct TlsHostModule {
     DWORD index = TLS_OUT_OF_INDEXES;
 };
 
-TlsHostModule load_tls_host() {
-    TlsHostModule host;
-    // Dynamic buffer loop for paths that exceed MAX_PATH
+std::filesystem::path tls_host_base_path() {
     std::wstring exe_path;
     DWORD size = MAX_PATH;
     while (true) {
         exe_path.resize(size);
         DWORD len = GetModuleFileNameW(nullptr, exe_path.data(), size);
-        if (len == 0) return host;
+        if (len == 0) return {};
         if (len < size - 1) {
             exe_path.resize(len);
             break;
         }
         size *= 2;
     }
-    const std::filesystem::path path = std::filesystem::path(exe_path).parent_path() / L"gta6rt_tls_host.dll";
+    return std::filesystem::path(exe_path).parent_path() / L"gta6rt_tls_host.dll";
+}
+
+std::filesystem::path tls_host_clone_dir() {
+    wchar_t buf[MAX_PATH];
+    DWORD n = GetTempPathW(MAX_PATH, buf);
+    if (n > 0 && n < MAX_PATH) return std::filesystem::path(buf);
+    return std::filesystem::temp_directory_path();
+}
+
+struct TlsCloneRecord {
+    HMODULE module = nullptr;
+    std::filesystem::path path;
+};
+
+std::mutex g_tls_alloc_mutex;
+std::array<TlsHostModule, kMaxMappedTlsModules> g_tls_hosts{};
+std::array<std::atomic<Module*>, kMaxMappedTlsModules> g_tls_slot_owners{};
+std::array<std::atomic<uint64_t>, kMaxMappedTlsModules> g_tls_slot_generations{};
+std::atomic<uint64_t> g_next_tls_generation{1};
+std::vector<TlsCloneRecord> g_tls_clones;
+
+// Frees every TLS helper clone this process loaded and deletes its files. load() registers the wrapper with atexit;
+// the --run path in main() must also call this directly before ExitProcess, which skips the atexit table. Call it
+// only when no mapped code can run again: it unmaps the helper images.
+void cleanup_tls_clones_internal() {
+    for (const auto& rec : g_tls_clones) {
+        if (rec.module) FreeLibrary(rec.module);
+        if (!rec.path.empty()) DeleteFileW(rec.path.c_str());
+    }
+    g_tls_clones.clear();
+}
+
+void cleanup_tls_clones_at_exit() { cleanup_tls_clones_internal(); }
+
+// The owner process named by "leonida_tls_host_<pid>_<slot>.dll"; 0 when the name does not carry one.
+DWORD clone_owner_pid(const wchar_t* name) {
+    constexpr wchar_t prefix[] = L"leonida_tls_host_";
+    const wchar_t* p = name;
+    for (size_t i = 0; i < sizeof(prefix) / sizeof(wchar_t) - 1; ++i)
+        if (*p++ != prefix[i]) return 0;
+    if (*p < L'0' || *p > L'9') return 0;
+    unsigned long pid = 0;
+    while (*p >= L'0' && *p <= L'9') {
+        pid = pid * 10 + (*p - L'0');
+        if (pid > 0xFFFFFFFFul) return 0;
+        ++p;
+    }
+    return static_cast<DWORD>(pid);
+}
+
+bool process_alive(DWORD pid) {
+    // PROCESS_QUERY_LIMITED_INFORMATION needs no handle rights a normal process could deny; a failure means the
+    // process is gone. A still-mapped or still-open file is caught by the checks below even for a misjudged PID.
+    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!p) return false;
+    CloseHandle(p);
+    return true;
+}
+
+// Deletes clones left behind by processes that have exited. Deletion is scoped to files whose owner is gone: a
+// clone of a live process is either still open by its copy step's handle or mapped as an image, so it is skipped
+// (or DeleteFileW fails harmlessly), and a concurrent process between CopyFileW and LoadLibraryExW keeps its file.
+void sweep_stale_tls_clones(const std::filesystem::path& dir) {
+    WIN32_FIND_DATAW fd{};
+    const std::filesystem::path pattern = dir / L"leonida_tls_host_*.dll";
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const std::filesystem::path path = dir / fd.cFileName;
+        const DWORD owner = clone_owner_pid(fd.cFileName);
+        if (owner && owner != GetCurrentProcessId() && process_alive(owner)) continue;
+        // An exclusive open (no sharing) conflicts with any handle another process holds on the file, so a failure
+        // means the copy->load sequence or a mapped image still owns it. Only unowned files reach DeleteFileW, and
+        // that stays harmless for a mapped image.
+        HANDLE probe =
+            CreateFileW(path.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (probe == INVALID_HANDLE_VALUE) continue;
+        CloseHandle(probe);
+        DeleteFileW(path.c_str());
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+TlsHostModule load_tls_host_image(const std::filesystem::path& path, bool hook_thread_events) {
+    TlsHostModule host;
+    if (path.empty()) return host;
     // The helper is linked with the static CRT (/MT), so it needs only system DLLs. Restricting the dependency search
     // to System32 keeps a game-supplied vcruntime next to the executable from being picked up.
     host.module = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -120,31 +212,96 @@ TlsHostModule load_tls_host() {
         return host;
     }
     host.index = *reinterpret_cast<DWORD*>(tls->AddressOfIndex);
-    // From here on the helper's DllMain reports every thread the process starts or ends (on_host_thread_event).
-    using SetThreadEvent = void(__cdecl*)(void(__cdecl*)(DWORD));
-    if (auto set = reinterpret_cast<SetThreadEvent>(GetProcAddress(host.module, "gta6rt_tls_host_set_thread_event")))
-        set(&on_host_thread_event);
+    if (hook_thread_events) {
+        // Only the primary helper reports thread attach/detach events; on_host_thread_event iterates all active slots.
+        using SetThreadEvent = void(__cdecl*)(void(__cdecl*)(DWORD));
+        if (auto set = reinterpret_cast<SetThreadEvent>(GetProcAddress(host.module, "gta6rt_tls_host_set_thread_event")))
+            set(&on_host_thread_event);
+    }
     return host;
 }
 
-TlsHostModule& tls_host() {
-    // The helper stays loaded for the process lifetime: unloading it would release the reserved TLS index. Its own
-    // per-thread blocks are restored by uninstall_tls_for_thread, so the OS loader can free them normally.
-    static TlsHostModule host = load_tls_host();
-    return host;
+// Must be called with g_tls_alloc_mutex held and WITHOUT g_tls_lock held (LoadLibraryExW takes the Windows loader lock).
+TlsHostModule ensure_tls_host(size_t slot) {
+    if (slot >= kMaxMappedTlsModules) return {};
+    if (g_tls_hosts[slot].index != TLS_OUT_OF_INDEXES) return g_tls_hosts[slot];
+
+    const std::filesystem::path primary = tls_host_base_path();
+    if (primary.empty()) return {};
+
+    if (slot == 0) {
+        g_tls_hosts[0] = load_tls_host_image(primary, true);
+        return g_tls_hosts[0];
+    }
+
+    // Ensure slot 0 is loaded first so thread attach/detach events are hooked.
+    if (g_tls_hosts[0].index == TLS_OUT_OF_INDEXES) {
+        g_tls_hosts[0] = load_tls_host_image(primary, true);
+        if (g_tls_hosts[0].index == TLS_OUT_OF_INDEXES) return {};
+    }
+
+    // Clone gta6rt_tls_host.dll to a distinct path using CopyFileW (Wine 9 lacks CopyFile2 used by std::filesystem).
+    const std::filesystem::path dir = tls_host_clone_dir();
+    static bool swept = false;
+    if (!swept) {
+        swept = true;
+        sweep_stale_tls_clones(dir);
+        std::atexit(&cleanup_tls_clones_at_exit);
+    }
+    const std::wstring name =
+        L"leonida_tls_host_" + std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(slot) + L".dll";
+    const std::filesystem::path clone_path = dir / name;
+    // The staging name must not match the sweep pattern, which only covers final clone names ending in .dll.
+    const std::filesystem::path staging = clone_path.wstring() + L".new";
+    if (!CopyFileW(primary.c_str(), staging.c_str(), FALSE)) return {};
+
+    // Open the guard before the clone exists under its final name and hold it across LoadLibraryExW: the rename
+    // below needs DELETE access, which the handle's FILE_SHARE_DELETE grants, and no purge can remove the clone
+    // while the handle is open (an exclusive open conflicts with it) or once the image is mapped. Copying straight
+    // to the final name would leave a window where a concurrent sweep sees an unowned file.
+    HANDLE guard = CreateFileW(staging.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (guard == INVALID_HANDLE_VALUE) {
+        DeleteFileW(staging.c_str());
+        return {};
+    }
+    if (!MoveFileExW(staging.c_str(), clone_path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        CloseHandle(guard);
+        DeleteFileW(staging.c_str());
+        return {};
+    }
+    TlsHostModule loaded = load_tls_host_image(clone_path, false);
+    CloseHandle(guard);
+
+    if (loaded.index == TLS_OUT_OF_INDEXES) {
+        DeleteFileW(clone_path.c_str());
+        return {};
+    }
+    for (size_t i = 0; i < kMaxMappedTlsModules; ++i) {
+        if (i != slot && g_tls_hosts[i].index == loaded.index) {
+            FreeLibrary(loaded.module);
+            DeleteFileW(clone_path.c_str());
+            return {};
+        }
+    }
+    g_tls_clones.push_back({loaded.module, clone_path});
+    g_tls_hosts[slot] = loaded;
+    return g_tls_hosts[slot];
 }
 
-std::atomic<Module*> g_tls_slot_owner{nullptr};
+struct ThreadTlsSlot {
+    Module* module = nullptr;
+    uint64_t generation = 0;
+    void* saved = nullptr;
+    void* block = nullptr;
+    uint32_t index = kNoTlsIndex;
+};
 
-// Per-thread installation state. Only one mapped TLS module can own the reserved slot, so one entry per thread is
-// enough; the saved pointer is the helper DLL's own block that the OS loader will free at thread exit.
-thread_local Module* g_thread_tls_module = nullptr;
-thread_local void* g_thread_tls_saved = nullptr;
-thread_local void* g_thread_tls_block = nullptr;
-thread_local uint32_t g_thread_tls_index = kNoTlsIndex;
+// Per-thread installation state for each reserved TLS slot.
+thread_local std::array<ThreadTlsSlot, kMaxMappedTlsModules> g_thread_tls_slots{};
 
-// Orders the TLS owner's publication, its `initialised` flag and its retirement against the thread events. Shared in
-// on_host_thread_event, exclusive only for those short writes (no allocation and no call that takes the Windows
+// Orders the TLS owners' publication, their `initialised` flags and their retirement against the thread events. Shared
+// in on_host_thread_event, exclusive only for those short writes (no allocation and no call that takes the Windows
 // loader lock, which the events run under).
 SRWLOCK g_tls_lock = SRWLOCK_INIT;
 struct SharedTlsLock {
@@ -162,30 +319,41 @@ struct ExclusiveTlsLock {
 
 // Puts the helper DLL's own block back in this thread's slot and frees the copy that replaced it. Uses only this
 // thread's record, so it also works after the module that installed the copy is gone.
-void release_thread_block() {
-    if (!g_thread_tls_block) return;
-    void** slots = module_tls_slots();
-    if (slots && g_thread_tls_index < kMaxModuleTlsSlots && slots[g_thread_tls_index] == g_thread_tls_block)
-        slots[g_thread_tls_index] = g_thread_tls_saved;
-    VirtualFree(g_thread_tls_block, 0, MEM_RELEASE);
-    g_thread_tls_module = nullptr;
-    g_thread_tls_saved = nullptr;
-    g_thread_tls_block = nullptr;
-    g_thread_tls_index = kNoTlsIndex;
+void release_thread_slot(size_t slot) {
+    if (slot >= kMaxMappedTlsModules) return;
+    ThreadTlsSlot& entry = g_thread_tls_slots[slot];
+    if (!entry.module && !entry.block) return;
+    if (entry.block) {
+        void** slots = module_tls_slots();
+        if (slots && entry.index < kMaxModuleTlsSlots && slots[entry.index] == entry.block)
+            slots[entry.index] = entry.saved;
+        VirtualFree(entry.block, 0, MEM_RELEASE);
+    }
+    entry = ThreadTlsSlot{};
 }
 
 void install_thread_block(Module& m) {
-    if (m.tls_index == kNoTlsIndex) return;
-    if (g_thread_tls_module == &m) return;
-    if (g_thread_tls_module) {
-        // A copy left by a module whose Loader is gone is released; a live module's is a conflict.
-        if (g_thread_tls_module == g_tls_slot_owner.load())
-            throw std::runtime_error("another manually mapped module's TLS is already installed in this thread");
-        release_thread_block();
+    if (m.tls_slot >= kMaxMappedTlsModules) return;
+    const size_t slot = m.tls_slot;
+    ThreadTlsSlot& entry = g_thread_tls_slots[slot];
+    if (entry.module == &m && entry.generation == m.tls_generation) return;
+    if (entry.module) {
+        // A copy left by a module whose Loader is gone (or from an earlier generation) is released; a live owner's is a conflict.
+        if (entry.module == g_tls_slot_owners[slot].load() &&
+            entry.generation == g_tls_slot_generations[slot].load()) {
+            throw std::runtime_error("another manually mapped module's TLS is already installed in this thread slot");
+        }
+        release_thread_slot(slot);
     }
 
     const uint64_t total = static_cast<uint64_t>(m.tls_raw_size) + m.tls_zero_fill;
-    if (!total) return;
+    if (!total) {
+        // Callback-only TLS module (no data block): still record attachment in this slot so DLL_THREAD_DETACH runs.
+        entry.module = &m;
+        entry.generation = m.tls_generation;
+        return;
+    }
+    if (m.tls_index == kNoTlsIndex) return;
     void** slots = module_tls_slots();
     if (!slots || m.tls_index >= kMaxModuleTlsSlots)
         throw std::runtime_error(m.name + ": cannot install TLS in this thread");
@@ -198,22 +366,28 @@ void install_thread_block(Module& m) {
 
     void* saved = slots[m.tls_index];
     slots[m.tls_index] = block;
-    g_thread_tls_module = &m;
-    g_thread_tls_saved = saved;
-    g_thread_tls_block = block;
-    g_thread_tls_index = m.tls_index;
+    entry.module = &m;
+    entry.generation = m.tls_generation;
+    entry.saved = saved;
+    entry.block = block;
+    entry.index = m.tls_index;
 }
 
 void uninstall_thread_block(Module& m) {
-    if (g_thread_tls_module != &m) return;
-    if (m.tls_block == g_thread_tls_block) {
+    if (m.tls_slot >= kMaxMappedTlsModules) return;
+    const size_t slot = m.tls_slot;
+    ThreadTlsSlot& entry = g_thread_tls_slots[slot];
+    if (entry.module != &m || entry.generation != m.tls_generation) return;
+    if (m.tls_block == entry.block) {
         m.tls_block = nullptr;
         m.tls_saved_block = nullptr;
     }
-    release_thread_block();
+    release_thread_slot(slot);
 }
 
-void run_callbacks(Module& m, uint32_t reason) {
+// `trace`: record each callback in the startup trace. Only the Loader's own calls (process attach and detach) pass
+// true; the thread events run under the Windows loader lock and stay out of the trace.
+void run_callbacks(Module& m, uint32_t reason, bool trace = false) {
     auto* tls = tls_directory(m);
     if (!tls || !tls->AddressOfCallBacks) return;
     const uint64_t table_rva = rva_in(m, tls->AddressOfCallBacks, "the TLS callback table");
@@ -225,35 +399,53 @@ void run_callbacks(Module& m, uint32_t reason) {
         if (!fn) break;
         auto callback =
             reinterpret_cast<PIMAGE_TLS_CALLBACK>(m.base + rva_in(m, fn, "a TLS callback"));
+        if (trace && startup_trace::enabled())
+            startup_trace::event("tls_callback", "\"module\":" + startup_trace::quote(m.name) + ",\"at\":" +
+                                                     startup_trace::quote(startup_trace::where(reinterpret_cast<uint64_t>(callback))) +
+                                                     ",\"reason\":" + std::to_string(reason));
         callback(m.base, static_cast<DWORD>(reason), nullptr);
     }
 }
 
 // Runs in gta6rt_tls_host.dll's DllMain for each thread the process starts or ends once the helper is loaded, under
-// the Windows loader lock, on that thread. A new thread gets its own copy of the TLS owner's template; an ending one
-// gives the helper's block back before the Windows loader frees it. TLS callbacks get the thread events only after
-// the module's DLL_PROCESS_ATTACH (initialise()), as the Windows loader orders them. Threads that existed before the
-// module was loaded get nothing: install_tls_for_thread is still the way to cover those.
+// the Windows loader lock, on that thread. A new thread gets its own copy of each active TLS owner's template; an
+// ending one gives each helper's block back before the Windows loader frees it. TLS callbacks get the thread events
+// only after the module's DLL_PROCESS_ATTACH (initialise()), as the Windows loader orders them.
 void __cdecl on_host_thread_event(DWORD reason) {
     SharedTlsLock lock;
-    Module* m = g_tls_slot_owner.load();
-    try {
-        if (reason == DLL_THREAD_ATTACH) {
-            if (!m) return;
-            install_thread_block(*m);
-            if (m->initialised) run_callbacks(*m, DLL_THREAD_ATTACH);
-        } else if (reason == DLL_THREAD_DETACH) {
-            if (m && g_thread_tls_module == m) {
-                if (m->initialised) run_callbacks(*m, DLL_THREAD_DETACH);
-                uninstall_thread_block(*m);
-            } else {
-                release_thread_block();  // installed by a module whose Loader is gone (or nothing to do)
+    // The try/catch is per slot: a throw from one module's install or callbacks must not take the thread events
+    // away from the other slots. Nothing may leave DllMain.
+    if (reason == DLL_THREAD_ATTACH) {
+        for (size_t slot = 0; slot < kMaxMappedTlsModules; ++slot) {
+            Module* m = g_tls_slot_owners[slot].load();
+            if (!m) continue;
+            try {
+                install_thread_block(*m);
+                if (m->initialised) run_callbacks(*m, DLL_THREAD_ATTACH);
+            } catch (const std::exception& e) {
+                // The thread runs on without this module's TLS; later slots still get theirs.
+                std::fprintf(stderr, "[rt] loader: thread attach, slot %zu (%s): %s\n", slot, m->name.c_str(),
+                             e.what());
             }
         }
-    } catch (const std::exception& e) {
-        // Nothing may leave DllMain. The thread runs on without the module's TLS (attach) or keeps the copy (detach).
-        std::fprintf(stderr, "[rt] loader: thread %s: %s\n", reason == DLL_THREAD_ATTACH ? "attach" : "detach",
-                     e.what());
+    } else if (reason == DLL_THREAD_DETACH) {
+        for (size_t i = kMaxMappedTlsModules; i-- > 0;) {
+            Module* m = g_tls_slot_owners[i].load();
+            if (m && g_thread_tls_slots[i].module == m &&
+                g_thread_tls_slots[i].generation == m->tls_generation) {
+                try {
+                    if (m->initialised) run_callbacks(*m, DLL_THREAD_DETACH);
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "[rt] loader: thread detach, slot %zu (%s): %s\n", i, m->name.c_str(),
+                                 e.what());
+                }
+                // Released even when the callbacks threw: a leaked block would be handed to the OS loader as the
+                // helper's own TLS block and freed with it at thread exit.
+                uninstall_thread_block(*m);
+            } else {
+                release_thread_slot(i);  // installed by a module whose Loader is gone (or nothing to do)
+            }
+        }
     }
 }
 
@@ -332,22 +524,41 @@ void redirect_pc_to_file_header_at(const void* resolved) {
 
 }  // namespace
 
+// Declared in pe_loader.h; the body needs the internal clone registry above.
+void cleanup_tls_clones() { cleanup_tls_clones_internal(); }
+
 namespace {
 bool lookup_in_loader(void* ctx, uint64_t address, std::string& module, uint32_t& rva) {
-    for (const Module* m : static_cast<Loader*>(ctx)->modules()) {
-        const auto base = reinterpret_cast<uint64_t>(m->base);
-        if (m->base && address >= base && address - base < m->size) {
-            module = m->name;
-            rva = static_cast<uint32_t>(address - base);
-            return true;
-        }
-    }
-    return false;
+    return static_cast<Loader*>(ctx)->find_address(address, module, rva);
 }
+
+void* bundled_find_loaded(void* ctx, const std::string& dll_lower) {
+    return static_cast<Loader*>(ctx)->find_loaded_module(dll_lower);
+}
+
+void* bundled_load(void* ctx, const std::string& dll_lower, uint32_t flags, bool& handled) {
+    return static_cast<Loader*>(ctx)->load_runtime_module(dll_lower, flags, handled);
+}
+
+void* bundled_get_proc(void* ctx, void* module, const std::string& sym, bool& owns_handle) {
+    return static_cast<Loader*>(ctx)->resolve_module_export(module, sym, owns_handle);
+}
+
+bool bundled_owns_handle(void* ctx, void* module) {
+    return static_cast<Loader*>(ctx)->owns_module_handle(module);
+}
+
+const shims::BundledModuleOps kBundledOps{
+    &bundled_find_loaded,
+    &bundled_load,
+    &bundled_get_proc,
+    &bundled_owns_handle,
+};
 }  // namespace
 
 Loader::Loader(std::filesystem::path game_dir) : game_dir_(std::move(game_dir)) {
     shims::add_module_lookup(this, &lookup_in_loader);
+    shims::add_bundled_loader(this, &kBundledOps);
 }
 
 Loader::~Loader() {
@@ -371,16 +582,18 @@ Loader::~Loader() {
             entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
         }
     }
+    shims::remove_bundled_loader(this);
     shims::remove_module_lookup(this);
     for (auto* m : order_) {
         // TLS state must go away before the image and its TLS block are unmapped.
-        if (m->tls_index != kNoTlsIndex) {
+        if (m->tls_index != kNoTlsIndex && m->tls_slot < kMaxMappedTlsModules) {
             // Retired first, under the lock: no thread event installs it or runs its callbacks after this, and a
             // thread that still holds a copy frees it when it ends (on_host_thread_event).
             {
                 ExclusiveTlsLock lock;
                 Module* owner = m;
-                g_tls_slot_owner.compare_exchange_strong(owner, nullptr);
+                if (g_tls_slot_owners[m->tls_slot].compare_exchange_strong(owner, nullptr))
+                    g_tls_slot_generations[m->tls_slot].store(0);
             }
             uninstall_tls_for_thread(*m);
         }
@@ -393,14 +606,132 @@ Loader::~Loader() {
 }
 
 Module& Loader::load(const std::filesystem::path& image) {
+    std::lock_guard lock(mutex_);
     std::string key = lower(image.filename().string());
     if (auto it = by_name_.find(key); it != by_name_.end()) return *it->second;
-    Module& m = map_image(image);
-    bind_imports(m);  // loads every bundled module m imports first, so they land in init_order_ before m
-    protect_sections(m);
-    register_unwind(m);
+    Module* mapped = nullptr;
+    try {
+        mapped = &map_image(image);
+        bind_imports(*mapped);  // loads every bundled module m imports first, so they land in init_order_ before m
+        protect_sections(*mapped);
+        register_unwind(*mapped);
+    } catch (...) {
+        // A failed load, nested ones (a dependency of a run-time load) included, must not stay findable by name:
+        // a later lookup would get a half-mapped image with unbound imports. ~Loader still frees it through order_.
+        by_name_.erase(key);
+        throw;
+    }
+    Module& m = *mapped;
     init_order_.push_back(&m);
+    if (startup_trace::enabled())
+        startup_trace::event("map", "\"module\":" + startup_trace::quote(m.name) +
+                                        ",\"base\":" + startup_trace::quote(startup_trace::hex(reinterpret_cast<uint64_t>(m.base))) +
+                                        ",\"size\":" + startup_trace::quote(startup_trace::hex(m.size)) +
+                                        ",\"relocated\":" + (m.relocated ? "true" : "false"));
     return m;
+}
+
+void* Loader::find_loaded_module(const std::string& dll_lower) const {
+    std::lock_guard lock(mutex_);
+    auto it = by_name_.find(dll_lower);
+    return it == by_name_.end() ? nullptr : static_cast<void*>(it->second->base);
+}
+
+void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, bool& handled) {
+    handled = false;
+    if (dll_lower.empty() || prefer_host_copy(dll_lower)) return nullptr;
+
+    std::lock_guard lock(mutex_);
+    const auto existing = by_name_.find(dll_lower);
+    const std::filesystem::path candidate = game_dir_ / dll_lower;
+    std::error_code ec;
+    const bool is_bundled = existing != by_name_.end() || std::filesystem::is_regular_file(candidate, ec);
+    if (!is_bundled) return nullptr;
+
+    handled = true;
+    // Win32 DONT_RESOLVE_DLL_REFERENCES (0x1) forbids resolving dependencies or running TLS/DllMain; refuse it
+    // explicitly instead of silently performing a normal resolving + initialising load.
+    if ((flags & DONT_RESOLVE_DLL_REFERENCES) != 0) {
+        std::fprintf(stderr,
+                     "[rt] loader: LoadLibraryEx(%s, DONT_RESOLVE_DLL_REFERENCES) is not supported for bundled DLLs\n",
+                     dll_lower.c_str());
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return nullptr;
+    }
+
+    if (existing != by_name_.end()) {
+        try {
+            initialise();
+            return static_cast<void*>(existing->second->base);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[rt] loader: run-time initialise of %s failed: %s\n", dll_lower.c_str(), e.what());
+            SetLastError(ERROR_DLL_INIT_FAILED);
+            return nullptr;
+        }
+    }
+
+    try {
+        Module& m = load(candidate);
+        initialise();
+        std::fprintf(stderr, "[rt] loader: %s mapped from game_dir (run-time load)\n", m.name.c_str());
+        return static_cast<void*>(m.base);
+    } catch (const std::exception& e) {
+        // load() drops a module that failed to map or bind (dependencies included); this also drops one whose
+        // initialise() failed, so later GetModuleHandle/LoadLibrary calls don't see it. ~Loader frees it via order_.
+        by_name_.erase(dll_lower);
+        std::fprintf(stderr, "[rt] loader: run-time load of %s failed: %s\n", dll_lower.c_str(), e.what());
+        SetLastError(ERROR_DLL_INIT_FAILED);
+        return nullptr;
+    }
+}
+
+void* Loader::resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle) {
+    owns_handle = false;
+    if (!module_handle) return nullptr;
+    std::lock_guard lock(mutex_);
+    Module* target = nullptr;
+    for (Module* m : order_) {
+        if (m->base == module_handle) {
+            target = m;
+            break;
+        }
+    }
+    if (!target) return nullptr;
+    owns_handle = true;
+    if (auto it = target->exports.find(sym); it != target->exports.end()) return it->second;
+    if (auto it = target->forwarders.find(sym); it != target->forwarders.end()) {
+        try {
+            Binding binding = Binding::Unimplemented;
+            void* fn = resolve_forwarder(it->second, binding, 0);
+            if (binding == Binding::Module) initialise();
+            return fn;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[rt] loader: forwarder %s from %s failed: %s\n", it->second.c_str(),
+                         target->name.c_str(), e.what());
+            return nullptr;
+        }
+    }
+    return nullptr;
+}
+
+bool Loader::find_address(uint64_t address, std::string& module, uint32_t& rva) const {
+    std::shared_lock lock(ranges_mutex_);
+    for (const MappedRange& r : ranges_) {
+        if (address >= r.base && address - r.base < r.size) {
+            module = r.name;
+            rva = static_cast<uint32_t>(address - r.base);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Loader::owns_module_handle(void* module_handle) const {
+    if (!module_handle) return false;
+    std::lock_guard lock(mutex_);
+    for (const Module* m : order_)
+        if (m->base == module_handle) return true;
+    return false;
 }
 
 // x64 has no frame-pointer chain to fall back on: without its .pdata registered, an exception raised in (or passing
@@ -455,9 +786,12 @@ void Loader::initialise(Module& m) {
     // Only a DLL gets DllMain. An EXE's entry point has a different signature and is the caller's to run.
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
     if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
-        if (m.entry_rva >= m.size) throw std::runtime_error(m.name + ": the entry point is outside the image");
         auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
-        if (!entry(m.base, DLL_PROCESS_ATTACH, nullptr)) {
+        const BOOL ok = entry(m.base, DLL_PROCESS_ATTACH, nullptr);
+        if (startup_trace::enabled())
+            startup_trace::event("dllmain", "\"module\":" + startup_trace::quote(m.name) +
+                                                ",\"result\":" + std::to_string(ok));
+        if (!ok) {
             set_initialised(m, true);  // it ran: a second DLL_PROCESS_ATTACH would be wrong
             throw std::runtime_error(m.name + ": DllMain returned FALSE");
         }
@@ -496,6 +830,8 @@ Module& Loader::map_image(const std::filesystem::path& path) {
     if (!oh.SizeOfImage || oh.SizeOfHeaders < headers_end || oh.SizeOfHeaders > oh.SizeOfImage ||
         oh.SizeOfHeaders > file.size())
         throw std::runtime_error(name + ": SizeOfHeaders and SizeOfImage don't fit the headers and file");
+    if (oh.AddressOfEntryPoint && oh.AddressOfEntryPoint >= oh.SizeOfImage)
+        throw std::runtime_error(name + ": the entry point is outside the image");
 
     auto* m = new Module;
     m->name = name;
@@ -506,14 +842,23 @@ Module& Loader::map_image(const std::filesystem::path& path) {
     by_name_[lower(m->name)] = m;
     order_.push_back(m);
 
-    m->base = static_cast<uint8_t*>(
-        VirtualAlloc(reinterpret_cast<void*>(oh.ImageBase), oh.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    // Inside the range gta6rt reserved for this image before the process started (base_reservation.h), else as usual.
+    m->base = static_cast<uint8_t*>(base_reservation::commit_reserved(oh.ImageBase, oh.SizeOfImage));
+    if (!m->base)
+        m->base = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(oh.ImageBase), oh.SizeOfImage,
+                                                     MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!m->base) {
         const auto relocs = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
         if (!relocs.Size)
             throw std::runtime_error(m->name + ": preferred base is taken and the image has no relocations");
         m->base = static_cast<uint8_t*>(VirtualAlloc(nullptr, oh.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (!m->base) throw std::runtime_error(m->name + ": VirtualAlloc failed");
+    }
+    {
+        // From here an address inside the image names it. The memory stays until ~Loader, which unregisters the
+        // lookup first.
+        std::unique_lock lock(ranges_mutex_);
+        ranges_.push_back({reinterpret_cast<uint64_t>(m->base), m->size, m->name});
     }
 
     std::memcpy(m->base, file.data(), oh.SizeOfHeaders);
@@ -577,8 +922,9 @@ Module& Loader::map_image(const std::filesystem::path& path) {
 // zero-fill size; it has no field naming the TLS block. The Windows loader allocates a block per module per thread and
 // puts it in TEB->ThreadLocalStoragePointer[module index], which is what __declspec(thread) code reads via _tls_index.
 // Only the OS loader can allocate that module index, so the loader reuses the index the OS assigned to
-// gta6rt_tls_host.dll. That makes one manually mapped TLS module work; a second one is rejected rather than silently
-// sharing (and corrupting) the same slot.
+// gta6rt_tls_host.dll and maps a fresh clone of the helper for every additional simultaneous TLS module, each clone
+// getting its own index. All kMaxMappedTlsModules slots can be live at once; a further module is rejected rather than
+// silently sharing (and corrupting) a slot.
 void Loader::initialize_tls(Module& m) {
     auto* tls = tls_directory(m);
     if (!tls) return;
@@ -600,19 +946,38 @@ void Loader::initialize_tls(Module& m) {
         require_range(m.name, index_rva, sizeof(uint32_t), m.size, "the TLS index");
     }
 
-    DWORD index = tls_host().index;
-    if (index == TLS_OUT_OF_INDEXES)
-        throw std::runtime_error(m.name + ": gta6rt_tls_host.dll is missing or has no module TLS index");
-    if (index >= kMaxModuleTlsSlots) throw std::runtime_error(m.name + ": reserved TLS index is out of range");
     if (!module_tls_slots()) throw std::runtime_error(m.name + ": this thread has no TLS array");
 
+    size_t slot = kMaxMappedTlsModules;
+    DWORD index = TLS_OUT_OF_INDEXES;
     {
+        std::lock_guard alloc_lock(g_tls_alloc_mutex);
+        for (size_t i = 0; i < kMaxMappedTlsModules; ++i) {
+            if (g_tls_slot_owners[i].load() == nullptr) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot >= kMaxMappedTlsModules)
+            throw std::runtime_error(m.name + ": all " + std::to_string(kMaxMappedTlsModules) +
+                                     " manually mapped static TLS slots are in use");
+
+        // Load/clone gta6rt_tls_host.dll OUTSIDE ExclusiveTlsLock so LoadLibraryExW cannot deadlock with
+        // on_host_thread_event (which runs under the Windows loader lock and takes SharedTlsLock).
+        index = ensure_tls_host(slot).index;
+        if (index == TLS_OUT_OF_INDEXES)
+            throw std::runtime_error(m.name + ": gta6rt_tls_host.dll is missing or has no module TLS index");
+        if (index >= kMaxModuleTlsSlots) throw std::runtime_error(m.name + ": reserved TLS index is out of range");
+
         // The fields are complete before a thread event can see the owner.
         ExclusiveTlsLock lock;
         Module* expected = nullptr;
-        if (!g_tls_slot_owner.compare_exchange_strong(expected, &m))
-            throw std::runtime_error(m.name + ": only one manually mapped module may use static TLS at a time");
+        if (!g_tls_slot_owners[slot].compare_exchange_strong(expected, &m))
+            throw std::runtime_error(m.name + ": static TLS slot was claimed concurrently");
 
+        m.tls_slot = static_cast<uint32_t>(slot);
+        m.tls_generation = g_next_tls_generation.fetch_add(1, std::memory_order_relaxed);
+        g_tls_slot_generations[slot].store(m.tls_generation);
         m.tls_index = index;
         m.tls_template = raw ? m.base + raw_rva : nullptr;
         m.tls_raw_size = static_cast<uint32_t>(raw);
@@ -627,13 +992,16 @@ void Loader::initialize_tls(Module& m) {
     } catch (...) {
         ExclusiveTlsLock lock;
         m.tls_index = kNoTlsIndex;
-        g_tls_slot_owner = nullptr;
+        m.tls_slot = kNoTlsIndex;
+        m.tls_generation = 0;
+        g_tls_slot_generations[slot].store(0);
+        g_tls_slot_owners[slot].store(nullptr);
         throw;
     }
     // The loading thread's copy is the one the Module records (and ~Loader frees on that thread).
-    if (g_thread_tls_module == &m) {
-        m.tls_block = g_thread_tls_block;
-        m.tls_saved_block = g_thread_tls_saved;
+    if (g_thread_tls_slots[slot].module == &m && g_thread_tls_slots[slot].generation == m.tls_generation) {
+        m.tls_block = g_thread_tls_slots[slot].block;
+        m.tls_saved_block = g_thread_tls_slots[slot].saved;
     }
 }
 
@@ -641,7 +1009,7 @@ void Loader::install_tls_for_thread(Module& m) { install_thread_block(m); }
 
 void Loader::uninstall_tls_for_thread(Module& m) { uninstall_thread_block(m); }
 
-void Loader::run_tls_callbacks(Module& m, uint32_t reason) { run_callbacks(m, reason); }
+void Loader::run_tls_callbacks(Module& m, uint32_t reason) { run_callbacks(m, reason, /*trace=*/true); }
 
 void Loader::parse_exports(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
@@ -663,8 +1031,11 @@ void Loader::parse_exports(Module& m) {
     // into the string, so forwarders are kept apart and followed when an import asks for one.
     const uint64_t dir_begin = dir.VirtualAddress, dir_end = dir_begin + dir.Size;
     auto add_export = [&](const std::string& key, uint32_t rva) {
+        if (!rva) return;  // An unused address-table slot is absent even when a name refers to it.
         if (rva >= dir_begin && rva < dir_end)
             m.forwarders[key] = read_string(m.name, m.base, m.size, rva, "a forwarded export");
+        else if (rva >= m.size)  // base + rva would point past the mapping, and a caller would jump there
+            throw std::runtime_error(m.name + ": export " + key + " points outside the image");
         else
             m.exports[key] = m.base + rva;
     };
@@ -705,10 +1076,12 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
         }
     }
 
+    // shim_key, not the bare module name: forwarder strings usually leave out ".dll" ("MSVCP140.?foo"), and the host
+    // CRT copies are named with it, so a forwarded CRT symbol must skip the bundled Xbox build as a direct import does.
     const std::filesystem::path candidates[] = {game_dir_ / module, game_dir_ / (module + ".dll")};
     for (const auto& candidate : candidates) {
         std::error_code ec;
-        if (prefer_host_copy(lower(module)) || !std::filesystem::exists(candidate, ec)) continue;
+        if (prefer_host_copy(shim_key) || !std::filesystem::exists(candidate, ec)) continue;
         Module& dep = load(candidate);
         if (auto it = dep.exports.find(symbol); it != dep.exports.end()) {
             binding = Binding::Module;
@@ -781,8 +1154,8 @@ void Loader::bind_imports(Module& m) {
             uint16_t ord = by_ord ? (uint16_t)IMAGE_ORDINAL64(lookup->u1.Ordinal) : 0;
             std::string name;
             if (!by_ord) {
+                require_range(m.name, lookup->u1.AddressOfData, sizeof(uint16_t), m.size, "an import name");
                 uint32_t hint = static_cast<uint32_t>(lookup->u1.AddressOfData);
-                require_range(m.name, hint, sizeof(uint16_t), m.size, "an import name");
                 name = read_string(m.name, m.base, m.size, hint + sizeof(uint16_t), "an import name");
             }
             at<IMAGE_THUNK_DATA64>(m.base, static_cast<uint32_t>(iat_rva))->u1.Function =

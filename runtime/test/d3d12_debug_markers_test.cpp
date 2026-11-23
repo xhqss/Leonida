@@ -186,7 +186,7 @@ struct Counted final : IUnknown {
 constexpr GUID kKey{0xd3d24a01, 0x0000, 0x4000, {0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}};
 constexpr GUID kOtherKey{0xd3d24a01, 0x0000, 0x4000, {0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02}};
 // WKPDID_D3DDebugObjectNameW (d3dcommon.h).
-constexpr GUID kDebugObjectNameW{0x4cca5fd8, 0x921f, 0x42c8, {0x85, 0x99, 0xd2, 0x86, 0x6a, 0x3e, 0x5f, 0x7e}};
+constexpr GUID kDebugObjectNameW{0x4cca5fd8, 0x921f, 0x42c8, {0x85, 0x66, 0x70, 0xca, 0xf2, 0xa9, 0xb7, 0x41}};
 
 int check_private_data(ID3D12Object* object, const char* what) {
     std::printf("private data: %s\n", what);
@@ -214,22 +214,33 @@ int check_private_data(ID3D12Object* object, const char* what) {
     EXPECT(size == sizeof(value));
     read = 0;
     EXPECT(object->GetPrivateData(kKey, &size, &read) == S_OK && size == sizeof(value) && read == value);
-    EXPECT(object->SetPrivateData(kKey, 4, nullptr) == E_INVALIDARG);
+    // Null data removes the entry whatever the size: S_OK, then S_FALSE once there is none (the host runtime's
+    // answers, d3d12_private_data_test).
+    EXPECT(object->SetPrivateData(kKey, 4, nullptr) == S_OK);
+    EXPECT(object->GetPrivateData(kKey, &size, nullptr) == DXGI_ERROR_NOT_FOUND && size == 0);
+    EXPECT(object->SetPrivateData(kKey, 4, nullptr) == S_FALSE);
     EXPECT(object->SetPrivateDataInterface(kKey, &counted) == S_OK && counted.refs == 2);
     EXPECT(object->SetPrivateDataInterface(kKey, &counted) == S_OK && counted.refs == 2);  // same one again
+    // A null interface releases the one held and stays as a pointer-sized entry that reads back as null.
     EXPECT(object->SetPrivateDataInterface(kKey, nullptr) == S_OK && counted.refs == 1);
     size = 99;
+    EXPECT(object->GetPrivateData(kKey, &size, nullptr) == S_OK && size == sizeof(IUnknown*));
+    got = &counted;
+    EXPECT(object->GetPrivateData(kKey, &size, &got) == S_OK && got == nullptr && counted.refs == 1);
+    EXPECT(object->SetPrivateData(kKey, 0, nullptr) == S_OK);
     EXPECT(object->GetPrivateData(kKey, &size, nullptr) == DXGI_ERROR_NOT_FOUND && size == 0);
 
-    // SetName is readable as WKPDID_D3DDebugObjectNameW, terminator included.
+    // SetName is readable as WKPDID_D3DDebugObjectNameW, terminator included, as on the host runtime. A null name
+    // (which the host faults on) changes nothing.
     const wchar_t name[] = L"leonida object";
     EXPECT(object->SetName(name) == S_OK);
     wchar_t stored[32] = {};
     size = sizeof(stored);
     EXPECT(object->GetPrivateData(kDebugObjectNameW, &size, stored) == S_OK);
     EXPECT(size == sizeof(name) && std::wcscmp(stored, name) == 0);
-    EXPECT(object->SetName(nullptr) == S_OK);
-    EXPECT(object->GetPrivateData(kDebugObjectNameW, &size, nullptr) == DXGI_ERROR_NOT_FOUND);
+    EXPECT(object->SetName(nullptr) == E_INVALIDARG);
+    size = sizeof(stored);
+    EXPECT(object->GetPrivateData(kDebugObjectNameW, &size, stored) == S_OK && size == sizeof(name));
 
     // Left set: released when the object dies (checked for a fence below).
     EXPECT(object->SetPrivateDataInterface(kOtherKey, nullptr) == S_OK);

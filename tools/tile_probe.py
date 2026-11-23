@@ -13,6 +13,10 @@ import sys
 
 import numpy as np
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 
 def morton_decode(i, bits):
     """Split a Z-order index into (x, y), x taking the even bits."""
@@ -35,8 +39,10 @@ def block_feature(blocks, bpe):
     """One RGB value per compressed block, from its first colour endpoint."""
     if bpe == 8:
         c = blocks[:, 0].astype(np.uint32) | (blocks[:, 1].astype(np.uint32) << 8)       # BC1 color0 (565)
-    else:
+    elif bpe == 16:
         c = blocks[:, 8].astype(np.uint32) | (blocks[:, 9].astype(np.uint32) << 8)       # BC3 color0 (565)
+    else:
+        raise ValueError(f"unsupported block size bpe={bpe} (expected 8 or 16)")
     r = ((c >> 11) & 31) * 255 // 31
     g = ((c >> 5) & 63) * 255 // 63
     b = (c & 31) * 255 // 31
@@ -68,10 +74,10 @@ def layout(nblocks, wblocks, mode, bpe):
     return y * wblocks + x
 
 
-def score(img):
-    dx = np.abs(np.diff(img, axis=1)).mean()
-    dy = np.abs(np.diff(img, axis=0)).mean()
-    return dx + dy
+def score(img: np.ndarray) -> float:
+    """Sum the mean color differences along axes with neighboring blocks."""
+    return float(sum(np.abs(np.diff(img, axis=axis)).mean()
+                     for axis in (1, 0) if img.shape[axis] > 1))
 
 
 def probe(data: bytes, offset=0):
@@ -111,6 +117,8 @@ def render(data, offset, bpe, wpx, mode, out):
         # only the preview needs Pillow; -I does not see a --user install of it
         raise SystemExit("--out needs Pillow: the scan runs without it, but the preview cannot be written "
                          "(run without -I, or install Pillow where this interpreter can see it)")
+    if bpe not in (8, 16):
+        raise ValueError(f"unsupported block size bpe={bpe} (expected 8 or 16)")
     wb = wpx // 4
     raw = np.frombuffer(data[offset:offset + (len(data) - offset) // bpe * bpe], np.uint8).reshape(-1, bpe)
     hb = min(len(raw) // wb, wb)
@@ -119,31 +127,24 @@ def render(data, offset, bpe, wpx, mode, out):
         hb = hb // th * th
     n = wb * hb
     pos = layout(n, wb, mode, bpe)
+    if n == 0 or pos is None:
+        raise ValueError(f"layout does not fit: wpx={wpx}, mode={mode!r}, bpe={bpe}")
     lin = np.zeros((n, bpe), np.uint8)
     lin[pos] = raw[:n]
     w, h = wb * 4, hb * 4
     hdr = bytearray(128)
     hdr[0:4] = b"DDS "
     struct.pack_into("<IIIIIII", hdr, 4, 124, 0x1007, h, w, n * bpe, 0, 1)
+    struct.pack_into("<I", hdr, 108, 0x1000)
     if bpe == 8:
         struct.pack_into("<II4s", hdr, 76, 32, 4, b"DXT1")
         body = bytes(hdr)
     else:
         struct.pack_into("<II4s", hdr, 76, 32, 4, b"DX10")
         body = bytes(hdr) + struct.pack("<IIIII", 98, 3, 0, 1, 0)  # BC7_UNORM, TEXTURE2D
-    struct.pack_into("<I", hdr, 108, 0x1000)
     im = Image.open(io.BytesIO(body + lin.tobytes())).convert("RGB")
     im.save(out)
     return im.size
-
-
-def same_report_path(first, second):
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
 
 
 def check_preview_path(out, blob):
@@ -157,7 +158,10 @@ def check_preview_path(out, blob):
     if same_report_path(out, blob):
         raise SystemExit(f"--out would overwrite the input {blob}")
     out_dir = os.path.dirname(os.path.abspath(out))
-    os.makedirs(out_dir, exist_ok=True)
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:  # a regular file where the folder should be: one line, not a traceback
+        raise SystemExit(f"--out {out}: cannot create {out_dir}: {e.strerror or e}")
 
 
 def main():
@@ -166,6 +170,9 @@ def main():
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--out")
     a = ap.parse_args()
+    if not os.path.exists(a.blob):
+        print(f"ERROR: {a.blob}: does not exist", file=sys.stderr)
+        return 2
     if a.out:
         check_preview_path(a.out, a.blob)
     try:

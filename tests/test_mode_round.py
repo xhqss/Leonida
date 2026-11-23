@@ -120,7 +120,8 @@ def test_add_f64_with_omod_not_asserted(prefix, want, tmp_path):
     ("v_cos_f16_e32", 0x3037), ("v_exp_f16_e32", 0x3037), ("v_log_f16_e32", 0x4a37),
 ])
 def test_transcendental_f16_ignores_mode(op, src, tmp_path):
-    # RX 6800: rcp/sqrt/rsq/sin give the same words in every rounding mode; cos, exp and log are unmeasured, assumed alike
+    # RX 6800 (rcp/sqrt/rsq/sin) + gfx1036 exhaustive 65,536-input sweep (SHADER-132, wave32 & wave64):
+    # all seven f16 transcendentals give identical bits in RNE and RTZ.
     got = []
     for prefix in ("", RNE, RTZ):
         asm = f"v_mov_b32 v1, {src:#x}\n{prefix}{op} v2, v1\n"
@@ -129,9 +130,11 @@ def test_transcendental_f16_ignores_mode(op, src, tmp_path):
 
 
 def test_transcendental_f16_nearest_after_rtz_write(tmp_path):
-    # MODE is set toward zero before the ops: they still give the nearest-even words
+    # MODE is set toward zero before the ops: all seven still give the nearest-even words (gfx1036, SHADER-132)
     for op, src, want in (("v_rcp_f16_e32", 0x3037, 0x4798), ("v_rsq_f16_e32", 0x3037, 0x4183),
-                          ("v_sqrt_f16_e32", 0x4200, 0x3EEE), ("v_sin_f16_e32", 0x3037, 0x39E4)):
+                          ("v_sqrt_f16_e32", 0x4200, 0x3EEE), ("v_sin_f16_e32", 0x3037, 0x39E4),
+                          ("v_cos_f16_e32", 0x3037, 0x396A), ("v_exp_f16_e32", 0x3037, 0x3C62),
+                          ("v_log_f16_e32", 0x4A37, 0x4345)):
         asm = f"v_mov_b32 v1, {src:#x}\n{RTZ}{op} v2, v1\n"
         assert vgprs(tmp_path, asm)[2] & 0xFFFF == want, op
 
@@ -157,6 +160,87 @@ def test_add_f64_overflow_saturates(tmp_path):
            f"{RTZ}v_add_f64 v[4:5], v[0:1], v[0:1]\n")
     v = vgprs(tmp_path, asm)
     assert (v[4], v[5]) == (0xFFFFFFFF, 0x7FEFFFFF)
+
+
+@pytest.mark.parametrize("x,y,prefix,want", [
+    # Opposite-sign operands near -DBL_MAX with |x| < |y| (#2891): unordered TwoSum overflows (r - x -> -inf),
+    # yielding e = NaN and leaving the RNE low word 0xc12af666 instead of the exact RTZ word 0xc12af665.
+    (0x7FDD9BB47DAA1333, 0xFFEFFFFFFFFFFFFF, RTZ, 0xFFE13225C12AF665),
+    (0xFFEFFFFFFFFFFFFF, 0x7FDD9BB47DAA1333, RTZ, 0xFFE13225C12AF665),
+    (0x7FDD9BB47DAA1333, 0xFFEFFFFFFFFFFFFF, RNE, 0xFFE13225C12AF666),
+    # Opposite-sign near +DBL_MAX with |x| < |y| and RNE lo == 0: FastTwoSum must borrow across lo -> hi - 1.
+    (0xFFCFFFFFFFFFFFFE, 0x7FEFFFFFFFFFFFFF, RTZ, 0x7FE7FFFFFFFFFFFF),
+    (0x7FEFFFFFFFFFFFFF, 0xFFCFFFFFFFFFFFFE, RTZ, 0x7FE7FFFFFFFFFFFF),
+    (0xFFCFFFFFFFFFFFFE, 0x7FEFFFFFFFFFFFFF, RNE, 0x7FE8000000000000),
+    # Negative finite overflow saturates to -DBL_MAX; half-ulp above DBL_MAX overflows RNE to inf and steps back.
+    (0xFFEFFFFFFFFFFFFF, 0xFFEFFFFFFFFFFFFF, RTZ, 0xFFEFFFFFFFFFFFFF),
+    (0x7FEFFFFFFFFFFFFF, 0x7CA0000000000000, RTZ, 0x7FEFFFFFFFFFFFFF),
+    # Real infinity and exact cancellation stay inf / +0.0 (no spurious -1 ulp step).
+    (0x7FF0000000000000, 0xC000000000000000, RTZ, 0x7FF0000000000000),
+    (0xC000000000000000, 0xFFF0000000000000, RTZ, 0xFFF0000000000000),
+    (0x7FEFFFFFFFFFFFFF, 0xFFEFFFFFFFFFFFFF, RTZ, 0x0000000000000000),
+    (0x8000000000000000, 0x8000000000000000, RTZ, 0x8000000000000000),
+])
+def test_add_f64_extreme_magnitude_and_specials(x, y, prefix, want, tmp_path):
+    asm = (f"v_mov_b32 v0, {x & 0xFFFFFFFF:#x}\nv_mov_b32 v1, {x >> 32:#x}\n"
+           f"v_mov_b32 v2, {y & 0xFFFFFFFF:#x}\nv_mov_b32 v3, {y >> 32:#x}\n"
+           f"{prefix}v_add_f64 v[4:5], v[0:1], v[2:3]\n")
+    v = vgprs(tmp_path, asm)
+    assert (v[4] | (v[5] << 32)) == want
+
+
+def test_add_f64_nan_and_no_contraction(tmp_path):
+    import math
+    import re
+    import struct
+
+    for a, b in ((0x7FF8000000000001, 0x3FF0000000000000), (0x3FF0000000000000, 0x7FF8000000000001)):
+        asm = (f"v_mov_b32 v0, {a & 0xFFFFFFFF:#x}\nv_mov_b32 v1, {a >> 32:#x}\n"
+               f"v_mov_b32 v2, {b & 0xFFFFFFFF:#x}\nv_mov_b32 v3, {b >> 32:#x}\n"
+               f"{RTZ}v_add_f64 v[4:5], v[0:1], v[2:3]\n")
+        spv = translate_listing(tmp_path, asm)
+        v = si.run(spv).vgpr
+        got = v[4] | (v[5] << 32)
+        assert math.isnan(struct.unpack("<d", struct.pack("<Q", got))[0])
+        fsubs = re.findall(r"^\s*(%\w+) = OpFSub %double ", spv, re.M)
+        assert len(fsubs) == 2
+        for res_id in fsubs:
+            assert re.search(rf"(?m)^\s*OpDecorate {re.escape(res_id)} NoContraction$", spv)
+
+
+@pytest.mark.parametrize("x,y", [
+    (0x0000000000000001, 0x0010000000000000),   # subnormal + DBL_MIN
+    (0x8000000000000001, 0x0010000000000000),   # -DBL_TRUE_MIN + DBL_MIN
+    (0x000FFFFFFFFFFFFF, 0x8000000000000001),   # max subnormal - DBL_TRUE_MIN
+    (0x3FF0000000000000, 0x3C90000000000000),   # 1.0 + 0.5 ulp tie (even LSB stays 1.0)
+    (0x3FF0000000000001, 0x3C90000000000000),   # (1 + 1 ulp) + 0.5 ulp tie (RNE rounds away; RTZ truncates)
+    (0xBFF0000000000001, 0xBC90000000000000),   # negative odd tie
+    (0x7FDFFFFFFFFFFFFF, 0xFFEFFFFFFFFFFFFF),   # ~0.5*DBL_MAX - DBL_MAX (|x| < |y| opposite sign)
+    (0x7FE0000000000001, 0xFFEFFFFFFFFFFFFF),   # 2^1023 + 1 ulp - DBL_MAX
+])
+def test_add_f64_rtz_against_fraction_oracle(x, y, tmp_path):
+    from fractions import Fraction
+    import struct
+
+    def u2d(u):
+        return struct.unpack("<d", struct.pack("<Q", u))[0]
+
+    def d2u(d):
+        return struct.unpack("<Q", struct.pack("<d", d))[0]
+
+    exact = Fraction(u2d(x)) + Fraction(u2d(y))
+    if exact == 0:
+        want = 0
+    else:
+        mag = abs(exact)
+        rmag = float(mag)
+        u = d2u(rmag) - (1 if Fraction(rmag) > mag else 0)
+        want = u | (1 << 63) if exact < 0 else u
+    asm = (f"v_mov_b32 v0, {x & 0xFFFFFFFF:#x}\nv_mov_b32 v1, {x >> 32:#x}\n"
+           f"v_mov_b32 v2, {y & 0xFFFFFFFF:#x}\nv_mov_b32 v3, {y >> 32:#x}\n"
+           f"{RTZ}v_add_f64 v[4:5], v[0:1], v[2:3]\n")
+    v = vgprs(tmp_path, asm)
+    assert (v[4] | (v[5] << 32)) == want
 
 
 @pytest.mark.parametrize("asm", [

@@ -2,11 +2,13 @@
 // Huffman blocks, compressed from synthetic data with Python's zlib), the JSON reader, FSSM extraction from a
 // synthetic DXBC container, and index lookup by content hash. No game data.
 #include "../src/shader_library.h"
+#include "test_temp_dir.h"
 
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -115,10 +117,161 @@ std::vector<std::uint8_t> container(std::initializer_list<Payload> payloads) {
     return out;
 }
 
+// A synthetic kind-6 program (docs/fspx.md): the 36-byte prologue (three VOP3 words with opcode 0x180 and their
+// literals), a filler word and s_endpgm.
+std::vector<std::uint8_t> fspx_code(std::uint32_t seed) {
+    std::vector<std::uint8_t> out;
+    for (int i = 0; i < 3; ++i) {
+        put32(out, 0xd5800000u | std::uint32_t(i));
+        put32(out, 0x000000ffu);
+        put32(out, seed + std::uint32_t(i));
+    }
+    put32(out, 0x7e000280u);  // v_mov_b32 v0, 0
+    put32(out, 0xbf810000u);  // s_endpgm
+    return out;
+}
+
+struct FspxEntry {
+    std::uint32_t kind, offset, size;
+};
+
+// An FSPX payload: the header, the directory as given and the bytes laid out after it. `total` 0 means the payload's
+// own size.
+std::vector<std::uint8_t> fspx_payload(const std::vector<FspxEntry>& directory, const std::vector<std::uint8_t>& body,
+                                       std::uint32_t total = 0) {
+    std::vector<std::uint8_t> out = {'F', 'S', 'P', 'X'};
+    put32(out, 1);
+    put32(out, std::uint32_t(directory.size()));
+    const std::uint32_t size = std::uint32_t(16 + 16 * directory.size() + body.size());
+    put32(out, total ? total : size);
+    for (const FspxEntry& e : directory) {
+        put32(out, e.kind);
+        put32(out, e.offset);
+        put32(out, e.size);
+        put32(out, 0);
+    }
+    out.insert(out.end(), body.begin(), body.end());
+    return out;
+}
+
+// The usual four entries, kinds 0, 1, 6 and 7, after a four-entry directory (body offset 80).
+std::vector<std::uint8_t> fspx_payload(const std::vector<std::uint8_t>& code) {
+    std::vector<std::uint8_t> body(28, 0x11);                      // kind 0 at 80
+    body.insert(body.end(), 20, 0x22);                             // kind 1 at 108
+    body.insert(body.end(), code.begin(), code.end());             // kind 6 at 128
+    body.insert(body.end(), 8, 0x77);                              // kind 7
+    const auto n = std::uint32_t(code.size());
+    return fspx_payload({{0, 80, 28}, {1, 108, 20}, {6, 128, n}, {7, 128 + n, 8}}, body);
+}
+
+// A DXBC container with an HASH part and an ACCC part holding `payload`, as the FidelityFX DLL's shaders have.
+std::vector<std::uint8_t> accc_container(const std::vector<std::uint8_t>& payload) {
+    std::vector<std::uint8_t> out = {'D', 'X', 'B', 'C'};
+    out.resize(28, 0);
+    put32(out, 2);
+    put32(out, 40);
+    put32(out, 40 + 8 + 20);
+    out.insert(out.end(), {'H', 'A', 'S', 'H'});
+    put32(out, 20);
+    out.insert(out.end(), 20, 0x5a);
+    out.insert(out.end(), {'A', 'C', 'C', 'C'});
+    put32(out, std::uint32_t(payload.size()));
+    out.insert(out.end(), payload.begin(), payload.end());
+    return out;
+}
+
+void set32(std::vector<std::uint8_t>& out, std::size_t at, std::uint32_t v) {
+    for (int i = 0; i < 4; ++i) out[at + std::size_t(i)] = std::uint8_t(v >> (8 * i));
+}
+
+// FSPX: the kind-6 program from a DXBC container's ACCC part, a bare payload and a bare program; malformed
+// directories are refused. Returns the failing line or 0.
+int fspx_checks() {
+    using namespace leonida;
+    using Kind = ComputeProgram::Kind;
+    const auto code = fspx_code(0x1000);
+    const auto payload = fspx_payload(code);
+    CHECK(payload.size() == 16 + 64 + 28 + 20 + code.size() + 8);
+    CHECK(std::vector<std::uint8_t>(fspx_program(payload).begin(), fspx_program(payload).end()) == code);
+    const auto wrapped = accc_container(payload);
+    CHECK(fssm_program(wrapped).empty());  // what slot 62 gets today: no FSSM program
+    for (const auto& input : {wrapped, payload, code}) {
+        const ComputeProgram program = compute_program(input);
+        CHECK(program.kind == Kind::fspx && program.bytes == code);
+    }
+    // The game's own shaders keep resolving as FSSM.
+    auto fssm = bytes("FSSM and a native program");
+    CHECK(compute_program(fssm).kind == Kind::fssm && compute_program(fssm).bytes == fssm);
+    CHECK(compute_program(container({{fixed, 25}})).kind == Kind::fssm);
+
+    // Refused: each is Kind::none, so the PSO keeps today's E_INVALIDARG.
+    const auto refused = [](const std::vector<std::uint8_t>& input) {
+        return fspx_program(input).empty() && compute_program(input).kind == Kind::none &&
+               compute_program(accc_container(input)).kind == Kind::none;
+    };
+    const auto n = std::uint32_t(code.size());
+    std::vector<std::uint8_t> body(48, 0x11);
+    body.insert(body.end(), code.begin(), code.end());
+    CHECK(refused(std::vector<std::uint8_t>(payload.begin(), payload.begin() + 15)));          // shorter than a header
+    auto magic = payload;
+    magic[3] = 'Y';
+    CHECK(fspx_program(magic).empty() && compute_program(accc_container(magic)).kind == Kind::none);
+    // Two entries end the directory at 48: kind 0 at 48 and kind 6 at 96 is a valid layout, the base of the rest.
+    CHECK(compute_program(fspx_payload({{0, 48, 28}, {6, 96, n}}, body)).bytes == code);
+    CHECK(refused(fspx_payload({{0, 48, 28}, {6, 48 + 48 + 1, n}}, body)));                  // kind 6 ends past the total
+    CHECK(refused(fspx_payload({{0, 48, 28}, {6, 16, n}}, body)));                           // kind 6 inside the directory
+    CHECK(refused(fspx_payload({{0, 48, 28}, {6, 0xffffff00u, 0x200}}, body)));              // offset + size wraps 32 bits
+    CHECK(refused(fspx_payload({{0, 48, 28}, {6, 96, 0xffffffffu}}, body)));                 // size past the buffer
+    CHECK(refused(fspx_payload({{0, 48, 28}, {7, 96, n}}, body)));                           // no kind 6
+    CHECK(refused(fspx_payload({{1, 48, 28}, {6, 96, n}}, body)));                           // no kind 0
+    CHECK(refused(fspx_payload({{0, 48, 28}, {6, 96, 0}}, body)));                           // kind 6 empty
+    CHECK(refused(fspx_payload({{0, 48, 28}, {6, 96, n}}, body, 96 + n - 4)));               // total cuts kind 6
+    auto long_directory = fspx_payload({{0, 48, 28}, {6, 96, n}}, body);
+    set32(long_directory, 8, 0x10000000u);                                                   // directory past the total
+    CHECK(refused(long_directory));
+    set32(long_directory, 8, 0xffffffffu);                                                   // 16 + 16 * count wraps 32 bits
+    CHECK(refused(long_directory));
+    // The total word larger than the buffer is clamped, as the DLL does; the entries still fit, so it is accepted.
+    CHECK(compute_program(fspx_payload({{0, 48, 28}, {6, 96, n}}, body, 0xffffffffu)).bytes == code);
+    // The last entry of a kind wins, as in the DLL's reader.
+    const auto other = fspx_code(0x2000);
+    auto two = body;
+    two.insert(two.end(), other.begin(), other.end());
+    CHECK(compute_program(fspx_payload({{0, 64, 28}, {6, 112, n}, {6, 112 + n, n}}, two)).bytes == other);
+    // A DXBC container without DXIL or ACCC, and bytes without the kind-6 prologue, are not programs.
+    CHECK(compute_program(container({{dynamic, 601}})).kind == Kind::none);  // DXIL without a program, no ACCC
+    auto no_prologue = code;
+    no_prologue[14] ^= 0x01;  // word 3: bits 31..16 no longer 0xD580
+    CHECK(compute_program(no_prologue).kind == Kind::none);
+    CHECK(compute_program(std::vector<std::uint8_t>(code.begin(), code.begin() + 35)).kind == Kind::none);
+    CHECK(compute_program(bytes("not a shader")).kind == Kind::none);
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     using namespace leonida;
+
+    // Test the shared file reader without passing malformed bytes to a driver.
+    const std::vector<std::uint32_t> header = {0x07230203, 0x00010300, 0, 1, 0};
+    const std::string header_bytes(reinterpret_cast<const char*>(header.data()), header.size() * sizeof(header.front()));
+    {
+        std::istringstream input(header_bytes);
+        input.seekg(0, std::ios::end);
+        CHECK(read_spirv_words(input, input.tellg()) == header);
+    }
+    for (const auto& bad : {std::string{}, header_bytes.substr(0, 16), header_bytes + 'x',
+                            std::string("bad!") + header_bytes.substr(4)}) {
+        std::istringstream input(bad);
+        input.seekg(0, std::ios::end);
+        CHECK(read_spirv_words(input, input.tellg()).empty());
+    }
+    {
+        std::istringstream input(header_bytes);
+        input.seekg(0, std::ios::end);
+        CHECK(read_spirv_words(input, static_cast<std::streamoff>(header_bytes.size() + 4)).empty());
+    }
 
     CHECK(sha256_hex({}) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     CHECK(sha256_hex(bytes("abc")) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
@@ -191,7 +344,8 @@ int main() {
     CHECK(fssm_program(container({{dynamic, 600}, {fixed, 25}})) == bytes("hello hello hello leonida"));
 
     // An index with one findable shader, one without a hash, and the module next to it.
-    const auto dir = std::filesystem::temp_directory_path() / "leonida_shader_library_test";
+    const testfiles::ScratchDir scratch("leonida_shader_library_test");
+    const auto& dir = scratch.path();
     std::filesystem::create_directories(dir);
     const std::string hash = sha256_hex(skewed(600));
     const std::string hash2 = sha256_hex(bytes("another program"));
@@ -208,11 +362,12 @@ int main() {
                  " \"vs_same_program\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << hash << "\", \"input_signature\": ["
                  "{\"semantic\": \"TEXCOORD\", \"semantic_index\": 3, \"register\": -1, \"system_value\": 0, "
                  "\"component_type\": \"float\"}]},\n"
-                 " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"outputs\": [0, 2]},\n"
+                 " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"inputs\": [0, 1, 28, 29], "
+                 "\"outputs\": [0, 2], \"f16_halves\": {\"0\": [28, 29], \"bad\": [1], \"7\": [20, 21]}},\n"
                  " \"ps_native\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
                  "\"subgroup_size\": 64},\n"
                  " \"cs_emulated\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
-                 "\"subgroup_size\": null, \"wave64_exchange\": \"workgroup\"},\n"
+                 "\"subgroup_size\": null, \"wave64_exchange\": \"workgroup\", \"lds_bytes\": 33332},\n"
                  " \"ps_unhashed\": {\"stage\": \"ps\", \"bindings\": []}}";
         std::ofstream spv(dir / "cs_test.spv", std::ios::binary);
         const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
@@ -233,6 +388,9 @@ int main() {
           vs_all[1]->input_signature[0].register_index == 0);
     const ShaderEntry* ps = library.find("ps", hash);
     CHECK(ps && ps->outputs.size() == 2 && ps->outputs[1] == 2);
+    CHECK(ps->inputs.size() == 4 && ps->inputs[0] == 0 && ps->inputs[3] == 29);
+    CHECK(ps->f16_halves.size() == 2 && ps->f16_halves.at(0)[0] == 28 && ps->f16_halves.at(0)[1] == 29 &&
+          ps->f16_halves.at(7)[0] == 20 && ps->f16_halves.at(7)[1] == 21);
     const ShaderEntry* entry = library.find("cs", sha256_hex(fssm_program(shader)));
     CHECK(entry && entry->name == "cs_test" && entry->binding_count == 1 && entry->push_constant_bytes == 144);
     CHECK(entry->local_size[0] == 64 && entry->uses_code_base && !entry->wave64);
@@ -244,6 +402,7 @@ int main() {
     const ShaderEntry* emulated = library.find("cs", hash2);
     CHECK(emulated && emulated->wave64 && emulated->subgroup_size == 0 && emulated->wave64_exchange == "workgroup" &&
           emulated->emulated());
+    CHECK(emulated->lds_bytes == 33332 && entry->lds_bytes == 0);  // workgroup bytes, emulation included (SHADER-309)
     CHECK(library.spirv(*entry).size() == 5);
     CHECK(!library.load((dir / "missing").string(), &error) && !error.empty());
     {
@@ -254,6 +413,111 @@ int main() {
     CHECK(!library.load(dir.string(), &error) && !error.empty());  // refused, not thrown
     std::filesystem::remove_all(dir);
 
-    std::printf("SHA-256, inflate (stored/fixed/dynamic), JSON, FSSM extraction and index lookup OK\n");
+    if (const int line = fspx_checks()) return line;
+
+    // FSPX entries: found by fspx_code_sha256, in the main index or in <dir>/fspx/index.json (named "fspx/<name>").
+    {
+        const auto code = fspx_code(0x1000), other = fspx_code(0x2000);
+        const std::string code_hash = sha256_hex(code), other_hash = sha256_hex(other);
+        std::filesystem::create_directories(dir / "fspx");
+        {
+            std::ofstream index(dir / "index.json", std::ios::binary);
+            index << "{\"cs_game\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash << "\"},\n"
+                     " \"cs_fspx_main\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << other_hash << "\"}}";
+            std::ofstream sub(dir / "fspx" / "index.json", std::ios::binary);
+            // fspx_payload's kind 0 is 28 bytes of 0x11.
+            sub << "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << code_hash
+                << "\", \"fspx_state_sha256\": \"" << sha256_hex(std::vector<std::uint8_t>(28, 0x11))
+                << "\", \"bindings\": [], \"local_size\": [8, 8, 1], \"wave64\": true}}";
+            std::ofstream spv(dir / "fspx" / "upscaler_00.spv", std::ios::binary);
+            const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
+            spv.write(reinterpret_cast<const char*>(words), sizeof(words));
+        }
+        ShaderLibrary fspx;
+        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 3 && fspx.fspx_size() == 1);
+        const auto found = fspx.fspx_candidates("cs", code_hash);
+        CHECK(found.size() == 1 && found[0]->name == "fspx/upscaler_00" && found[0]->local_size[0] == 8 &&
+              found[0]->wave64 && found[0]->fssm_sha256.empty());
+        CHECK(fspx.spirv(*found[0]).size() == 5);  // <dir>/fspx/upscaler_00.spv
+        // The key computed both ways finds the entry: from the container slot 62 gets, from the bare program.
+        CHECK(fspx.program_candidates("cs", compute_program(accc_container(fspx_payload(code)))) == found);
+        CHECK(fspx.program_candidates("cs", compute_program(code)) == found);
+        CHECK(fspx.program_candidates("cs", compute_program(other)).at(0)->name == "cs_fspx_main");
+        // The two keys do not mix: an FSPX hash is not an FSSM hash and the other way round.
+        CHECK(fspx.candidates("cs", code_hash).empty() && fspx.fspx_candidates("cs", hash).empty());
+        CHECK(fspx.find("cs", hash) && fspx.find("cs", hash)->name == "cs_game");
+        CHECK(fspx.fspx_candidates("vs", code_hash).empty());
+        CHECK(fspx.program_candidates("cs", compute_program(fspx_code(0x3000))).empty());  // not translated
+        CHECK(fspx.program_candidates("cs", ComputeProgram{}).empty());
+        // A broken fspx/index.json leaves the main index loaded; a missing one is not an error either.
+        {
+            std::ofstream sub(dir / "fspx" / "index.json", std::ios::binary | std::ios::trunc);
+            sub << "{broken";
+        }
+        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 2 && fspx.fspx_size() == 0 &&
+              fspx.fspx_candidates("cs", code_hash).empty());
+        std::filesystem::remove(dir / "fspx" / "index.json");
+        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 2 && fspx.fspx_size() == 0 && fspx.find("cs", hash));
+        std::filesystem::remove_all(dir);
+    }
+
+    // The review case on #1911: one kind-6 program in two containers whose kind-0 entries differ (32x1x1 and
+    // 64x1x1), translated to two different modules. A container picks its own entry by fspx_state_sha256; a bare
+    // kind-6 program cannot tell them apart and is refused as ambiguous; with one module for the key it is accepted.
+    {
+        const auto code = fspx_code(0x4000);
+        std::vector<std::uint8_t> state32(28, 0), state64(28, 0), state16(28, 0);
+        state32[12] = 32;  // word 3: NumThreadsX
+        state64[12] = 64;
+        state16[12] = 16;
+        const auto n = std::uint32_t(code.size());
+        const auto wrapped = [&](const std::vector<std::uint8_t>& state) {
+            std::vector<std::uint8_t> body = state;
+            body.insert(body.end(), code.begin(), code.end());
+            return accc_container(fspx_payload({{0, 48, 28}, {6, 48 + 28, n}}, body));
+        };
+        const auto module = [](std::uint32_t generator) {
+            return std::vector<std::uint32_t>{0x07230203, 0x00010500, generator, 1, 0};
+        };
+        const auto write = [&](const std::string& name, const std::vector<std::uint32_t>& words) {
+            std::ofstream spv(dir / "fspx" / (name + ".spv"), std::ios::binary);
+            spv.write(reinterpret_cast<const char*>(words.data()), std::streamsize(words.size() * 4));
+        };
+        const auto index = [&](const std::vector<std::pair<std::string, const std::vector<std::uint8_t>*>>& entries) {
+            std::ofstream main(dir / "index.json", std::ios::binary | std::ios::trunc);
+            main << "{}";
+            std::ofstream sub(dir / "fspx" / "index.json", std::ios::binary | std::ios::trunc);
+            sub << "{";
+            for (std::size_t i = 0; i < entries.size(); ++i)
+                sub << (i ? ",\n" : "") << "\"" << entries[i].first << "\": {\"stage\": \"cs\", \"fspx_code_sha256\": \""
+                    << sha256_hex(code) << "\", \"fspx_state_sha256\": \"" << sha256_hex(*entries[i].second) << "\"}";
+            sub << "}";
+        };
+        std::filesystem::create_directories(dir / "fspx");
+        write("pair_32", module(1));
+        write("pair_64", module(2));
+        index({{"pair_32", &state32}, {"pair_64", &state64}});
+        ShaderLibrary pair;
+        CHECK(pair.load(dir.string(), &error) && pair.size() == 2);
+        CHECK(pair.fspx_candidates("cs", sha256_hex(code)).size() == 2);
+        bool ambiguous = true;
+        const auto by32 = pair.program_candidates("cs", compute_program(wrapped(state32)), &ambiguous);
+        CHECK(by32.size() == 1 && by32[0]->name == "fspx/pair_32" && !ambiguous);
+        const auto by64 = pair.program_candidates("cs", compute_program(wrapped(state64)), &ambiguous);
+        CHECK(by64.size() == 1 && by64[0]->name == "fspx/pair_64" && !ambiguous);
+        CHECK(pair.program_candidates("cs", compute_program(wrapped(state16)), &ambiguous).empty() && !ambiguous);
+        CHECK(pair.program_candidates("cs", compute_program(code), &ambiguous).empty() && ambiguous);
+        // The same two keys with one module (a duplicate container) is not ambiguous for the bare program.
+        write("pair_64", module(1));
+        CHECK(pair.program_candidates("cs", compute_program(code), &ambiguous).size() == 2 && !ambiguous);
+        // One translation for the code key: the bare program takes it.
+        index({{"pair_32", &state32}});
+        CHECK(pair.load(dir.string(), &error) && pair.size() == 1);
+        const auto bare = pair.program_candidates("cs", compute_program(code), &ambiguous);
+        CHECK(bare.size() == 1 && bare[0]->name == "fspx/pair_32" && !ambiguous);
+        std::filesystem::remove_all(dir);
+    }
+
+    std::printf("SHA-256, inflate (stored/fixed/dynamic), JSON, FSSM extraction, FSPX programs and index lookup OK\n");
     return 0;
 }

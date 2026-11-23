@@ -163,6 +163,39 @@ class GamedataGraphTest(unittest.TestCase):
             data = json.load(f)
         self.assertEqual(data["summary"]["mode"], "carve")
 
+    def test_json_over_directory_mode_nested_xml_is_refused(self):
+        # Directory mode (no index.json) reads every nested *.xml; --json into one of them must not
+        # truncate it.
+        directory = os.path.join(self.root, "dir")
+        nested_dir = os.path.join(directory, "nested")
+        os.makedirs(nested_dir)
+        xml_path = os.path.join(nested_dir, "a.xml")
+        with open(xml_path, "wb") as f:
+            f.write(ALPHA)
+
+        r = self.run_tool(directory, "--json", xml_path)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("would overwrite the input", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        with open(xml_path, "rb") as f:
+            self.assertEqual(f.read(), ALPHA)
+
+    def test_json_over_directory_mode_xml_hardlink_is_refused(self):
+        directory = os.path.join(self.root, "dir")
+        os.makedirs(directory)
+        xml_path = os.path.join(directory, "a.xml")
+        with open(xml_path, "wb") as f:
+            f.write(ALPHA)
+        alias = os.path.join(self.root, "alias.xml")
+        os.link(xml_path, alias)
+
+        r = self.run_tool(directory, "--json", alias)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("would overwrite the input", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        with open(xml_path, "rb") as f:
+            self.assertEqual(f.read(), ALPHA)
+
     def test_cycle_at_end_of_a_deep_include_chain(self):
         size = sys.getrecursionlimit() + 50
         adjacency = {node: [node + 1] for node in range(size - 1)}

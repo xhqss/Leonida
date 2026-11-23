@@ -71,7 +71,8 @@ OUT_SCC = 30   # s_cselect_b32 s30, 1, 0 observes SCC at the end
 BFE_ANY = False    # any s_bfe_* control word (--bfe-any), not only offset + width <= 32
 INLINE64 = False   # inline constants in 64-bit positions (--inline64); the translator reads those as lane masks
 
-LANE_MASK_OPS = ("s_and_b64", "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_orn2_b64", "s_not_b64", "s_wqm_b64",
+LANE_MASK_OPS = ("s_and_b64", "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_orn2_b64", "s_nand_b64", "s_nor_b64",
+                 "s_xnor_b64", "s_not_b64", "s_wqm_b64",
                  "s_wqm_b32", "s_cselect_b64", "s_bfm_b64")
 
 INTERESTING = (0, 1, 2, 3, 31, 32, 33, 63, 64, 0x7FFFFFFF, 0x80000000, 0x80000001, 0xFFFFFFFF, 0xFFFFFFFE,
@@ -88,9 +89,23 @@ def s64(x):
     return x - (1 << 64) if x >> 63 else x
 
 
+def sext8(x):
+    x &= 0xFF
+    return x - 0x100 if x & 0x80 else x
+
+
 def sext16(x):
     x &= 0xFFFF
     return x - 0x10000 if x & 0x8000 else x
+
+
+def flbit32(x):
+    x &= M32
+    sign = x >> 31
+    for n in range(1, 32):
+        if (x >> (31 - n)) & 1 != sign:
+            return n
+    return M32
 
 
 def is_nan(w):
@@ -117,11 +132,46 @@ def wqm(x, width):
     return out
 
 
+def quadmask(x, width):
+    out = 0
+    for q in range(width // 4):
+        if (x >> (4 * q)) & 0xF:
+            out |= 1 << q
+    return out
+
+
+def bitreplicate(x):
+    out = 0
+    for i in range(32):
+        if (x >> i) & 1:
+            out |= 3 << (2 * i)
+    return out
+
+
+def flbit_signed(x, width):
+    mask = (1 << width) - 1
+    x &= mask
+    sign = (x >> (width - 1)) & 1
+    v = (~x & mask) if sign else x
+    return (width - v.bit_length()) if v else M32
+
+
+def bfe64(src, ctl, signed):
+    off, width = ctl & 63, (ctl >> 16) & 0x7F
+    width = min(width, 64 - off)
+    if width == 0:
+        return 0
+    field = (src >> off) & ((1 << width) - 1)
+    if signed and (field >> (width - 1)) & 1:
+        field -= 1 << width
+    return field & M64
+
+
 def bfe(src, ctl, signed):
     off, width = ctl & 31, (ctl >> 16) & 0x7F
     # A field that runs past bit 31 stops there: s_bfe_i32 sign-extends from the top bit that exists (LLVM
     # constantFoldBFE does for v_bfe; 5-bit width there). The s_bfe rule itself rests on the gfx1150 measurement
-    # (4000 random control words, --oracle hw), and RDNA2 agrees: gfx1036, 20,000 programs with --bfe-any.
+    # (4000 random control words, --oracle hw), and RDNA2 agrees: gfx1036 (counts in the s_bfe row of docs/design.md).
     width = min(width, 32 - off)
     if width == 0:
         return 0
@@ -164,20 +214,33 @@ def _sop2():
     add("s_bfm_b32", lambda a, b, c: ((((1 << (a & 31)) - 1) << (b & 31)) & M32, None))
     add("s_mul_i32", lambda a, b, c: ((s32(a) * s32(b)) & M32, None))
     add("s_mul_hi_u32", lambda a, b, c: ((a * b) >> 32, None))
+    add("s_mul_hi_i32", lambda a, b, c: (((s32(a) * s32(b)) >> 32) & M32, None))
+    add("s_absdiff_i32", lambda a, b, c: (abs(s32((a - b) & M32)) & M32, int(abs(s32((a - b) & M32)) & M32 != 0)))
+    add("s_lshl1_add_u32", lambda a, b, c: (((a << 1) + b) & M32, int(((a << 1) + b) >= (1 << 32))))
+    add("s_lshl2_add_u32", lambda a, b, c: (((a << 2) + b) & M32, int(((a << 2) + b) >= (1 << 32))))
+    add("s_lshl3_add_u32", lambda a, b, c: (((a << 3) + b) & M32, int(((a << 3) + b) >= (1 << 32))))
+    add("s_lshl4_add_u32", lambda a, b, c: (((a << 4) + b) & M32, int(((a << 4) + b) >= (1 << 32))))
     add("s_bfe_u32", lambda a, b, c: (bfe(a, b, False), int(bfe(a, b, False) != 0)))
     add("s_bfe_i32", lambda a, b, c: (bfe(a, b, True), int(bfe(a, b, True) != 0)))
+    add("s_pack_ll_b32_b16", lambda a, b, c: (((b & 0xFFFF) << 16) | (a & 0xFFFF), None))
+    add("s_pack_lh_b32_b16", lambda a, b, c: ((b & 0xFFFF0000) | (a & 0xFFFF), None))
+    add("s_pack_hh_b32_b16", lambda a, b, c: ((b & 0xFFFF0000) | ((a >> 16) & 0xFFFF), None))
     return ops
 
 
 def _sop2_64():
     ops = {}
     for name, f in (("and", lambda a, b: a & b), ("or", lambda a, b: a | b), ("xor", lambda a, b: a ^ b),
-                    ("andn2", lambda a, b: a & ~b), ("orn2", lambda a, b: a | ~b)):
+                    ("andn2", lambda a, b: a & ~b), ("orn2", lambda a, b: a | ~b),
+                    ("nand", lambda a, b: ~(a & b)), ("nor", lambda a, b: ~(a | b)),
+                    ("xnor", lambda a, b: ~(a ^ b))):
         ops[f"s_{name}_b64"] = ("sop2_64", lambda a, b, c, f=f: (f(a, b) & M64, int(f(a, b) & M64 != 0)))
     ops["s_cselect_b64"] = ("sop2_64", lambda a, b, c: (a if c else b, None))
     ops["s_lshl_b64"] = ("sop2_64s", lambda a, b, c: ((a << (b & 63)) & M64, int((a << (b & 63)) & M64 != 0)))
     ops["s_lshr_b64"] = ("sop2_64s", lambda a, b, c: (a >> (b & 63), int(a >> (b & 63) != 0)))
     ops["s_ashr_i64"] = ("sop2_64s", lambda a, b, c: ((s64(a) >> (b & 63)) & M64, int((s64(a) >> (b & 63)) & M64 != 0)))
+    ops["s_bfe_u64"] = ("sop2_64s", lambda a, b, c: (bfe64(a, b, False), int(bfe64(a, b, False) != 0)))
+    ops["s_bfe_i64"] = ("sop2_64s", lambda a, b, c: (bfe64(a, b, True), int(bfe64(a, b, True) != 0)))
     ops["s_bfm_b64"] = ("sop2_bfm64", lambda a, b, c: ((((1 << (a & 63)) - 1) << (b & 63)) & M64, None))
     return ops
 
@@ -192,18 +255,29 @@ def _sop1():
         "s_ff0_i32_b32": ("sop1", lambda a, b, c: (first_set(~a & M32, 32), None)),
         "s_ff1_i32_b32": ("sop1", lambda a, b, c: (first_set(a, 32), None)),
         "s_flbit_i32_b32": ("sop1", lambda a, b, c: (32 - a.bit_length() if a else M32, None)),
+        "s_flbit_i32": ("sop1", lambda a, b, c: (flbit32(a), None)),
+        "s_sext_i32_i8": ("sop1", lambda a, b, c: (sext8(a) & M32, None)),
+        "s_sext_i32_i16": ("sop1", lambda a, b, c: (sext16(a) & M32, None)),
+        "s_quadmask_b32": ("sop1", lambda a, b, c: (quadmask(a, 32), int(quadmask(a, 32) != 0))),
         "s_abs_i32": ("sop1", lambda a, b, c: (abs(s32(a)) & M32, int(abs(s32(a)) & M32 != 0))),
         "s_wqm_b32": ("sop1", lambda a, b, c: (wqm(a, 32), int(wqm(a, 32) != 0))),
-        # D is read: bit S0[4:0] of the destination is cleared or set.
+        # D is read: bit S0[4:0] (or S0[5:0] for b64) of the destination is cleared or set.
         "s_bitset0_b32": ("sop1_rmw", lambda a, b, c, d: (d & ~(1 << (a & 31)) & M32, None)),
         "s_bitset1_b32": ("sop1_rmw", lambda a, b, c, d: (d | (1 << (a & 31)), None)),
+        "s_bitset0_b64": ("sop1_64_rmw", lambda a, b, c, d: (d & ~(1 << (a & 63)) & M64, None)),
+        "s_bitset1_b64": ("sop1_64_rmw", lambda a, b, c, d: (d | (1 << (a & 63)), None)),
         "s_mov_b64": ("sop1_64", lambda a, b, c: (a, None)),
         "s_not_b64": ("sop1_64", lambda a, b, c: (~a & M64, int(~a & M64 != 0))),
+        "s_brev_b64": ("sop1_64", lambda a, b, c: (int(f"{a:064b}"[::-1], 2), None)),
+        "s_quadmask_b64": ("sop1_64", lambda a, b, c: (quadmask(a, 64), int(quadmask(a, 64) != 0))),
         "s_wqm_b64": ("sop1_64", lambda a, b, c: (wqm(a, 64), int(wqm(a, 64) != 0))),
+        "s_bitreplicate_b64_b32": ("sop1_32to64", lambda a, b, c: (bitreplicate(a), None)),
         "s_bcnt0_i32_b64": ("sop1_64to32", lambda a, b, c: (64 - popcount(a), int(64 - popcount(a) != 0))),
         "s_bcnt1_i32_b64": ("sop1_64to32", lambda a, b, c: (popcount(a), int(popcount(a) != 0))),
         "s_ff0_i32_b64": ("sop1_64to32", lambda a, b, c: (first_set(~a & M64, 64), None)),
         "s_ff1_i32_b64": ("sop1_64to32", lambda a, b, c: (first_set(a, 64), None)),
+        "s_flbit_i32_b64": ("sop1_64to32", lambda a, b, c: (64 - a.bit_length() if a else M32, None)),
+        "s_flbit_i32_i64": ("sop1_64to32", lambda a, b, c: (flbit_signed(a, 64), None)),
     }
     return ops
 
@@ -237,7 +311,7 @@ SCC_BRANCHES = ("s_cbranch_scc0", "s_cbranch_scc1")
 def writes_scc(name):
     """Whether the opcode writes SCC (each one always does or never does)."""
     form, fn = OPS[name]
-    return (fn(1, 2, 0, 3) if form == "sop1_rmw" else fn(1, 2, 0))[1] is not None
+    return (fn(1, 2, 0, 3) if form in ("sop1_rmw", "sop1_64_rmw") else fn(1, 2, 0))[1] is not None
 
 
 def branch_skip(line):
@@ -282,26 +356,35 @@ def _bfe_ctl(rng):
     return f"0x{(width << 16) | off:x}"
 
 
+def _shared_literal_sources(src0: str, src1: str, register: int) -> str:
+    # A scalar instruction can carry only one literal dword. Equal literals can share it.
+    if src0 != src1 and _is_literal(src0) and _is_literal(src1):
+        src0 = f"s{register}"
+    return f"{src0}, {src1}"
+
+
 def emit(rng, name):
     form = OPS[name][0]
     d, p = rng.choice(REGS), rng.choice(PAIRS)
     if form == "sop2":
         b = _src32(rng) if name.startswith("s_bfe") and BFE_ANY and rng.random() < 0.3 else             _bfe_ctl(rng) if name.startswith("s_bfe") else _src32(rng)
-        return f"{name} s{d}, {_src32(rng)}, {b}"
+        return f"{name} s{d}, {_shared_literal_sources(_src32(rng), b, d)}"
     if form == "sop2_64":
         return f"{name} {_pair(p)}, {_src64(rng)}, {_src64(rng)}"
     if form == "sop2_64s":
         return f"{name} {_pair(p)}, {_src64(rng)}, {_src32(rng)}"
     if form == "sop2_bfm64":
-        return f"{name} {_pair(p)}, {_src32(rng)}, {_src32(rng)}"
+        return f"{name} {_pair(p)}, {_shared_literal_sources(_src32(rng), _src32(rng), d)}"
     if form in ("sop1", "sop1_rmw"):
         return f"{name} s{d}, {_src32(rng)}"
     if form == "sop1_64":
         return f"{name} {_pair(p)}, {_src64(rng)}"
+    if form in ("sop1_32to64", "sop1_64_rmw"):
+        return f"{name} {_pair(p)}, {_src32(rng)}"
     if form == "sop1_64to32":
         return f"{name} s{d}, {_src64(rng)}"
     if form == "sopc":
-        return f"{name} {_src32(rng)}, {_src32(rng)}"
+        return f"{name} {_shared_literal_sources(_src32(rng), _src32(rng), d)}"
     if form == "sopc_64":
         return f"{name} {_src64(rng)}, {_src64(rng)}"
     k = rng.choice((0, 1, 0x7FFF, 0x8000, 0xFFFF, 0xFFFE, rng.getrandbits(16)))
@@ -424,6 +507,12 @@ def reference(lines):
         elif form == "sop1_64":
             r, c = fn(_parse_src(args[1], sgpr, 64), None, scc)
             _write(sgpr, args[0], r, 64)
+        elif form == "sop1_64_rmw":
+            r, c = fn(_parse_src(args[1], sgpr, 32), None, scc, _parse_src(args[0], sgpr, 64))
+            _write(sgpr, args[0], r, 64)
+        elif form == "sop1_32to64":
+            r, c = fn(_parse_src(args[1], sgpr, 32), None, scc)
+            _write(sgpr, args[0], r, 64)
         elif form == "sop1_64to32":
             r, c = fn(_parse_src(args[1], sgpr, 64), None, scc)
             _write(sgpr, args[0], r, 32)
@@ -493,7 +582,7 @@ def translated(lines, name="ps_salu"):
         dis = os.path.join(tmp, "disasm")
         os.mkdir(dis)
         path = os.path.join(dis, name + ".s")
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             if has_branches(lines):
                 # The translator places branch targets from the encoding sizes; it does not read the bytes.
                 body = listing(lines + ["exp mrt0 v8, v9, v10, v11 done vm", "s_endpgm"])

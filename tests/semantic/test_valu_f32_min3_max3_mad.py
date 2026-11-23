@@ -724,6 +724,9 @@ class DenormalFlushTests(unittest.TestCase):
         ("v_mad_legacy_f32", SUBNORM_MIN, POS_INF, NEG_ONE, "", NEG_ONE),    # 2^-149 -> +0, 0*inf -> +0
         ("v_mad_legacy_f32", NEG_SUBNORM_MIN, POS_INF, ONE, "", ONE),        # -2^-149 -> -0, 0*inf -> +0
         ("v_mad_f32", 0x00800000, ONE, POS_ZERO, "div:2", POS_ZERO),        # FLT_MIN/2 flushed after omod
+        ("v_mad_f32", 0x00C00000, ONE, NEG_FLT_MIN, "mul:2", POS_ZERO),     # (1.5*2^-126 - 2^-126) flushed before mul:2
+        ("v_mad_f32", 0x00C00000, ONE, NEG_FLT_MIN, "mul:4", POS_ZERO),     # (1.5*2^-126 - 2^-126) flushed before mul:4
+        ("v_mad_legacy_f32", 0x00C00000, ONE, NEG_FLT_MIN, "mul:2", POS_ZERO),
     ]
 
     def test_flush_matches_the_rdna2_column(self):

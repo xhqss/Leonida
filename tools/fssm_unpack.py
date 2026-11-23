@@ -21,7 +21,7 @@ The FSSM blob is the precompiled RDNA2 program plus its metadata. It contains th
 the code.
 
 Usage:
-    python -I fssm_unpack.py <carved_shader_dir> [--payload first|last]
+    python -I fssm_unpack.py <carved_shader_dir> [--carve-index FILE] [--payload first|last]
     (writes <dir>/fssm/<name>.fssm and fssm_index.json)
 """
 import argparse
@@ -29,8 +29,12 @@ import json
 import os
 import struct
 import sys
+import tempfile
 import zlib
 from collections import Counter
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from shader_stage_manifest import shader_stems  # noqa: E402
 
 # Defensive per-blob ceiling, not a maximum defined by the XBCH format.
 # 64 MiB matches the repository's existing per-resource cap in tools/world_index.py.
@@ -38,10 +42,22 @@ MAX_FSSM_BYTES = 64 << 20
 
 
 def parts(d: bytes) -> dict:
+    if len(d) < 32:
+        raise ValueError("truncated DXBC header")
+    count = struct.unpack_from("<I", d, 28)[0]
+    table_end = 32 + 4 * count
+    if table_end > len(d):
+        raise ValueError("truncated DXBC offset table")
     out = {}
-    for k in range(struct.unpack_from("<I", d, 28)[0]):
+    for k in range(count):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
-        out[d[off:off + 4]] = d[off + 8:off + 8 + struct.unpack_from("<I", d, off + 4)[0]]
+        if off < table_end or off + 8 > len(d):
+            raise ValueError(f"invalid DXBC part {k} header offset {off}")
+        size = struct.unpack_from("<I", d, off + 4)[0]
+        end = off + 8 + size
+        if end > len(d):
+            raise ValueError(f"truncated DXBC part {k} payload")
+        out[d[off:off + 4]] = d[off + 8:end]
     return out
 
 
@@ -50,11 +66,21 @@ def xdat_entries_all(dxil: bytes) -> list:
     x = dxil.find(b"XDAT")
     if x < 0:
         return []
-    count, hdr = struct.unpack_from("<II", dxil, x + 4)
+    if x + 12 > len(dxil):
+        raise ValueError("truncated XDAT header")
+    count = struct.unpack_from("<I", dxil, x + 4)[0]
+    table_end = x + 12 + 12 * count
+    if table_end > len(dxil):
+        raise ValueError("truncated XDAT entry table")
     out = []
     for k in range(count):
         tag, off, size = struct.unpack_from("<III", dxil, x + 12 + 12 * k)
-        out.append((tag, dxil[off:off + size]))
+        end = off + size
+        if end > len(dxil):
+            raise ValueError(f"XDAT entry {k} extends past the DXIL part")
+        if size and off < table_end and end > x:
+            raise ValueError(f"XDAT entry {k} overlaps its directory")
+        out.append((tag, dxil[off:end]))
     return out
 
 
@@ -107,6 +133,7 @@ def unpack(dxbc: bytes, payload: str = "last"):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Unpack the FSSM program from each carved shader container.")
     ap.add_argument("src", help="carved shader directory")
+    ap.add_argument("--carve-index", help="unpack only the DXBC files listed in this carve index")
     ap.add_argument("--payload", choices=("first", "last"), default="last",
                     help="tag-0x0D payload when a container has more than one (default: last)")
     a = ap.parse_args(argv)
@@ -117,18 +144,28 @@ def main(argv=None) -> int:
         print(f"ERROR: {src} {what}. Give the folder with the carved .dxbc files.", file=sys.stderr)
         return 2
     try:
-        with os.scandir(src) as entries:
-            shaders = sorted((entry for entry in entries
-                              if entry.name.endswith(".dxbc") and entry.is_file()),
-                             key=lambda entry: entry.name)
-    except OSError as e:
-        print(f"ERROR: cannot list {src}: {e.strerror or e}", file=sys.stderr)
+        if a.carve_index:
+            names = shader_stems(a.carve_index, "file", ".dxbc")
+            shaders = sorted(os.path.join(src, name + ".dxbc") for name in names)
+            for path in shaders:
+                if not os.path.isfile(path):
+                    raise ValueError(f"{a.carve_index}: declared shader file is missing: {path}")
+        else:
+            with os.scandir(src) as entries:
+                shaders = sorted(entry.path for entry in entries
+                                 if entry.name.endswith(".dxbc") and entry.is_file())
+    except (OSError, ValueError) as e:
+        print(f"ERROR: cannot list shaders in {src}: {e}", file=sys.stderr)
         return 2
     out = os.path.join(src, "fssm")
-    os.makedirs(out, exist_ok=True)
+    try:
+        os.makedirs(out, exist_ok=True)
+    except OSError as e:
+        print(f"ERROR: cannot create output directory {out}: {e.strerror or e}", file=sys.stderr)
+        return 2
     rows, problems = [], Counter()
     for shader in shaders:
-        with open(shader.path, "rb") as f:
+        with open(shader, "rb") as f:
             d = f.read()
         try:
             fssm, ents = unpack(d, payload=a.payload)
@@ -138,7 +175,7 @@ def main(argv=None) -> int:
         if fssm is None:
             problems["no XBCH"] += 1
             continue
-        stem = shader.name[:-5]
+        stem = os.path.basename(shader)[:-5]
         with open(os.path.join(out, stem + ".fssm"), "wb") as f:
             f.write(fssm)
         ends = [i for i in range(0, len(fssm) - 3, 4) if fssm[i:i + 4] == b"\x00\x00\x81\xbf"]
@@ -152,12 +189,14 @@ def main(argv=None) -> int:
         print(f"ERROR: no shader in {src} unpacked. Check that it holds the carved .dxbc files of a supported "
               "game version.", file=sys.stderr)
         return 1
-    tmp = os.path.join(src, "fssm_index.json.tmp")   # written last and renamed in, so a stopped run leaves none
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(rows, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, os.path.join(src, "fssm_index.json"))
+    # Stage privately and publish only after the index is complete and synced.
+    with tempfile.TemporaryDirectory(dir=src) as staging:
+        tmp = os.path.join(staging, "fssm_index.json")
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(rows, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, os.path.join(src, "fssm_index.json"))
     print("magic:", dict(Counter(r["magic"] for r in rows)))
     print("s_endpgm per blob:", dict(Counter(len(r["endpgm"]) for r in rows)))
     sizes = sorted(r["size"] for r in rows)

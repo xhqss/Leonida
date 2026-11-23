@@ -234,7 +234,7 @@ class TestBC1Tables(unittest.TestCase):
         self.assertEqual(quadrant_to_indices(tables.BC1_QUADRANT[3]), (1, 1, 1, 1))
 
     def test_bc1_history_confirmed_counts_and_keys(self) -> None:
-        self.assertEqual(len(tables.BC1_HISTORY_CONFIRMED), 248)
+        self.assertEqual(len(tables.BC1_HISTORY_CONFIRMED), 252)
         self.assertNotIn(0, tables.BC1_HISTORY_CONFIRMED)
         for k in tables.BC1_HISTORY_CONFIRMED:
             self.assertTrue(1 <= k <= 255, f"key {k} out of range 1..255")
@@ -249,8 +249,8 @@ class TestBC1Tables(unittest.TestCase):
             self.assertTrue(0 <= b0 < 32 and 0 <= b1 < 32, f"blue out of range at key {k}")
 
     def test_bc1_history_provisional_entries(self) -> None:
-        self.assertEqual(len(tables.BC1_HISTORY_PROVISIONAL), 7)
-        expected_provisional_keys = {6, 9, 67, 68, 71, 74, 122}
+        self.assertEqual(len(tables.BC1_HISTORY_PROVISIONAL), 3)
+        expected_provisional_keys = {6, 71, 122}
         self.assertEqual(set(tables.BC1_HISTORY_PROVISIONAL.keys()), expected_provisional_keys)
         # Confirmed and provisional must be strictly disjoint
         self.assertTrue(
@@ -329,9 +329,10 @@ class TestBC4AndBC5Tables(unittest.TestCase):
             self.assertEqual(inv_pair[pair], i)
 
     def test_bc4_history_structure_and_bounds(self) -> None:
-        self.assertEqual(len(tables.BC4_HISTORY_CONFIRMED), 0)
-        self.assertEqual(len(tables.BC4_HISTORY_PROVISIONAL), 55)
-        for k, ep in tables.BC4_HISTORY_PROVISIONAL.items():
+        self.assertEqual(len(tables.BC4_HISTORY_CONFIRMED), 2)
+        self.assertEqual(len(tables.BC4_HISTORY_PROVISIONAL), 170)
+        self.assertTrue(set(tables.BC4_HISTORY_CONFIRMED).isdisjoint(set(tables.BC4_HISTORY_PROVISIONAL)))
+        for k, ep in {**tables.BC4_HISTORY_CONFIRMED, **tables.BC4_HISTORY_PROVISIONAL}.items():
             self.assertTrue(1 <= k <= 255, f"key {k} out of range 1..255")
             self.assertEqual(len(ep), 2, f"BC4 history entry {k} must have 2 channels")
             a0, a1 = ep
@@ -351,9 +352,9 @@ class TestBC4AndBC5Tables(unittest.TestCase):
             self.assertEqual(inv_pair[pair], i)
 
     def test_bc5_history_structure_and_bounds(self) -> None:
-        self.assertEqual(len(tables.BC5_HISTORY_CONFIRMED), 3)
-        self.assertEqual(set(tables.BC5_HISTORY_CONFIRMED.keys()), {182, 183, 222})
-        self.assertEqual(len(tables.BC5_HISTORY_PROVISIONAL), 211)
+        self.assertEqual(len(tables.BC5_HISTORY_CONFIRMED), 5)
+        self.assertEqual(set(tables.BC5_HISTORY_CONFIRMED.keys()), {105, 182, 183, 222, 255})
+        self.assertEqual(len(tables.BC5_HISTORY_PROVISIONAL), 209)
         self.assertTrue(
             set(tables.BC5_HISTORY_CONFIRMED).isdisjoint(set(tables.BC5_HISTORY_PROVISIONAL))
         )

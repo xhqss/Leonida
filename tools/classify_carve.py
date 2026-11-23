@@ -78,6 +78,10 @@ def main():
         what = "is not a folder" if os.path.exists(root) else "does not exist"
         print(f"{root}: {what}; give the carve folder (the one with an index.json per archive)", file=sys.stderr)
         return 2
+    report = os.path.join(root, "types.json")
+    if os.path.isdir(report):
+        print(f"{report}: is a directory; remove or rename that directory before rerun", file=sys.stderr)
+        return 2
     per = {}
     total = defaultdict(lambda: [0, 0, []])
     for name in sorted(os.listdir(root)):
@@ -102,12 +106,12 @@ def main():
     out = {"overall": {k: entry(v) for k, v in top}, "per_archive": per}
     fd, temp = tempfile.mkstemp(dir=root, prefix=".types-", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             json.dump(out, f, indent=1)
             f.flush()
             os.fsync(f.fileno())
-        os.chmod(temp, published_mode(os.path.join(root, "types.json")))   # mkstemp creates 0600
-        os.replace(temp, os.path.join(root, "types.json"))
+        os.chmod(temp, published_mode(report))                             # mkstemp creates 0600
+        os.replace(temp, report)
     except BaseException:
         try:
             os.unlink(temp)

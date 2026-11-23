@@ -24,8 +24,8 @@ Usage:
     python -I tools/f16_trans_sweep.py --self-test
 
 Exit 0 when the sweep ran (differences from the rule are findings, not failures), 1 when wave32 and wave64
-disagree, 2 on a harness error (a MODE that did not apply, a kernel without its words), 77 when the hardware
-oracle is unavailable. On Linux the
+disagree or --json cannot be written, 2 on a harness error (a MODE that did not apply, a kernel without its
+words), 77 when the hardware oracle is unavailable. On Linux the
 oracle needs LEONIDA_HW_DRM_NODE (docs/shader_validation.md). Nothing here reads game files.
 """
 import argparse
@@ -385,6 +385,43 @@ def self_test():
     return 0
 
 
+def validate_json_path(path):
+    """Return an error string if `path` cannot be used as a --json output file, or None."""
+    if not path or not path.strip():
+        return "--json path must not be empty"
+    if "\x00" in path:
+        return "--json path contains a NUL byte"
+    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)) or os.path.isdir(path):
+        return f"--json path is a directory: {path}"
+    cur = os.path.dirname(os.path.abspath(path))
+    while cur:
+        if os.path.isdir(cur):
+            break
+        if os.path.lexists(cur):
+            return f"--json parent is not a directory: {cur}"
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return None
+
+
+def write_json_report(path, report):
+    """Create missing parent directories and write `report` as LF-terminated JSON, or return an error string."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            return f"cannot create directory for --json {path}: {e.strerror or e}"
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=1)
+    except OSError as e:
+        return f"cannot write --json {path}: {e.strerror or e}"
+    return None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--ops", default=",".join(OPS))
@@ -396,13 +433,24 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
-    ops = [o for o in a.ops.split(",") if o]
-    modes = [m for m in a.modes.split(",") if m]
-    waves = [int(w) for w in a.waves.split(",") if w]
+    ops = [o.strip() for o in a.ops.split(",") if o.strip()]
+    modes = [m.strip() for m in a.modes.split(",") if m.strip()]
+    try:
+        waves = [int(w.strip()) for w in a.waves.split(",") if w.strip()]
+    except ValueError:
+        ap.error("--waves must contain only 32 and/or 64")
+    for option, values in (("--ops", ops), ("--modes", modes), ("--waves", waves)):
+        if not values:
+            ap.error(f"{option} must select at least one value")
     bad = [o for o in ops if o not in OPS] + [m for m in modes if m not in MODES] + [str(w) for w in waves
                                                                                     if w not in (32, 64)]
     if bad:
         ap.error("unknown: " + ", ".join(bad))
+    if a.json is not None:
+        err = validate_json_path(a.json)
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            return 1
     from hw_oracle import runner
     try:
         oracle = runner.open_oracle(arch=a.hw_arch)
@@ -453,9 +501,11 @@ def main(argv=None):
         return 2
     finally:
         oracle.close()
-    if a.json:
-        with open(a.json, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=1)
+    if a.json is not None:
+        err = write_json_report(a.json, report)
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            return 1
     return rc
 
 

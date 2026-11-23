@@ -8,12 +8,15 @@ Run:
     python -I tests/test_shader_profile.py
     python -m unittest discover -s tests -v
 """
+from contextlib import nullcontext, redirect_stdout
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -476,6 +479,51 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         self.assertEqual(data["shaders"], 1)
         self.assertEqual([shader["name"] for shader in data["per_shader"]], ["cs_main"])
 
+    def test_profile_rankings_do_not_depend_on_directory_order(self) -> None:
+        self.write("ps_vector", "\n".join((
+            "\tv_add_f32 v0, v0, v1",
+            "\tv_add_f32 v0, v0, v1",
+            "\tv_and_b32 v0, v0, v1",
+            "\tv_max_f32 v0, v0, v1",
+            "\tv_min_f32 v0, v0, v1",
+            "\tv_mov_b32 v0, v1",
+            "\tv_or_b32 v0, v0, v1",
+            "\tv_xor_b32 v0, v0, v1",
+            "\ts_endpgm",
+        )))
+        self.write("ps_scalar", "\n".join((
+            "\ts_add_u32 s0, s0, s1",
+            "\ts_and_b32 s0, s0, s1",
+            "\ts_mov_b32 s0, s1",
+            "\ts_nop 0",
+            "\ts_or_b32 s0, s0, s1",
+            "\ts_xor_b32 s0, s0, s1",
+            "\ts_endpgm",
+        )))
+        with os.scandir(self.disasm_dir) as scan:
+            entries = sorted(scan, key=lambda entry: entry.name)
+        report = os.path.join(self.tmp.name, "profile.json")
+        args = ["shader_profile.py", self.disasm_dir, "--out", report]
+
+        def profile(order: list[os.DirEntry[str]]) -> tuple[str, bytes]:
+            stdout = io.StringIO()
+            with (patch.object(P.os, "scandir", return_value=nullcontext(order)),
+                  patch.object(sys, "argv", args), redirect_stdout(stdout)):
+                self.assertIsNone(P.main())
+            with open(report, "rb") as output:
+                return stdout.getvalue(), output.read()
+
+        forward, data = profile(entries)
+        reverse, reversed_data = profile(list(reversed(entries)))
+        self.assertEqual(data, reversed_data)
+        self.assertEqual(forward, reverse)
+        rankings = json.loads(data)["by_mnemonic"]
+        self.assertEqual(rankings[0], {"m": "s_endpgm", "shaders": 2, "count": 2})
+        self.assertEqual([row["m"] for row in rankings[1:]], sorted(row["m"] for row in rankings[1:]))
+        most_widespread = next(line for line in forward.splitlines() if "most widespread:" in line)
+        self.assertEqual(most_widespread.removeprefix("  most widespread: "),
+                         ", ".join(f"{row['m']} ({row['shaders']})" for row in rankings[:12]))
+
     def test_cli_warning_words_from_llvm_messages(self):
         a = echo("070080bf feffffff ffffffd7 050080bf feffffff 000081bf")
         b = echo("090080bf ffffffd7 000081bf")
@@ -534,6 +582,43 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         b = os.path.join(self.disasm_dir, "b.json")
         self.assertFalse(P.same_output_path(a, b))
 
+    def assert_carve_index_output_refused(self, output):
+        tool = os.path.join(ROOT, "tools", "shader_profile.py")
+        res = subprocess.run(
+            [sys.executable, "-I", tool, self.disasm_dir, "--out", output],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn("ERROR: output would overwrite the shader carve index", res.stderr)
+
+    def test_cli_reserves_the_carve_index_path(self):
+        self.write("cs_main", "\ts_endpgm\n")
+        index = os.path.join(self.tmp.name, "index.json")
+        self.assert_carve_index_output_refused(index)
+        self.assertFalse(os.path.exists(index))
+        original = '[{"file": "cs_main.dxbc", "stage": "cs"}]'
+        with open(index, "w", encoding="utf-8") as f:
+            f.write(original)
+        self.assert_carve_index_output_refused(index)
+        with open(index, encoding="utf-8") as f:
+            self.assertEqual(f.read(), original)
+
+    def test_cli_refuses_a_hard_link_to_the_carve_index(self):
+        self.write("cs_main", "\ts_endpgm\n")
+        index = os.path.join(self.tmp.name, "index.json")
+        original = '[{"file": "cs_main.dxbc", "stage": "cs"}]'
+        with open(index, "w", encoding="utf-8") as f:
+            f.write(original)
+        alias = os.path.join(self.tmp.name, "alias.json")
+        try:
+            os.link(index, alias)
+        except OSError as error:
+            self.skipTest(f"hard links are unavailable: {error}")
+        self.assert_carve_index_output_refused(alias)
+        with open(index, encoding="utf-8") as f:
+            self.assertEqual(f.read(), original)
+
     def test_cli_refuses_output_overwriting_input_shader(self):
         tool = os.path.join(ROOT, "tools", "shader_profile.py")
         shader_file = os.path.join(self.disasm_dir, "ps_001.s")
@@ -550,6 +635,32 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         self.assertIn("ERROR: output would overwrite input shader", res.stderr)
         with open(shader_file, "r", encoding="utf-8") as f:
             self.assertEqual(f.read(), original_content)
+
+    def test_unreadable_listing_reports_its_path_and_preserves_report(self):
+        from io import StringIO
+        from unittest.mock import patch
+
+        self.write("cs_main", "\ts_endpgm\n")
+        listing = os.path.join(self.disasm_dir, "cs_main.s")
+        report = os.path.join(self.tmp.name, "profile.json")
+        original = b'{"previous": true}\n'
+        with open(report, "wb") as f:
+            f.write(original)
+
+        def open_listing(path, *args, **kwargs):
+            if path == listing:
+                raise PermissionError(13, "Cannot read listing", listing)
+            return open(path, *args, **kwargs)
+
+        stderr = StringIO()
+        with (patch.object(P, "open", open_listing, create=True),
+              patch.object(sys, "argv", ["shader_profile.py", self.disasm_dir, "--out", report]),
+              patch.object(sys, "stderr", stderr)):
+            self.assertEqual(P.main(), 2)
+
+        self.assertEqual(stderr.getvalue().splitlines(), [f"ERROR: cannot read {listing}: Cannot read listing"])
+        with open(report, "rb") as f:
+            self.assertEqual(f.read(), original)
 
 
 if __name__ == "__main__":

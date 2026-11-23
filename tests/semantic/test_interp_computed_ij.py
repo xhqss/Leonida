@@ -130,6 +130,97 @@ class ComputedIJ(unittest.TestCase):
         self.assertNotIn("PerVertexKHR", spv)
         self.assertNotIn("%bary", spv)
 
+    def test_only_i_overwritten_preserves_hardware_j(self):
+        """Overwriting only v0 promotes the pair to computed I/J; untouched v1 must still load BaryCoordKHR.z."""
+        _, w = run(["v_mov_b32_e32 v0, 0",
+                    "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                    "v_interp_p1_f32_e32 v3, v0, attr0.y", "v_interp_p2_f32_e32 v3, v1, attr0.y",
+                    "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"])
+        self.assertEqual(floats(w[:2]), (0.0, 2 * J))
+
+    def test_only_j_overwritten_preserves_hardware_i(self):
+        """Overwriting only v1 promotes the pair to computed I/J; untouched v0 must still load BaryCoordKHR.y."""
+        _, w = run(["v_mov_b32_e32 v1, 0",
+                    "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                    "v_interp_p1_f32_e32 v3, v0, attr0.y", "v_interp_p2_f32_e32 v3, v1, attr0.y",
+                    "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"])
+        self.assertEqual(floats(w[:2]), (2 * I, 0.0))
+
+    def test_conditional_overwrite_preserves_hardware_barycentrics_on_untaken_path(self):
+        """When a branch conditionally overwrites v0, the untaken path must still interpolate with hardware (I, J)."""
+        asm = [
+            "s_cmp_eq_u32 s0, 1    ; encoding: [0,0,0,0]",
+            "s_cbranch_scc0 1    ; encoding: [0,0,0,0]",
+            "v_mov_b32_e32 v0, 0    ; encoding: [0,0,0,0]",
+            "v_interp_p1_f32_e32 v2, v0, attr0.x    ; encoding: [0,0,0,0]",
+            "v_interp_p2_f32_e32 v2, v1, attr0.x    ; encoding: [0,0,0,0]",
+            "v_interp_p1_f32_e32 v3, v0, attr0.y    ; encoding: [0,0,0,0]",
+            "v_interp_p2_f32_e32 v3, v1, attr0.y    ; encoding: [0,0,0,0]",
+            "exp mrt0 v2, v3, v2, v3 done vm    ; encoding: [0,0,0,0,0,0,0,0]",
+            "s_endpgm    ; encoding: [0,0,0,0]",
+        ]
+        spv = support.translate_lines("ps_ij_cond", asm)
+        inputs = support.varyings(spv, {0: ATTR0}, BARY)
+        w_untaken = support.mrt0_words(spv, inputs=inputs, push_constants=[0] * 36)
+        w_taken = support.mrt0_words(spv, inputs=inputs, push_constants=[1] + [0] * 35)
+        self.assertEqual(floats(w_untaken[:2]), (2 * I, 2 * J))
+        self.assertEqual(floats(w_taken[:2]), (0.0, 2 * J))
+
+    def test_exec_masked_overwrite_preserves_hardware_barycentrics_in_masked_lanes(self):
+        """EXEC can mask a VGPR write in straight-line code without a branch; masked lanes still hold hardware I/J."""
+        asm = [
+            "s_mov_b32 exec_lo, s0",
+            "v_mov_b32_e32 v0, 0",
+            "s_mov_b32 exec_lo, -1",
+            "v_interp_p1_f32_e32 v2, v0, attr0.x",
+            "v_interp_p2_f32_e32 v2, v1, attr0.x",
+            "v_interp_p1_f32_e32 v3, v0, attr0.y",
+            "v_interp_p2_f32_e32 v3, v1, attr0.y",
+            "exp mrt0 v2, v3, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ij_exec", asm)
+        inputs = support.varyings(spv, {0: ATTR0}, BARY)
+        w_masked = support.mrt0_words(spv, inputs=inputs, push_constants=[0] * 36)
+        w_active = support.mrt0_words(spv, inputs=inputs, push_constants=[0xFFFFFFFF] + [0] * 35)
+        self.assertEqual(floats(w_masked[:2]), (2 * I, 2 * J))
+        self.assertEqual(floats(w_active[:2]), (0.0, 2 * J))
+
+        # Also check saveexec form loads both barycentric components in the prologue.
+        spv_save = support.translate_lines("ps_ij_saveexec", [
+            "s_and_saveexec_b32 s10, s0",
+            "v_mov_b32_e32 v0, 0",
+            "s_mov_b32 exec_lo, s10",
+            "v_interp_p1_f32_e32 v2, v0, attr0.x",
+            "v_interp_p2_f32_e32 v2, v1, attr0.x",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ])
+        self.assertIn("%bc1 = OpCompositeExtract %float %bc 1", spv_save)
+        self.assertIn("%bc2 = OpCompositeExtract %float %bc 2", spv_save)
+
+    def test_conditional_overwrite_then_copied_coords_preserves_hardware_barycentrics(self):
+        """After a conditional overwrite of v0, copying v0/v1 into temporaries for v_interp must still see hardware I/J."""
+        asm = [
+            "s_cmp_eq_u32 s0, 1    ; encoding: [0,0,0,0]",
+            "s_cbranch_scc0 1    ; encoding: [0,0,0,0]",
+            "v_mov_b32_e32 v0, 0    ; encoding: [0,0,0,0]",
+            "v_mov_b32_e32 v5, v0    ; encoding: [0,0,0,0]",
+            "v_mov_b32_e32 v6, v1    ; encoding: [0,0,0,0]",
+            "v_interp_p1_f32_e32 v2, v5, attr0.x    ; encoding: [0,0,0,0]",
+            "v_interp_p2_f32_e32 v2, v6, attr0.x    ; encoding: [0,0,0,0]",
+            "v_interp_p1_f32_e32 v3, v5, attr0.y    ; encoding: [0,0,0,0]",
+            "v_interp_p2_f32_e32 v3, v6, attr0.y    ; encoding: [0,0,0,0]",
+            "exp mrt0 v2, v3, v2, v3 done vm    ; encoding: [0,0,0,0,0,0,0,0]",
+            "s_endpgm    ; encoding: [0,0,0,0]",
+        ]
+        spv = support.translate_lines("ps_ij_cond_copy", asm)
+        inputs = support.varyings(spv, {0: ATTR0}, BARY)
+        w_untaken = support.mrt0_words(spv, inputs=inputs, push_constants=[0] * 36)
+        w_taken = support.mrt0_words(spv, inputs=inputs, push_constants=[1] + [0] * 35)
+        self.assertEqual(floats(w_untaken[:2]), (2 * I, 2 * J))
+        self.assertEqual(floats(w_taken[:2]), (0.0, 2 * J))
+
 
 class ComputedIJRefusals(unittest.TestCase):
     def refuse(self, asm, message):

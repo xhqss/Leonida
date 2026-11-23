@@ -172,6 +172,53 @@ int main() {
         EXPECT(totals(f).all <= 30000 && count(f, D::dim_2d) > 4096);
     }
 
+    // D3D-219: past maxPerSetDescriptors, growth follows layout_supported (vkGetDescriptorSetLayoutSupport), which
+    // is asked only above that limit. Intel's Xe-LP reports 6159 and supports the full sizes.
+    {
+        Device d = uniform(1048576, 1048576);
+        d.v11.maxPerSetDescriptors = 6159;
+        d.limits.maxSamplerAllocationCount = 4000;
+        unsigned asked = 0, asked_within = 0;
+        const auto all_supported = [&](const BindlessFeatures& candidate) {
+            ++asked;
+            asked_within += totals(candidate).all <= 6159;
+            return true;
+        };
+        BindlessFeatures f = with_ms(true);
+        EXPECT(bindless::size_bindings(f, d.limits, d.v11, d.v12, all_supported));
+        EXPECT(asked > 0 && asked_within == 0);
+        EXPECT(count(f, D::dim_2d) == bindless::max_2d_images &&
+               f.counts[bindless::sampler_binding] == 4000 - bindless::reserved_samplers);
+        EXPECT(storage(f, D::dim_2d) == bindless::max_storage_indices && storage_consistent(f));
+
+        // A driver that supports less: growth stops where it says no.
+        const auto up_to_20000 = [&](const BindlessFeatures& candidate) { return totals(candidate).all <= 20000; };
+        f = with_ms(true);
+        EXPECT(bindless::size_bindings(f, d.limits, d.v11, d.v12, up_to_20000));
+        EXPECT(totals(f).all <= 20000 && totals(f).all > 6159 && count(f, D::dim_2d) > 4096);
+
+        // Without the callback, maxPerSetDescriptors still caps growth as before.
+        f = with_ms(true);
+        EXPECT(bindless::size_bindings(f, d.limits, d.v11, d.v12));
+        EXPECT(totals(f).all <= 6159 || (count(f, D::dim_2d) == 4096 && f.counts[bindless::sampler_binding] == 1024));
+    }
+
+    // MoltenVK 1.4.3 on an M3 Max: update-after-bind limits of 1000000 sampled images and 500000 samplers, but
+    // maxPerSetDescriptors 1212 and a vkGetDescriptorSetLayoutSupport that accepts only fewer descriptors than that
+    // (MVKDevice::getDescriptorSetLayoutSupport), though the device creates and samples far larger sets. So the
+    // set keeps the default counts: 1024 samplers, short of a full D3D12 sampler heap (d3d12_descriptor_test).
+    {
+        Device d = uniform(1048576, 1000000);
+        d.v12.maxPerStageDescriptorUpdateAfterBindSamplers = d.v12.maxDescriptorSetUpdateAfterBindSamplers = 500000;
+        d.limits.maxSamplerAllocationCount = 500000;
+        d.v11.maxPerSetDescriptors = 1212;
+        const auto below_1212 = [](const BindlessFeatures& candidate) { return totals(candidate).all < 1212; };
+        BindlessFeatures f = with_ms(true);
+        EXPECT(bindless::size_bindings(f, d.limits, d.v11, d.v12, below_1212));
+        EXPECT(count(f, D::dim_2d) == 4096 && f.counts[bindless::sampler_binding] == 1024 &&
+               storage(f, D::dim_2d) == 256);
+    }
+
     // The default features are today's counts, which the device-less users (vk_image_fuzz) still get.
     EXPECT(BindlessFeatures{}.counts == defaults);
     std::printf("bindless sizing: synthetic limits gave the expected counts\n");

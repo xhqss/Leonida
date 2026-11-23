@@ -1,6 +1,9 @@
 """tools/spirv_gs_to_compute.py: a translated geometry shader as a compute capture pass (SHADER-159)."""
+import json
 import os
+from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 
@@ -136,9 +139,143 @@ def test_phi_from_entry_block_names_the_split_block(tmp_path):
     assert r.returncode == 0, r.stderr
 
 
+@pytest.mark.skipif(not HAVE_SPIRV or not shutil.which("spirv-dis"), reason="needs SPIRV-Tools on PATH")
+@pytest.mark.parametrize("target", ["vulkan1.0", "vulkan1.1", "vulkan1.2"])
+def test_cli_preserves_valid_capture_across_spirv_versions(tmp_path: Path, target: str) -> None:
+    source, output = tmp_path / "gs.spv", tmp_path / "cs.spv"
+    subprocess.run(["spirv-as", "--target-env", target, "-", "-o", source], input=PHI_GS, text=True, check=True)
+    subprocess.run(["spirv-val", "--target-env", target, source], check=True)
+    tool = os.path.join(ROOT, "tools", "spirv_gs_to_compute.py")
+    result = subprocess.run([sys.executable, "-I", tool, source, output], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    result = subprocess.run(["spirv-val", "--target-env", target, output], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert output.read_bytes()[4:8] == source.read_bytes()[4:8]
+
+
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+def test_lowers_in_bounds_geometry_interface_access_chains(tmp_path: Path) -> None:
+    geometry = PHI_GS.replace(
+        "%p = OpAccessChain %ptr_in_v4 %in_pos %x",
+        "%p = OpInBoundsAccessChain %ptr_in_v4 %in_pos %x",
+    ).replace(
+        "%out_pos = OpVariable %ptr_out_v4 Output",
+        "%ptr_out_float = OpTypePointer Output %float\n%out_pos = OpVariable %ptr_out_v4 Output",
+    ).replace(
+        "OpStore %out_pos %v",
+        "OpStore %out_pos %v\n"
+        "%out_x = OpInBoundsAccessChain %ptr_out_float %out_pos %u0\n"
+        "%x_value = OpCompositeExtract %float %v 0\n"
+        "OpStore %out_x %x_value",
+    )
+
+    def validate(name: str, assembly: str) -> None:
+        module = tmp_path / f"{name}.spv"
+        subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(module)],
+                       input=assembly, text=True, check=True)
+        result = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(module)],
+                                capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+
+    validate("geometry", geometry)
+    lowered, _ = gsc.rewrite(geometry)
+    assert "%p = OpAccessChain %gsc_ptr_sb_v4 %gsc_in " in lowered
+    assert "%out_x = OpAccessChain %gsc_ptr_pv_f %gsc_out0 %u0" in lowered
+    validate("compute", lowered)
+
+
+@pytest.fixture
+def gs_module(tmp_path):
+    if not (HAVE_SPIRV and shutil.which("spirv-dis")):
+        pytest.skip("needs SPIRV-Tools on PATH")
+    source = tmp_path / "gs.spv"
+    subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(source)],
+                   input=PHI_GS, text=True, check=True)
+    return source
+
+
+@pytest.mark.parametrize("overlap", ["input-output", "input-layout", "output-layout", "hardlinked-layout"])
+def test_cli_rejects_overlapping_paths_without_writing(tmp_path, gs_module, overlap):
+    source = gs_module
+    output = tmp_path / "cs.spv"
+    layout = tmp_path / "layout.json"
+    original = source.read_bytes()
+    if overlap == "input-output":
+        output = source
+    elif overlap == "input-layout":
+        layout = source
+    elif overlap == "output-layout":
+        subdir = tmp_path / "subdir"
+        subdir.mkdir()
+        layout = subdir / ".." / output.name
+    else:
+        try:
+            os.link(source, layout)
+        except OSError as e:
+            pytest.skip(f"hard links unavailable: {e}")
+
+    result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "spirv_gs_to_compute.py"),
+                             str(source), str(output), "--layout", str(layout)], capture_output=True, text=True)
+    assert result.returncode == 2, result.stderr
+    assert "same file" in result.stderr
+    assert source.read_bytes() == original
+    assert not (tmp_path / "cs.spv").exists()
+    if overlap == "hardlinked-layout":
+        assert layout.read_bytes() == original
+
+
+def test_cli_accepts_distinct_module_and_layout_paths(tmp_path, gs_module):
+    output = tmp_path / "cs.spv"
+    layout = tmp_path / "layout.json"
+    original = gs_module.read_bytes()
+    result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "spirv_gs_to_compute.py"),
+                             str(gs_module), str(output), "--layout", str(layout)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert gs_module.read_bytes() == original
+    assert json.loads(layout.read_text(encoding="utf-8"))["topology"] == "triangle_strip"
+    subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(output)], check=True)
+
+
 def test_help_is_a_clean_exit_zero(capsys):
     for flag in ("-h", "--help"):
         assert gsc.main(["spirv_gs_to_compute.py", flag]) == 0
         out = capsys.readouterr().out
         assert "spirv_gs_to_compute.py in.spv out.spv" in out
         assert "SPIRV-Tools" in out
+
+
+def test_builtin_load_and_output_store_with_memory_operands():
+    gs = PHI_GS.replace(
+        'OpEntryPoint Geometry %main "main" %in_pos %out_pos',
+        'OpEntryPoint Geometry %main "main" %in_pos %out_pos %prim_id %inv_id',
+    ).replace(
+        "OpDecorate %out_pos BuiltIn Position",
+        "OpDecorate %out_pos BuiltIn Position\n"
+        "OpDecorate %prim_id BuiltIn PrimitiveId\n"
+        "OpDecorate %inv_id BuiltIn InvocationId",
+    ).replace(
+        "%out_pos = OpVariable %ptr_out_v4 Output",
+        "%ptr_in_u = OpTypePointer Input %uint\n"
+        "%out_pos = OpVariable %ptr_out_v4 Output\n"
+        "%prim_id = OpVariable %ptr_in_u Input\n"
+        "%inv_id = OpVariable %ptr_in_u Input",
+    ).replace(
+        "%v = OpLoad %v4float %p\nOpStore %out_pos %v",
+        "%pid = OpLoad %uint %prim_id Aligned 4\n"
+        "%iid = OpLoad %uint %inv_id Volatile\n"
+        "%v = OpLoad %v4float %p\n"
+        "OpStore %out_pos %v Aligned 16",
+    )
+    out, _ = gsc.rewrite(gs)
+    assert "%prim_id" not in out and "%inv_id" not in out
+    assert "%pid = OpCopyObject %uint %gsc_prim" in out
+    assert "%iid = OpCopyObject %uint " in out
+    assert "OpStore %gsc_out0 %v" in out
+    if HAVE_SPIRV:
+        res = subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", os.devnull],
+                             input=out, text=True, capture_output=True)
+        assert res.returncode == 0, res.stderr
+
+    bad_gs = gs.replace("%pid = OpLoad %uint %prim_id Aligned 4", "OpCopyMemory %prim_id %inv_id")
+    with pytest.raises(gsc.Unsupported, match="%prim_id"):
+        gsc.rewrite(bad_gs)

@@ -16,6 +16,19 @@ public static class Util
     public static void WriteAllBytes(string path, byte[] data) => WriteAtomic(path, t => File.WriteAllBytes(t, data));
     public static void WriteAllText(string path, string text) => WriteAtomic(path, t => File.WriteAllText(t, text));
 
+    // The decoder names every geometry mesh `model_{mi}_geometry_{gi}`, where mi is the position of the model in the
+    // drawable's primary-LOD model list and gi the position of the geometry in that model - the pair a dehydrated
+    // BLAS leaf stores as its geometry index (docs/bvh.md §4a). Other spellings give -1.
+    public static (int Model, int Geometry) MeshKey(string name)
+    {
+        string[] parts = name.Split('_');
+        if (parts.Length == 4 && parts[0] == "model" && parts[2] == "geometry" &&
+            int.TryParse(parts[1], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int model) &&
+            int.TryParse(parts[3], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int geometry))
+            return (model, geometry);
+        return (-1, -1);
+    }
+
     public static string Safe(string s)
     {
         var bad = Path.GetInvalidFileNameChars();

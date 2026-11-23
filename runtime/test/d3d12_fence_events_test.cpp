@@ -3,6 +3,7 @@
 // as one fence reached, ANY is satisfied), and SetEventOnMultipleFenceCompletion with no fences is E_INVALIDARG and
 // sets nothing. No shaders or game data. LEONIDA_VK_VALIDATION=1 fails the test on any validation error.
 #include "vk_test_device.h"
+#include "host_adapter.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
@@ -95,9 +96,10 @@ int main() {
             for (const bool warp : {false, true}) {  // the reference the expectations were measured on
                 Ref<IDXGIAdapter> adapter;
                 Ref<ID3D12Device> host;
-                if (warp && FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p)))) continue;
+                std::string adapter_name;
+                if (!hostadapter::reference(factory.p, vk, warp, &adapter.p, adapter_name)) continue;
                 if (FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) continue;
-                failures += check(host.p, warp ? "host WARP" : "host default adapter");
+                failures += check(host.p, ("host " + adapter_name).c_str());
             }
         }
     }

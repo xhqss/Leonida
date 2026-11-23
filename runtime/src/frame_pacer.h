@@ -282,10 +282,8 @@ public:
         timing.period_us = period_us_;
         if (!pending_.empty()) return timing;
         for (const Record& r : records_)
-            if (r.token == token && !r.presented && token > last_presented_) {
-                const std::uint64_t due = r.origin_us - std::min<std::uint64_t>(r.origin_us, offset_us_) + period_us_;
-                if (now > due) timing.late_us = now - due;
-            }
+            if (r.token == token && !r.presented && token > last_presented_ && now > r.due_us)
+                timing.late_us = now - r.due_us;
         return timing;
     }
 
@@ -312,10 +310,7 @@ public:
             flip = now;
             std::uint64_t late_us = 0;
             for (const Record& r : records_)
-                if (r.token == token) {
-                    const std::uint64_t due = r.origin_us - std::min<std::uint64_t>(r.origin_us, offset_us_) + period_us_;
-                    if (now > due) late_us = now - due;
-                }
+                if (r.token == token && now > r.due_us) late_us = now - r.due_us;
             percent = scan_percent(late_us, period_us_);
             ++immediate_presents_;
         }
@@ -374,6 +369,7 @@ private:
     };
     struct Record {
         std::uint64_t token = 0, origin_us = 0, present_us = 0, display_us = 0;
+        std::uint64_t due_us = 0;  // vblank after this token's origin, fixed when issued
         float percent_scanned = 0.0f;
         bool presented = false, displayed = false;
     };
@@ -412,6 +408,7 @@ private:
                     Record record;
                     record.token = *token;
                     record.origin_us = first + std::uint64_t(origin) * period_us_;
+                    record.due_us = record.origin_us - offset_us_ + period_us_;
                     records_.push_back(record);
                     if (records_.size() > 64) records_.pop_front();
                     return pacer_hr::ok;

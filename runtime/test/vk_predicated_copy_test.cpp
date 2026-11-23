@@ -19,7 +19,12 @@ VKAPI_ATTR void VKAPI_CALL observe_host(VkCommandBuffer cb, const VkDependencyIn
 }
 int main() {
     vktest::Device d;
-    if(!d.create())return 1;
+    const auto status = d.initialize();
+    if (status == vktest::DeviceStatus::unavailable) {
+        std::printf("vk_predicated_copy_test: no Vulkan device, skipped\n");
+        return 77;
+    }
+    if (status != vktest::DeviceStatus::ready) return 1;
     if(!d.conditional_rendering || !d.storage_buffer_8bit) {
         std::puts("predicated copy: skipped (requires conditional rendering and storageBuffer8BitAccess)"); return 0;
     }
@@ -33,6 +38,7 @@ int main() {
     limits.maxStorageBufferRange=static_cast<std::uint32_t>(std::max<VkDeviceSize>(256,limits.minStorageBufferOffsetAlignment));
     limits.maxComputeWorkGroupCount[0]=1;
     VulkanContext context(d.device_proc,d.device,true,true);
+    context.set_occlusion_resolve_memory(memory);
     context.configure_predication(d.device_proc,memory,properties.limits.maxStorageBufferRange,d.family);
     VulkanQueue queue(context,d.queue,d.family);
     VulkanFence gate(context,0);
@@ -51,7 +57,21 @@ int main() {
     ResourceBinding b{};b.buffer=dst;b.buffer_offset=3;b.size=bytes-3;b.host_readable=true;
     ResourceBinding p{};p.buffer=pred;p.size=16;
     context.add_resource(1,a);context.add_resource(2,b);context.add_resource(3,p);
+    // D3D-162: capture/rebind and executing/suppressed copy dispatches inside one empty statistics query.
+    VkQueryPool statistics = VK_NULL_HANDLE;
+    void* statistics_data = nullptr;
+    if (d.pipeline_statistics_query) {
+        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS; info.queryCount = 1; info.pipelineStatistics = 0x7ff;
+        EXPECT(d.fn<PFN_vkCreateQueryPool>("vkCreateQueryPool")(d.device, &info, nullptr, &statistics) == VK_SUCCESS);
+        context.add_query_pool(4, {statistics, d3d12_query_heap::pipeline_statistics, 1, false, {false}, {}});
+        ResourceBinding counters{}; counters.size = 88; counters.host_readable = true;
+        counters.buffer = d.buffer(counters.size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &statistics_data);
+        EXPECT(counters.buffer && statistics_data);
+        std::memset(statistics_data, 0xcd, 88); context.add_resource(5, counters);
+    }
     CommandList list;
+    if (statistics) EXPECT(list.begin_query({4,d3d12_query::pipeline_statistics,0}));
     EXPECT(list.set_predication({3,0,d3d12_predication::equal_zero}));
     EXPECT(list.copy_buffer({2,4,1,2,4096}));  // high-word-only condition; offsets include arena prefixes
     EXPECT(list.copy_buffer({2,6000,2,4,33})); // dependent, non-overlapping copy within one VkBuffer
@@ -61,6 +81,10 @@ int main() {
     EXPECT(list.copy_buffer({2,7000,1,0,37}));// suppressed: high word must not be truncated
     EXPECT(list.set_predication({0,0,0}));
     EXPECT(list.copy_buffer({2,5000,1,0,17}));// reset restores ordinary transfer path
+    if (statistics) {
+        EXPECT(list.end_query({4,d3d12_query::pipeline_statistics,0}));
+        EXPECT(list.resolve_queries({4,d3d12_query::pipeline_statistics,0,1,5,0}));
+    }
     EXPECT(list.close());
     std::memcpy(expected.data()+7,input.data()+3,4096);
     std::memcpy(expected.data()+6003,expected.data()+7,33);
@@ -99,13 +123,22 @@ int main() {
             EXPECT(host_stages==VK_PIPELINE_STAGE_2_COPY_BIT);
         } else {
             EXPECT(typed.execute({&pointer,1})==ReplayResult::success);
-            EXPECT(host_stages==(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_2_COPY_BIT));
+            EXPECT(host_stages==(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_2_COPY_BIT|
+                                 (statistics ? VK_PIPELINE_STAGE_2_TRANSFER_BIT : 0)));
         }
         EXPECT(typed.idle() && host_barriers==1);
         EXPECT((host_stages & ~VulkanQueue::queue_supported_stages(kind))==0);
         EXPECT(std::memcmp(dst_data,expected.data(),bytes)==0);
     }
     context.vk.vkCmdPipelineBarrier2=real_barrier2;
+    if (statistics) {
+        for (unsigned word=0; word<11; ++word) {
+            std::uint64_t value=UINT64_MAX;
+            std::memcpy(&value, static_cast<const char*>(statistics_data)+8*word, 8);
+            EXPECT(value==0);
+        }
+        d.fn<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(d.device,statistics,nullptr);
+    }
     EXPECT(d.validation_errors()==0);
     std::puts("predicated copy integration: failed-submit cleanup and direct/compute/copy host stages passed");
     std::puts("predicated copy: 32 gated + 32 reused submissions; byte offsets, forced windows, copy dependency, rebinding/reset and untouched bytes passed");

@@ -45,6 +45,55 @@ class AuditShader4RegsTests(unittest.TestCase):
         )]
         self.assertEqual(audit_mod.rbw_registers(insns), ([3, 4, 5], [], ["s_addk_i32 s3, 1"]))
 
+    def test_stores_atomics_dual_dest_valu_and_nsa_lists(self):
+        # 1. tbuffer_store / s_store / s_buffer_store have no destination operand.
+        store_insns = [audit_mod.shader_ir.parse_line(line) for line in (
+            "\ttbuffer_store_format_xyzw v[0:1], v2, s[4:7], 0 idxen",
+            "\ts_store_dword s8, s[10:11], 0x0",
+            "\ts_buffer_store_dword s9, s[4:7], 0x0",
+            "\tv_mov_b32 v3, v0",
+            "\ts_mov_b32 s12, s8",
+        )]
+        self.assertEqual(audit_mod.rbw_registers(store_insns), ([4, 5, 6, 7, 8, 9, 10, 11], [0, 1, 2], []))
+
+        # 2. Non-glc atomics do not write args[0]; glc global_atomic writes vdst at args[0] without reading it.
+        atomic_insns = [audit_mod.shader_ir.parse_line(line) for line in (
+            "\tbuffer_atomic_add v0, v1, s[4:7], 0 offen",
+            "\tglobal_atomic_add v[2:3], v4, off",
+            "\tglobal_atomic_add v5, v[6:7], v8, off glc",
+            "\tv_mov_b32 v9, v0",
+            "\tv_mov_b32 v10, v2",
+            "\tv_mov_b32 v11, v5",
+        )]
+        self.assertEqual(audit_mod.rbw_registers(atomic_insns), ([4, 5, 6, 7], [0, 1, 2, 3, 4, 6, 7, 8], []))
+
+        # 3. v_mad_u64_u32 / v_mad_i64_i32 / v_div_scale_f32 write both args[0] (VGPR) and args[1] (SGPR mask).
+        dual_insns = [audit_mod.shader_ir.parse_line(line) for line in (
+            "\tv_mad_u64_u32 v[0:1], s[2:3], v4, v5, v[6:7]",
+            "\ts_mov_b32 s8, s2",
+        )]
+        self.assertEqual(audit_mod.rbw_registers(dual_insns), ([], [4, 5, 6, 7], []))
+
+        # 4. NSA vlist and slist operands report unread registers.
+        nsa_insns = [audit_mod.shader_ir.parse_line(line) for line in (
+            "\timage_sample v0, [v1, v3], s[4:11], s[12:15] dmask:0x1 dim:SQ_RSRC_IMG_2D",
+        )]
+        self.assertEqual(audit_mod.rbw_registers(nsa_insns), (list(range(4, 16)), [1, 3], []))
+
+    def test_vector_carry_in_and_out_are_distinct_in_the_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as disasm:
+            for op in ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32"):
+                path = os.path.join(disasm, f"cs_{op}.s")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(f"\t{op}_e64 v1, s3, v2, v4, s8\n"
+                            "\ts_mov_b32 s9, s3\n\ts_endpgm\n")
+
+            report = audit_mod.audit(disasm)["cs"]
+            self.assertEqual(report["count"], 3)
+            self.assertEqual(report["rbw_sgpr_counts"], {"s8": 3})
+            self.assertEqual(report["rbw_vgpr_counts"], {"v2": 3, "v4": 3})
+            self.assertEqual(report["s3_rbw_op_patterns"], {})
+
     def test_negative_limit_is_rejected_before_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             disasm = os.path.join(tmp, "disasm")
@@ -70,6 +119,21 @@ class AuditShader4RegsTests(unittest.TestCase):
                 audit_mod.audit(disasm, limit=-1)
             for limit, count in ((None, 2), (0, 0), (1, 1)):
                 self.assertEqual(audit_mod.audit(disasm, limit=limit)["cs"]["count"], count)
+
+    def test_directory_named_like_shader_is_skipped_by_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.mkdir(disasm)
+            # A directory that sorts before the real shader must not consume the --limit slot.
+            os.mkdir(os.path.join(disasm, "cs_a.s"))
+            with open(os.path.join(disasm, "cs_b.s"), "w", encoding="utf-8") as f:
+                f.write("\ts_endpgm\n")
+            with open(os.path.join(disasm, "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"cs_b": {"stage": "cs"}}, f)
+
+            # Without scanning regular files only, the directory cs_a.s would be parsed,
+            # raising IsADirectoryError or consuming the sole limit slot.
+            self.assertEqual(audit_mod.audit(disasm, limit=1)["cs"]["count"], 1)
 
     def test_bad_input_and_output_paths_are_one_error_line(self):
         with tempfile.TemporaryDirectory() as tmp:

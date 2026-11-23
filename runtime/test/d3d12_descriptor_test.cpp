@@ -15,12 +15,15 @@
 //     at the same S# type, so this also checks that they are two samplers, not one.
 //   - B8G8R8X8 (D3D-87): a B8G8R8X8_UNORM and a B8G8R8A8_UNORM texture uploaded with the same bytes, the fourth
 //     never 255. Their default views read the same red, green and blue; B8G8R8X8 reads alpha 1, B8G8R8A8 the
-//     stored byte. Views between the two typeless families give a null descriptor.
+//     stored byte. Views between the two typeless families give a null descriptor, unless a castable-format list
+//     names the view's format: then a B8G8R8X8 view of a B8G8R8A8 texture reads alpha 1, and a B8G8R8A8 view of a
+//     B8G8R8X8 one the stored byte, as on WARP and AMD's D3D12 driver.
 // Multisample SRVs: four masked triangles seed different values per sample and array layer. A compute shader reads
 // them back using the T#s for the 2D, full-array and sliced-array views. The test builds its pipelines in Vulkan
 // and binds the device's set (rt::d3d12::bindless_set). Without glslangValidator the GPU readbacks are skipped.
 // No game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
+#include "shader_fixture_path.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
@@ -54,6 +57,23 @@ struct Ref {
 };
 
 void* slot(void* object, unsigned index) { return (*reinterpret_cast<void***>(object))[index]; }
+
+// A root signature blob from the PC runtime's own serializer; empty when it has none for that version.
+std::vector<std::uint8_t> serialize_root_signature(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& desc) {
+    using SerializeFn = HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
+    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto fn = d3d12 ? reinterpret_cast<SerializeFn>(
+                                reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12SerializeVersionedRootSignature")))
+                          : nullptr;
+    std::vector<std::uint8_t> out;
+    ID3DBlob* blob = nullptr;
+    if (fn && SUCCEEDED(fn(&desc, &blob, nullptr)) && blob) {
+        const auto* bytes = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
+        out.assign(bytes, bytes + blob->GetBufferSize());
+        blob->Release();
+    }
+    return out;
+}
 
 D3D12_RESOURCE_DESC buffer_desc(UINT64 bytes, D3D12_RESOURCE_FLAGS flags) {
     D3D12_RESOURCE_DESC desc{};
@@ -102,7 +122,7 @@ struct SampleKeys {
 };
 
 VkShaderModule load_shader(vktest::Device& d, const char* path) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    std::ifstream file(vktest::shader_fixture_path(path), std::ios::binary | std::ios::ate);
     if (!file) return VK_NULL_HANDLE;
     std::vector<std::uint32_t> code(std::size_t(file.tellg()) / 4);
     file.seekg(0);
@@ -302,7 +322,7 @@ int main() {
     if (device_status != vktest::DeviceStatus::ready) return 1;
 
     constexpr UINT size = 8, texels = size * size, bytes = texels * 4;
-    std::vector<std::uint8_t> results(4 * bytes), after_destruction(bytes), borders(3 * bytes), bgr_results(2 * bytes);
+    std::vector<std::uint8_t> results(4 * bytes), after_destruction(bytes), borders(3 * bytes), bgr_results(6 * bytes);
     bool sampled_through_set = false;
     UINT lod_mismatches = 0;
     {
@@ -318,6 +338,8 @@ int main() {
         info.bindless_partially_bound = d.partially_bound;
         info.image_view_min_lod = d.image_view_min_lod;
         info.sampler_filter_minmax = d.sampler_filter_minmax;
+        info.custom_border_color = d.custom_border_color;
+        info.custom_border_color_without_format = d.custom_border_color_without_format;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -542,22 +564,49 @@ int main() {
                 for (UINT x = 0; x < fp.Width; ++x) std::memcpy(row + 4 * x, color.data(), 4);
             }
         }
-        // A B8G8R8X8_UNORM texture and a B8G8R8A8_UNORM one, uploaded with the same bgrx_texel bytes past the cube
-        // array's footprints.
-        constexpr DXGI_FORMAT bgr_formats[2] = {DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM};
-        Ref<ID3D12Resource> bgr_textures[2];
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT bgr_placed[2]{};
+        // Five textures uploaded with the same bgrx_texel bytes past the cube array's footprints: a B8G8R8X8_UNORM and
+        // a B8G8R8A8_UNORM one for their default views, then a B8G8R8A8_UNORM texture whose castable-format list names
+        // B8G8R8X8_UNORM and a B8G8R8X8_UNORM one whose list names B8G8R8A8_UNORM, each viewed in the other family,
+        // and two R8G8B8A8_UNORM ones whose lists name B8G8R8X8_UNORM and B8G8R8A8_UNORM, viewed through them (red
+        // and blue swap places).
+        constexpr UINT bgr_count = 6;
+        constexpr DXGI_FORMAT bgr_formats[bgr_count] = {DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM,
+                                                        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM,
+                                                        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM};
+        constexpr DXGI_FORMAT bgr_casts[bgr_count] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
+                                                      DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM,
+                                                      DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM};
+        Ref<ID3D12Resource> bgr_textures[bgr_count];
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT bgr_placed[bgr_count]{};
+        Ref<ID3D12Device10> bgr_device10;
+        EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&bgr_device10.p))));
         const auto& last_array = array_levels[std::size(array_levels) - 1];
         constexpr UINT64 placement = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
         const UINT64 bgr_start =
             (last_array.Offset + UINT64(last_array.Footprint.RowPitch) * last_array.Footprint.Height + placement - 1) &
             ~(placement - 1);
-        for (UINT f = 0; f < 2; ++f) {
+        for (UINT f = 0; f < bgr_count; ++f) {
             D3D12_RESOURCE_DESC desc = texture_desc;
             desc.Format = bgr_formats[f];
-            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                             IID_PPV_ARGS(&bgr_textures[f].p))));
+            if (bgr_casts[f] == DXGI_FORMAT_UNKNOWN) {
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                                 IID_PPV_ARGS(&bgr_textures[f].p))));
+            } else {
+                D3D12_RESOURCE_DESC1 desc1{};
+                desc1.Dimension = desc.Dimension;
+                desc1.Width = desc.Width;
+                desc1.Height = desc.Height;
+                desc1.DepthOrArraySize = desc.DepthOrArraySize;
+                desc1.MipLevels = desc.MipLevels;
+                desc1.Format = desc.Format;
+                desc1.SampleDesc = desc.SampleDesc;
+                desc1.Layout = desc.Layout;
+                desc1.Flags = desc.Flags;
+                EXPECT(SUCCEEDED(bgr_device10->CreateCommittedResource3(
+                    &default_heap, D3D12_HEAP_FLAG_NONE, &desc1, D3D12_BARRIER_LAYOUT_COPY_DEST, nullptr, nullptr, 1,
+                    &bgr_casts[f], IID_PPV_ARGS(&bgr_textures[f].p))));
+            }
             device->GetCopyableFootprints(&desc, 0, 1, bgr_start + 8192 * f, &bgr_placed[f], nullptr, nullptr, nullptr);
             EXPECT(bgr_placed[f].Footprint.Format == bgr_formats[f]);
             EXPECT(bgr_placed[f].Offset + UINT64(bgr_placed[f].Footprint.RowPitch) * size <= upload_desc.Width);
@@ -598,7 +647,8 @@ int main() {
             volume_lod_slot = cube_lod_slot + cube_lod_count,
             ms_slot = volume_lod_slot + volume_lod_count, ms_array_slot, ms_slice_slot, ms_first_layer_slot,
             ms_uint_slot, ms_uint_array_slot, ms_sint_slot, ms_sint_array_slot,
-            line_default, line_mip, line_clamped, bgrx_slot, bgra_slot, typed_bgrx_slot, view_slot_count
+            line_default, line_mip, line_clamped, bgrx_slot, bgra_slot, typed_bgrx_slot, cast_bgrx_slot,
+            cast_bgra_slot, cast_rgbx_slot, cast_rgba_slot, view_slot_count
         };
         D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, view_slot_count,
                                              D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
@@ -698,6 +748,42 @@ int main() {
         const auto null_at = [&](UINT i) {
             return std::all_of(view_bytes(i), view_bytes(i) + step, [](std::uint8_t byte) { return byte == 0; });
         };
+        // An explicit D3D12_SRV_DIMENSION_TEXTURE1D view on a 1D texture array selects layer zero (like TEXTURE2D
+        // and TEXTURE2DMS on 2D arrays), while a default (nullptr) SRV on a 1D array remains a null descriptor.
+        {
+            auto line_array_desc = line_desc;
+            line_array_desc.DepthOrArraySize = 3;
+            Ref<ID3D12Resource> line_array;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &line_array_desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&line_array.p))));
+            D3D12_DESCRIPTOR_HEAP_DESC la_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+                                                    D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            Ref<ID3D12DescriptorHeap> la_heap;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&la_heap_desc, IID_PPV_ARGS(&la_heap.p))));
+            const std::uint64_t la_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(la_heap.p, 9))(la_heap.p);
+            const D3D12_CPU_DESCRIPTOR_HANDLE la_default{SIZE_T(la_cpu)}, la_slice0{SIZE_T(la_cpu + step)};
+            std::memset(reinterpret_cast<void*>(la_default.ptr), 0x77, step);
+            device->CreateShaderResourceView(line_array.p, nullptr, la_default);
+            EXPECT(std::all_of(reinterpret_cast<const std::uint8_t*>(la_default.ptr),
+                               reinterpret_cast<const std::uint8_t*>(la_default.ptr) + step,
+                               [](std::uint8_t byte) { return byte == 0; }));
+            D3D12_SHADER_RESOURCE_VIEW_DESC la_view{};
+            la_view.Format = DXGI_FORMAT_UNKNOWN;
+            la_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+            la_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            la_view.Texture1D = {1, 1, 0};
+            device->CreateShaderResourceView(line_array.p, &la_view, la_slice0);
+            g::ImageWords la_words{};
+            std::memcpy(la_words.data(), reinterpret_cast<const void*>(la_slice0.ptr), sizeof(la_words));
+            g::Image la_image{};
+            EXPECT(g::is_image(la_words) && g::decode(la_words, la_image) &&
+                   la_image.type == g::ImageType::image_1d && la_image.first_mip == 1 && la_image.mip_count == 1 &&
+                   la_image.first_layer == 0 && la_image.layer_count == 1);
+            std::uint32_t la_key[8]{};
+            std::memcpy(la_key, la_words.data(), sizeof(la_key));
+            EXPECT(rt::d3d12::bindless_hash_lookup(device.p, la_key) != 0);
+        }
         D3D12_RESOURCE_DESC ms_desc = texture_desc;
         ms_desc.Width = ms_desc.Height = 4;
         ms_desc.SampleDesc.Count = 4;
@@ -799,6 +885,90 @@ int main() {
         const auto positive_bias = g::encode(literal);
         const g::SamplerWords biased_samplers[] = {negative_bias, positive_bias};
         EXPECT(rt::d3d12::register_samplers(device.p, biased_samplers) == S_OK);
+
+        // Static samplers of a root signature (docs/d3d12_vulkan.md section 3.5): no heap slot and no root argument,
+        // the shader holds the S# by value, so CreateRootSignature has to register it. One per blob version, each
+        // the wrapping sampler above with its own LOD range (so its own key), and one that only the fourth has:
+        // a border sampler with the UINT white border of the static enum. None is in the hash table before its
+        // root signature is created, all are after. A version the PC serializer here does not write is skipped.
+        const auto sampler_index = [&](const g::SamplerWords& words) {
+            std::uint32_t key[8]{~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
+            std::memcpy(key, words.data(), sizeof(words));
+            return rt::d3d12::bindless_hash_lookup(device.p, key);
+        };
+        struct StaticCase {
+            D3D_ROOT_SIGNATURE_VERSION version;
+            const char* name;
+            float max_lod;
+            bool uint_white_border;
+            g::SamplerWords words;
+            bool created;
+        } static_cases[] = {{D3D_ROOT_SIGNATURE_VERSION_1_0, "1.0", 6.0f, false, {}, false},
+                            {D3D_ROOT_SIGNATURE_VERSION_1_1, "1.1", 7.0f, false, {}, false},
+                            {D3D_ROOT_SIGNATURE_VERSION_1_2, "1.2", 8.0f, false, {}, false},
+                            {D3D_ROOT_SIGNATURE_VERSION_1_1, "1.1, UINT white border", 9.0f, true, {}, false}};
+        std::vector<Ref<ID3D12RootSignature>> static_roots(std::size(static_cases));
+        UINT static_created = 0;
+        for (std::size_t c = 0; c < std::size(static_cases); ++c) {
+            StaticCase& test = static_cases[c];
+            g::Sampler expected = sampler;
+            expected.max_lod = test.max_lod;
+            if (test.uint_white_border) {
+                expected.address_u = g::AddressMode::clamp_border;
+                expected.border_color = g::BorderColor::opaque_white;
+                expected.integer_border = true;
+            }
+            test.words = g::encode(expected);
+            EXPECT(test.words != sampler_words && sampler_index(test.words) == 0);
+
+            D3D12_STATIC_SAMPLER_DESC1 fixed{};
+            fixed.Filter = sampler_desc.Filter;
+            fixed.AddressU = test.uint_white_border ? D3D12_TEXTURE_ADDRESS_MODE_BORDER : sampler_desc.AddressU;
+            fixed.AddressV = sampler_desc.AddressV;
+            fixed.AddressW = sampler_desc.AddressW;
+            fixed.MaxAnisotropy = sampler_desc.MaxAnisotropy;
+            fixed.ComparisonFunc = sampler_desc.ComparisonFunc;
+            fixed.BorderColor = test.uint_white_border ? D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT
+                                                       : D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+            fixed.MaxLOD = test.max_lod;
+            fixed.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            // D3D12_STATIC_SAMPLER_DESC is D3D12_STATIC_SAMPLER_DESC1 without the trailing Flags.
+            D3D12_STATIC_SAMPLER_DESC fixed0{};
+            std::memcpy(&fixed0, &fixed, sizeof(fixed0));
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+            root_desc.Version = test.version;
+            if (test.version == D3D_ROOT_SIGNATURE_VERSION_1_0) {
+                root_desc.Desc_1_0.NumStaticSamplers = 1;
+                root_desc.Desc_1_0.pStaticSamplers = &fixed0;
+            } else if (test.version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
+                root_desc.Desc_1_1.NumStaticSamplers = 1;
+                root_desc.Desc_1_1.pStaticSamplers = &fixed0;
+            } else {
+                root_desc.Desc_1_2.NumStaticSamplers = 1;
+                root_desc.Desc_1_2.pStaticSamplers = &fixed;
+            }
+            const std::vector<std::uint8_t> blob = serialize_root_signature(root_desc);
+            if (blob.empty()) {
+                std::printf("static sampler, root signature %s: the PC serializer does not write it, skipped\n",
+                            test.name);
+                continue;
+            }
+            EXPECT(SUCCEEDED(device->CreateRootSignature(0, blob.data(), blob.size(),
+                                                         IID_PPV_ARGS(&static_roots[c].p))));
+            EXPECT(sampler_index(test.words) != 0);
+            test.created = true;
+            ++static_created;
+        }
+        // The entries outlive their root signatures, as a heap slot's S# outlives the heap: the shader pass below
+        // samples with them after the last reference is gone.
+        for (std::size_t c = 0; c < std::size(static_cases); ++c) {
+            const std::uint32_t before = sampler_index(static_cases[c].words);
+            static_roots[c].reset();
+            EXPECT(sampler_index(static_cases[c].words) == before);
+        }
+        std::printf("static samplers: %u of %u root signatures registered their S#\n", static_created,
+                    UINT(std::size(static_cases)));
+        EXPECT(static_created >= 3);  // 1.0 and 1.1 are in every d3d12.dll; 1.2 came later
 
         // The UINT texture's view in slot 0, and three border samplers after the first: UINT (0,0,0,0) and
         // (1,1,1,1) from CreateSampler2, which the proxy does not have (the inner device does), and float white.
@@ -1146,6 +1316,35 @@ int main() {
                bgra_image.format == bgrx_image.format);
         EXPECT((bgrx_image.swizzle == g::Swizzle{g::select_z, g::select_y, g::select_x, g::select_one}));
         EXPECT((bgra_image.swizzle == g::Swizzle{g::select_z, g::select_y, g::select_x, g::select_w}));
+        // A castable-format list lets a view cross the two families, and the view's own format decides the alpha:
+        // WARP and AMD's D3D12 driver read 1 through a B8G8R8X8 view of a B8G8R8A8 texture, and the stored byte
+        // through a B8G8R8A8 view of a B8G8R8X8 one. A format the list doesn't name stays refused.
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC cast_view = flat_view;
+            cast_view.Format = DXGI_FORMAT_B8G8R8X8_UNORM;
+            device->CreateShaderResourceView(bgr_textures[2].p, &cast_view, view_slot(cast_bgrx_slot));
+            cast_view.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            device->CreateShaderResourceView(bgr_textures[3].p, &cast_view, view_slot(cast_bgra_slot));
+            cast_view.Format = DXGI_FORMAT_B8G8R8X8_UNORM;
+            device->CreateShaderResourceView(bgr_textures[4].p, &cast_view, view_slot(cast_rgbx_slot));
+            cast_view.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            device->CreateShaderResourceView(bgr_textures[5].p, &cast_view, view_slot(cast_rgba_slot));
+            g::Image cast_bgrx_image{}, cast_bgra_image{}, cast_rgbx_image{}, cast_rgba_image{};
+            EXPECT(image_at(cast_bgrx_slot, cast_bgrx_image) && image_at(cast_bgra_slot, cast_bgra_image) &&
+                   image_at(cast_rgbx_slot, cast_rgbx_image) && image_at(cast_rgba_slot, cast_rgba_image));
+            EXPECT(cast_bgrx_image.format == bgrx_image.format && cast_bgra_image.format == bgrx_image.format &&
+                   cast_rgbx_image.format == bgrx_image.format && cast_rgba_image.format == bgrx_image.format);
+            // The T#'s format code is the same for both channel orders, so the swizzle carries the view's order.
+            EXPECT(cast_bgrx_image.swizzle == bgrx_image.swizzle && cast_bgra_image.swizzle == bgra_image.swizzle);
+            EXPECT(cast_rgba_image.swizzle == bgra_image.swizzle);  // B8G8R8A8 view of R8G8B8A8, no B8G8R8X8 involved
+            EXPECT(cast_rgbx_image.swizzle == bgrx_image.swizzle);
+            cast_view.Format = DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+            for (ID3D12Resource* listed : {bgr_textures[2].p, bgr_textures[3].p, bgr_textures[4].p, bgr_textures[5].p}) {
+                std::memset(view_bytes(null_slot), 0x77, step);
+                device->CreateShaderResourceView(listed, &cast_view, view_slot(null_slot));
+                EXPECT(null_at(null_slot));
+            }
+        }
         Ref<ID3D12Resource> bgrx_typeless;
         D3D12_RESOURCE_DESC bgrx_typeless_desc = texture_desc;
         bgrx_typeless_desc.Format = DXGI_FORMAT_B8G8R8X8_TYPELESS;
@@ -1286,7 +1485,7 @@ int main() {
                 transition(bc.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             list->ResourceBarrier(1, &barrier);
         }
-        for (UINT f = 0; f < 2; ++f) {
+        for (UINT f = 0; f < bgr_count; ++f) {
             to_texture.pResource = bgr_textures[f].p;
             from_upload.PlacedFootprint = bgr_placed[f];
             list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
@@ -1311,6 +1510,14 @@ int main() {
             transition(bgr_textures[0].p, D3D12_RESOURCE_STATE_COPY_DEST,
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             transition(bgr_textures[1].p, D3D12_RESOURCE_STATE_COPY_DEST,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            transition(bgr_textures[2].p, D3D12_RESOURCE_STATE_COPY_DEST,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            transition(bgr_textures[3].p, D3D12_RESOURCE_STATE_COPY_DEST,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            transition(bgr_textures[4].p, D3D12_RESOURCE_STATE_COPY_DEST,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            transition(bgr_textures[5].p, D3D12_RESOURCE_STATE_COPY_DEST,
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
         list->ResourceBarrier(UINT(std::size(sampled)), sampled);
         to_texture.pResource = array_texture.p;
@@ -1445,6 +1652,24 @@ int main() {
                         clamped, texels);
             EXPECT(wrapped == texels && clamped == texels);
 
+            // The static samplers' S#s: the three wrapping ones give the texture, texel for texel, as the registered
+            // literal does. Unregistered (CreateRootSignature dropping them) they would clamp like the second above.
+            for (const StaticCase& test : static_cases) {
+                if (!test.created || test.uint_white_border) continue;
+                SampleKeys key = keys[0];
+                std::memcpy(key.ssharp, test.words.data(), sizeof(key.ssharp));
+                std::array<std::uint8_t, bytes> pixels{};
+                EXPECT(sample_through_set(d, set0, set0_layout, {&key, 1}, pixels.data()));
+                UINT static_wrapped = 0, static_clamped = 0;
+                for (UINT i = 0; i < texels; ++i) {
+                    static_wrapped += std::memcmp(pixels.data() + 4 * i, texel(i % size, i / size).data(), 4) == 0;
+                    static_clamped += std::memcmp(pixels.data() + 4 * i, texel(size - 1, i / size).data(), 4) == 0;
+                }
+                std::printf("static sampler, root signature %s: %u/%u texels wrapped (%u would match a clamp)\n",
+                            test.name, static_wrapped, texels, static_clamped);
+                EXPECT(static_wrapped == texels && static_clamped < texels);
+            }
+
             // With LOD zero requested, opposite bias extremes select the first and last mips.
             for (const auto& words : biased_samplers) {
                 SampleKeys key = keys[0];
@@ -1488,7 +1713,14 @@ int main() {
             lod_keys[i].first = i * texels;
         }
         EXPECT(sample_through_set(d, set0, set0_layout, lod_keys, lod_pixels.data()));
-        std::array<UINT, std::size(lod_views)> lod_errors{};
+        // A fractional image-view minimum LOD is not exact on every driver: Vulkan defines the view's minimum as
+        // minLodFloat (preferred) or minLodInteger = floor(minLodFloat) (alternative), and an implementation may use
+        // either (Vulkan spec, "Image Level(s) Selection" and VkImageViewMinLodCreateInfoEXT). The UHD 770 floors it.
+        // So a view with a fractional clamp inside its mip range passes if all of its texels follow one of the two
+        // rules; the rest of the views have one answer either way.
+        std::array<UINT, std::size(lod_views)> lod_errors{}, lod_errors_floored{};
+        std::array<bool, std::size(lod_views)> lod_fractional{};
+        char lod_first[std::size(lod_views)][160]{};
         for (UINT i = 0; i < texels; ++i) {
             using Pixel = std::array<std::uint8_t, 4>;
             const Pixel expected[] = {
@@ -1497,18 +1729,34 @@ int main() {
                 d.image_view_min_lod ? mip_colors[1] : Pixel{},
                 {}, mip_colors[0], {0, 0, 0, 255}
             };
+            // The same views with the minimum floored where the extension is used (views 1 and 2: 0.75 -> 0, 1.75 -> 1).
+            const Pixel floored[] = {
+                expected[0], d.image_view_min_lod ? texel(i % size, i / size) : Pixel{},
+                d.image_view_min_lod ? mip_colors[0] : Pixel{}, expected[3], expected[4], expected[5]
+            };
             static_assert(std::size(expected) == std::size(lod_views));
+            lod_fractional[1] = lod_fractional[2] = d.image_view_min_lod;
             for (UINT view = 0; view < std::size(lod_views); ++view) {
                 const auto* sample = &lod_pixels[view * bytes + 4 * i];
+                if (std::memcmp(sample, floored[view].data(), 4)) ++lod_errors_floored[view];
                 if (std::memcmp(sample, expected[view].data(), 4) && lod_errors[view]++ == 0) {
-                    std::fprintf(stderr, "minimum LOD view %u texel %u: got %u %u %u %u, expected %u %u %u %u\n",
-                                 view, i, sample[0], sample[1], sample[2], sample[3],
-                                 expected[view][0], expected[view][1], expected[view][2], expected[view][3]);
+                    std::snprintf(lod_first[view], sizeof(lod_first[view]),
+                                  "minimum LOD view %u texel %u: got %u %u %u %u, expected %u %u %u %u\n", view, i,
+                                  sample[0], sample[1], sample[2], sample[3], expected[view][0], expected[view][1],
+                                  expected[view][2], expected[view][3]);
                 }
             }
         }
         for (UINT view = 0; view < lod_errors.size(); ++view) {
-            if (lod_errors[view]) std::fprintf(stderr, "2D LOD view %u: %u/%u mismatched\n", view, lod_errors[view], texels);
+            if (lod_fractional[view] && lod_errors[view] && !lod_errors_floored[view]) {
+                std::printf("2D LOD view %u: the driver floors the fractional minimum LOD (%.2f), as Vulkan allows\n",
+                            view, lod_views[view].clamp);
+                lod_errors[view] = 0;
+            }
+            if (lod_errors[view]) {
+                std::fputs(lod_first[view], stderr);
+                std::fprintf(stderr, "2D LOD view %u: %u/%u mismatched\n", view, lod_errors[view], texels);
+            }
             lod_mismatches += lod_errors[view];
         }
 
@@ -1520,26 +1768,37 @@ int main() {
         }
         std::array<std::uint8_t, std::size(array_keys) * bytes> array_pixels{};
         EXPECT(sample_through_set(d, set0, set0_layout, array_keys, array_pixels.data()));
-        std::array<UINT, std::size(array_clamps)> array_errors{};
+        std::array<UINT, std::size(array_clamps)> array_errors{}, array_errors_floored{};
+        char array_first[std::size(array_clamps)][160]{};
         for (UINT i = 0; i < texels; ++i) {
             const UINT layer = 1 + i / 32;
             const std::array<std::uint8_t, 4> zero{};
             const auto mip2 = d.image_view_min_lod ? array_color(layer, 2) : zero;
             const std::array expected{array_color(layer, 1), mip2, mip2, zero};
+            // View 1 (minimum 1.75) floors to mip 1 where the driver uses minLodInteger; see the 2D views above.
+            const std::array floored{array_color(layer, 1), d.image_view_min_lod ? array_color(layer, 1) : zero, mip2, zero};
             static_assert(expected.size() == std::size(array_clamps));
             for (UINT view = 0; view < expected.size(); ++view) {
                 const auto* got = array_pixels.data() + view * bytes + i * 4;
+                if (std::memcmp(got, floored[view].data(), 4)) ++array_errors_floored[view];
                 if (std::memcmp(got, expected[view].data(), 4) && array_errors[view]++ == 0) {
-                    std::fprintf(stderr, "array LOD %.2f, layer %u: got %u,%u,%u,%u; expected %u,%u,%u,%u\n",
-                                 array_clamps[view], layer, got[0], got[1], got[2], got[3],
-                                 expected[view][0], expected[view][1], expected[view][2], expected[view][3]);
+                    std::snprintf(array_first[view], sizeof(array_first[view]),
+                                  "array LOD %.2f, layer %u: got %u,%u,%u,%u; expected %u,%u,%u,%u\n",
+                                  array_clamps[view], layer, got[0], got[1], got[2], got[3], expected[view][0],
+                                  expected[view][1], expected[view][2], expected[view][3]);
                 }
             }
         }
+        if (d.image_view_min_lod && array_errors[1] && !array_errors_floored[1]) {
+            std::printf("array LOD %.2f: the driver floors the fractional minimum LOD, as Vulkan allows\n", array_clamps[1]);
+            array_errors[1] = 0;
+        }
         UINT array_mismatches = 0;
         for (UINT view = 0; view < array_errors.size(); ++view) {
-            if (array_errors[view]) std::fprintf(stderr, "array LOD %.2f: %u/%u mismatched\n",
-                                                array_clamps[view], array_errors[view], texels);
+            if (array_errors[view]) {
+                std::fputs(array_first[view], stderr);
+                std::fprintf(stderr, "array LOD %.2f: %u/%u mismatched\n", array_clamps[view], array_errors[view], texels);
+            }
             array_mismatches += array_errors[view];
         }
         lod_mismatches += array_mismatches;
@@ -1746,11 +2005,19 @@ int main() {
         // More than 4096 SRVs and more than a full shader-visible sampler heap (2048): 5000 distinct views of the
         // texture (mip ranges by swizzles), then one more that samples as the texture, and 2100 distinct wrapping
         // samplers (MaxLOD apart). The last view through the last sampler must give the texture, one tile to the
-        // right; a fallback view or the fallback (clamping) sampler would not.
+        // right; a fallback view or the fallback (clamping) sampler would not. A set with less room than that
+        // (MoltenVK's keeps the default 4096 2D images and 1024 samplers, docs/d3d12_vulkan.md section 5) gets as
+        // many as fill each short array exactly: its last view and sampler must still give the texture, and one
+        // more of each must be refused and read as the fallbacks.
         {
-            constexpr UINT many_views = 5000, many_samplers = 2100, heap_samplers = 2048;
+            constexpr UINT wanted_views = 5000, wanted_samplers = 2100, heap_samplers = 2048;
+            const auto room = rt::d3d12::bindless_room(device.p);
+            EXPECT(room.images_2d >= 2 && room.samplers >= 1);
+            const bool views_capped = room.images_2d < wanted_views + 1, samplers_capped = room.samplers < wanted_samplers;
+            const UINT many_views = views_capped ? room.images_2d - 1 : wanted_views;
+            const UINT many_samplers = samplers_capped ? room.samplers : wanted_samplers;
             Ref<ID3D12DescriptorHeap> many_view_heap, many_sampler_heaps[2];
-            D3D12_DESCRIPTOR_HEAP_DESC many_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, many_views + 1,
+            D3D12_DESCRIPTOR_HEAP_DESC many_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, many_views + 2,
                                                  D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
             EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&many_desc, IID_PPV_ARGS(&many_view_heap.p))));
             many_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, heap_samplers, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
@@ -1777,28 +2044,41 @@ int main() {
                 std::memcpy(tsharps.emplace_back().data(), reinterpret_cast<const void*>(many_view_cpu + i * step), 32);
             }
             // Every mip with alpha forced to one: the texture's texels (alpha 255), under a T# no other view has.
+            // The one past it, a short array's extra, forces alpha to zero.
             D3D12_SHADER_RESOURCE_VIEW_DESC last_srv{};
             last_srv.Format = sampled_desc.Format;
             last_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             last_srv.Shader4ComponentMapping =
                 D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 1, 2, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1);
             last_srv.Texture2D = {0, UINT(-1), 0, 0};
-            const std::uint64_t last_view = many_view_cpu + many_views * step;
+            const std::uint64_t last_view = many_view_cpu + many_views * step, extra_view = last_view + step;
             device->CreateShaderResourceView(texture.p, &last_srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(last_view)});
             std::memcpy(tsharps.emplace_back().data(), reinterpret_cast<const void*>(last_view), 32);
+            if (views_capped) {
+                EXPECT(rt::d3d12::bindless_room(device.p).images_2d == 0);
+                last_srv.Shader4ComponentMapping =
+                    D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 1, 2, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0);
+                device->CreateShaderResourceView(texture.p, &last_srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(extra_view)});
+                std::memcpy(tsharps.emplace_back().data(), reinterpret_cast<const void*>(extra_view), 32);
+            }
             std::memcpy(tsharps.emplace_back().data(), view_bytes(own), 32);
             std::sort(tsharps.begin(), tsharps.end());
             EXPECT(std::unique(tsharps.begin(), tsharps.end()) == tsharps.end());  // distinct set entries
 
             std::vector<std::array<std::uint32_t, 4>> ssharps;
             std::uint64_t last_sampler = 0;
-            for (UINT i = 0; i < many_samplers; ++i) {
+            const UINT created_samplers = many_samplers + (samplers_capped ? 1 : 0);
+            for (UINT i = 0; i < created_samplers; ++i) {
+                if (i == many_samplers) EXPECT(rt::d3d12::bindless_room(device.p).samplers == 0);
                 D3D12_SAMPLER_DESC many_sampler = sampler_desc;
                 many_sampler.MaxLOD = float(i + 1) / 256.0f;  // the S# keeps 8 fraction bits; LOD 0 is sampled
-                last_sampler = cpu_start(many_sampler_heaps[i / heap_samplers].p) + (i % heap_samplers) * sampler_step;
-                device->CreateSampler(&many_sampler, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(last_sampler)});
-                std::memcpy(ssharps.emplace_back().data(), reinterpret_cast<const void*>(last_sampler), 16);
+                const std::uint64_t at =
+                    cpu_start(many_sampler_heaps[i / heap_samplers].p) + (i % heap_samplers) * sampler_step;
+                device->CreateSampler(&many_sampler, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(at)});
+                std::memcpy(ssharps.emplace_back().data(), reinterpret_cast<const void*>(at), 16);
+                if (i < many_samplers) last_sampler = at;
             }
+            const std::uint64_t extra_sampler = last_sampler + sampler_step;  // many_samplers < heap_samplers then
             std::memcpy(ssharps.emplace_back().data(), sampler_bytes, 16);
             std::sort(ssharps.begin(), ssharps.end());
             EXPECT(std::unique(ssharps.begin(), ssharps.end()) == ssharps.end());
@@ -1809,20 +2089,63 @@ int main() {
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
             d.fn<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(d.device);
-            SampleKeys last_keys{};
-            std::memcpy(last_keys.tsharp, reinterpret_cast<const void*>(last_view), sizeof(last_keys.tsharp));
-            std::memcpy(last_keys.ssharp, reinterpret_cast<const void*>(last_sampler), sizeof(last_keys.ssharp));
-            std::array<std::uint8_t, bytes> last_texels{};
-            EXPECT(sample_through_set(d, set0, set0_layout, {&last_keys, 1}, last_texels.data()));
+            const auto in_table = [&](std::uint64_t descriptor, bool sampler) {
+                std::uint32_t key[8]{~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
+                std::memcpy(key, reinterpret_cast<const void*>(descriptor), sampler ? 16 : 32);
+                return rt::d3d12::bindless_hash_lookup(device.p, key) != 0;
+            };
+            EXPECT(in_table(last_view, false) && in_table(last_sampler, true));
+            if (views_capped) EXPECT(!in_table(extra_view, false));
+            if (samplers_capped) EXPECT(!in_table(extra_sampler, true));
+
+            // The last view through the last sampler; then a short array's extra in its place, which reads as the
+            // fallback: zeros for the view, and the clamping sampler's edge column for the sampler.
+            SampleKeys last_keys[3]{};
+            std::memcpy(last_keys[0].tsharp, reinterpret_cast<const void*>(last_view), sizeof(last_keys[0].tsharp));
+            std::memcpy(last_keys[0].ssharp, reinterpret_cast<const void*>(last_sampler), sizeof(last_keys[0].ssharp));
+            UINT key_count = 1;
+            if (views_capped) {
+                last_keys[key_count] = last_keys[0];
+                std::memcpy(last_keys[key_count].tsharp, reinterpret_cast<const void*>(extra_view),
+                            sizeof(last_keys[key_count].tsharp));
+                last_keys[key_count].first = key_count * texels;
+                ++key_count;
+            }
+            if (samplers_capped) {
+                last_keys[key_count] = last_keys[0];
+                std::memcpy(last_keys[key_count].ssharp, reinterpret_cast<const void*>(extra_sampler),
+                            sizeof(last_keys[key_count].ssharp));
+                last_keys[key_count].first = key_count * texels;
+                ++key_count;
+            }
+            std::array<std::uint8_t, 3 * bytes> last_texels{};
+            EXPECT(sample_through_set(d, set0, set0_layout, {last_keys, key_count}, last_texels.data()));
+            const char* const names[] = {"the last view through the last sampler", "the refused view",
+                                         "the refused sampler"};
             UINT differ = 0;
-            for (UINT i = 0; i < texels; ++i)
-                if (std::memcmp(last_texels.data() + 4 * i, texel(i % size, i / size).data(), 4) != 0 && differ++ < 4)
-                    std::fprintf(stderr, "view %u through sampler %u, texel %u: got %u,%u,%u,%u\n", many_views + 1,
-                                 many_samplers, i, last_texels[4 * i], last_texels[4 * i + 1], last_texels[4 * i + 2],
-                                 last_texels[4 * i + 3]);
+            for (UINT k = 0; k < key_count; ++k) {
+                const UINT kind = k == 0 ? 0 : views_capped && k == 1 ? 1 : 2;
+                for (UINT i = 0; i < texels; ++i) {
+                    const auto want = kind == 0 ? texel(i % size, i / size)
+                                      : kind == 1 ? std::array<std::uint8_t, 4>{}
+                                                  : texel(size - 1, i / size);
+                    const auto* got = last_texels.data() + k * bytes + 4 * i;
+                    if (std::memcmp(got, want.data(), 4) != 0 && differ++ < 4)
+                        std::fprintf(stderr, "%s, texel %u: got %u,%u,%u,%u; expected %u,%u,%u,%u\n", names[kind], i,
+                                     got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+                }
+            }
             EXPECT(differ == 0);
-            std::printf("bindless capacity: the %uth SRV through the %uth sampler gave the texture\n", many_views + 1,
-                        many_samplers);
+            if (!views_capped && !samplers_capped)
+                std::printf("bindless capacity: the %uth SRV through the %uth sampler gave the texture\n",
+                            many_views + 1, many_samplers);
+            else
+                std::printf("bindless capacity: the set had room for %u more 2D views and %u more samplers, fewer than "
+                            "%u and %u: the last of each gave the texture, and one more %s refused and read as the "
+                            "fallback\n", room.images_2d, room.samplers, wanted_views + 1, wanted_samplers,
+                            views_capped && samplers_capped ? "of each was"
+                            : views_capped                  ? "view was"
+                                                            : "sampler was");
         }
 
         // 96-bit textures (D3D-62): R32G32B32_FLOAT holding the texture's red, green and blue as n/255,
@@ -1944,10 +2267,12 @@ int main() {
                 }
             EXPECT(rgb96_differ == 0);
         }
-        // The B8G8R8X8 and B8G8R8A8 textures through their default views.
-        SampleKeys bgr_keys[2] = {};
-        const UINT bgr_slots[2] = {bgrx_slot, bgra_slot};
-        for (UINT k = 0; k < 2; ++k) {
+        // The B8G8R8X8 and B8G8R8A8 textures through their default views, then the two castable ones through a view
+        // of the other family.
+        SampleKeys bgr_keys[bgr_count] = {};
+        const UINT bgr_slots[bgr_count] = {bgrx_slot,      bgra_slot,      cast_bgrx_slot,
+                                           cast_bgra_slot, cast_rgbx_slot, cast_rgba_slot};
+        for (UINT k = 0; k < bgr_count; ++k) {
             std::memcpy(bgr_keys[k].tsharp, view_bytes(bgr_slots[k]), sizeof(bgr_keys[k].tsharp));
             std::memcpy(bgr_keys[k].ssharp, sampler_bytes, sizeof(bgr_keys[k].ssharp));
             bgr_keys[k].first = k * texels;
@@ -1980,10 +2305,22 @@ int main() {
         };
         constexpr PackedFormat packed_formats[] = {
             {DXGI_FORMAT_B4G4R4A4_UNORM, VK_FORMAT_A4R4G4B4_UNORM_PACK16, "B4G4R4A4"},
+            {DXGI_FORMAT_A4B4G4R4_UNORM, VK_FORMAT_R4G4B4A4_UNORM_PACK16, "A4B4G4R4"},
             {DXGI_FORMAT_B5G5R5A1_UNORM, VK_FORMAT_A1R5G5B5_UNORM_PACK16, "B5G5R5A1"}
         };
         UINT64 packed_signal = 2;
         for (const auto& format : packed_formats) {
+            // Vulkan requires sampling A4R4G4B4 (1.3) and A1R5G5B5 but not R4G4B4A4: skip A4B4G4R4 where the Vulkan
+            // driver can't sample it (the driver's answer, not the layer's, so a dropped mapping still fails).
+            if (format.dxgi == DXGI_FORMAT_A4B4G4R4_UNORM) {
+                VkFormatProperties props{};
+                d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
+                    d.physical, format.vk, &props);
+                if (!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+                    std::printf("%s: the Vulkan driver can't sample it, skipped\n", format.name);
+                    continue;
+                }
+            }
             D3D12_RESOURCE_DESC format_desc = texture_desc;
             format_desc.Format = format.dxgi;
             Ref<ID3D12Resource> format_texture;
@@ -2010,7 +2347,10 @@ int main() {
                         rgba = b5_rgba[i];
                     } else {
                         const UINT r = x, g = y + 8, b = (x + y) & 15, a = 15 - x;
-                        word = std::uint16_t(b | (g << 4) | (r << 8) | (a << 12));
+                        // B4G4R4A4 keeps blue in bits 0-3 and alpha in 12-15, A4B4G4R4 alpha in 0-3 and red in 12-15.
+                        word = format.dxgi == DXGI_FORMAT_A4B4G4R4_UNORM
+                                   ? std::uint16_t(a | (b << 4) | (g << 8) | (r << 12))
+                                   : std::uint16_t(b | (g << 4) | (r << 8) | (a << 12));
                         rgba = {std::uint8_t(r * 17), std::uint8_t(g * 17), std::uint8_t(b * 17), std::uint8_t(a * 17)};
                     }
                     std::memcpy(static_cast<std::uint8_t*>(mapped) + format_footprint.Offset +
@@ -2039,6 +2379,7 @@ int main() {
             EXPECT(image_at(null_slot, packed_image));
             EXPECT(packed_image.format == g::format_from_vulkan(format.vk) && packed_image.format != 0);
             if (format.dxgi == DXGI_FORMAT_B5G5R5A1_UNORM) EXPECT(packed_image.swizzle == g::channels_bgra);
+            if (format.dxgi == DXGI_FORMAT_A4B4G4R4_UNORM) EXPECT(packed_image.swizzle == g::channels_abgr);
 #ifdef LEONIDA_TEST_CS_SAMPLE_SPV
             SampleKeys packed_keys{};
             std::memcpy(packed_keys.tsharp, view_bytes(null_slot), sizeof(packed_keys.tsharp));
@@ -2166,6 +2507,303 @@ int main() {
 #endif
         }
 
+        // Cross-family castable SRV: write_image_descriptor must pass resource.has_view_format_list() into a single
+        // bind_image call so a listed R8G8B8A8_UINT -> R32_UINT view registers cleanly without a spurious first-pass
+        // failure (and without double-binding every view).
+        if (d.bindless) {
+            Ref<ID3D12Device10> inner10;
+            EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&inner10.p))));
+            D3D12_RESOURCE_DESC1 cast_desc{};
+            cast_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            cast_desc.Width = 4;
+            cast_desc.Height = 4;
+            cast_desc.DepthOrArraySize = 1;
+            cast_desc.MipLevels = 1;
+            cast_desc.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+            cast_desc.SampleDesc = {1, 0};
+            cast_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            const DXGI_FORMAT cast_formats[] = {DXGI_FORMAT_R8G8B8A8_UINT, DXGI_FORMAT_R32_UINT};
+            Ref<ID3D12Resource> cast_tex;
+            EXPECT(SUCCEEDED(inner10->CreateCommittedResource3(
+                &default_heap, D3D12_HEAP_FLAG_NONE, &cast_desc, D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr,
+                2, cast_formats, IID_PPV_ARGS(&cast_tex.p))));
+            const D3D12_DESCRIPTOR_HEAP_DESC cast_hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+                                                     D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            Ref<ID3D12DescriptorHeap> cast_heap;
+            EXPECT(SUCCEEDED(inner10->CreateDescriptorHeap(&cast_hd, IID_PPV_ARGS(&cast_heap.p))));
+            const D3D12_CPU_DESCRIPTOR_HANDLE cast_slot = cast_heap->GetCPUDescriptorHandleForHeapStart();
+            D3D12_SHADER_RESOURCE_VIEW_DESC cast_srv{};
+            cast_srv.Format = DXGI_FORMAT_R32_UINT;
+            cast_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            cast_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            cast_srv.Texture2D.MipLevels = 1;
+            inner10->CreateShaderResourceView(cast_tex.p, &cast_srv, cast_slot);
+            g::ImageWords cast_words{};
+            std::memcpy(cast_words.data(), reinterpret_cast<const void*>(cast_slot.ptr), sizeof(cast_words));
+            g::Image decoded{};
+            EXPECT(g::decode(cast_words, decoded) && decoded.type == g::ImageType::image_2d);
+            EXPECT(decoded.format == g::format_from_vulkan(VK_FORMAT_R32_UINT));
+            std::uint32_t cast_key[8]{};
+            std::memcpy(cast_key, cast_words.data(), sizeof(cast_key));
+            EXPECT(rt::d3d12::bindless_hash_lookup(device.p, cast_key) != 0);
+        }
+
+        // Depth SRVs: D16_UNORM / R16_TYPELESS (depth) and D32_FLOAT / R32_TYPELESS (depth) only allow matching depth
+        // view formats (R16_UNORM / R32_FLOAT, plus UNKNOWN on typed D16/D32). Colour casts on depth textures
+        // (R16_FLOAT/SNORM/UINT/SINT on D16, R32_UINT/SINT on D32, or any colour format on D24S8/D32S8) must produce
+        // null descriptors with zero Vulkan validation errors.
+        {
+            const unsigned validation_before_depth = d.validation_errors();
+            constexpr UINT depth_tex_count = 4;
+            constexpr DXGI_FORMAT depth_tex_formats[depth_tex_count] = {
+                DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_TYPELESS};
+            constexpr DXGI_FORMAT depth_dsv_formats[depth_tex_count] = {
+                DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT};
+            // Multiples of 1/255 are exact in both D16_UNORM (65535 = 255 * 257) and D32_FLOAT.
+            constexpr std::uint8_t depth_clear_u8[depth_tex_count] = {51, 102, 153, 204};
+            Ref<ID3D12Resource> depth_textures[depth_tex_count];
+            for (UINT i = 0; i < depth_tex_count; ++i) {
+                D3D12_RESOURCE_DESC dd = texture_desc;
+                dd.Format = depth_tex_formats[i];
+                dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &dd,
+                                                                 D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr,
+                                                                 IID_PPV_ARGS(&depth_textures[i].p))));
+            }
+            Ref<ID3D12DescriptorHeap> depth_dsv_heap, depth_srv_heap;
+            const D3D12_DESCRIPTOR_HEAP_DESC depth_dsv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, depth_tex_count,
+                                                          D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&depth_dsv_hd, IID_PPV_ARGS(&depth_dsv_heap.p))));
+            const UINT dsv_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+            const std::uint64_t dsv_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(depth_dsv_heap.p, 9))(depth_dsv_heap.p);
+            const auto dsv_slot = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(dsv_cpu + i * dsv_step)}; };
+            for (UINT i = 0; i < depth_tex_count; ++i) {
+                D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
+                dsv.Format = depth_dsv_formats[i];
+                dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+                device->CreateDepthStencilView(depth_textures[i].p, &dsv, dsv_slot(i));
+            }
+
+            // Valid depth SRVs: 0: D16 default, 1: D16->R16_UNORM, 2: R16_TYPELESS->R16_UNORM,
+            //                   3: D32 default, 4: D32->R32_FLOAT, 5: R32_TYPELESS->R32_FLOAT; 6: scratch for invalid.
+            constexpr UINT valid_depth_srvs = 6, depth_scratch = 6;
+            const D3D12_DESCRIPTOR_HEAP_DESC depth_srv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, valid_depth_srvs + 1,
+                                                          D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&depth_srv_hd, IID_PPV_ARGS(&depth_srv_heap.p))));
+            const std::uint64_t depth_srv_cpu =
+                reinterpret_cast<XboxHeapHandleFn>(slot(depth_srv_heap.p, 9))(depth_srv_heap.p);
+            const auto depth_slot = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(depth_srv_cpu + i * step)}; };
+            const auto depth_bytes = [&](UINT i) { return reinterpret_cast<std::uint8_t*>(depth_srv_cpu + i * step); };
+            const auto depth_null = [&](UINT i) {
+                return std::all_of(depth_bytes(i), depth_bytes(i) + step, [](std::uint8_t b) { return b == 0; });
+            };
+
+            struct ValidDepthSrv {
+                UINT tex_index;
+                DXGI_FORMAT view_format;  // UNKNOWN => pass nullptr
+                VkFormat expected_vk;
+            };
+            constexpr ValidDepthSrv valid_cases[valid_depth_srvs] = {
+                {0, DXGI_FORMAT_UNKNOWN, VK_FORMAT_D16_UNORM},
+                {0, DXGI_FORMAT_R16_UNORM, VK_FORMAT_D16_UNORM},
+                {1, DXGI_FORMAT_R16_UNORM, VK_FORMAT_D16_UNORM},
+                {2, DXGI_FORMAT_UNKNOWN, VK_FORMAT_D32_SFLOAT},
+                {2, DXGI_FORMAT_R32_FLOAT, VK_FORMAT_D32_SFLOAT},
+                {3, DXGI_FORMAT_R32_FLOAT, VK_FORMAT_D32_SFLOAT},
+            };
+            for (UINT i = 0; i < valid_depth_srvs; ++i) {
+                const auto& vc = valid_cases[i];
+                D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                srv.Format = vc.view_format;
+                srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                srv.Texture2D.MipLevels = 1;
+                device->CreateShaderResourceView(depth_textures[vc.tex_index].p,
+                                                 vc.view_format == DXGI_FORMAT_UNKNOWN ? nullptr : &srv, depth_slot(i));
+                g::ImageWords words{};
+                std::memcpy(words.data(), depth_bytes(i), sizeof(words));
+                g::Image decoded{};
+                EXPECT(g::is_image(words) && g::decode(words, decoded));
+                EXPECT(decoded.type == g::ImageType::image_2d);
+                EXPECT(decoded.format == g::format_from_vulkan(vc.expected_vk));
+                EXPECT(decoded.swizzle == g::channels_r);
+                std::uint32_t key[8]{};
+                std::memcpy(key, words.data(), sizeof(key));
+                EXPECT(rt::d3d12::bindless_hash_lookup(device.p, key) != 0);
+            }
+
+            // Invalid depth SRVs: every non-depth colour format and mismatched/typeless format must leave a null
+            // descriptor and emit zero Vulkan validation errors.
+            const auto expect_depth_srv_null = [&](ID3D12Resource* res, const D3D12_SHADER_RESOURCE_VIEW_DESC* srv) {
+                std::memset(depth_bytes(depth_scratch), 0x77, step);
+                device->CreateShaderResourceView(res, srv, depth_slot(depth_scratch));
+                return depth_null(depth_scratch);
+            };
+            const auto check_bad_formats = [&](ID3D12Resource* res, std::initializer_list<DXGI_FORMAT> bad_formats) {
+                for (const DXGI_FORMAT fmt : bad_formats) {
+                    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                    srv.Format = fmt;
+                    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    srv.Texture2D.MipLevels = 1;
+                    if (!expect_depth_srv_null(res, &srv)) return false;
+                }
+                return true;
+            };
+            // D16_UNORM and R16_TYPELESS (depth): R16_FLOAT, R16_SNORM, R16_UINT, R16_SINT and other mismatched views.
+            EXPECT(check_bad_formats(depth_textures[0].p,
+                                     {DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_SNORM, DXGI_FORMAT_R16_UINT,
+                                      DXGI_FORMAT_R16_SINT, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_D16_UNORM,
+                                      DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM}));
+            EXPECT(expect_depth_srv_null(depth_textures[1].p, nullptr));  // UNKNOWN on R16_TYPELESS (depth)
+            EXPECT(check_bad_formats(depth_textures[1].p,
+                                     {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_SNORM,
+                                      DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R16_SINT, DXGI_FORMAT_R16_TYPELESS,
+                                      DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM}));
+            // D32_FLOAT and R32_TYPELESS (depth): R32_UINT, R32_SINT and other mismatched views.
+            EXPECT(check_bad_formats(depth_textures[2].p,
+                                     {DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_TYPELESS,
+                                      DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM}));
+            EXPECT(expect_depth_srv_null(depth_textures[3].p, nullptr));  // UNKNOWN on R32_TYPELESS (depth)
+            EXPECT(check_bad_formats(depth_textures[3].p,
+                                     {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_SINT,
+                                      DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R16_UNORM,
+                                      DXGI_FORMAT_R8G8B8A8_UNORM}));
+
+            // D24_UNORM_S8_UINT / R24G8_TYPELESS and D32_FLOAT_S8X24_UINT / R32G8X24_TYPELESS: colour view formats
+            // must also be rejected, while depth-plane and stencil-plane views continue working.
+            for (const auto& [res_fmt, valid_depth_fmt, valid_stencil_fmt, is_typeless] :
+                 {std::tuple{DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                             DXGI_FORMAT_X24_TYPELESS_G8_UINT, false},
+                  std::tuple{DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                             DXGI_FORMAT_X24_TYPELESS_G8_UINT, true},
+                  std::tuple{DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+                             DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, false},
+                  std::tuple{DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+                             DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, true}}) {
+                D3D12_RESOURCE_DESC ds_desc = texture_desc;
+                ds_desc.Format = res_fmt;
+                ds_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+                Ref<ID3D12Resource> ds_tex;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &ds_desc,
+                                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                 IID_PPV_ARGS(&ds_tex.p))));
+                if (is_typeless) EXPECT(expect_depth_srv_null(ds_tex.p, nullptr));
+                EXPECT(check_bad_formats(ds_tex.p,
+                                         {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_SINT,
+                                          DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                          DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                                          DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS}));
+                D3D12_SHADER_RESOURCE_VIEW_DESC ds_srv{};
+                ds_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                ds_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                ds_srv.Texture2D.MipLevels = 1;
+                ds_srv.Format = valid_depth_fmt;
+                ds_srv.Texture2D.PlaneSlice = 0;
+                device->CreateShaderResourceView(ds_tex.p, &ds_srv, depth_slot(depth_scratch));
+                EXPECT(!depth_null(depth_scratch));
+                ds_srv.Format = valid_stencil_fmt;
+                ds_srv.Texture2D.PlaneSlice = 1;
+                device->CreateShaderResourceView(ds_tex.p, &ds_srv, depth_slot(depth_scratch));
+                EXPECT(!depth_null(depth_scratch));
+            }
+
+            // Colour R16_TYPELESS and R32_TYPELESS (without ALLOW_DEPTH_STENCIL) still allow colour casts,
+            // while rejecting depth view formats on colour textures.
+            for (const auto& [colour_typeless, good_colour, bad_depth] :
+                 {std::tuple{DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_D16_UNORM},
+                  std::tuple{DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_D32_FLOAT}}) {
+                D3D12_RESOURCE_DESC col_desc = texture_desc;
+                col_desc.Format = colour_typeless;
+                Ref<ID3D12Resource> col_tex;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &col_desc,
+                                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                 IID_PPV_ARGS(&col_tex.p))));
+                D3D12_SHADER_RESOURCE_VIEW_DESC col_srv{};
+                col_srv.Format = good_colour;
+                col_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                col_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                col_srv.Texture2D.MipLevels = 1;
+                device->CreateShaderResourceView(col_tex.p, &col_srv, depth_slot(depth_scratch));
+                EXPECT(!depth_null(depth_scratch));
+                EXPECT(check_bad_formats(col_tex.p, {bad_depth}));
+            }
+
+            // Depth resource with a castable format list (allow_channel_cast = true): valid depth SRV still works
+            // and colour SRVs still leave a null descriptor with zero validation errors.
+            {
+                Ref<ID3D12Device10> inner10;
+                EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&inner10.p))));
+                D3D12_RESOURCE_DESC1 d16_cast_desc{};
+                d16_cast_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                d16_cast_desc.Width = size;
+                d16_cast_desc.Height = size;
+                d16_cast_desc.DepthOrArraySize = 1;
+                d16_cast_desc.MipLevels = 1;
+                d16_cast_desc.Format = DXGI_FORMAT_D16_UNORM;
+                d16_cast_desc.SampleDesc = {1, 0};
+                d16_cast_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+                const DXGI_FORMAT d16_list[] = {DXGI_FORMAT_D16_UNORM};
+                Ref<ID3D12Resource> d16_cast_tex;
+                EXPECT(SUCCEEDED(inner10->CreateCommittedResource3(
+                    &default_heap, D3D12_HEAP_FLAG_NONE, &d16_cast_desc, D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr,
+                    1, d16_list, IID_PPV_ARGS(&d16_cast_tex.p))));
+                D3D12_SHADER_RESOURCE_VIEW_DESC d16_srv{};
+                d16_srv.Format = DXGI_FORMAT_R16_UNORM;
+                d16_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                d16_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                d16_srv.Texture2D.MipLevels = 1;
+                device->CreateShaderResourceView(d16_cast_tex.p, &d16_srv, depth_slot(depth_scratch));
+                EXPECT(!depth_null(depth_scratch));
+                EXPECT(check_bad_formats(d16_cast_tex.p,
+                                         {DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_SNORM, DXGI_FORMAT_R16_UINT,
+                                          DXGI_FORMAT_R16_SINT, DXGI_FORMAT_R8G8B8A8_UNORM}));
+            }
+
+            // Clear each depth texture and sample all 6 valid depth SRVs on the GPU to confirm they read back their
+            // cleared depth value in R (with G=0, B=0, A=1).
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            for (UINT i = 0; i < depth_tex_count; ++i) {
+                list->ClearDepthStencilView(dsv_slot(i), D3D12_CLEAR_FLAG_DEPTH, float(depth_clear_u8[i]) / 255.0f, 0,
+                                            0, nullptr);
+                const D3D12_RESOURCE_BARRIER barrier = transition(
+                    depth_textures[i].p, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                list->ResourceBarrier(1, &barrier);
+            }
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            ++packed_signal;
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, packed_signal)) &&
+                   SUCCEEDED(fence->SetEventOnCompletion(packed_signal, nullptr)));
+#ifdef LEONIDA_TEST_CS_SAMPLE_SPV
+            SampleKeys depth_keys[valid_depth_srvs]{};
+            for (UINT i = 0; i < valid_depth_srvs; ++i) {
+                std::memcpy(depth_keys[i].tsharp, depth_bytes(i), sizeof(depth_keys[i].tsharp));
+                std::memcpy(depth_keys[i].ssharp, sampler_bytes, sizeof(depth_keys[i].ssharp));
+                depth_keys[i].first = i * texels;
+            }
+            std::vector<std::uint8_t> depth_pixels(valid_depth_srvs * bytes);
+            EXPECT(sample_through_set(d, set0, set0_layout, depth_keys, depth_pixels.data()));
+            UINT depth_differ = 0;
+            for (UINT k = 0; k < valid_depth_srvs; ++k) {
+                const std::uint8_t want[4] = {depth_clear_u8[valid_cases[k].tex_index], 0, 0, 255};
+                for (UINT i = 0; i < texels; ++i) {
+                    const std::uint8_t* got = depth_pixels.data() + k * bytes + i * 4;
+                    if (std::memcmp(got, want, 4) != 0 && depth_differ++ < 4)
+                        std::fprintf(stderr, "depth SRV %u texel %u: got %u,%u,%u,%u, want %u,%u,%u,%u\n", k, i,
+                                     unsigned(got[0]), unsigned(got[1]), unsigned(got[2]), unsigned(got[3]),
+                                     unsigned(want[0]), unsigned(want[1]), unsigned(want[2]), unsigned(want[3]));
+                }
+            }
+            EXPECT(depth_differ == 0);
+            std::printf("depth SRVs: %u valid D16/D32 views sampled cleared depth values; invalid colour casts rejected "
+                        "as null descriptors (validation errors: %u)\n",
+                        valid_depth_srvs, d.validation_errors() - validation_before_depth);
+#endif
+            EXPECT(d.validation_errors() == validation_before_depth);
+        }
+
         upload.reset();
         array_texture.reset();
         line.reset();
@@ -2241,12 +2879,15 @@ int main() {
         }
     EXPECT(!mismatches);
     EXPECT(lod_mismatches == 0);
-    // Both read red, green and blue from the same bytes; B8G8R8X8 reads alpha 1, B8G8R8A8 the stored byte.
-    const char* bgr_names[2] = {"B8G8R8X8_UNORM", "B8G8R8A8_UNORM"};
-    for (UINT k = 0; k < 2; ++k)
+    // All read red, green and blue from the same bytes; a B8G8R8X8 view reads alpha 1, a B8G8R8A8 view the stored
+    // byte, whatever the texture's own format (R8G8B8A8 textures read through B8G8R8X8 and B8G8R8A8 views included).
+    const char* bgr_names[] = {"B8G8R8X8_UNORM", "B8G8R8A8_UNORM", "B8G8R8X8_UNORM view of castable B8G8R8A8",
+                               "B8G8R8A8_UNORM view of castable B8G8R8X8", "B8G8R8X8_UNORM view of castable R8G8B8A8",
+                               "B8G8R8A8_UNORM view of castable R8G8B8A8"};
+    for (UINT k = 0; k < 6; ++k)
         for (UINT i = 0; i < texels; ++i) {
             auto want = texel(i % size, i / size);
-            if (k == 1) want[3] = bgrx_texel(i % size, i / size)[3];
+            if (k == 1 || k == 3 || k == 5) want[3] = bgrx_texel(i % size, i / size)[3];
             const std::uint8_t* got = bgr_results.data() + k * bytes + i * 4;
             if (std::memcmp(got, want.data(), 4) != 0 && mismatches++ < 4)
                 std::fprintf(stderr, "%s texel %u: got %u,%u,%u,%u, want %u,%u,%u,%u\n", bgr_names[k], i,
@@ -2261,7 +2902,8 @@ int main() {
     std::printf("descriptors: copies matched; a T# and an S# from CreateShaderResourceView and CreateSampler were "
                 "found in the device's bindless set by a shader, %u RGBA8 and RGB9E5 texels matched, and an unknown descriptor "
                 "and a destroyed texture's gave the fallback; UINT black, UINT white and float white borders read "
-                "0, 1 and 255; B8G8R8X8 read alpha 1 where B8G8R8A8 read the same bytes' alpha (%u texels each)\n",
+                "0, 1 and 255; B8G8R8X8 views read alpha 1 where B8G8R8A8 views read the same bytes' alpha, also across "
+                "a castable-format list (%u texels each)\n",
                 texels, texels);
     return 0;
 }

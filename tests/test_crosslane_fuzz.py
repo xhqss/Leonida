@@ -170,6 +170,124 @@ class Model(unittest.TestCase):
     def test_self_test(self):
         self.assertEqual(X.self_test(), 0)
 
+    def test_dpp_seeds_are_unchanged(self):
+        # dpp_op was split out of Gen.op_dpp keeping the draw order; this program (5 DPP ops) is the one main
+        # generated before the split, so a seed someone reported still means the same program.
+        import hashlib
+        p = X.make_program(77, 64, 28, dpp=True)
+        self.assertEqual(sum("_dpp " in o.text for o in p.ops), 5)
+        self.assertEqual(hashlib.sha1(p.source().encode()).hexdigest(), "7174158b8d064cbddca318d3d7f433afac072691")
+
+
+def run_dpp(op, exec_mask, size=64, old=7):
+    """Apply one DPP op to a wave whose src0 (v3, or v2 in place) is 100 + lane, src1 (v4) 1000 + lane and vD (v2)
+    `old`; returns (vD, hypothesis flag)."""
+    w = X.Wave(size, (1 << size) - 1)
+    w.v[3] = [100 + l for l in range(size)]
+    w.v[4] = [1000 + l for l in range(size)]
+    if op.text.split()[2].rstrip(",") == "v2":      # in place: vD is src0
+        w.v[2] = [100 + l for l in range(size)]
+    else:
+        w.v[2] = [old] * size
+    w.exec = exec_mask
+    hyp = op.fn(w)
+    return w.vr(2), hyp
+
+
+class DppSweep(unittest.TestCase):
+    """dpp_op against values worked out by hand from the RDNA2 DPP rules, and what --dpp-sweep generates."""
+    ODD = 0x5555555555555555
+
+    def test_row_shr_invalid_source_is_unwritten_or_zero(self):
+        v, _ = run_dpp(X.dpp_op(2, 3, 4, "mov", control=("row_shr", 1)), X.M64)
+        self.assertEqual((v[0], v[1], v[15], v[16], v[17]), (7, 100, 114, 7, 116))
+        v, _ = run_dpp(X.dpp_op(2, 3, 4, "mov", control=("row_shr", 1), bound=True), X.M64)
+        self.assertEqual((v[0], v[16], v[17]), (0, 0, 116))
+
+    def test_inactive_source_fi_and_bound_ctrl(self):
+        # EXEC odd lanes off: lane 2 reads lane 1 (off). fi 0: bound_ctrl decides; fi 1: the inactive value is read.
+        shr = lambda **kw: run_dpp(X.dpp_op(2, 3, 4, "mov", control=("row_shr", 1), **kw), self.ODD)[0]
+        self.assertEqual(shr()[2], 7)
+        self.assertEqual(shr(bound=True)[2], 0)
+        self.assertEqual(shr(fi=True)[2], 101)
+        self.assertEqual(shr(fi=True, bound=True)[2], 101)
+        self.assertEqual(shr(fi=True)[1], 7)                    # lane 1 itself is off: never written
+
+    def test_non_mov_unwritten_lane_keeps_old_vd(self):
+        # #238: an invalid source without bound_ctrl leaves the lane alone, not op(old vD, src1).
+        v, _ = run_dpp(X.dpp_op(2, 3, 4, "add", control=("row_shl", 2)), X.M64)
+        self.assertEqual((v[0], v[13], v[14], v[15]), (102 + 1000, 115 + 1013, 7, 7))
+
+    def test_row_and_bank_masks(self):
+        v, _ = run_dpp(X.dpp_op(2, 3, 4, "mov", control=("quad_perm", (0, 0, 0, 0)), row_mask=0x2, bank_mask=0x5),
+                       X.M64)
+        written = [l for l in range(64) if v[l] != 7]
+        self.assertEqual(written, [16, 17, 18, 19, 24, 25, 26, 27])
+        self.assertEqual(v[18], 116)
+
+    def test_in_place_reads_every_source_first(self):
+        v, _ = run_dpp(X.dpp_op(2, 2, 4, "mov", control=("row_ror", 1)), X.M64)
+        self.assertEqual((v[0], v[1], v[16]), (115, 100, 131))
+
+    def test_dpp8_inactive_source(self):
+        bcast7 = (7,) * 8
+        v, hyp = run_dpp(X.dpp_op(2, 3, 4, "mov", dpp8=bcast7), self.ODD)
+        self.assertEqual((v[0], v[8], v[1]), (0, 0, 7))            # lane 7 is off: 0 (the #238 hypothesis)
+        self.assertTrue(hyp)
+        v, hyp = run_dpp(X.dpp_op(2, 3, 4, "mov", dpp8=bcast7, fi=True), self.ODD)
+        self.assertEqual((v[0], v[8]), (107, 115))
+        self.assertFalse(hyp)
+
+    def test_row_share_and_xmask_wave32(self):
+        v, _ = run_dpp(X.dpp_op(2, 3, 4, "mov", control=("row_share", 5)), X.M32, size=32)
+        self.assertEqual((v[0], v[15], v[16], v[31]), (105, 105, 121, 121))
+        v, _ = run_dpp(X.dpp_op(2, 3, 4, "xor", control=("row_xmask", 3)), X.M32, size=32)
+        self.assertEqual(v[5], (100 + 6) ^ 1005)
+
+    def test_sweep_covers_every_control(self):
+        controls = X.dpp16_sweep_controls()
+        self.assertEqual(len(controls), 335)
+        self.assertEqual(len(set(controls)), 335)
+        for wave in (32, 64):
+            progs = X.dpp_sweep_programs(wave)
+            self.assertEqual(len(progs), 7206)
+            self.assertEqual(len({p.name for p in progs}), len(progs))
+            self.assertEqual({p.family for p in progs}, set(X.DPP16_CONTROLS) | {"masks", "dpp8"})
+            texts = [p.ops[1].text for p in progs]
+            for c, arg in controls:
+                text = X.dpp16_select(c, arg)[0]
+                self.assertTrue(any(f" {text} " in t for t in texts), text)
+            for kind in X.DPP_OPS.values():
+                self.assertTrue(any(t.startswith(kind + "_dpp v2, v2,") or t.startswith(kind + "_dpp v2, v2 ")
+                                    for t in texts), kind)
+            masks = {re.search(r"row_mask:(0x\w+) bank_mask:(0x\w+)", t).groups() for t in texts if "row_mask" in t}
+            self.assertEqual(len(masks), 256)
+            for p in progs:
+                self.assertEqual(p.group, wave)
+                self.assertEqual([o.tag for o in p.ops], ["exec", "dpp"])
+                p.expected()                                     # the model runs every case
+
+    def test_sweep_cli_needs_the_oracle_tools(self):
+        env = dict(os.environ, LEONIDA_AMD_CLANG=os.path.join(TOOLS, "no-such-clang.exe"))
+        r = subprocess.run([sys.executable, "-I", TOOL, "--oracle", "hw", "--dpp-sweep"],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 77, r.stdout + r.stderr)
+
+    def test_sweep_on_hardware(self):
+        from hw_oracle import runner
+        try:
+            oracle = runner.open_oracle()
+        except runner.Unavailable as e:
+            self.skipTest(f"hardware oracle unavailable: {e}")
+        try:
+            stats, fails = {}, []
+            progs = [p for wave in (32, 64) for p in X.dpp_sweep_programs(wave)[::97]]
+            X.run_hw(oracle, progs, stats, fails)
+        finally:
+            oracle.close()
+        self.assertEqual([(p.name, p.label, w) for p, _, w, _ in fails], [])
+        self.assertEqual(sum(st["match"] for st in stats.values()), len(progs))
+
 
 class Modes(unittest.TestCase):
     """--modes takes native, emulate or both. Anything else used to run every program natively, wave64 included."""
@@ -513,6 +631,278 @@ class HarnessErrors(unittest.TestCase):
                                ["--programs", "3", "--wave", "32", "--modes", "native", "--no-maskdata"])
         self.assertEqual(code, 0)
         self.assertIn("match 3, mismatch 0, hyp_only 0, rejected 0, harness_errors 0", out)
+
+
+def mask_name(text):
+    """'vcc' / 'exec' / the first SGPR of 's[16:17]', as Wave.mask takes it."""
+    m = re.fullmatch(r"s\[(\d+):\d+\]", text)
+    return int(m.group(1)) if m else text
+
+
+def ext_gen(seed=1, group=64):
+    g = X.Gen(random.Random(seed), 64, group, ext=True)
+    g.masks += ["vcc", 16, 18, 20]
+    return g
+
+
+class Ext(unittest.TestCase):
+    """--ext: the wave64 extension ops, each against values worked out by hand from the rule in the docstring."""
+
+    def test_only_wave64_programs_change(self):
+        self.assertEqual(X.make_program(5, 32, 24, ext=True).source(), X.make_program(5, 32, 24).source())
+        a, b = X.make_program(5, 64, 24, ext=True), X.make_program(5, 64, 24, ext=True)
+        self.assertEqual(a.source(), b.source())
+        self.assertEqual(a.expected()[0], b.expected()[0])
+        self.assertNotEqual(a.source(), X.make_program(5, 64, 24).source())
+        g32 = X.Gen(random.Random(1), 32, 32, ext=True)
+        for name, _ in X.Gen.EXT_WEIGHTS:
+            self.assertIsNone(getattr(g32, name)(), name)
+
+    def test_every_ext_op_is_generated(self):
+        seen = set()
+        for seed in range(60):
+            p = X.make_program(seed, 64, 24, ext=True)
+            p.expected()                                # the model runs every op
+            seen |= {t for o in p.ops for t in getattr(o, "tags", {o.tag})}
+        self.assertLessEqual({"scan64", "mask_scc", "cselect64", "mask_test", "bfm", "wqm", "carry", "bpermute",
+                              "permute", "swizzle", "lane_wrap", "loop"}, seen)
+
+    def test_carry_in_and_out(self):
+        # 0xffffffff + 0 + carry-in: the sum wraps to 0 and carries exactly where the carry-in is set. Lanes 48-63
+        # are off: they keep vD and their carry-out bit is 0.
+        o = draw(ext_gen(), "op_carry", lambda o: o.text.startswith("v_add_co_ci_u32_e64") and
+                 len(set(operands(o.text)[i] for i in (0, 2, 3))) == 3)
+        d, mo, a, b, mi = operands(o.text)
+        d, a, b = int(d[1:]), int(a[1:]), int(b[1:])
+        w = wave()
+        w.exec = (1 << 48) - 1
+        w.v[a], w.v[b], w.v[d] = [0xFFFFFFFF] * 64, [0] * 64, [7] * 64
+        w.set_mask(mask_name(mi), 0xFFFF0000FFFF00F0)
+        o.apply([w])
+        self.assertEqual(w.mask(mask_name(mo)), 0x00000000FFFF00F0)
+        self.assertEqual([w.vr(d)[l] for l in (0, 4, 15, 16, 31, 47, 48, 63)],
+                         [0xFFFFFFFF, 0, 0xFFFFFFFF, 0, 0, 0xFFFFFFFF, 7, 7])
+
+    def test_subrev_borrow(self):
+        # v_subrev_co: D = S1 - S0; 5 - 9 borrows, 9 - 5 does not.
+        o = draw(ext_gen(2), "op_carry", lambda o: o.text.startswith("v_subrev_co_u32_e64") and
+                 len(set(operands(o.text)[i] for i in (0, 2, 3))) == 3)
+        d, mo, a, b = operands(o.text)
+        d, a, b = int(d[1:]), int(a[1:]), int(b[1:])
+        w = wave()
+        w.v[a] = [9 if l < 40 else 5 for l in range(64)]
+        w.v[b] = [5 if l < 40 else 9 for l in range(64)]
+        o.apply([w])
+        self.assertEqual(w.mask(mask_name(mo)), (1 << 40) - 1)
+        self.assertEqual((w.vr(d)[0], w.vr(d)[63]), (0xFFFFFFFC, 4))
+
+    def test_bpermute_stays_in_its_half_and_reads_0_from_an_inactive_lane(self):
+        o = draw(ext_gen(3), "op_bpermute", lambda o: "offset" not in o.text and
+                 len(set(operands(o.text.split("\n")[0]))) == 3)
+        d, ad, dat = (int(t[1:]) for t in operands(o.text.split("\n")[0]))
+        self.assertEqual(o.text.split("\n")[1].strip(), "s_waitcnt lgkmcnt(0)")
+        w = wave()
+        w.exec = X.M64 & ~(1 << 5) & ~(1 << 40)
+        w.v[ad] = [4 * (l + 1) for l in range(64)]      # lane l reads lane (l + 1) & 31 of its half
+        w.v[dat] = [100 + l for l in range(64)]
+        w.v[d] = [7] * 64
+        o.apply([w])
+        got = w.vr(d)
+        self.assertEqual([got[l] for l in (0, 4, 5, 6, 31, 32, 39, 40, 63)], [101, 0, 7, 107, 100, 133, 0, 7, 132])
+
+    def test_permute_scatters_and_the_highest_sender_wins(self):
+        g = ext_gen(4)
+        o = draw(g, "op_permute", lambda o: o.text.startswith("ds_permute_b32") and "offset" not in o.text and
+                 len(set(operands(o.text.split("\n")[0]))) == 3)
+        d, ad, dat = (int(t[1:]) for t in operands(o.text.split("\n")[0]))
+        w = wave()
+        w.v[dat] = [100 + l for l in range(64)]
+        w.v[ad] = [0] * 64                              # every lane sends to lane 0 of its half
+        o.apply([w])
+        self.assertEqual([w.vr(d)[l] for l in (0, 1, 31, 32, 33)], [131, 0, 0, 163, 0])
+        w.v[ad] = [4 * (l ^ 1) for l in range(64)]      # a permutation: lane l sends to lane l ^ 1
+        w.v[d] = [7] * 64
+        w.exec = X.M64 & ~(1 << 2)                      # lane 2 neither sends nor is written
+        o.apply([w])
+        self.assertEqual([w.vr(d)[l] for l in (0, 1, 2, 3, 62)], [101, 100, 7, 0, 163])
+
+    def test_permute_with_generated_addresses_is_a_permutation(self):
+        o = draw(ext_gen(5), "op_permute", lambda o: o.text.startswith("v_mad_u32_u24") and
+                 len(set(operands(o.text.split("\n")[2].split(" offset")[0]))) == 3)
+        d, ad, dat = (int(t[1:]) for t in operands(o.text.split("\n")[2].split(" offset")[0]))
+        self.assertEqual(ad, X.PERM_V)
+        w = wave()
+        w.v[1] = list(range(64))
+        w.v[dat] = [100 + l for l in range(64)]
+        o.apply([w])
+        self.assertEqual(sorted(w.vr(d)[:32]), [100 + l for l in range(32)])     # each half is permuted in itself
+        self.assertEqual(sorted(w.vr(d)[32:]), [132 + l for l in range(32)])
+
+    def test_swizzle_modes(self):
+        g = ext_gen(6)
+        rev = draw(g, "op_swizzle", lambda o: "swizzle(REVERSE,8)" in o.text and
+                   len(set(operands(o.text.split(" offset")[0]))) == 2)
+        d, v = (int(t[1:]) for t in operands(rev.text.split(" offset")[0]))
+        w = wave()
+        w.v[v] = [100 + l for l in range(64)]
+        self.assertFalse(rev.apply([w]))
+        self.assertEqual([w.vr(d)[l] for l in (0, 7, 8, 33)], [107, 100, 115, 138])
+        w.exec = X.M64 & ~(1 << 7)                      # lane 0's source is off: it reads 0, reported apart
+        self.assertTrue(rev.apply([w]))
+        self.assertEqual((w.vr(d)[0], w.vr(d)[1]), (0, 106))
+        quad = draw(g, "op_swizzle", lambda o: "QUAD_PERM" in o.text and
+                    len(set(operands(o.text.split(" offset")[0]))) == 2)
+        d, v = (int(t[1:]) for t in operands(quad.text.split(" offset")[0]))
+        q = [int(x) for x in re.search(r"QUAD_PERM, (\d), (\d), (\d), (\d)", quad.text).groups()]
+        w = wave()
+        w.v[v] = [100 + l for l in range(64)]
+        quad.apply([w])
+        self.assertEqual([w.vr(d)[l] for l in (0, 5, 62)], [100 + q[0], 104 + q[1], 160 + q[2]])
+        bits = draw(g, "op_swizzle", lambda o: "BITMASK_PERM" in o.text and
+                    len(set(operands(o.text.split(" offset")[0]))) == 2)
+        pat = re.search(r'BITMASK_PERM, "([01pi]{5})"', bits.text).group(1)
+        d, v = (int(t[1:]) for t in operands(bits.text.split(" offset")[0]))
+        w = wave()
+        w.v[v] = [100 + l for l in range(64)]
+        bits.apply([w])
+        lane = 37                                       # lane 5 of the upper half
+        src = 0
+        for i, ch in enumerate(pat):                    # bit 4 first
+            bit = 1 << (4 - i)
+            own = (lane & 31) & bit
+            src |= bit if ch == "1" else 0 if ch == "0" else own if ch == "p" else own ^ bit
+        self.assertEqual(w.vr(d)[lane], 100 + (32 | src), pat)
+
+    def test_lane_select_wraps_at_64(self):
+        o = draw(ext_gen(7), "op_lane_wrap", lambda o: "v_readlane_b32" in o.text)
+        enc = int(re.search(r"s_mov_b32 s28, (\d+)", o.text).group(1))
+        d, v = re.search(r"v_readlane_b32 s(\d+), v(\d+), s28", o.text).groups()
+        self.assertGreaterEqual(enc, 64)
+        w = wave()
+        w.v[int(v)] = [100 + l for l in range(64)]
+        o.apply([w])
+        self.assertEqual(w.s[int(d)], 100 + (enc & 63))
+
+    def probe(self, text):
+        d, a, b = (int(x) for x in re.search(r"s_cselect_b32 s(\d+), s(\d+), s(\d+)", text).groups())
+        return d, a, b
+
+    def test_wrexec_and_saveexec_forms(self):
+        g = ext_gen(8)
+        wr = draw(g, "op_exec_logic", lambda o: o.text.startswith("s_andn2_wrexec_b64"))
+        dst, src = (mask_name(t) for t in operands(wr.text.split("\n")[0]))
+        w = wave()
+        w.exec = 0x00FF
+        w.set_mask(src, 0x0FF0)
+        wr.apply([w])                                   # EXEC = S0 & ~EXEC; D = EXEC
+        self.assertEqual((w.exec, w.mask(dst)), (0x0F00, 0x0F00))
+        nor = draw(g, "op_exec_logic", lambda o: o.text.startswith("s_nor_saveexec_b64"))
+        dst, src = (mask_name(t) for t in operands(nor.text.split("\n")[0]))
+        w = wave()
+        w.exec = X.M64 & ~0xFF
+        w.set_mask(src, 0xF0)
+        nor.apply([w])                                  # D = EXEC; EXEC = ~(S0 | EXEC) = lanes 0-3
+        self.assertEqual((w.exec, w.mask(dst)), (0x0F, X.M64 & ~0xFF))
+        partial = X.Gen(random.Random(8), 64, 40, ext=True)
+        partial.masks += [16]
+        for _ in range(300):                            # a partial wave never gets a form that complements a mask
+            self.assertNotRegex(partial.op_exec_logic().text, r"s_(orn1|orn2|nand|nor|xnor)_")
+
+    def test_bfm_and_wqm(self):
+        g = ext_gen(9)
+        bfm = draw(g, "op_bfm", lambda o: re.fullmatch(r"s_bfm_b64 s\[\d+:\d+\], s(\d+), s(\d+)", o.text) and
+                   len(set(operands(o.text)[1:])) == 2)
+        dst, sa, sb = operands(bfm.text)
+        w = wave()
+        w.s[int(sa[1:])], w.s[int(sb[1:])] = 64 + 5, 128 + 40     # size 5 at offset 40: the counts are taken mod 64
+        bfm.apply([w])
+        self.assertEqual(w.mask(mask_name(dst)), 0x1F << 40)
+        wqm = draw(g, "op_wqm", lambda o: len(set(operands(o.text.split("\n")[0]))) == 2)
+        dst, src = (mask_name(t) for t in operands(wqm.text.split("\n")[0]))
+        w = wave()
+        if src == "exec":
+            w.exec = 0x0000000100000100
+        else:
+            w.set_mask(src, 0x0000000100000100)
+        wqm.apply([w])
+        self.assertEqual(w.mask(dst), 0x0000000F00000F00)
+        self.assertIsNone(X.Gen(random.Random(1), 64, 40, ext=True).op_bfm())      # full waves only
+
+    def test_mask_scan_and_tests(self):
+        g = ext_gen(10)
+        ff0 = draw(g, "op_scan64", lambda o: o.text.startswith("s_ff0_i32_b64") and "exec" not in o.text)
+        d, m = operands(ff0.text)
+        w = wave()
+        w.set_mask(mask_name(m), (1 << 37) - 1)
+        ff0.apply([w])
+        self.assertEqual(w.s[int(d[1:])], 37)
+        w.set_mask(mask_name(m), X.M64)
+        ff0.apply([w])
+        self.assertEqual(w.s[int(d[1:])], 0xFFFFFFFF)
+        bit = draw(g, "op_mask_test", lambda o: o.text.startswith("s_bitcmp1_b64") and "exec" not in o.text and
+                   len(set(self.probe(o.text))) == 3)
+        m, lane = operands(bit.text.split("\n")[0])
+        d, a, b = self.probe(bit.text)                  # s_cselect_b32 sD, sA, sB: D = SCC ? A : B
+        w = wave()
+        w.s[a], w.s[b] = 111, 222
+        w.set_mask(mask_name(m), 1 << int(lane))
+        bit.apply([w])
+        self.assertEqual(w.s[d], 111)
+        w.set_mask(mask_name(m), X.M64 & ~(1 << int(lane)))
+        bit.apply([w])
+        self.assertEqual(w.s[d], 222)
+
+    def test_loop_runs_each_lane_its_own_trip_count(self):
+        # Trip limit = lane & 3, all 64 lanes on: 64, 48, 32 and 16 lanes run iterations 1 to 4, and each lane adds
+        # the count of every iteration it runs: 64, 112, 144 or 160.
+        g = ext_gen(11)
+        g.LOOP_BODY = ("op_salu",)
+        loop = draw(g, "op_loop", lambda o: o.text.startswith("v_and_b32_e32 v24, 3, v") and
+                    re.search(r"v_and_b32_e32 v24, 3, v(\d+)", o.text).group(1) !=
+                    re.search(r"v_add_nc_u32_e32 v(\d+), s\d+, v\d+", o.text).group(1))
+        src = int(re.search(r"v_and_b32_e32 v24, 3, v(\d+)", loop.text).group(1))
+        vx = int(re.search(r"v_add_nc_u32_e32 v(\d+), s\d+, v\d+", loop.text).group(1))
+        k = re.search(r";@LOOP(\d+)", loop.text).group(1)
+        self.assertIn(f"s_cbranch_execnz @-{k}", loop.text)
+        w = wave()
+        w.v[src] = list(range(64))
+        w.v[vx] = [1000] * 64
+        loop.apply([w])
+        self.assertEqual(w.exec, X.M64)                 # EXEC comes back from the break mask
+        self.assertEqual(w.mask(X.LOOP_S[0]), X.M64)
+        self.assertEqual([w.vr(vx)[l] for l in (0, 1, 2, 3, 60, 63)], [1064, 1112, 1144, 1160, 1064, 1160])
+        w = wave()                                      # a wave that enters with EXEC 0 runs the body once
+        w.exec = 0
+        w.v[vx] = [1000] * 64
+        loop.apply([w])
+        self.assertEqual((w.exec, w.vr(vx)[0]), (0, 1000))
+
+    def test_branch_offsets_forward_and_back(self):
+        lines = ["a", ";@LOOP0", "b", "c", "s_cbranch_execnz @-0", "s_cbranch_execz @1", "d", ";@END1", "e"]
+        sizes = {0: 1, 2: 1, 3: 2, 4: 1, 5: 1, 6: 3, 8: 1}
+        out = X.branch_offsets(lines, sizes)
+        self.assertEqual(out[4], "s_cbranch_execnz -4")   # back over b, c and the branch itself
+        self.assertEqual(out[5], "s_cbranch_execz 3")     # forward over d
+        self.assertEqual([out[i] for i in (0, 1, 2, 3, 6, 7, 8)], [lines[i] for i in (0, 1, 2, 3, 6, 7, 8)])
+
+    def test_native_kernel_has_a_label_for_every_loop(self):
+        loops = 0
+        for seed in range(40):
+            prog = X.make_program(seed, 64, 24, ext=True)
+            plain, guarded = prog.hw_lines(guard=False), prog.hw_lines(guard=True)
+            text = "\n".join(plain)
+            self.assertNotIn("@", text)
+            targets = re.findall(r"s_cbranch_\w+ (\.L\S+)", text)
+            for t in targets:
+                self.assertIn(t + ":", plain)
+            self.assertEqual(len(targets), len(set(targets)))
+            back = [t for t in targets if re.search(r"_B\d+$", t)]
+            loops += len(back)
+            for t in back:                              # a loop's label is above its branch
+                self.assertLess(plain.index(t + ":"), plain.index(f"s_cbranch_execnz {t}"))
+            labels = [ln for ln in plain if ln.endswith(":")]
+            self.assertEqual(len(guarded), 2 * (len(plain) - len(labels)) - 1 + len(labels))
+        self.assertGreater(loops, 10)
 
 
 if __name__ == "__main__":

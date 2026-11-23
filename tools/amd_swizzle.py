@@ -160,7 +160,8 @@ def main():
         data = f.read()[a.offset:]
     # BC formats cover 4x4 pixels per element; uncompressed 1/2/4 bpe formats have one pixel per element.
     block = 4 if a.bpe in (8, 16) else 1
-    wb, hb = a.width // block, a.height // block
+    wb = (a.width + block - 1) // block
+    hb = (a.height + block - 1) // block
     res = []
     for tname, entries in tables.items():
         bits = block_bits(tname)
@@ -190,22 +191,30 @@ def main():
         from PIL import Image
         bits = res[0][4]
         lin = detile(data, equation(nibbles, res[0][3], bits), a.bpe, wb, hb, 1 << bits)
-        hdr = bytearray(128)
-        hdr[0:4] = b"DDS "
-        struct.pack_into("<IIIIIII", hdr, 4, 124, 0x1007, a.height, a.width, lin.size, 0, 1)
-        struct.pack_into("<I", hdr, 108, 0x1000)
-        if a.bpe == 8:
-            struct.pack_into("<II4s", hdr, 76, 32, 4, b"DXT1")
-            body = bytes(hdr)
-        elif a.bpe == 4:
-            # Uncompressed RGBA8, not BC7: the 4 bpe path is a plain pixel grid.
-            struct.pack_into("<IIIIIIII", hdr, 76, 32, 0x41, 0, 32,
-                             0xFF, 0xFF00, 0xFF0000, 0xFF000000)
-            body = bytes(hdr)
+        if a.bpe == 1:
+            preview = Image.fromarray(lin.reshape(hb, wb)).convert("RGB")
+        elif a.bpe == 2:
+            rgb = np.zeros((hb, wb, 3), dtype=np.uint8)
+            rgb[:, :, :2] = lin.reshape(hb, wb, 2)
+            preview = Image.fromarray(rgb)
         else:
-            struct.pack_into("<II4s", hdr, 76, 32, 4, b"DX10")
-            body = bytes(hdr) + struct.pack("<IIIII", 98, 3, 0, 1, 0)
-        Image.open(io.BytesIO(body + lin.tobytes())).convert("RGB").save(a.out)
+            hdr = bytearray(128)
+            hdr[0:4] = b"DDS "
+            struct.pack_into("<IIIIIII", hdr, 4, 124, 0x1007, a.height, a.width, lin.size, 0, 1)
+            struct.pack_into("<I", hdr, 108, 0x1000)
+            if a.bpe == 8:
+                struct.pack_into("<II4s", hdr, 76, 32, 4, b"DXT1")
+                body = bytes(hdr)
+            elif a.bpe == 4:
+                # Uncompressed RGBA8, not BC7: the 4 bpe path is a plain pixel grid.
+                struct.pack_into("<IIIIIIII", hdr, 76, 32, 0x41, 0, 32,
+                                 0xFF, 0xFF00, 0xFF0000, 0xFF000000)
+                body = bytes(hdr)
+            else:
+                struct.pack_into("<II4s", hdr, 76, 32, 4, b"DX10")
+                body = bytes(hdr) + struct.pack("<IIIII", 98, 3, 0, 1, 0)
+            preview = Image.open(io.BytesIO(body + lin.tobytes())).convert("RGB")
+        preview.save(a.out)
         print("best ->", a.out)
 
 

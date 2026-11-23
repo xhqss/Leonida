@@ -51,24 +51,26 @@ public:
 
     // Private data (ID3D12Object): bytes, or with SetPrivateDataInterface an interface the object holds a reference
     // to until the entry is replaced, removed or the object dies. GetPrivateData hands such an interface back with a
-    // reference added, as D3D12 does. A buffer too small for the entry gets DXGI_ERROR_MORE_DATA and the size it
-    // needs, so the caller can retry. SetName stores the name as WKPDID_D3DDebugObjectNameW, which is where D3D12
-    // keeps it, so GetPrivateData reads it back.
+    // reference added, as D3D12 does. The answers are the host runtime's (d3d12_private_data_test, RTX 3060 /
+    // 610.88, on the device and four child objects): a buffer too small for the entry gets DXGI_ERROR_MORE_DATA and
+    // the size it needs; SetPrivateData with null data removes the entry whatever the size, S_OK when there was one
+    // and S_FALSE when there wasn't; zero bytes with data keep an empty entry; SetPrivateDataInterface with null
+    // keeps a pointer-sized entry that reads back as null.
     HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT* size, void* data) override {
         if (!size) return E_INVALIDARG;
         std::lock_guard lock(data_mutex_);
         for (const auto& entry : data_) {
             if (entry.key != guid) continue;
-            const UINT bytes = entry.object ? UINT(sizeof(IUnknown*)) : UINT(entry.bytes.size());
+            const UINT bytes = entry.is_interface ? UINT(sizeof(IUnknown*)) : UINT(entry.bytes.size());
             if (data && *size < bytes) {
-                *size = bytes;  // the size to retry with, as vkd3d-proton does
+                *size = bytes;  // the size to retry with
                 return DXGI_ERROR_MORE_DATA;
             }
             if (data) {
-                if (entry.object) {
-                    entry.object->AddRef();
+                if (entry.is_interface) {
+                    if (entry.object) entry.object->AddRef();
                     std::memcpy(data, &entry.object, sizeof(IUnknown*));
-                } else {
+                } else if (bytes) {
                     std::memcpy(data, entry.bytes.data(), bytes);
                 }
             }
@@ -80,30 +82,32 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT size, const void* data) override {
-        if (size && !data) return E_INVALIDARG;
-        PrivateData entry{guid, {}, nullptr};
-        if (size) {
-            const auto* bytes = static_cast<const std::uint8_t*>(data);
-            entry.bytes.assign(bytes, bytes + size);
-        }
-        store(std::move(entry), size != 0);
+        if (!data) return remove(guid) ? S_OK : S_FALSE;
+        PrivateData entry{guid, {}, nullptr, false};
+        const auto* bytes = static_cast<const std::uint8_t*>(data);
+        entry.bytes.assign(bytes, bytes + size);
+        store(std::move(entry));
         return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown* object) override {
         IUnknown* held = const_cast<IUnknown*>(object);
         if (held) held->AddRef();
-        store(PrivateData{guid, {}, held}, held != nullptr);
+        store(PrivateData{guid, {}, held, true});
         return S_OK;
     }
 
+    // SetName is SetPrivateData with WKPDID_D3DDebugObjectNameW and the name with its terminator, as D3D12 documents
+    // and the host runtime does: GetPrivateData reads it back (an empty name is a 2-byte entry), and the narrow
+    // WKPDID_D3DDebugObjectName is not touched. A null name, which the host runtime faults on, changes nothing.
     HRESULT STDMETHODCALLTYPE SetName(LPCWSTR name) override {
-        if (!name) return SetPrivateData(kDebugObjectNameW, 0, nullptr);
+        if (!name) return E_INVALIDARG;
         return SetPrivateData(kDebugObjectNameW, UINT((std::wcslen(name) + 1) * sizeof(wchar_t)), name);
     }
 
     // WKPDID_D3DDebugObjectNameW (d3dcommon.h), spelled out so nothing needs dxguid.lib.
-    static constexpr GUID kDebugObjectNameW{0x4cca5fd8, 0x921f, 0x42c8, {0x85, 0x99, 0xd2, 0x86, 0x6a, 0x3e, 0x5f, 0x7e}};
+    static constexpr GUID kDebugObjectNameW{0x4cca5fd8, 0x921f, 0x42c8,
+                                            {0x85, 0x66, 0x70, 0xca, 0xf2, 0xa9, 0xb7, 0x41}};
 
     // The implementation behind a public interface pointer, or null when it is not a T. No reference is added.
     template<class T>
@@ -125,24 +129,33 @@ private:
     struct PrivateData {
         GUID key;
         std::vector<std::uint8_t> bytes;
-        IUnknown* object;  // SetPrivateDataInterface: one reference held
+        IUnknown* object;  // SetPrivateDataInterface: one reference held (null for a null interface)
+        bool is_interface;  // set by SetPrivateDataInterface, even with null: reads back as a pointer
     };
 
-    // Replaces the entry for `entry.key` (or only removes it when `keep` is false). The replaced interface is
-    // released after the lock is dropped, since its Release may run arbitrary code.
-    void store(PrivateData entry, bool keep) {
+    // Takes the entry for `key` out; true when there was one. The interface it held is released after the lock is
+    // dropped, since its Release may run arbitrary code.
+    bool remove(REFGUID key) { return replace(key, nullptr); }
+    void store(PrivateData entry) {
+        const GUID key = entry.key;
+        replace(key, &entry);
+    }
+    bool replace(REFGUID key, PrivateData* entry) {
         IUnknown* released = nullptr;
+        bool found = false;
         {
             std::lock_guard lock(data_mutex_);
             for (auto it = data_.begin(); it != data_.end(); ++it) {
-                if (it->key != entry.key) continue;
+                if (it->key != key) continue;
                 released = it->object;
                 data_.erase(it);
+                found = true;
                 break;
             }
-            if (keep) data_.push_back(std::move(entry));
+            if (entry) data_.push_back(std::move(*entry));
         }
         if (released) released->Release();
+        return found;
     }
 
     std::atomic<ULONG> refs_{1};

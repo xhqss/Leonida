@@ -18,6 +18,7 @@ import argparse
 import array
 import json
 import os
+import stat
 import struct
 import sys
 from collections import Counter
@@ -205,6 +206,116 @@ def gfx10_tile_mode(mode):
 def gfx10_tile_bytes(mode):
     """Tile size for a descriptor mode: 64 KiB only for tile mode 0."""
     return COMPACT_TILE_64K if gfx10_tile_mode(mode) == 0 else COMPACT_TILE_4K
+
+
+def joaat(s: str) -> int:
+    """Standard Jenkins One-at-a-Time 32-bit hash of lowercase ASCII string."""
+    h = 0
+    for c in s.lower().encode("latin-1", "replace"):
+        h = (h + c) & 0xFFFFFFFF
+        h = (h + (h << 10)) & 0xFFFFFFFF
+        h ^= h >> 6
+    h = (h + (h << 3)) & 0xFFFFFFFF
+    h ^= h >> 11
+    return (h + (h << 15)) & 0xFFFFFFFF
+
+
+def is_system_pointer(val: int, max_len: int) -> bool:
+    """Validate that the pointer is strictly in the system page segment (0x50000000..0x5FFFFFFF)."""
+    if (val >> 28) != 5:
+        return False
+    offset = val & 0x0FFFFFFF
+    return 0 < offset + 8 <= max_len
+
+
+def parse_texture_dict_page(data: bytes):
+    """Parse a small RAGE texture dictionary system page (e.g. the 400-byte stream in textures.rpf).
+
+    Layout:
+      +0x20: 64-bit pointer to hash array (optional in synthetic tests)
+      +0x30: 64-bit pointer to grcTexture descriptor pointer array (optional in synthetic tests)
+      +0x38: u16 texture count (optional in synthetic tests)
+      +0x140..pointers_off: null-separated lower-case ASCII texture names
+      pointers_off (+0x170 or +0x178): array of 64-bit pointers to grcTexture descriptors (tagged 0x5...)
+      hashes_off (+0x180 or +0x188): array of 32-bit joaat32 name hashes
+      Within each grcTexture descriptor:
+        +0x10: dtype (0x980)
+        +0x18: data pointer (0x60000000 + GPU data offset)
+        +0x38: u16 width, u16 height, u16 depth, u8 b6, u8 DXGI format
+        +0x40: u64 flags (bits 16..23: mip count)
+    """
+    if len(data) < 400:
+        raise ValueError(f"texture dictionary page truncated: expected >= 400 bytes, got {len(data)}")
+
+    pointers_off = None
+    hashes_off = None
+    count = 2
+
+    # Check pgDictionary header at 0x20 / 0x30
+    if len(data) >= 0x40:
+        h_cand = struct.unpack_from("<Q", data, 0x20)[0]
+        p_cand = struct.unpack_from("<Q", data, 0x30)[0]
+        cnt = struct.unpack_from("<H", data, 0x38)[0]
+        if is_system_pointer(h_cand, len(data)) and is_system_pointer(p_cand, len(data)):
+            h_off = h_cand & 0x0FFFFFFF
+            p_off = p_cand & 0x0FFFFFFF
+            if 0 < cnt <= 64 and p_off + cnt * 8 <= len(data) and h_off + cnt * 4 <= len(data):
+                pointers_off = p_off
+                hashes_off = h_off
+                count = cnt
+
+    if pointers_off is None:
+        # Fallback probe for shifted or unheadered layouts:
+        # 1. Standard layout: pointers start at 0x170
+        # 2. Shifted layout (longer names in 0x140..): pointers start at 0x178, so both 0x178 and 0x180 are system pointers
+        if is_system_pointer(struct.unpack_from("<Q", data, 0x170)[0], len(data)):
+            pointers_off = 0x170
+            hashes_off = 0x180
+        elif is_system_pointer(struct.unpack_from("<Q", data, 0x178)[0], len(data)) and is_system_pointer(struct.unpack_from("<Q", data, 0x180)[0], len(data)):
+            pointers_off = 0x178
+            hashes_off = 0x188
+        else:
+            pointers_off = 0x170
+            hashes_off = 0x180
+
+    names_raw = data[0x140:pointers_off]
+    names = [s.decode("latin1") for s in names_raw.split(b"\x00") if s]
+    names_by_hash = {joaat(n): n for n in names}
+
+    textures = []
+    for i in range(count):
+        if pointers_off + (i + 1) * 8 > len(data):
+            break
+        raw_ptr = struct.unpack_from("<Q", data, pointers_off + i * 8)[0]
+        thash = struct.unpack_from("<I", data, hashes_off + i * 4)[0] if hashes_off + (i + 1) * 4 <= len(data) else 0
+
+        # Validate that the pointer is strictly in the system page segment (0x5...)
+        if (raw_ptr >> 28) != 5:
+            continue
+        ptr = raw_ptr & 0x0FFFFFFF
+        if ptr == 0 or ptr + 0x48 > len(data):
+            continue
+        dtype = struct.unpack_from("<Q", data, ptr + 0x10)[0]
+        data_off = struct.unpack_from("<Q", data, ptr + 0x18)[0] & 0x0FFFFFFF
+        w, height, depth, b6, fmt = struct.unpack_from("<HHHBB", data, ptr + 0x38)
+        flags = struct.unpack_from("<Q", data, ptr + 0x40)[0]
+        mips = (flags >> 16) & 0xFF
+        name = names_by_hash.get(thash, f"tex_{thash:08x}")
+        textures.append({
+            "name": name,
+            "hash": thash,
+            "width": w,
+            "height": height,
+            "depth": depth,
+            "b6": b6,
+            "mips": mips,
+            "flags": flags,
+            "format": fmt,
+            "format_name": DXGI.get(fmt, f"dxgi{fmt}"),
+            "data_offset": data_off,
+            "dtype": dtype,
+        })
+    return textures
 
 
 def parse_etpf_texture_record(record):
@@ -554,7 +665,11 @@ D3D10_RESOURCE_MISC_TEXTURECUBE = 0x4
 
 
 def dds_header(w, h, depth=1, mips=1, fmt=28, is_cube=False, linear_size=0, array_size=1):
-    """Build a DX10 DDS header; array_size counts cubes, not faces, for cubemaps."""
+    """Build a DX10 DDS header; array_size counts cubes for cubemaps.
+
+    For known uncompressed formats, derive the row pitch. A nonzero linear_size
+    overrides the derived top mip size for compressed formats.
+    """
     hdr = bytearray(128)
     hdr[0:4] = b"DDS "
     flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT
@@ -562,10 +677,15 @@ def dds_header(w, h, depth=1, mips=1, fmt=28, is_cube=False, linear_size=0, arra
         flags |= DDSD_MIPMAPCOUNT
     if depth > 1:
         flags |= DDSD_DEPTH
-    if linear_size > 0:
-        flags |= DDSD_LINEARSIZE
+    layout = FMT_INFO.get(fmt)
+    if layout is not None and layout[1] == 1:
+        flags |= DDSD_PITCH
+        pitch_or_size = calc_mip_level_bytes(w, 1, fmt=fmt)
     else:
-        flags |= 0x80000
+        flags |= DDSD_LINEARSIZE
+        pitch_or_size = linear_size
+        if layout is not None and linear_size == 0:
+            pitch_or_size = calc_mip_level_bytes(w, h, depth=depth, fmt=fmt)
 
     caps = DDSCAPS_TEXTURE
     if mips > 1:
@@ -579,7 +699,8 @@ def dds_header(w, h, depth=1, mips=1, fmt=28, is_cube=False, linear_size=0, arra
     if is_cube:
         caps2 |= DDSCAPS2_CUBEMAP_ALLFACES
 
-    struct.pack_into("<IIIIIII", hdr, 4, 124, flags, h, w, linear_size, depth if depth > 1 else 0, mips if mips > 1 else 1)
+    struct.pack_into("<IIIIIII", hdr, 4, 124, flags, h, w, pitch_or_size,
+                     depth if depth > 1 else 0, mips if mips > 1 else 1)
     struct.pack_into("<II4s", hdr, 76, 32, 4, b"DX10")
     struct.pack_into("<II", hdr, 108, caps, caps2)
 
@@ -590,8 +711,9 @@ def dds_header(w, h, depth=1, mips=1, fmt=28, is_cube=False, linear_size=0, arra
 
 
 def dds_bytes(w, h, fmt, payload=b"", mips=1, depth=1, is_cube=False, array_size=1):
+    linear_size = 0 if fmt in FMT_INFO else len(payload)
     return dds_header(w, h, depth=depth, mips=mips, fmt=fmt, is_cube=is_cube,
-                      linear_size=len(payload), array_size=array_size) + payload
+                      linear_size=linear_size, array_size=array_size) + payload
 
 
 def parse_dds_header(data):
@@ -693,15 +815,21 @@ def scan_archive(carve, arch):
             d = int(q[k + 4]).to_bytes(8, "little")
             w, h, depth = int.from_bytes(d[0:2], "little"), int.from_bytes(d[2:4], "little"), int.from_bytes(d[4:6], "little")
             fmt = d[7]
-            if fmt not in DXGI or not (4 <= w <= 16384 and 4 <= h <= 16384 and 1 <= depth <= 2048):
+            if fmt not in DXGI or not (1 <= w <= 16384 and 1 <= h <= 16384 and 1 <= depth <= 2048):
+                continue
+            flags = int(q[k + 5])
+            mips = (flags >> 16) & 0xFF
+            dtype = int(q[k - 1])
+            # Small dimensions need the known texture type and a mip count that fits the extent.
+            if min(w, h) < 4 and (dtype != 0x980 or not 1 <= mips <= calc_mipmap_count(w, h, depth)):
                 continue
             # Real texture data is 256-byte aligned (4 KB in every verified case); unaligned hits are other structs.
             if (int(q[k]) & 0xFF) != 0:
                 continue
             out.append({"archive": arch, "cpu": v["off"], "gpu": g["off"], "gpu_size": g["size"], "gpu_chain": chain,
                         "data_off": int(q[k]) & 0x0FFFFFFF, "w": w, "h": h, "depth": depth, "b6": d[6], "fmt": fmt,
-                        "fmt_name": DXGI.get(fmt, f"dxgi{fmt}"), "flags": int(q[k + 5]), "packed": int(q[k - 2]),
-                        "dtype": int(q[k - 1]), "mips": (int(q[k + 5]) >> 16) & 0xFF, "q_index": k})
+                        "fmt_name": DXGI.get(fmt, f"dxgi{fmt}"), "flags": flags, "packed": int(q[k - 2]),
+                        "dtype": dtype, "mips": mips, "q_index": k})
     return out
 
 
@@ -713,6 +841,48 @@ def same_output_path(first, second):
         return os.path.samefile(first, second)
     except OSError:
         return False
+
+
+def input_files(carve, archs):
+    """Yield (kind, path) for every file the scan reads from the selected carve archives.
+
+    Each archive contributes its ``index.json`` manifest and the ``<offset>.bin`` streams next to it.
+    A report path only has to match one of these, not the carve folder argument itself.
+    """
+    for arch in archs:
+        folder = os.path.join(carve, arch)
+        yield "manifest", os.path.join(folder, "index.json")
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if entry.is_file() and entry.name.lower().endswith(".bin"):
+                    yield "blob", entry.path
+
+
+def report_needs_input_check(carve, archs, path):
+    """Whether a report path has to be compared with every scanned input.
+
+    A report that already exists as a regular file, is not a symlink and has one link is reachable
+    only through its own name. When that name is not ``index.json`` or a ``*.bin`` stream, no input
+    can resolve to it, so the per-file realpath/samefile checks can be skipped. A missing report,
+    a link, or an input-like name is always compared; an input may also be a symlink to it.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return True
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        return True
+    name = os.path.basename(os.path.realpath(path)).lower()
+    if name == "index.json" or name.endswith(".bin"):
+        return True
+    for arch in archs:
+        with os.scandir(os.path.join(carve, arch)) as entries:
+            for entry in entries:
+                if entry.is_symlink():
+                    leaf = entry.name.lower()
+                    if leaf == "index.json" or leaf.endswith(".bin"):
+                        return True
+    return False
 
 
 def main():
@@ -733,10 +903,10 @@ def main():
     path = a.out or os.path.join(a.carve, "textures_index.json")
     if os.path.isdir(path):
         ap.error(f"{path} is a directory, not a .json file")
-    for arch in archs:
-        manifest = os.path.join(a.carve, arch, "index.json")
-        if same_output_path(manifest, path):
-            ap.error(f"output would overwrite an input manifest: {path}")
+    if report_needs_input_check(a.carve, archs, path):
+        for kind, source in input_files(a.carve, archs):
+            if same_output_path(source, path):
+                ap.error(f"output would overwrite an input {kind}: {path}")
     allt = []
     for arch in archs:
         try:
@@ -748,10 +918,9 @@ def main():
         print(f"{arch}: {len(t)} texture headers", flush=True)
         allt += t
     parent = os.path.dirname(os.path.abspath(path))
-    if parent:      # the scan is already done; a missing folder used to lose it in a FileNotFoundError
-        os.makedirs(parent, exist_ok=True)
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(allt, f)
     except OSError as e:
         print(f"ERROR: cannot write {path}: {e.strerror or e}", file=sys.stderr)

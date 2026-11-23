@@ -86,13 +86,13 @@ class VulkanMatrixTests(unittest.TestCase):
 class ValidationGateTests(unittest.TestCase):
     """The malformed control must fail, or the atlas results prove nothing. Tools are mocked."""
 
-    def fake_run(self, accept_control=False, fail_assembly=False):
+    def fake_run(self, accept_control=False, fail_assembly=False, fail_validation=False):
         def run(cmd, **kw):
             broken = any("broken_negative" in str(arg) for arg in cmd)
             if cmd[0] == "spirv-as":
                 ok = 1 if fail_assembly and broken else 0
                 return subprocess.CompletedProcess(cmd, ok, "", "syntax error" if ok else "")
-            ok = 0 if not broken or accept_control else 1
+            ok = 1 if fail_validation or (broken and not accept_control) else 0
             return subprocess.CompletedProcess(cmd, ok, "", "" if ok else "invalid module")
         return run
 
@@ -101,11 +101,11 @@ class ValidationGateTests(unittest.TestCase):
                 patch.object(turing_atlas, "run", self.fake_run(accept_control, fail_assembly)):
             return turing_atlas.validate_cases()
 
-    def main_with(self, accept_control=False, fail_assembly=False, tools=True, argv=None):
+    def main_with(self, accept_control=False, fail_assembly=False, tools=True, argv=None, fail_validation=False):
         err = io.StringIO()
         with patch.object(sys, "argv", argv or ["turing_atlas.py"]), \
                 patch.object(turing_atlas.shutil, "which", return_value="tool" if tools else None), \
-                patch.object(turing_atlas, "run", self.fake_run(accept_control, fail_assembly)), \
+                patch.object(turing_atlas, "run", self.fake_run(accept_control, fail_assembly, fail_validation)), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
             code = turing_atlas.main()
         return code, err.getvalue()
@@ -115,6 +115,7 @@ class ValidationGateTests(unittest.TestCase):
         self.assertEqual(len(cases), len(turing_atlas.CASES))
         self.assertTrue(all(cases[n]["assemble"] and cases[n]["valid"] for n in cases
                             if n != "broken_negative"))
+        self.assertTrue(cases["compute32"]["control_ok"])
         control = cases["broken_negative"]
         self.assertTrue(control["assemble"])
         self.assertFalse(control["valid"])
@@ -138,6 +139,11 @@ class ValidationGateTests(unittest.TestCase):
         self.assertIn("turing_atlas: error:", err)
         self.assertIn("broken_negative", err)
 
+    def test_main_fails_when_the_validator_rejects_the_known_good_control(self) -> None:
+        code, err = self.main_with(fail_validation=True)
+        self.assertEqual(code, 2)
+        self.assertIn("compute32", err)
+
     def test_main_succeeds_when_the_control_was_rejected(self):
         for kwargs in ({}, {"fail_assembly": True}):
             with self.subTest(**kwargs):
@@ -152,6 +158,19 @@ class ValidationGateTests(unittest.TestCase):
             code, err = self.main_with(argv=["turing_atlas.py", "--out", out])
             self.assertEqual((code, err), (0, ""))
             self.assertTrue(os.path.isfile(out))
+
+    def test_reports_atlas_output_write_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = os.path.join(tmp, "existing-file")
+            with open(parent, "w", encoding="utf-8") as f:
+                f.write("keep me")
+            out = os.path.join(parent, "atlas.json")
+            code, err = self.main_with(argv=["turing_atlas.py", "--out", out])
+
+            self.assertEqual(code, 2)
+            self.assertIn(f"cannot write {out}", err)
+            with open(parent, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "keep me")
 
     def test_out_cannot_be_a_directory(self):
         with tempfile.TemporaryDirectory() as tmp:

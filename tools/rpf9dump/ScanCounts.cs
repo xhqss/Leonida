@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using RpfPreview.Core;
 
 // Scan-level counts for the manifest. Candidates that RecoverAtOffsets rejects never reach Program.cs, so
 // Candidates - Recovered is the only place those rejects show up.
@@ -18,4 +19,10 @@ internal static class ScanCounts
         string digits = new(m.Groups[1].Value.Where(char.IsAsciiDigit).ToArray());
         return int.TryParse(digits, out int n) ? n : null;
     }
+
+    // Whether a cached index can stand in for a full scan. rpf9-explorer saves its model index while it is still
+    // indexing and when the scan is cancelled, and marks it complete only at the end. rpf9dump before this check saved
+    // full scans without the mark, so its own coverage text counts too.
+    public static bool IsFullScan(RecoveryIndexCache.CachedIndex? cached) =>
+        cached is not null && (cached.IsComplete || Candidates(cached.Coverage) is not null);
 }

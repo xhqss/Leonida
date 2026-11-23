@@ -53,10 +53,12 @@ X = 64          # anything else that depends on the partition
 CTRL = 128      # scalar defined behind a wave-wide vote and read where the def may not have run
 MASKD = 256     # a lane mask used as data
 WFS = 512       # scalar read from the first lane of a waterfall loop
-TAG_BITS = RNK | ELECT | WFS
+ACT_RFL = 1024  # scalar from v_readfirstlane of active-EXEC-only uniform VGPR (valid only inside that EXEC mask)
+TAG_BITS = RNK | ELECT | WFS | ACT_RFL
 
 NAMES = {CNT: "lane-count", RNK: "lane-rank", FF1: "first-lane", BASE: "allocation-order", ELECT: "elected-lane",
-         LANE: "lane-id", X: "cross-lane", CTRL: "stale-scalar", MASKD: "mask-as-data", WFS: "waterfall-scalar"}
+         LANE: "lane-id", X: "cross-lane", CTRL: "stale-scalar", MASKD: "mask-as-data", WFS: "waterfall-scalar",
+         ACT_RFL: "cross-lane"}
 REASONS = sorted(set(NAMES.values()) | {"tainted-branch", "unsafe-vote-branch", "mask-half", "elected-side-effect",
                                         "tainted-exec", "mask-compare", "unmodelled-op", "unsafe-execz-branch",
                                         "analysis-error"})
@@ -68,17 +70,29 @@ NO_DEST = ("s_cmp", "s_bitcmp", "v_cmpx", "exp", "buffer_store", "global_store",
            "s_nop", "s_endpgm", "s_barrier", "s_sendmsg", "s_setprio", "s_inst_prefetch", "s_clause", "s_trap",
            "s_icache", "s_dcache", "s_sleep", "s_code_end", "s_denorm_mode", "s_round_mode", "s_waitcnt_vscnt",
            "s_ttracedata", "v_nop", "s_set", "s_sethalt", "s_setkill", "s_wakeup", "s_version", "buffer_gl",
-           "buffer_wbinvl", "ds_gws", "ds_nop", "s_pack")
+           "buffer_wbinvl", "ds_gws", "ds_nop")
 LOADS = ("buffer_load", "global_load", "flat_load", "scratch_load", "tbuffer_load", "image_load", "image_sample",
          "image_gather", "image_get", "s_load", "s_buffer_load", "ds_read", "v_interp")
 SINKS = ("exp", "buffer_store", "global_store", "flat_store", "scratch_store", "tbuffer_store", "image_store",
          "ds_write", "ds_store")
 SCC_LESS = ("s_mov", "s_cmov", "s_cselect", "s_load", "s_buffer_load", "s_getpc", "s_setpc", "s_nop", "s_waitcnt",
-            "s_sendmsg", "s_getreg", "s_setreg", "s_movrel", "s_bitset", "s_movk", "s_cbranch", "s_branch", "s_endpgm",
-            "s_barrier", "v_", "buffer_", "global_", "ds_", "exp", "image_", "flat_", "s_set", "s_inst", "s_clause")
+            "s_sendmsg", "s_getreg", "s_setreg", "s_movrel", "s_bitset", "s_movk", "s_mul", "s_pack", "s_sext",
+            "s_flbit", "s_ff0", "s_ff1", "s_brev", "s_bfm", "s_bitreplicate", "s_get_waveid", "s_cbranch", "s_branch",
+            "s_endpgm", "s_barrier", "v_", "buffer_", "global_", "ds_", "exp", "image_", "flat_", "s_set", "s_inst",
+            "s_clause")
 SAVEEXEC = ("s_and_saveexec_b", "s_or_saveexec_b", "s_xor_saveexec_b", "s_andn2_saveexec_b", "s_orn2_saveexec_b",
             "s_nand_saveexec_b", "s_nor_saveexec_b", "s_xnor_saveexec_b", "s_andn1_saveexec_b", "s_orn1_saveexec_b",
-            "s_and_wrexec_b", "s_andn2_wrexec_b")
+            "s_and_wrexec_b", "s_andn2_wrexec_b", "s_andn1_wrexec_b")
+RMW_DEST = (
+    "v_fmac_f32", "v_fmac_f16", "v_mac_f32", "v_mac_legacy_f32", "v_pk_fmac_f16",
+    "v_dot2c_f32_f16", "v_dot2c_f32_bf16", "v_dot2c_i32_i16", "v_dot4c_i32_i8", "v_dot8c_i32_i4",
+    "s_addk_i32", "s_mulk_i32", "s_cmovk_i32", "s_cmov_b32", "s_cmov_b64",
+    "s_bitset0_b32", "s_bitset0_b64", "s_bitset1_b32", "s_bitset1_b64",
+)
+MOVREL_OPS = (
+    "v_movrels_b32", "v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32",
+    "v_swaprel_b32", "s_movrels_b32", "s_movrels_b64",
+)
 MASK_BITWISE = ("s_and_b", "s_or_b", "s_xor_b", "s_andn2_b", "s_orn2_b", "s_nand_b", "s_nor_b", "s_xnor_b", "s_not_b",
                 "s_mov_b", "s_cselect_b", "s_wqm_b")
 DPP_BAD = ("row_bcast", "wave_")
@@ -122,6 +136,25 @@ def _half(a):
     return None
 
 
+def _zero(a):
+    return a.get("k") == "imm" and a.get("v") == 0
+
+
+def _mask64(a):
+    """A whole 64-bit SGPR pair or VCC (a lane mask register), not EXEC and not a 32-bit half."""
+    if a.get("k") == "sgpr":
+        return a.get("n", 1) == 2
+    return a.get("k") == "special" and a.get("t") == "vcc"
+
+
+ZERO_SCC = ("s_and_b64", "s_andn2_b64", "s_or_b64", "s_orn2_b64", "s_xor_b64", "s_nand_b64", "s_nor_b64",
+            "s_xnor_b64", "s_not_b64", "s_wqm_b64")      # SCC = (64-bit result != 0)
+# Before the run side narrows EXEC: mask arithmetic, and the SAVEEXEC/WREXEC forms whose new EXEC is S0 & EXEC or
+# S0 & ~EXEC (a narrowing into S0; confine_step decides whether S0 is inside, and what the destination holds).
+OFF_OK = ("s_nop", "s_waitcnt", "s_mov_b64", "s_wqm_b64", "s_and_b64", "s_and_saveexec_b64", "s_and_wrexec_b64",
+          "s_andn2_saveexec_b64", "s_andn2_wrexec_b64")
+
+
 def operands(ins):
     """(dests, srcs, implicit defs, implicit uses): operand dicts, and register keys the text does not show."""
     op, a = base_op(ins["op"]), ins["args"]
@@ -148,8 +181,13 @@ def operands(ins):
         returns = op.startswith(("ds_read", "ds_bpermute", "ds_permute", "ds_swizzle", "ds_consume", "ds_append")) \
             or "_rtn" in op
         dests, srcs = ([a[0]], list(a[1:])) if returns and a else ([], list(a))
+    elif op == "v_swap_b32" and len(a) >= 2:
+        dests, srcs = [a[0], a[1]], [a[0], a[1]]
     elif a:
-        dests, srcs = [a[0]], list(a[1:])
+        if op in RMW_DEST:
+            dests, srcs = [a[0]], [a[0], *a[1:]]
+        else:
+            dests, srcs = [a[0]], list(a[1:])
         if op.startswith("v_") and len(a) > 2 and (
                 "_co_" in op or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64")) \
                 and a[1].get("k") in ("sgpr", "special"):
@@ -160,14 +198,19 @@ def operands(ins):
         defs += ["exec", "scc"]
     if op.startswith("s_") and not op.startswith(SCC_LESS) and "scc" not in defs and not op.startswith("s_cbranch"):
         defs.append("scc")
-    if op in ("v_cndmask_b32", "v_addc_co_u32", "v_subb_co_u32", "v_subbrev_co_u32", "v_addc_u32", "v_subb_u32",
-              "v_div_fmas_f32", "v_div_fmas_f64") and len(a) <= 4 and "vcc" not in [r for x in a for r in _regs(x)]:
+    if op in ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32",
+              "v_addc_co_u32", "v_subb_co_u32", "v_subbrev_co_u32",
+              "v_cndmask_b32", "v_addc_u32", "v_subb_u32") and len(srcs) == 2:
+        uses.append("vcc")
+    if op in ("v_div_fmas_f32", "v_div_fmas_f64") and "vcc" not in [r for x in srcs for r in _regs(x)]:
         uses.append("vcc")
     if op in ("s_cselect_b32", "s_cselect_b64", "s_addc_u32", "s_subb_u32", "s_cmov_b32", "s_cmov_b64",
-              "s_cbranch_scc0", "s_cbranch_scc1"):
+              "s_cmovk_i32", "s_cbranch_scc0", "s_cbranch_scc1"):
         uses.append("scc")
     if op in ("s_cbranch_vccz", "s_cbranch_vccnz"):
         uses.append("vcc")
+    if op in MOVREL_OPS:
+        uses.append("m0")
     return dests, srcs, defs, uses
 
 
@@ -175,10 +218,55 @@ class Analysis:
     def __init__(self, blocks, succ, masks, stage):
         self.blocks, self.succ, self.masks, self.stage = blocks, succ, masks or {}, stage
         self.n = len(blocks)
+        self.vgprs = sorted({r[1] for b in blocks for ins in b for x in ins["args"]
+                             for r in _regs(x) if isinstance(r, tuple) and r[0] == "v"})
         self.tok = {("e",): (None, None, True)}      # exec token -> (parent token, exec tag after, exec is the entry exec)
         self.stale = set()
         self.voted = {}                              # block -> mask register key the terminating branch votes on
         self.branch_class = {}
+        self.pure_spill_vgprs = self._find_pure_spill_vgprs()
+
+    def _find_pure_spill_vgprs(self):
+        """VGPRs used ONLY as constant-lane scalar spill storage (v_writelane_b32 / v_readlane_b32 with immediate
+        lane 0..63 and non-VGPR source, never read/written as a vector operand, never aliased by v_movrel*, and
+        never holding a lane mask). Every constant lane 0..63 of such a VGPR can be lowered to a parked scalar slot
+        in rdna2spirv.py so SGPR spills past lane 31 stay exact on 32-wide (and narrower) subgroups."""
+        candidates = set()
+        disqualified = set()
+        movrel_min = None
+        for blk in self.blocks:
+            for ins in blk:
+                op = base_op(ins["op"])
+                a = ins["args"]
+                if op in ("v_movrels_b32", "v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32", "v_swaprel_b32"):
+                    for x in a:
+                        if x.get("k") == "vgpr":
+                            movrel_min = x["r"] if movrel_min is None else min(movrel_min, x["r"])
+                if op == "v_writelane_b32" and len(a) == 3 and a[0].get("k") == "vgpr" and a[0].get("n", 1) == 1 \
+                        and a[2].get("k") == "imm" and a[1].get("k") != "vgpr":
+                    vr = a[0]["r"]
+                    slot = lane_masks.lane_slot(a[0], a[2])
+                    if slot and (slot in self.masks.get(id(ins), {}) or self.is_mask(ins, a[1])):
+                        disqualified.add(vr)
+                    else:
+                        candidates.add(vr)
+                    continue
+                if op == "v_readlane_b32" and len(a) == 3 and a[1].get("k") == "vgpr" and a[1].get("n", 1) == 1 \
+                        and a[2].get("k") == "imm":
+                    vr = a[1]["r"]
+                    slot = lane_masks.lane_slot(a[1], a[2])
+                    if slot and slot in self.masks.get(id(ins), {}):
+                        disqualified.add(vr)
+                    else:
+                        candidates.add(vr)
+                    continue
+                for x in a:
+                    for r in _regs(x):
+                        if isinstance(r, tuple) and r[0] == "v":
+                            disqualified.add(r[1])
+        if movrel_min is not None:
+            candidates = {vr for vr in candidates if vr < movrel_min}
+        return frozenset(candidates - disqualified)
 
     # ---- helpers ----
     def is_mask(self, ins, a):
@@ -196,6 +284,43 @@ class Analysis:
                 t |= CTRL
         return t
 
+    LMOD_KEEP = ("v_mov_b32", "v_add_nc_u32", "v_add_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_sub_u32",
+                 "v_subrev_u32", "v_xor_b32", "v_or_b32", "v_and_b32")
+
+    def lmod(self, st, ins, a):
+        """k when the operand is the same in the wave and in a half modulo 2**k: 32 for a partition-invariant value
+        (an immediate, an untainted register), the tag's k for a lane id, -1 for anything else."""
+        if a.get("k") in ("imm", "fimm"):
+            return 32
+        if self.is_mask(ins, a) or a.get("neg") or a.get("abs"):
+            return -1
+        regs = _regs(a)
+        if not regs or self.rd(st, ins, a):
+            if regs and self.rd(st, ins, a) == LANE and all(st["g"].get(r, ("",))[0] == "lmod" for r in regs):
+                return min(st["g"][r][1] for r in regs)
+            return -1
+        return 32
+
+    def lmod_result(self, st, ins, op, a):
+        """k of a VALU result whose only partition-dependent source is a lane id exact modulo 2**k: sums,
+        differences and bitwise ops with invariant values keep k, a left shift by an immediate c raises it to k + c."""
+        # SDWA selects, DPP, op_sel and integer clamp change the value: no tag
+        mods = ins.get("mods") or []
+        if ins["op"].endswith(("_sdwa", "_dpp")) or any(
+                m == "clamp" or m.startswith(("op_sel", "dst_unused")) or "_sel:" in m for m in mods):
+            return None
+        src = a[1:]
+        ks = [self.lmod(st, ins, x) for x in src]
+        if not src or min(ks) < 0:
+            return None
+        if op in self.LMOD_KEEP:
+            return min(ks)
+        if op == "v_lshlrev_b32" and len(src) == 2 and src[0].get("k") == "imm":
+            return min(32, ks[1] + (src[0]["v"] & 31))
+        if op in ("v_lshl_add_u32", "v_lshl_or_b32") and len(src) == 3 and src[1].get("k") == "imm":
+            return min(32, ks[0] + (src[1]["v"] & 31), ks[2])
+        return None
+
     def join(self, a, b, blk=0):
         t = dict(a["t"])
         for k, v in b["t"].items():
@@ -206,8 +331,10 @@ class Analysis:
                 t[k] = v | X
         x = a["x"] if a["x"] == b["x"] else ("j", blk)
         self.tok.setdefault(x, (None, None, False))
+        u = a["u"] & b["u"]
+        ua = (a["ua"] & b["ua"]) if a["x"] == b["x"] else u
         return {"t": t, "g": g, "x": x, "xg": a["xg"] if a["xg"] == b["xg"] else None, "f": a["f"] and b["f"],
-                "u": a["u"] & b["u"], "l": {k: v for k, v in a["l"].items() if b["l"].get(k) == v},
+                "u": u, "ua": ua, "l": {k: v for k, v in a["l"].items() if b["l"].get(k) == v},
                 "r": self.union_map(a["r"], b["r"]), "b": self.union_map(a["b"], b["b"])}
 
     @staticmethod
@@ -215,12 +342,13 @@ class Analysis:
         return {k: a.get(k, frozenset()) | b.get(k, frozenset()) for k in set(a) | set(b)}
 
     def entry(self):
-        return {"t": {}, "g": {}, "x": ("e",), "xg": None, "f": True, "u": frozenset(), "l": {}, "r": {}, "b": {}}
+        return {"t": {}, "g": {}, "x": ("e",), "xg": None, "f": True, "u": frozenset(), "ua": frozenset(), "l": {},
+                "r": {}, "b": {}}
 
     # ---- the transfer function ----
     def block(self, n, st, ev):
         st = {"t": dict(st["t"]), "g": dict(st["g"]), "x": st["x"], "xg": st["xg"], "f": st["f"], "u": st["u"],
-              "l": dict(st["l"]), "r": dict(st["r"]), "b": dict(st["b"])}
+              "ua": st["ua"], "l": dict(st["l"]), "r": dict(st["r"]), "b": dict(st["b"])}
         for i, ins in enumerate(self.blocks[n]):
             self.step(n, i, ins, st, ev)
         return st
@@ -229,12 +357,53 @@ class Analysis:
         """One instruction. Around the transfer function it keeps, per register, the exec tokens of the lane ranks
         (st["r"]) and of the aggregated-atomic bases (st["b"]) its value is made of: a slot address is exact only
         when its rank and its base belong to the same mask."""
+        if base_op(ins["op"]) == "v_swap_b32" and len(ins["args"]) == 2:
+            r0, r1 = _regs(ins["args"][0]), _regs(ins["args"][1])
+            if len(r0) == 1 and len(r1) == 1:
+                full = st["f"]
+                rk0, rk1 = st["r"].get(r0[0], frozenset()), st["r"].get(r1[0], frozenset())
+                bs0, bs1 = st["b"].get(r0[0], frozenset()), st["b"].get(r1[0], frozenset())
+                self.new_rank = self.new_base = None
+                self.transfer(n, i, ins, st, ev)
+                pairs = ((r0[0], rk1, bs1), (r1[0], rk0, bs0)) if full else (
+                    (r0[0], rk0 | rk1, bs0 | bs1), (r1[0], rk0 | rk1, bs0 | bs1))
+                for r, r_toks, b_toks in pairs:
+                    t = st["t"].get(r, 0)
+                    for key, bit, toks in (("r", RNK, r_toks), ("b", BASE, b_toks)):
+                        kept = toks if t & bit else frozenset()
+                        if kept:
+                            st[key][r] = kept
+                        else:
+                            st[key].pop(r, None)
+                return
         self.new_rank = self.new_base = None
+        op, a = base_op(ins["op"]), ins["args"]
         dests, srcs, _, uses = operands(ins)
         read = [r for x in srcs for r in _regs(x)] + [r for r in uses if r != "exec"]
+        if op == "v_movrels_b32" and len(a) > 1:
+            src_base = a[1]["r"] if a[1].get("k") == "vgpr" else 0
+            read.extend(("v", vr) for vr in self.vgprs if vr >= src_base)
+        dyn_v = op in ("v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32", "v_swaprel_b32") and len(a) >= 2
+        if dyn_v:
+            dst_base = (min(a[0]["r"], a[1]["r"])
+                        if op == "v_swaprel_b32" and a[0].get("k") == "vgpr" and a[1].get("k") == "vgpr"
+                        else (a[0]["r"] if a[0].get("k") == "vgpr" else 0))
+            if op != "v_movreld_b32":
+                src_base = dst_base if op == "v_swaprel_b32" else (a[1]["r"] if a[1].get("k") == "vgpr" else 0)
+                read.extend(("v", vr) for vr in self.vgprs if vr >= src_base)
         rk = frozenset().union(*[st["r"].get(r, frozenset()) for r in read])
         bs = frozenset().union(*[st["b"].get(r, frozenset()) for r in read])
         self.transfer(n, i, ins, st, ev)
+        if dyn_v:
+            for vr in sorted(set(self.vgprs) | {dst_base}):
+                if vr < dst_base:
+                    continue
+                r = ("v", vr)
+                t = st["t"].get(r, 0)
+                for key, bit, inherited in (("r", RNK, rk), ("b", BASE, bs)):
+                    if t & bit and inherited:
+                        st[key][r] = st[key].get(r, frozenset()) | inherited
+            return
         for d in dests:
             for r in _regs(d):
                 if r == "exec":
@@ -269,7 +438,7 @@ class Analysis:
                 t |= T.get(r, 0) | (CTRL if (id(ins), r) in self.stale else 0)
             return t
 
-        def put(a_, t, tag=None, uniform=False):
+        def put(a_, t, tag=None, uniform=False, uniform_active=False):
             for r in _regs(a_):
                 if r == "exec":
                     continue
@@ -279,6 +448,7 @@ class Analysis:
                     st["g"][r] = tag
                 if isinstance(r, tuple) and r[0] == "v":
                     st["u"] = st["u"] | {r[1]} if uniform else st["u"] - {r[1]}
+                    st["ua"] = st["ua"] | {r[1]} if (uniform or uniform_active) else st["ua"] - {r[1]}
                     for k in [k for k in st["l"] if k[0] == r[1]]:
                         del st["l"][k]
                     # a waterfall scalar / mask names the VGPR it was read from: once that is rewritten the
@@ -311,11 +481,21 @@ class Analysis:
 
         # --- sinks
         if op.startswith(SINKS) and not op.startswith(("buffer_atomic",)):
-            # buffer_store vdata, vaddr, s[V#], soffset: operand 0 is the data, the rest address and descriptor;
+            # buffer_store/tbuffer_store/image_store: operand 0 is data, the rest address and descriptor;
+            # global_store/flat_store/scratch_store: operand 0 is vaddr, operand 1 is vdata, the rest saddr;
+            # ds_write/ds_store: operand 0 is vaddr, the rest is vdata;
             # exp target, v, v, v, v: the first operand is the target (no taint), the rest is data
             addr, data = [], list(srcs)
-            if op != "exp" and srcs:
+            if op.startswith(("global_store", "flat_store", "scratch_store")) and len(srcs) >= 2:
+                addr, data = [srcs[0]] + list(srcs[2:]), [srcs[1]]
+            elif op.startswith(("ds_write", "ds_store")) and len(srcs) >= 2:
+                addr, data = [srcs[0]], list(srcs[1:])
+            elif op != "exp" and srcs:
                 data, addr = [srcs[0]], list(srcs[1:])
+            if self.stage == "gs" and op.startswith(("ds_write", "ds_store")):
+                # ds_write vaddr, vdata...: in a legacy GS the write is an output slot from its offset alone
+                # (rdna2spirv.gs_ds drops the VGPR address, the lane's GSVS area), so only the data is observable
+                data, addr = list(srcs[1:]), []
             dt = 0
             for x in data:
                 dt |= self.rd(st, ins, x) | (MASKD | X if self.is_mask(ins, x) and x.get("k") != "imm" else 0)
@@ -340,14 +520,31 @@ class Analysis:
             return
         if op.startswith(("buffer_atomic", "global_atomic", "flat_atomic", "ds_add", "ds_sub", "ds_inc", "ds_dec",
                           "ds_min", "ds_max", "ds_and", "ds_or", "ds_xor", "ds_cmpst", "ds_wrxchg", "ds_mskor")):
-            data_t = self.rd(st, ins, a[0]) if a else 0
+            if op.startswith(("global_atomic", "flat_atomic")):
+                if "glc" in mods:
+                    data_op = a[2] if len(a) > 2 else None
+                    addr_ops = ([a[1]] if len(a) > 1 else []) + list(a[3:])
+                else:
+                    data_op = a[1] if len(a) > 1 else None
+                    addr_ops = ([a[0]] if a else []) + list(a[2:])
+            elif op.startswith("ds_"):
+                if "_rtn" in op:
+                    data_op = a[2] if len(a) > 2 else None
+                    addr_ops = [a[1]] if len(a) > 1 else []
+                else:
+                    data_op = a[1] if len(a) > 1 else None
+                    addr_ops = [a[0]] if a else []
+            else:
+                data_op = a[0] if a else None
+                addr_ops = list(a[1:])
+            data_t = self.rd(st, ins, data_op) if data_op is not None else 0
             addr_t = 0
-            for x in a[1:]:
+            for x in addr_ops:
                 addr_t |= self.rd(st, ins, x)
             elected = bool(st["xg"] and st["xg"][0] == "elect")
             bits_violation(addr_t, ELECT if elected else 0)
             if data_t & CNT:
-                dreg = _regs(a[0])[0] if a and _regs(a[0]) else None
+                dreg = _regs(data_op)[0] if data_op is not None and _regs(data_op) else None
                 if not (elected and (op.endswith("add") or op.endswith("add_u32") or op.endswith("_add"))
                         and self.cnt_token(st, dreg) == st["xg"][1]):
                     violation("lane-count")
@@ -390,19 +587,33 @@ class Analysis:
             else:
                 ctok = st["g"].get(mreg, (None, None))[1] if st["g"].get(mreg, ("",))[0] == "mask" else None
             put(a[0], bit | (t_src & ELECT), ("cnt", ctok) if bit == CNT and ctok is not None else None)
-            T["scc"] = X | (t_src & ELECT)
-            st["g"]["scc"] = ("vote", _regs(a[1])[0] if _regs(a[1]) else "exec")
+            if op == "s_bcnt1_i32_b64":
+                T["scc"] = X | (t_src & ELECT)
+                st["g"]["scc"] = ("vote", _regs(a[1])[0] if _regs(a[1]) else "exec")
             return
         if op in ("s_bcnt0_i32_b64", "s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_ff0_i32_b64", "s_ff0_i32_b32",
                   "s_ff1_i32_b32", "s_flbit_i32_b64", "s_flbit_i32_b32", "s_flbit_i32") and len(a) == 2 \
                 and self.is_mask(ins, a[1]):
             put(a[0], X | t_src)
+            if op.startswith("s_bcnt"):
+                T["scc"] = X | t_src
+                st["g"].pop("scc", None)
             return
         if op in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32") and len(a) == 3:
             m, acc = a[1], a[2]
             tacc = self.rd(st, ins, acc)
             if m.get("k") == "imm" and m["v"] in (-1, 0xFFFFFFFF):
-                put(a[0], LANE | tacc)
+                # v_mbcnt_lo(-1, 0) then v_mbcnt_hi(-1, that) is the lane id: 0..63 in the wave, 0..31 in a half,
+                # so the two differ by a multiple of 32 (tag ("lmod", 5)); the low count alone does not (lanes 32..63
+                # count 32 in the wave)
+                if op == "v_mbcnt_lo_u32_b32" and acc.get("k") == "imm" and acc["v"] == 0:
+                    tag = ("lane_lo",)
+                elif op == "v_mbcnt_hi_u32_b32" and tacc == LANE and _regs(acc) and \
+                        st["g"].get(_regs(acc)[0]) == ("lane_lo",):
+                    tag = ("lmod", 5)
+                else:
+                    tag = None
+                put(a[0], LANE | tacc, tag)
             elif self.is_mask(ins, m):
                 if m.get("k") == "special" and m.get("t", "").startswith("exec"):
                     token = st["x"]
@@ -418,6 +629,11 @@ class Analysis:
             else:
                 put(a[0], X | LANE | tacc)
             return
+        if op == "s_bfm_b64" and dests:
+            # rdna2spirv.py compares per-half wave_lane (0..31) against offset..offset+size, so the upper half
+            # produces bits for lanes 0..31 instead of 32..63.
+            put(dests[0], t_src | LANE)
+            return
 
         # --- cross-lane reads and writes
         if op == "v_readfirstlane_b32" and len(a) == 2:
@@ -426,6 +642,11 @@ class Analysis:
             if vr is not None and vr in st["u"]:
                 idiom("readfirstlane-uniform")
                 put(a[0], tv)
+            elif vr is not None and vr in st["ua"]:
+                # Uniform over active lanes only: if a half has EXEC == 0 here, v_readfirstlane returns lane 0's
+                # stale value, so this scalar is only exact while EXEC remains a subset of st["x"].
+                idiom("readfirstlane-uniform")
+                put(a[0], tv | ACT_RFL, ("act_rfl", st["x"]))
             elif tv & ELECT and st["g"].get(_regs(a[1])[0], ("",))[0] == "elect" \
                     and st["g"][_regs(a[1])[0]][1] == st["x"]:
                 idiom("aggregated-atomic")
@@ -444,9 +665,16 @@ class Analysis:
                 if ev is not None:
                     ev["uniform_readlane"].add(id(ins))
                 put(a[0], self.rd(st, ins, a[1]))
-            elif vr is not None and a[2].get("k") == "imm" and (vr, a[2]["v"] & 63) in st["l"] and a[2]["v"] & 63 < 32:
-                put(a[0], st["l"][(vr, a[2]["v"] & 63)])
+            elif vr is not None and a[2].get("k") == "imm" and (vr, a[2]["v"] & 63) in st["l"] \
+                    and ((a[2]["v"] & 63) < 32 or vr in self.pure_spill_vgprs):
+                lane = a[2]["v"] & 63
+                spill_t = st["l"][(vr, lane)]
+                if (id(ins), ("spill", vr, lane)) in self.stale:
+                    spill_t |= CTRL
+                put(a[0], spill_t)
                 idiom("lane-spill")
+                if ev is not None and vr in self.pure_spill_vgprs:
+                    ev["scalar_spills"].add((vr, lane))
             else:
                 put(a[0], X | self.rd(st, ins, a[1]) | tl)
             return
@@ -455,8 +683,12 @@ class Analysis:
             tv, tl = self.rd(st, ins, a[1]), self.rd(st, ins, a[2])
             T[("v", vr)] = T.get(("v", vr), 0) | X
             st["u"] = st["u"] - {vr}
-            if a[2].get("k") == "imm" and (a[2]["v"] & 63) < 32 and not tl:
-                st["l"][(vr, a[2]["v"] & 63)] = tv
+            st["ua"] = st["ua"] - {vr}
+            if a[2].get("k") == "imm" and not tl and ((a[2]["v"] & 63) < 32 or vr in self.pure_spill_vgprs):
+                lane = a[2]["v"] & 63
+                st["l"][(vr, lane)] = tv
+                if ev is not None and vr in self.pure_spill_vgprs:
+                    ev["scalar_spills"].add((vr, lane))
             else:
                 violation("cross-lane")
             return
@@ -464,6 +696,12 @@ class Analysis:
                 or any(m.startswith("row_") or m.startswith("quad_perm") for m in mods):
             bad = any(m.startswith(DPP_BAD) for m in mods)
             put_t = t_src | (X if bad else 0)
+            # a wave64 ds_bpermute/ds_permute works on each half (ISA 10.4.4) and uses address bits 2..6 only, so a
+            # lane-id address that is the same modulo 128 in the wave and in a half reads/writes the same lane
+            if op in ("ds_bpermute_b32", "ds_permute_b32") and len(a) >= 3 and self.lmod(st, ins, a[1]) >= 7:
+                put_t = self.rd(st, ins, a[2])
+                for r in uses:
+                    put_t |= T.get(r, 0) | (CTRL if (id(ins), r) in self.stale else 0)
             for d in dests:
                 put(d, put_t)
             return
@@ -486,7 +724,9 @@ class Analysis:
                 zero = any(x.get("k") == "imm" and x["v"] == 0 for x in srcs)
                 if op in ("s_cmp_eq_u64", "s_cmp_lg_u64") and zero and not _half(m):
                     T["scc"] = X | (t_src & ELECT)
-                    st["g"]["scc"] = ("vote", _regs(m)[0] if _regs(m) else "exec")
+                    # cmp_eq: SCC = (mask == 0), the opposite sense of every other vote (SCC = mask != 0)
+                    st["g"]["scc"] = ("vote", _regs(m)[0] if _regs(m) else "exec") + \
+                        (("empty",) if op == "s_cmp_eq_u64" else ())
                     if t_src & ~ELECT & ~0:
                         bits_violation(t_src & ~ELECT)
                 else:
@@ -518,19 +758,137 @@ class Analysis:
                 elif r and r[0] in st["g"] and st["g"][r[0]][0] in ("mask", "elect", "wfmask"):
                     tag = st["g"][r[0]]
             put(dests[0], t_src, tag)
-            T["scc"] = X
-            st["g"]["scc"] = ("vote", _regs(dests[0])[0] if _regs(dests[0]) else "exec")
+            if not op.startswith(("s_mov", "s_cselect")):     # those leave SCC as it was: no vote on their dest
+                T["scc"] = X
+                st["g"]["scc"] = ("vote", _regs(dests[0])[0] if _regs(dests[0]) else "exec")
+            return
+
+        # --- register swap and dynamic indexing
+        if op == "v_swap_b32" and len(a) == 2:
+            r0, r1 = _regs(a[0]), _regs(a[1])
+            t0, t1 = self.rd(st, ins, a[0]), self.rd(st, ins, a[1])
+            if st["f"] and not (st["xg"] and st["xg"][0] == "elect"):
+                g0 = st["g"].get(r0[0]) if r0 else None
+                g1 = st["g"].get(r1[0]) if r1 else None
+                u0 = bool(r0 and isinstance(r0[0], tuple) and r0[0][0] == "v" and r0[0][1] in st["u"])
+                u1 = bool(r1 and isinstance(r1[0], tuple) and r1[0][0] == "v" and r1[0][1] in st["u"])
+                ua0 = bool(r0 and isinstance(r0[0], tuple) and r0[0][0] == "v" and r0[0][1] in st["ua"])
+                ua1 = bool(r1 and isinstance(r1[0], tuple) and r1[0][0] == "v" and r1[0][1] in st["ua"])
+                put(a[0], t1, g1, uniform=u1, uniform_active=ua1)
+                put(a[1], t0, g0, uniform=u0, uniform_active=ua0)
+            else:
+                tb = t0 | t1 | (ELECT if st["xg"] and st["xg"][0] == "elect" else 0)
+                put(a[0], tb, uniform=False)
+                put(a[1], tb, uniform=False)
+            return
+        if op in ("s_movrels_b32", "s_movrels_b64") and dests:
+            any_s = 0
+            for r, tv in T.items():
+                if isinstance(r, tuple) and r[0] == "s":
+                    any_s |= tv
+            if any(isinstance(k, int) and v in lane_masks.MASK_KINDS for k, v in self.masks.get(id(ins), {}).items()):
+                any_s |= MASKD | X
+            if any_s & TAG_BITS:
+                any_s |= X
+            put(dests[0], t_src | any_s)
+            return
+        if op == "v_movrels_b32" and dests:
+            src_base = a[1]["r"] if len(a) > 1 and a[1].get("k") == "vgpr" else 0
+            any_v = 0
+            for r, tv in T.items():
+                if isinstance(r, tuple) and r[0] == "v" and r[1] >= src_base:
+                    any_v |= tv
+            if any(isinstance(k, tuple) and k[0] in ("v", "lane") and k[1] >= src_base and v in lane_masks.MASK_KINDS
+                   for k, v in self.masks.get(id(ins), {}).items()):
+                any_v |= MASKD | X
+            if any_v & TAG_BITS:
+                any_v |= X
+            if st["xg"] and st["xg"][0] == "elect":
+                any_v |= ELECT
+            put(dests[0], t_src | any_v, uniform=False)
+            return
+        if op in ("v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32", "v_swaprel_b32") and len(a) >= 2:
+            dst_base = (min(a[0]["r"], a[1]["r"])
+                        if op == "v_swaprel_b32" and a[0].get("k") == "vgpr" and a[1].get("k") == "vgpr"
+                        else (a[0]["r"] if a[0].get("k") == "vgpr" else 0))
+            any_v = 0
+            if op != "v_movreld_b32":
+                src_base = dst_base if op == "v_swaprel_b32" else (a[1]["r"] if a[1].get("k") == "vgpr" else 0)
+                for r, tv in T.items():
+                    if isinstance(r, tuple) and r[0] == "v" and r[1] >= src_base:
+                        any_v |= tv
+                if any(isinstance(k, tuple) and k[0] in ("v", "lane") and k[1] >= src_base
+                       and v in lane_masks.MASK_KINDS for k, v in self.masks.get(id(ins), {}).items()):
+                    any_v |= MASKD | X
+            wt = t_src | any_v
+            if wt & TAG_BITS:
+                wt |= X
+            if st["xg"] and st["xg"][0] == "elect":
+                wt |= ELECT
+            st["u"] = frozenset(u for u in st["u"] if u < dst_base)
+            st["ua"] = frozenset(u for u in st["ua"] if u < dst_base)
+            for k in [k for k in st["l"] if k[0] >= dst_base]:
+                del st["l"][k]
+            for k, v in list(st["g"].items()):
+                if v[0] in ("wfs", "wfmask") and v[1] >= dst_base:
+                    del st["g"][k]
+                    T[k] = T.get(k, 0) | X
+            if wt:
+                bits_violation(wt)
+                for vr in self.vgprs:
+                    if vr >= dst_base:
+                        T[("v", vr)] = T.get(("v", vr), 0) | wt
+                T[("v", dst_base)] = T.get(("v", dst_base), 0) | wt
             return
 
         # --- everything else: results depend on the sources
+        def scaled_cnt_token():
+            """Linear scaling of a lane count by a clean uniform 32-bit stride preserves wave-aggregated atomic
+            partition invariance: (c_lo + c_hi) * K == c_lo * K + c_hi * K (mod 2^32).
+            Shift ops require the count to be the shifted value operand (never the shift distance), and
+            24-bit truncating multiplies (v_mul_u32_u24) are excluded because mod-2^24 truncation is nonlinear."""
+            if op in ("s_lshl_b32", "v_lshlrev_b32"):
+                if len(srcs) != 2:
+                    return None
+                val_op, sh_op = (srcs[0], srcs[1]) if op == "s_lshl_b32" else (srcs[1], srcs[0])
+                vt = self.rd(st, ins, val_op)
+                st_sh = self.rd(st, ins, sh_op)
+                if not (vt & CNT) or (vt & ~(CNT | ELECT)):
+                    return None
+                if st_sh != 0 or self.is_mask(ins, sh_op) or (
+                        sh_op.get("k") == "vgpr" and not all(r[1] in st["ua"] for r in _regs(sh_op))):
+                    return None
+                r = _regs(val_op)
+                return self.cnt_token(st, r[0]) if r else None
+            if op in ("s_mul_i32", "s_mulk_i32", "v_mul_lo_u32"):
+                cnt_toks = []
+                for x in srcs:
+                    xt = self.rd(st, ins, x)
+                    if xt & CNT:
+                        r = _regs(x)
+                        ct = self.cnt_token(st, r[0]) if r else None
+                        if ct is None or (xt & ~(CNT | ELECT)):
+                            return None
+                        cnt_toks.append(ct)
+                    elif xt != 0 or self.is_mask(ins, x) or (
+                            x.get("k") == "vgpr" and not all(r[1] in st["ua"] for r in _regs(x))):
+                        return None
+                if len(cnt_toks) == 1:
+                    return cnt_toks[0]
+            return None
+
         if op in ("v_cndmask_b32", "v_cndmask_b16") or op.startswith("v_"):
             tj = t_src
             uniform = False
+            uniform_active = False
             if op.startswith("v_") and not op.startswith(("v_interp", "v_mbcnt", "v_readlane", "v_writelane", "v_permlane",
                                                           "v_cndmask")) and dests:
                 uniform = st["f"] and all(
                     x.get("k") in ("imm", "fimm") or (x.get("k") == "sgpr" and not self.is_mask(ins, x)) or
                     (x.get("k") == "vgpr" and all(r[1] in st["u"] for r in _regs(x))) for x in srcs) and not uses
+                uniform_active = not (st["xg"] and st["xg"][0] == "elect") and all(
+                    x.get("k") in ("imm", "fimm") or (x.get("k") == "sgpr" and not self.is_mask(ins, x)) or
+                    (x.get("k") == "vgpr" and all(r[1] in st["ua"] for r in _regs(x))) for x in srcs) and not uses
             # a waterfall scalar used by a lane whose v equals it is that lane's own value
             if tj & WFS:
                 ok = st["xg"] and st["xg"][0] == "wf"
@@ -541,28 +899,64 @@ class Analysis:
                         if T.get(r, 0) & WFS and not (ok and g and g[0] == "wfs" and g[1] == st["xg"][1]):
                             good = False
                 tj = tj & ~WFS if good else tj | X
+            # an active-EXEC-only v_readfirstlane scalar is exact only on lanes active within its EXEC mask
+            if tj & ACT_RFL:
+                good = True
+                for x in srcs:
+                    for r in _regs(x):
+                        g = st["g"].get(r)
+                        if T.get(r, 0) & ACT_RFL and not (g and g[0] == "act_rfl" and self.ancestor(g[1], st["x"])):
+                            good = False
+                tj = tj & ~ACT_RFL if good else tj | X
+            if tj & X:
+                uniform = False
+                uniform_active = False
             tag = None
             ctok = None
             if op in ("v_mov_b32", "v_mov_b32_e32") and len(srcs) == 1 and tj & CNT and _regs(srcs[0]):
                 ctok = self.cnt_token(st, _regs(srcs[0])[0])
                 tag = ("cnt", ctok) if ctok is not None else None
+            elif tj & CNT:
+                ctok = scaled_cnt_token()
+                tag = ("cnt", ctok) if ctok is not None else None
+            if tag is None and tj == LANE and len(dests) == 1:
+                k = self.lmod_result(st, ins, op, a)
+                if k is not None:
+                    tag = ("lmod", k)
             if st["xg"] and st["xg"][0] == "elect" and dests:
                 tj |= ELECT
                 tag = ("elect", st["xg"][1], ctok)
             for d in dests:
-                put(d, tj, tag, uniform=uniform and d.get("k") == "vgpr")
+                put(d, tj, tag, uniform=uniform and d.get("k") == "vgpr",
+                    uniform_active=uniform_active and d.get("k") == "vgpr")
             return
         # scalar ALU, loads, anything unnamed
         tag = None
-        if t_src & WFS:
+        if t_src & WFS and t_src & ACT_RFL:
+            t_src |= X
+        elif t_src & WFS:
             gs = {st["g"].get(r) for x in srcs for r in _regs(x) if T.get(r, 0) & WFS}
             if len(gs) == 1 and None not in gs:
                 tag = next(iter(gs))
             else:
                 t_src |= X
+        elif t_src & ACT_RFL:
+            gs = {st["g"].get(r) for x in srcs for r in _regs(x) if T.get(r, 0) & ACT_RFL}
+            if len(gs) == 1 and None not in gs:
+                g0 = next(iter(gs))
+                if g0[0] == "act_rfl" and self.ancestor(g0[1], st["x"]):
+                    tag = g0
+                else:
+                    t_src |= X
+            else:
+                t_src |= X
         elif op.startswith(("s_mov", "s_load", "s_buffer_load")) and len(srcs) == 1 and _regs(srcs[0]) and \
                 _regs(srcs[0])[0] in st["g"] and st["g"][_regs(srcs[0])[0]][0] in ("mask", "elect", "wfmask", "cnt"):
             tag = st["g"][_regs(srcs[0])[0]]
+        elif t_src & CNT:
+            ctok = scaled_cnt_token()
+            if ctok is not None:
+                tag = ("cnt", ctok)
         for d in dests:
             put(d, t_src, tag)
         if "scc" in defs:
@@ -600,18 +994,21 @@ class Analysis:
         T = st["t"]
         site = ("n", n, i)
         old = st["x"]
-        if any(_half(x) for x in dests + srcs):
+        if any(_half(x) for x in dests + srcs) or (op.startswith("s_") and op.endswith("_b32")):
             violation("mask-half")
         if any(op.startswith(p) for p in SAVEEXEC):
             m = srcs[0] if srcs else None
-            if dests:
-                T[_regs(dests[0])[0]] = 0
-                for r in _regs(dests[0]):
-                    T[r] = 0
-                    st["g"][r] = ("mask", old)
             mt = self.rd(st, ins, m) if m else 0
             mg = st["g"].get(_regs(m)[0]) if m and _regs(m) else None
-            self.new_exec(site, old, st, op.startswith(("s_and", "s_andn2")), mg, mt, violation, idiom)
+            is_wrexec = "_wrexec_" in op
+            narrowing = op.startswith(("s_and_saveexec_", "s_andn1_saveexec_", "s_and_wrexec_", "s_andn1_wrexec_"))
+            pos_mask = op.startswith(("s_and_saveexec_", "s_and_wrexec_"))
+            self.new_exec(site, old, st, narrowing, mg if pos_mask else None, mt, violation, idiom)
+            if dests:
+                saved_tok = site if is_wrexec else old
+                for r in _regs(dests[0]):
+                    T[r] = 0
+                    st["g"][r] = ("mask", saved_tok)
             T["scc"] = X
             st["g"]["scc"] = ("vote", "exec")
             return
@@ -624,21 +1021,30 @@ class Analysis:
                 if mg:
                     mt = 0
             else:
-                mg = st["g"].get(_regs(x0)[0]) if x0 is not None and _regs(x0) else None
-                mt = self.rd(st, ins, x0) if x0 is not None else 0
-            if op in ("s_or_b64", "s_mov_b64") and mg and mg[0] == "mask" and (
-                    op == "s_mov_b64" or self.ancestor(mg[1], old)):
+                mg = st["g"].get(_regs(x0)[0]) if len(srcregs) == 1 and x0 is not None and _regs(x0) else None
+                mt = 0
+                for x in srcregs:
+                    mt |= self.rd(st, ins, x)
+            if (op == "s_mov_b64" or (op == "s_or_b64" and any(_regs(x) == ["exec"] for x in srcs))) \
+                    and mg and mg[0] == "mask" and (op == "s_mov_b64" or self.ancestor(mg[1], old)):
                 st["x"] = mg[1]
                 st["xg"], st["f"] = self.tok.get(mg[1], (None, None, False))[1:]
-                T["scc"] = X
-                st["g"]["scc"] = ("vote", "exec")
+                st["ua"] = st["u"]
+                if op == "s_or_b64":                            # s_mov_b64 leaves SCC as it was
+                    T["scc"] = X
+                    st["g"]["scc"] = ("vote", "exec")
                 return
-            if op in ("s_and_b64", "s_andn2_b64", "s_and_b32") or op.startswith("v_cmpx"):
+            if op.startswith("v_cmpx"):
                 self.new_exec(site, old, st, True, mg, mt, violation, idiom)
+            elif op == "s_and_b64" and any(_regs(x) == ["exec"] for x in srcs):
+                self.new_exec(site, old, st, True, mg, mt, violation, idiom)
+            elif op == "s_andn2_b64" and len(srcs) == 2 and _regs(srcs[0]) == ["exec"]:
+                self.new_exec(site, old, st, True, None, mt, violation, idiom)
             else:
                 st["x"] = site
                 self.tok[site] = (None, None, False)
                 st["xg"], st["f"] = None, False
+                st["ua"] = st["u"]
                 if mt & ~0:
                     for b, name in NAMES.items():
                         if mt & b and not (b & ELECT):
@@ -651,6 +1057,7 @@ class Analysis:
         st["x"] = site
         self.tok[site] = (None, None, False)
         st["xg"], st["f"] = None, False
+        st["ua"] = st["u"]
 
     def ancestor(self, anc, tok):
         seen = set()
@@ -678,6 +1085,8 @@ class Analysis:
                         break
         self.tok[site] = (old if narrowing else None, xg, st["f"] and False)
         st["x"], st["xg"], st["f"] = site, xg, False
+        if not narrowing:
+            st["ua"] = st["u"]
 
     def branch(self, n, ins, op, st, ev):
         T = st["t"]
@@ -691,7 +1100,8 @@ class Analysis:
                 self.bad_branch(ev, ins, op, t)
                 return
             if g and g[0] == "vote":
-                self.vote(n, ins, op, g[1], op == "s_cbranch_scc1", ev)
+                # the vote is yes (some lane in the mask) when SCC = 1, or SCC = 0 for an "empty" test
+                self.vote(n, ins, op, g[1], (op == "s_cbranch_scc1") != (g[2:] == ("empty",)), ev)
             return
         reg = "vcc" if "vcc" in op else "exec"
         t = (T.get(reg, 0) | (CTRL if (id(ins), "vcc") in self.stale else 0)) if reg == "vcc" else 0
@@ -734,8 +1144,167 @@ class Analysis:
         # that side must be no code of its own: the join, which the run side reaches again.
         ok = run is not None and self.narrows(run, reg) and skip is not None \
             and self.reaches(run, self.past_jumps(skip), n)
+        # The early exit of a pixel kill: the side a half takes when its mask is empty only empties EXEC (from that
+        # mask or 0), may export with that EXEC and ends, so it writes nothing; the run side narrows EXEC into the
+        # mask's whole quads and never widens it again, so in the wave the lanes of that half stay off to the end.
+        # Any lane mask would do; the vote must be the mask's own "not empty" (checked from the SCC writer), not a
+        # stale or other SCC.
+        # A pixel's fate is its EXEC bit at the last `exp ... vm` it ran (else at the end), so no such export may run
+        # before the vote: one that did would keep the pixels of the empty half alive in the wave.
+        kregs = self.kill_vote(n, op, reg)
+        if not ok and kregs and run is not None and skip is not None and self.inert_exit(skip, kregs) \
+                and self.confined(run, kregs) and not self.vm_export_before(n):
+            ok = True
         if not ok and ev is not None:
             ev["viol"].append(("unsafe-vote-branch", ins.get("pc"), op))
+
+    def kill_vote(self, n, op, reg):
+        """Registers of the mask whose emptiness the branch ending block `n` tests (SCC or VCC = mask != 0), or None
+        when that is not plain: the last SCC writer must set SCC = (its 64-bit mask destination != 0), and nothing
+        after it in the block may write that mask."""
+        if op in ("s_cbranch_vccz", "s_cbranch_vccnz"):
+            return ("vcc",) if reg == "vcc" else None
+        body = self.blocks[n][:-1]
+        for k in range(len(body) - 1, -1, -1):
+            ins = body[k]
+            o, a = base_op(ins["op"]), ins["args"]
+            dests, _, defs, _ = operands(ins)
+            if "scc" not in defs and not o.startswith(("s_cmp", "s_bitcmp")):
+                continue
+            if o in ZERO_SCC and len(a) >= 2 and _mask64(a[0]):
+                m = tuple(_regs(a[0]))
+            elif o == "s_cmp_lg_u64" and len(a) == 2 and _mask64(a[0]) and a[1].get("k") == "imm" and a[1]["v"] == 0:
+                m = tuple(_regs(a[0]))
+            else:
+                return None
+            if m[0] != reg or m == ("exec",):
+                return None
+            for later in body[k + 1:]:
+                d, _, df, _ = operands(later)
+                if set(m) & ({r for x in d for r in _regs(x)} | set(df)):
+                    return None
+            return m
+        return None
+
+    def vm_export_before(self, n):
+        """Whether an `exp ... vm` is in a block from which block `n` can be reached (`n` itself included)."""
+        pred = {}
+        for b, ss in enumerate(self.succ):
+            for s_ in ss:
+                pred.setdefault(s_, []).append(b)
+        seen, work = set(), [n]
+        while work:
+            b = work.pop()
+            if b in seen:
+                continue
+            seen.add(b)
+            if any(base_op(i["op"]) == "exp" and "vm" in (i.get("mods") or []) for i in self.blocks[b]):
+                return True
+            work.extend(pred.get(b, []))
+        return False
+
+    def inert_exit(self, blk, m):
+        """Whether `blk` (through plain jumps) only sets EXEC to a subset of mask `m` (or to 0), then may export
+        with that EXEC, and ends: nothing else, no other successor."""
+        seen = set()
+        narrowed = False
+        while blk not in seen:
+            seen.add(blk)
+            for ins in self.blocks[blk]:
+                op, a = base_op(ins["op"]), ins["args"]
+                if op in ("s_nop", "s_waitcnt", "s_branch"):
+                    continue
+                if op == "s_endpgm":
+                    return narrowed
+                if op == "exp" and narrowed:
+                    continue
+                if a and _regs(a[0]) == ["exec"] and not _half(a[0]) and (
+                        (op == "s_mov_b64" and len(a) == 2 and (tuple(_regs(a[1])) == m or _zero(a[1]))) or
+                        (op == "s_and_b64" and len(a) == 3 and any(tuple(_regs(x)) == m or _zero(x) for x in a[1:]))):
+                    narrowed = True
+                    continue
+                return False
+            if len(self.succ[blk]) != 1:
+                return False
+            blk = self.succ[blk][0]
+        return False
+
+    def confined(self, run, m):
+        """Whether, on every path from block `run` (loops included), EXEC is narrowed into the whole quads of mask
+        `m` before anything but mask arithmetic runs, and stays inside them: then a lane of a half whose `m` is empty
+        is off for the rest of the wave. A must-dataflow over the blocks `run` reaches: (EXEC inside, set of 64-bit
+        registers that hold a subset); a write to EXEC keeps it inside only when it is provably a subset (a narrowing,
+        or a copy / union of registers known to be inside)."""
+        region, work = set(), [run]
+        while work:
+            b = work.pop()
+            if b not in region:
+                region.add(b)
+                work.extend(self.succ[b])
+        entry = {run: (False, frozenset({m}))}
+        work = [run]
+        while work:
+            b = work.pop()
+            inside, sub = entry[b]
+            for ins in self.blocks[b]:
+                if not inside and base_op(ins["op"]) not in OFF_OK:
+                    return False
+                inside, sub = self.confine_step(ins, inside, sub)
+            for s in self.succ[b]:
+                new = (inside, sub) if s not in entry else (entry[s][0] and inside, entry[s][1] & sub)
+                if new != entry.get(s):
+                    entry[s] = new
+                    work.append(s)
+        return True
+
+    @staticmethod
+    def confine_step(ins, inside, sub):
+        op, a = base_op(ins["op"]), ins["args"]
+        dests, srcs, defs, _ = operands(ins)
+
+        def ok(x):
+            return _zero(x) or (inside and _regs(x) == ["exec"] and not _half(x)) or tuple(_regs(x)) in sub
+
+        def combine(o, xs):
+            if o in ("s_mov_b64", "s_wqm_b64") and len(xs) == 1:
+                return ok(xs[0])
+            if o == "s_and_b64" and len(xs) == 2:
+                return ok(xs[0]) or ok(xs[1])
+            if o == "s_andn2_b64" and len(xs) == 2:
+                return ok(xs[0])
+            if o in ("s_or_b64", "s_xor_b64") and len(xs) == 2:
+                return ok(xs[0]) and ok(xs[1])
+            return False
+
+        written = {r for x in dests for r in _regs(x)} | set(defs)
+        new_sub = {k for k in sub if not set(k) & written}
+        old_inside = inside
+        if "exec" in written:
+            if op.startswith("v_cmpx"):
+                pass                                            # EXEC &= compare: a narrowing
+            elif op.startswith(SAVEEXEC) and len(a) == 2 and not _half(a[1]):
+                x = a[1]
+                if op.startswith(("s_and_saveexec_b64", "s_and_wrexec_b64")):
+                    inside = old_inside or ok(x)
+                elif op.startswith(("s_andn1_saveexec_b64", "s_andn1_wrexec_b64")):
+                    inside = old_inside
+                elif op.startswith(("s_andn2_saveexec_b64", "s_andn2_wrexec_b64")):
+                    inside = ok(x)
+                elif op.startswith(("s_or_saveexec_b64", "s_xor_saveexec_b64")):
+                    inside = old_inside and ok(x)
+                else:
+                    inside = False
+                if _mask64(a[0]):
+                    keep = inside if "_wrexec_" in op else old_inside
+                    if keep:
+                        new_sub.add(tuple(_regs(a[0])))
+            elif dests and _regs(dests[0]) == ["exec"] and not _half(dests[0]):
+                inside = combine(op, srcs)
+            else:
+                inside = False
+        elif dests and _mask64(dests[0]) and combine(op, srcs):
+            new_sub.add(tuple(_regs(dests[0])))
+        return inside, frozenset(new_sub)
 
     def past_jumps(self, blk):
         """`blk`, or where it leads when it holds nothing but jumps and waits (the layout of a vccnz skip)."""
@@ -765,7 +1334,7 @@ class Analysis:
             if op in ("s_waitcnt", "s_nop"):
                 continue
             a = ins["args"]
-            if op.startswith(("s_and_saveexec_b64", "s_andn2_saveexec_b64")) and len(a) == 2:
+            if op.startswith(("s_and_saveexec_b64", "s_and_wrexec_b64")) and len(a) == 2:
                 return (_regs(a[1]) or [None])[0] == reg
             if op in ("s_and_b64",) and len(a) == 3 and _regs(a[0]) == ["exec"]:
                 return reg in [(_regs(x) or [None])[0] for x in a[1:] if _regs(x) != ["exec"]]
@@ -790,7 +1359,7 @@ class Analysis:
                 if entry[s] is None or new != entry[s]:
                     entry[s] = new
                     work.append(s)
-        ev = {"viol": [], "idioms": set(), "uniform_readlane": set()}
+        ev = {"viol": [], "idioms": set(), "uniform_readlane": set(), "scalar_spills": set()}
         self.voted = {}
         for n in range(self.n):
             if entry[n] is not None:
@@ -860,6 +1429,10 @@ class Analysis:
                 regs += [r for r in d2 if r not in ("exec",)]
                 if any(_half(d) and d["t"].startswith("vcc") for d in dests):
                     regs.append("vcc")
+                if base_op(ins["op"]) == "v_writelane_b32" and len(ins["args"]) == 3 \
+                        and ins["args"][0].get("k") == "vgpr" and ins["args"][0]["r"] in self.pure_spill_vgprs \
+                        and ins["args"][2].get("k") == "imm":
+                    regs.append(("spill", ins["args"][0]["r"], ins["args"][2]["v"] & 63))
                 defs_of[(b, i)] = regs
 
         def sregs(x):
@@ -903,10 +1476,18 @@ class Analysis:
                 read = {r for x in srcs for r in sregs(x)} | {r for r in uses if r != "exec"}
                 if base_op(ins["op"]).startswith(("buffer_atomic", "global_atomic")) or dests and False:
                     read |= {r for x in ins["args"] for r in sregs(x)}
+                if base_op(ins["op"]) == "v_readlane_b32" and len(ins["args"]) == 3 \
+                        and ins["args"][1].get("k") == "vgpr" and ins["args"][1]["r"] in self.pure_spill_vgprs \
+                        and ins["args"][2].get("k") == "imm":
+                    read.add(("spill", ins["args"][1]["r"], ins["args"][2]["v"] & 63))
                 for r in read:
                     rd = st.get(r, frozenset({(-1, 0)}))
                     if len(rd) > 1 and any(d[0] >= 0 and ctrl[d[0]] for d in rd):
                         stale.add((id(ins), r))
+                if base_op(ins["op"]) in ("s_movrels_b32", "s_movrels_b64") and any(
+                        isinstance(r, tuple) and r[0] == "s" and len(rd) > 1 and any(d[0] >= 0 and ctrl[d[0]] for d in rd)
+                        for r, rd in st.items()):
+                    stale.add((id(ins), "m0"))
                 for r in defs_of[(b, i)]:
                     st[r] = frozenset({(b, i)})
         return stale
@@ -929,7 +1510,7 @@ def analyse(blocks, succ, masks, stage):
         pass
     tier = "C" if reasons else ("B" if idioms else "A")
     return {"tier": tier, "reasons": reasons, "idioms": idioms, "uniform_readlane": ev["uniform_readlane"],
-            "sites": ev["viol"][:8]}
+            "scalar_spills": sorted(ev["scalar_spills"]), "sites": ev["viol"][:8]}
 
 
 # ---- census over a shader index ----

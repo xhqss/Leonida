@@ -10,15 +10,18 @@
 // What a driver chooses (D3D11.3 functional spec 5.9.2.8.5: a mip with any dimension below the tile "may or may not
 // be packed, depending on the IHV"): where the packed tail starts, and how many tiles the packed mips take. Here
 // a mip stays standard while it is wider than half the tile or taller than the tile (depth does not count), as
-// AMD's PC runtime does on RDNA2 and RDNA4 (D3D-65; the console is AMD): 47 measured layouts, see
+// AMD's PC runtime does on RDNA2 and RDNA4 (D3D-65; the console is AMD): measured on the 47 layouts of #868, see
 // resource_tiling_test. A standard mip may be smaller than a tile and then takes one tile on that axis. An NVIDIA
 // GPU packs from the first mip smaller than a tile on any axis and WARP packs nothing; the test accepts all of
-// them. The packed size is their tight
-// linear size rounded up to whole tiles (at least one); NVIDIA sometimes reports one more. Applications read the
-// numbers rather than assume them, and this layer backs every reserved resource fully, so any split is consistent.
+// them. The packed tail takes one tile per tile-depth slice it spans: ceil(depth of the first packed mip / tile
+// depth), so 1 for 2D, as AMD's PC runtime reports on RDNA2 and RDNA4 (those 47 and 32 deeper volumes, see
+// resource_tiling_test), and never fewer than the tail's tight linear size in whole tiles. NVIDIA sometimes reports
+// one more. Applications read the numbers rather than assume them, and this layer backs reserved textures fully, so
+// any split is consistent.
 
 #include <algorithm>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace leonida {
@@ -107,10 +110,14 @@ constexpr TileShape small_tile_shape(bool volume, std::uint32_t element_bytes) {
 // False when the resource cannot be tiled: an untileable element size, no mips, or more than 2^32 tiles.
 inline bool resource_tiling(const TilingDesc& desc, ResourceTiling& out) {
     out = {};
-    const auto up = [](std::uint64_t value, std::uint64_t by) { return (value + by - 1) / by; };
+    constexpr std::uint64_t max_tiles = 0xffffffffu;
+    constexpr std::uint64_t max_packed_bytes = max_tiles * tile_size_in_bytes;
+    const auto up = [](std::uint64_t value, std::uint64_t by) -> std::uint64_t {
+        return value ? 1 + (value - 1) / by : 0;
+    };
     if (desc.kind == TiledKind::buffer) {
         const std::uint64_t tiles = up(desc.width, tile_size_in_bytes);
-        if (!tiles || tiles > 0xffffffffu) return false;
+        if (!tiles || tiles > max_tiles) return false;
         out.total_tiles = std::uint32_t(tiles);
         out.shape = {tile_size_in_bytes, 1, 1};
         out.subresources = {{out.total_tiles, 1, 1, 0}};
@@ -121,40 +128,63 @@ inline bool resource_tiling(const TilingDesc& desc, ResourceTiling& out) {
     const TileShape elements = element_tile_shape(volume, desc.element_bytes, desc.samples);
     if (!elements.width || !desc.mips || !desc.block || !desc.width || !desc.height || !desc.depth_or_layers)
         return false;
-    out.shape = {elements.width * desc.block, elements.height * desc.block, elements.depth};
+    const std::uint64_t shape_w = std::uint64_t(elements.width) * desc.block;
+    const std::uint64_t shape_h = std::uint64_t(elements.height) * desc.block;
+    if (shape_w > 0xffffffffu || shape_h > 0xffffffffu) return false;
+    ResourceTiling result;
+    result.shape = {std::uint32_t(shape_w), std::uint32_t(shape_h), elements.depth};
     const std::uint32_t layers = volume ? 1 : desc.depth_or_layers;
     const std::uint32_t depth = volume ? desc.depth_or_layers : 1;
 
     // One array slice: standard mips while wider than half a tile or taller than a tile, then the packed tail.
     std::vector<SubresourceTiling> slice(desc.mips);
     std::uint64_t standard_tiles = 0, packed_bytes = 0;
+    std::uint32_t tail_depth = 0;   // depth of the first packed mip
     for (std::uint32_t mip = 0; mip < desc.mips; ++mip) {
-        const std::uint64_t w = std::max<std::uint64_t>(1, desc.width >> mip);
-        const std::uint32_t h = std::max(1u, desc.height >> mip), d = std::max(1u, depth >> mip);
-        const bool standard = out.packed_mips == 0 && (w > out.shape.width / 2 || h > out.shape.height);
+        const std::uint64_t w = mip >= 64 ? 1 : std::max<std::uint64_t>(1, desc.width >> mip);
+        const std::uint32_t h = mip >= 32 ? 1u : std::max(1u, desc.height >> mip);
+        const std::uint32_t d = mip >= 32 ? 1u : std::max(1u, depth >> mip);
+        const bool standard = result.packed_mips == 0 && (w > result.shape.width / 2 || h > result.shape.height);
         if (standard) {
-            const std::uint64_t tw = up(w, out.shape.width), th = up(h, out.shape.height), td = up(d, out.shape.depth);
+            const std::uint64_t tw = up(w, result.shape.width);
+            const std::uint64_t th = up(h, result.shape.height);
+            const std::uint64_t td = up(d, result.shape.depth);
+            if (tw > max_tiles || th > max_tiles || td > max_tiles) return false;
+            const std::uint64_t xy = tw * th;
+            if (xy > max_tiles || xy > max_tiles / td) return false;
+            const std::uint64_t mip_tiles = xy * td;
+            if (mip_tiles > max_tiles - standard_tiles) return false;
             slice[mip] = {std::uint32_t(tw), std::uint32_t(th), std::uint32_t(td), std::uint32_t(standard_tiles)};
-            standard_tiles += tw * th * td;
-            ++out.standard_mips;
+            standard_tiles += mip_tiles;
+            ++result.standard_mips;
         } else {
             slice[mip] = {0, 0, 0, packed_tile};
-            packed_bytes += up(w, desc.block) * up(h, desc.block) * d * desc.element_bytes * desc.samples;
-            ++out.packed_mips;
+            const std::uint64_t row_slice_bytes =
+                up(w, desc.block) * up(h, desc.block) * desc.element_bytes * desc.samples;
+            if (d > (max_packed_bytes - packed_bytes) / row_slice_bytes) return false;
+            packed_bytes += row_slice_bytes * d;
+            if (result.packed_mips == 0) tail_depth = d;
+            ++result.packed_mips;
         }
     }
-    const std::uint64_t packed_tiles = out.packed_mips ? std::max<std::uint64_t>(1, up(packed_bytes, tile_size_in_bytes)) : 0;
+    // One tile per tile-depth slice of the tail (AMD), at least its tight size; 1 for 2D.
+    const std::uint64_t packed_tiles =
+        result.packed_mips ? std::max<std::uint64_t>({1, up(packed_bytes, tile_size_in_bytes),
+                                                      up(tail_depth, result.shape.depth)})
+                           : 0;
+    if (packed_tiles > max_tiles - standard_tiles) return false;
     const std::uint64_t per_slice = standard_tiles + packed_tiles;
-    if (per_slice * layers > 0xffffffffu) return false;
-    out.packed_tiles = std::uint32_t(packed_tiles);
-    out.packed_start = out.packed_mips ? std::uint32_t(standard_tiles) : 0;
-    out.total_tiles = std::uint32_t(per_slice * layers);
-    out.subresources.reserve(std::size_t(desc.mips) * layers);
+    if (per_slice > max_tiles / layers) return false;
+    result.packed_tiles = std::uint32_t(packed_tiles);
+    result.packed_start = result.packed_mips ? std::uint32_t(standard_tiles) : 0;
+    result.total_tiles = std::uint32_t(per_slice * layers);
+    result.subresources.reserve(std::size_t(desc.mips) * layers);
     for (std::uint32_t layer = 0; layer < layers; ++layer)
         for (SubresourceTiling s : slice) {
             if (s.start != packed_tile) s.start += std::uint32_t(per_slice * layer);
-            out.subresources.push_back(s);
+            result.subresources.push_back(s);
         }
+    out = std::move(result);
     return true;
 }
 

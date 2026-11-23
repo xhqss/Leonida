@@ -75,6 +75,10 @@ FIELD = {
 # Per-entity 64-bit archetype key (Murmur3-64 of the archetype name, docs/world_names.md); the engine name of
 # this member is not recovered.
 ARCHETYPE_KEY = 0xC8A7B90A
+# CMapData.entities and the measured terrain map-reference array and entity selector (docs/world.md).
+MAP_ENTITIES = 0xCCAB9307
+PARENT_MAPS = 0x75D16ADF
+PARENT_MAP_SLOT = 0x84799847
 LOD_NAMES = {0: "HD", 1: "LOD", 2: "SLOD1", 3: "SLOD2", 4: "SLOD3", 5: "ORPHAN_HD", 6: "SLOD4"}
 
 
@@ -148,13 +152,56 @@ def _r4(values):
     return [round(v, 4) for v in values] if values else None
 
 
+def _typed_member(schema, key, ty, width):
+    size, members = schema
+    m = members.get(key)
+    return m if m is not None and m[1] == ty and m[0] + width <= size else None
+
+
+def _placement_tables(b, blocks, map_schema, entity_schema):
+    """Index encoded entity references by their original slot in the declared map root."""
+    root = _u32(b, 0x20)
+    if not 1 <= root <= len(blocks):
+        return None, {}, ()
+    tag, size, at = blocks[root - 1]
+    name = _typed_member(map_schema, FIELD["name"], 0x4A, 4)
+    if (tag != MAPDATA or at is None or name is None or map_schema[0] > size
+            or at + map_schema[0] > len(b)):
+        return None, {}, ()
+
+    def array(key, block_type, fmt):
+        member = _typed_member(map_schema, key, 0x52, 12)
+        if member is None:
+            return ()
+        ref, count, capacity = struct.unpack_from("<QHH", b, at + member[0])
+        number, offset = ref & 0xFFFFF, ref >> 20
+        if not count or count > capacity or not 1 <= number <= len(blocks):
+            return ()
+        kind, length, base = blocks[number - 1]
+        end = offset + count * struct.calcsize("<" + fmt)
+        if kind != block_type or base is None or end > length or base + end > len(b):
+            return ()
+        return struct.unpack_from(f"<{count}{fmt}", b, base + offset)
+
+    ordinals = {}
+    for i, ref in enumerate(array(MAP_ENTITIES, 7, "Q")):
+        # A repeated reference has no unique ordinal. Other classes still occupy their authored slots.
+        ordinals[ref] = None if ref in ordinals else i
+    parents = ()
+    if (ordinals and _typed_member(entity_schema, PARENT_MAP_SLOT, 0x10, 1)
+            and _typed_member(entity_schema, FIELD["parentIndex"], 0x12, 2)
+            and _typed_member(entity_schema, FIELD["parentInstance"], 0x12, 2)):
+        parents = array(PARENT_MAPS, 0x4A, "I")
+    return f"{_u32(b, at + name[0]):08x}", ordinals, parents
+
+
 def parse_resource(b, collect=None):
     """Return a row dict for a 0x7a resource, or None if the header/schema does not validate.
 
     When ``collect`` is given (a list, or an object with ``append`` such as ``ArchetypeCounts``), one dict per
     CEntityDef is appended to it. ``complete`` is False for an entity whose record is not entirely inside ``b``,
-    including every entity of a block whose start lies past the end of ``b``. The CLI uses it only for
-    ``--archetypes-out``, which writes aggregate counts.
+    including every entity of a block whose start lies past the end of ``b``. The CLI uses collectors for
+    ``--archetypes-out`` counts and ``--entities-out`` placement rows.
     """
     if len(b) < 0x50 or b[0x10:0x14] != SIGNATURE or b[0x14] != VERSION:
         return None
@@ -204,11 +251,14 @@ def parse_resource(b, collect=None):
 
     em = structs[ENTITY][1]
     mm = structs[MAPDATA][1]
+    map_name, ordinals, parents = None, {}, ()
+    if getattr(collect, "placement_ids", False):
+        map_name, ordinals, parents = _placement_tables(b, blocks, structs[MAPDATA], structs[ENTITY])
     lod = {}
     archetypes = set()
     positions = []
     lod_dists = []
-    for name, size, off in blocks:
+    for block_number, (name, size, off) in enumerate(blocks, 1):
         if name != ENTITY or entity_size == 0 or size % entity_size:
             continue
         if off is None:
@@ -232,7 +282,7 @@ def parse_resource(b, collect=None):
             if isinstance(dist, float) and dist >= 0:
                 lod_dists.append(dist)
             if collect is not None:
-                collect.append({
+                entity = {
                     "complete": o + entity_size <= len(b),
                     "archetype": a,
                     "archetype_key": _value(b, o, em.get(ARCHETYPE_KEY)),
@@ -248,7 +298,16 @@ def parse_resource(b, collect=None):
                     "num_children": _value(b, o, em.get(FIELD["numChildren"])),
                     "lod_dist": dist,
                     "child_lod_dist": _value(b, o, em.get(FIELD["childLodDist"])),
-                })
+                }
+                # Match a typed record start exactly, without renumbering or reordering the legacy rows.
+                ordinal = ordinals.get(((k * entity_size) << 20) | block_number) if ordinals else None
+                if ordinal is not None and entity["complete"]:
+                    entity.update(map_name=map_name, entity_index=ordinal)
+                    if parents and entity["parent_instance"] == -1 and entity["parent_index"] >= 0:
+                        slot = _value(b, o, em[PARENT_MAP_SLOT])
+                        if slot is not None and 0 <= slot < len(parents):
+                            entity["parent_map_name"] = f"{parents[slot]:08x}"
+                collect.append(entity)
     row.update({
         "kind": "map",
         "entity_size": entity_size,
@@ -285,16 +344,21 @@ ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 
 
 def _needs_continuation(b):
-    """True when a 0x7a header's instance table or a system block pointer lies beyond this stream."""
+    """True when a 0x7a header's instance table or a system block extends beyond this stream."""
     if len(b) < 0x50 or b[0x10:0x14] != SIGNATURE or b[0x14] != VERSION:
         return False
-    it = _ptr(_u64(b, 0x38), len(b))
     nbl = _u16(b, 0x4C)
+    if nbl == 0 or nbl > 4096:
+        return False
+    it = _ptr(_u64(b, 0x38), len(b))
     if it is None or it + 16 * nbl > len(b):
         return True
     for i in range(nbl):
-        p = _u64(b, it + 16 * i + 8)
-        if p >> 28 == 5 and (p & 0x0FFFFFFF) >= len(b):
+        o = it + 16 * i
+        size, p = _u32(b, o + 4), _u64(b, o + 8)
+        if size > (1 << 24):
+            return False
+        if p >> 28 == 5 and (p & 0x0FFFFFFF) + size > len(b):
             return True
     return False
 
@@ -371,10 +435,10 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
                     if not mt:
                         break
                     try:
-                        more, mused, meof, _ = _inflate_stream(m, nxt, end, max_inflate, keep=True)
+                        more, mused, meof, more_is_meta = _inflate_stream(m, nxt, end, max_inflate, keep=True)
                     except zlib.error:
                         break
-                    if not meof or not more:
+                    if not meof or not more or more_is_meta:
                         break
                     data += more
                     used += mused
@@ -419,6 +483,15 @@ def _carve_successors(folder):
             for off, stored in by_off.items() if (off + stored + 15) & ~15 in by_off}
 
 
+def _read_carved(path, max_inflate):
+    """Read a carved file within the cap, or return None if it is too large."""
+    with open(path, "rb") as f:
+        if os.fstat(f.fileno()).st_size > max_inflate:
+            return None
+        data = f.read(max_inflate + 1)  # detect growth after fstat
+    return data if len(data) <= max_inflate else None
+
+
 def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, directory_files=None):
     """Scan an RPF9 archive, or every carved file in a directory."""
     if directory_files is not None or os.path.isdir(path):
@@ -440,10 +513,9 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, di
                 stats["files"] += 1
                 stats["scanned_bytes"] += sub["scanned_bytes"]
                 continue
-            if os.path.getsize(p) > max_inflate:
+            b = _read_carved(p, max_inflate)
+            if b is None:
                 continue
-            with open(p, "rb") as f:
-                b = f.read(max_inflate + 1)
             stats["files"] += 1
             stats["scanned_bytes"] += len(b)
             # As in scan_rpf: a 0DRPz resource that needs a continuation takes the next stream, when the
@@ -464,6 +536,8 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, di
                     break
                 with open(q, "rb") as f:
                     more = f.read()
+                if more[0x10:0x15] == b"0DRPz":
+                    break
                 b += more
                 consumed.add(q)
                 stats["files"] += 1
@@ -480,8 +554,9 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, di
         magic = f.read(4)
     if magic == b"9FPR":
         return scan_rpf(path, start, limit, max_inflate, collect)
-    with open(path, "rb") as f:
-        b = f.read(max_inflate + 1)
+    b = _read_carved(path, max_inflate)
+    if b is None:
+        return [], {"path": os.path.abspath(path), "files": 0, "scanned_bytes": 0}
     row = parse_resource(b, collect)
     return ([dict(row, offset=0, size=len(b), file=os.path.basename(path))] if row else [],
             {"path": os.path.abspath(path), "files": 1, "scanned_bytes": len(b)})
@@ -527,6 +602,7 @@ class EntityRows:
 
     FIELDS = ("position", "rotation", "scale_xy", "scale_z", "lod_level", "parent_index", "num_children",
               "lod_dist", "child_lod_dist")
+    placement_ids = True
 
     def __init__(self, handle):
         self.handle = handle
@@ -542,6 +618,9 @@ class EntityRows:
             row["key"] = f"{entity['archetype_key']:016x}"
         for k in self.FIELDS:
             row[k] = entity.get(k)
+        for k in ("map_name", "entity_index", "parent_map_name"):
+            if k in entity:
+                row[k] = entity[k]
         self.handle.write(json.dumps(row, separators=(",", ":")) + "\n")
         self.written += 1
 
@@ -551,6 +630,7 @@ class _Both:
 
     def __init__(self, *sinks):
         self.sinks = [x for x in sinks if x is not None]
+        self.placement_ids = any(getattr(x, "placement_ids", False) for x in self.sinks)
 
     def append(self, entity):
         for x in self.sinks:
@@ -742,7 +822,7 @@ def _write_reports(a, rows, stats, agg):
     summary["versions"] = sorted({r["version"] for r in rows})
     doc = {"summary": summary, "resources": rows}
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    with open(a.out, "w", encoding="utf-8") as f:
+    with open(a.out, "w", encoding="utf-8", newline="\n") as f:
         json.dump(doc, f, indent=1, sort_keys=True)
     if a.csv:
         cols = ["source", "offset", "size", "signature", "version", "kind", "structs", "enums", "blocks",
@@ -763,7 +843,7 @@ def _write_reports(a, rows, stats, agg):
                 w.writerow(r)
     if agg is not None:
         os.makedirs(os.path.dirname(os.path.abspath(a.archetypes_out)), exist_ok=True)
-        with open(a.archetypes_out, "w", encoding="utf-8") as f:
+        with open(a.archetypes_out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(agg.to_json(), f, indent=1, sort_keys=True)
         summary["archetype_file"] = agg.to_json()["summary"]
     return summary

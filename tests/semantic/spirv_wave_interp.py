@@ -20,7 +20,8 @@ tests/semantic/spirv_mini_interp.py runs one invocation of forward-only code. Th
     composited. Float arithmetic raises, so a NaN payload can never be rewritten by the host.
 
 Inputs: Input variables decorated BuiltIn SubgroupLocalInvocationId read the lane number, SubgroupSize reads the
-wave size; other Input variables read zero, except the built-ins named in `builtins` (name -> function of the
+wave size; BaseVertex and BaseInstance read 0; other Input variables read zero, except the built-ins named in
+`builtins` (name -> function of the
 lane number giving that lane's integer value, e.g. {"VertexIndex": lambda lane: first + lane}). PushConstant words
 can be seeded (default zero).
 
@@ -28,7 +29,9 @@ can be seeded (default zero).
         {"outputs": [ {output_name: tuple_of_words} or None (lane killed) for each lane ],
          "steps": instructions executed (summed over invocations)}
 """
+import math
 import re
+import struct
 
 MASK = 0xFFFFFFFF
 SUBGROUP = 3        # Scope Subgroup
@@ -99,6 +102,29 @@ def _signed(v, bits):
     return v - (1 << bits) if v >> (bits - 1) else v
 
 
+def _f32_unpack(v):
+    if not isinstance(v, F):
+        raise UnsupportedConstruct(f"float operation on {type(v).__name__}")
+    return struct.unpack("<f", struct.pack("<I", v.bits))[0]
+
+
+def _f32_pack(x):
+    if math.isnan(x):
+        return F(0x7FC00000)
+    try:
+        return F(struct.unpack("<I", struct.pack("<f", x))[0])
+    except OverflowError:
+        return F(0xFF800000 if math.copysign(1.0, x) < 0 else 0x7F800000)
+
+
+def _wrap_input(v):
+    if isinstance(v, float):
+        return _f32_pack(v)
+    if isinstance(v, (tuple, list)):
+        return tuple(_wrap_input(x) for x in v)
+    return v
+
+
 class _Block:
     __slots__ = ("label", "phis", "body", "merge", "term")
 
@@ -124,6 +150,7 @@ class _Module:
         self.ptr_types = {}
         self.globals = []           # (id, storage class, pointee type, initializer id)
         self.builtins = {}
+        self.locations = {}
         self.blocks = {}
         self.entry = None
         self.id_type = {}
@@ -160,7 +187,12 @@ class _Module:
                     raise UnsupportedConstruct(f"{op} before the first label")
                 if res and a and op != "OpStore":
                     self.id_type[res] = a[0]
+                if op == "OpVariable" and a[1:2] == ["Function"] and len(self.blocks) > 1:
+                    raise InvalidModule(f"{line!r} is a Function variable outside the function's first block")
                 if op == "OpPhi":
+                    if cur.body:
+                        raise InvalidModule(f"{line!r} follows a non-phi instruction of its block (spirv-val: "
+                                            "OpPhi must come first)")
                     cur.phis.append((res, a))
                 elif op in ("OpSelectionMerge", "OpLoopMerge"):
                     cur.merge = (op, a[0], a[1] if op == "OpLoopMerge" else None)
@@ -181,6 +213,8 @@ class _Module:
             if op == "OpDecorate":
                 if len(a) >= 3 and a[1] == "BuiltIn":
                     self.builtins[a[0]] = a[2]
+                elif len(a) >= 3 and a[1] == "Location":
+                    self.locations[a[0]] = int(a[2])
                 continue
             self._header(res, op, a)
         if self.entry is None:
@@ -226,6 +260,7 @@ class _Module:
             self.consts[res] = False
         elif op == "OpConstantNull":
             self.consts[res] = self.zero(a[0])
+            self.id_type[res] = a[0]
         elif op == "OpConstantComposite":
             self.consts[res] = tuple(self.consts[x] for x in a[1:])
         elif op == "OpVariable":
@@ -286,7 +321,7 @@ def _copy(v):
 
 
 class _Wave:
-    def __init__(self, mod, wave, push_constants, max_steps, builtins=None):
+    def __init__(self, mod, wave, push_constants, max_steps, builtins=None, inputs=None, memory=None):
         self.m = mod
         self.wave = wave
         self.pcw = list(push_constants or [])
@@ -295,6 +330,7 @@ class _Wave:
         self.lanes = [_Lane(i) for i in range(wave)]
         self.killed = set()
         self.returned = set()
+        self.memory = memory if memory is not None else {}
         for lane in self.lanes:
             for vid, cls, pointee, init in mod.globals:
                 if cls == "PushConstant":
@@ -308,8 +344,14 @@ class _Wave:
                         value = wave
                     elif builtins and b in builtins:
                         value = builtins[b](lane.index) & MASK
+                    elif b in ("BaseVertex", "BaseInstance"):
+                        value = 0     # a draw with no vertex/instance offset, unless `builtins` seeds one
                     elif b is None:
-                        value = mod.zero(pointee)
+                        loc = mod.locations.get(vid)
+                        if inputs is not None and loc in inputs:
+                            value = _wrap_input(inputs[loc](lane.index))
+                        else:
+                            value = mod.zero(pointee)
                     else:
                         value = _BuiltinNotModelled(b)
                     box = [value]
@@ -486,8 +528,9 @@ class _Wave:
             return a[1] if self.bool_of(lane, a[0]) else a[2]
         if op == "OpSwitch":
             sel = self.int_of(lane, a[0])
+            mask = (1 << self.m.bits(self.m.id_type[a[0]])) - 1
             for k in range(2, len(a) - 1, 2):
-                if int(a[k], 0) == sel:
+                if (int(a[k], 0) & mask) == sel:
                     return a[k + 1]
             return a[1]
         raise UnsupportedConstruct(op)
@@ -612,6 +655,22 @@ class _Wave:
         elif op == "OpGroupNonUniformElect":
             for i in members:
                 L[i].values[res] = i == members[0]
+        elif op == "OpGroupNonUniformQuadSwap":
+            src_vals = {i: self.raw(L[i], a[2]) for i in members}
+            for i in members:
+                d = self.int_of(L[i], a[3])
+                if d not in (0, 1, 2):
+                    raise UnsupportedConstruct(f"OpGroupNonUniformQuadSwap direction {d}")
+                partner = i ^ (d + 1)
+                L[i].values[res] = src_vals[partner] if partner in src_vals else                     _Poison(f"QuadSwap from invocation {partner}, which is not running")
+        elif op == "OpGroupNonUniformQuadBroadcast":
+            src_vals = {i: self.raw(L[i], a[2]) for i in members}
+            for i in members:
+                idx = self.int_of(L[i], a[3])
+                if not 0 <= idx < 4:
+                    raise UnsupportedConstruct(f"OpGroupNonUniformQuadBroadcast index {idx}")
+                partner = (i & ~3) | idx
+                L[i].values[res] = src_vals[partner] if partner in src_vals else                     _Poison(f"QuadBroadcast from invocation {partner}, which is not running")
         else:
             raise UnsupportedConstruct(op)
 
@@ -629,6 +688,26 @@ class _Wave:
             p = lane.pointers.get(a[1])
             if p is None:
                 raise UnsupportedConstruct(f"OpAccessChain on {a[1]}, which is not a pointer")
+            if p[0] == "psb":
+                addr, ty = p[1], p[2]
+                for x in a[2:]:
+                    idx = self.int_of(lane, x)
+                    k = m.types[ty]
+                    if k[0] in ("arr", "rarr", "vec"):
+                        addr += m.size(k[1]) * idx
+                        ty = k[1]
+                    elif k[0] == "struct":
+                        addr += sum(m.size(t) for t in k[1][:idx])
+                        ty = k[1][idx]
+                    else:
+                        raise UnsupportedConstruct(f"psb access chain into {k[0]}")
+                lane.pointers[res] = ("psb", addr, ty)
+                return None
+            if p[0] == "psb":
+                if m.size(p[2]) != 4:
+                    raise UnsupportedConstruct("psb load wider than one word")
+                v = self.memory.get(p[1], 0)
+                return F(v) if m.types[p[2]][0] == "float" else v & MASK
             if p[0] == "pc":
                 off, ty = p[1], p[2]
                 for x in a[2:]:
@@ -673,10 +752,33 @@ class _Wave:
             if isinstance(v, list) and m.types[p[2]][0] == "vec":
                 return tuple(v)
             return _copy(v)
+        if op == "OpConvertUToPtr":
+            addr = self.int_of(lane, a[1])
+            cls, pointee = m.ptr_types[a[0]]
+            if cls != "PhysicalStorageBuffer":
+                raise UnsupportedConstruct(f"OpConvertUToPtr to storage class {cls}")
+            lane.pointers[res] = ("psb", addr, pointee)
+            return None
+        if op == "OpAtomicIAdd":
+            p = lane.pointers.get(a[1])
+            if p is None or p[0] == "pc":
+                raise UnsupportedConstruct(f"OpAtomicIAdd on {a[1]}")
+            val = self.int_of(lane, a[4])
+            if p[0] == "psb":
+                old = self.memory.get(p[1], 0)
+                self.memory[p[1]] = (old + val) & MASK
+                return old
+            old = p[0][p[1]] & MASK
+            p[0][p[1]] = (old + val) & MASK
+            return old
         if op == "OpStore":
             p = lane.pointers.get(a[0])
             if p is None or p[0] == "pc":
                 raise UnsupportedConstruct(f"OpStore to {a[0]}")
+            if p[0] == "psb":
+                v = self.val(lane, a[1])
+                self.memory[p[1]] = (v.bits if isinstance(v, F) else int(v)) & MASK
+                return None
             p[0][p[1]] = _copy(self.raw(lane, a[1]))
             return None
         if op == "OpSelect":
@@ -720,8 +822,60 @@ class _Wave:
                     "OpLogicalNotEqual": x != y}[op]
         if op == "OpLogicalNot":
             return not self.bool_of(lane, a[1])
-        if op.startswith("OpF") or op in ("OpConvertFToU", "OpConvertFToS", "OpConvertUToF", "OpConvertSToF",
-                                          "OpExtInst") and not self._int_ext(a):
+        if op == "OpFNegate":
+            if m.types.get(a[0], ("",))[0] != "float":
+                raise UnsupportedConstruct(f"OpFNegate with result type {a[0]}")
+            x = self.val(lane, a[1])
+            if not isinstance(x, F):
+                raise UnsupportedConstruct(f"OpFNegate on {type(x).__name__}")
+            return F(x.bits ^ 0x80000000)
+        if op in ("OpFAdd", "OpFSub", "OpFMul", "OpFDiv"):
+            if m.types.get(a[0], ("",))[0] != "float":
+                raise UnsupportedConstruct(f"{op} with result type {a[0]}")
+            x, y = _f32_unpack(self.val(lane, a[1])), _f32_unpack(self.val(lane, a[2]))
+            if op == "OpFAdd":
+                return _f32_pack(x + y)
+            if op == "OpFSub":
+                return _f32_pack(x - y)
+            if op == "OpFMul":
+                return _f32_pack(x * y)
+            if y == 0.0:
+                if x == 0.0 or math.isnan(x):
+                    return F(0x7FC00000)
+                neg = (math.copysign(1.0, x) * math.copysign(1.0, y)) < 0
+                return F(0xFF800000 if neg else 0x7F800000)
+            return _f32_pack(x / y)
+        if op in ("OpFOrdEqual", "OpFOrdNotEqual", "OpFOrdLessThan", "OpFOrdGreaterThan",
+                  "OpFOrdLessThanEqual", "OpFOrdGreaterThanEqual",
+                  "OpFUnordEqual", "OpFUnordNotEqual", "OpFUnordLessThan", "OpFUnordGreaterThan",
+                  "OpFUnordLessThanEqual", "OpFUnordGreaterThanEqual"):
+            x, y = _f32_unpack(self.val(lane, a[1])), _f32_unpack(self.val(lane, a[2]))
+            if math.isnan(x) or math.isnan(y):
+                return op.startswith("OpFUnord")
+            cmp_name = op.removeprefix("OpFUnord").removeprefix("OpFOrd")
+            return {"Equal": x == y, "NotEqual": x != y, "LessThan": x < y, "GreaterThan": x > y,
+                    "LessThanEqual": x <= y, "GreaterThanEqual": x >= y}[cmp_name]
+        if op in ("OpConvertFToU", "OpConvertFToS"):
+            if m.types.get(a[0], ("",))[0] != "int":
+                raise UnsupportedConstruct(f"{op} with result type {a[0]}")
+            bits = m.bits(a[0])
+            x = _f32_unpack(self.val(lane, a[1]))
+            if math.isnan(x) or not math.isfinite(x):
+                return _Poison(f"{op} on {x}")
+            t = int(x)
+            lo, hi = (0, 1 << bits) if op == "OpConvertFToU" else (-(1 << (bits - 1)), 1 << (bits - 1))
+            if not lo <= t < hi:
+                return _Poison(f"{op} out of range: {t}")
+            return t & ((1 << bits) - 1)
+        if op in ("OpConvertUToF", "OpConvertSToF"):
+            if m.types.get(a[0], ("",))[0] != "float":
+                raise UnsupportedConstruct(f"{op} with result type {a[0]}")
+            v = self.int_of(lane, a[1])
+            if op == "OpConvertSToF":
+                bw = m.bits(m.id_type.get(a[1], a[0])) if m.types.get(m.id_type.get(a[1]), ("",))[0] == "int" else 32
+                v = _signed(v, bw)
+            return _f32_pack(float(v))
+        if op.startswith("OpF") or op == "OpExtInst" and not self._int_ext(a):
             raise UnsupportedConstruct(f"{op}: float arithmetic is not modelled here")
         if op == "OpExtInst":
             return self.ext(lane, a)
@@ -762,7 +916,9 @@ class _Wave:
                 x = _signed(x, src_bits)
             return x & w
         if op == "OpBitCount":
-            return (self.int_of(lane, a[1]) & MASK).bit_count()
+            # Every bit of the operand counts: its width, not 32 (a 64-bit operand with a 32-bit result).
+            src_bits = m.bits(m.id_type[a[1]]) if a[1] in m.id_type else 32
+            return (self.int_of(lane, a[1]) & ((1 << src_bits) - 1)).bit_count()
         if op == "OpBitReverse":
             return int(f"{self.int_of(lane, a[1]) & w:0{bits}b}"[::-1], 2)
         if op in ("OpUDiv", "OpUMod"):
@@ -807,7 +963,8 @@ class _Wave:
             raise UnsupportedConstruct(f"extended instruction set {a[1]}")
         name = a[2]
         args = [self.int_of(lane, x) for x in a[3:]]
-        s = lambda v: _signed(v, 32)  # noqa: E731
+        bits = self.m.bits(a[0])        # the operands have the result's type (GLSL.std.450)
+        s = lambda v: _signed(v, bits)  # noqa: E731
         if name == "UMin":
             return min(args)
         if name == "UMax":
@@ -817,13 +974,15 @@ class _Wave:
         if name == "SMax":
             return max(args, key=s)
         if name == "SAbs":
-            return abs(s(args[0])) & MASK
+            return abs(s(args[0])) & ((1 << bits) - 1)
         if name in ("UClamp", "SClamp"):
             key = s if name == "SClamp" else (lambda v: v)
             x, lo, hi = args
             if key(lo) > key(hi):
                 raise UnsupportedConstruct(f"{name} with minVal > maxVal (undefined)")
             return min(max(x, lo, key=key), hi, key=key)
+        if name in ("FindILsb", "FindUMsb", "FindSMsb") and bits != 32:
+            raise UnsupportedConstruct(f"GLSL.std.450 {name} on a {bits}-bit integer (limited to 32-bit components)")
         if name == "FindILsb":
             x = args[0] & MASK
             return ((x & -x).bit_length() - 1) & MASK if x else MASK
@@ -845,9 +1004,9 @@ class _BuiltinNotModelled:
         self.name = name
 
 
-def run_wave(text, wave=32, push_constants=None, max_steps=2_000_000, builtins=None):
+def run_wave(text, wave=32, push_constants=None, max_steps=2_000_000, builtins=None, inputs=None, memory=None):
     if wave not in (32, 64):
         raise ValueError("wave must be 32 or 64")
-    w = _Wave(_Module(text), wave, push_constants, max_steps, builtins)
+    w = _Wave(_Module(text), wave, push_constants, max_steps, builtins, inputs=inputs, memory=memory)
     outputs = w.run()
-    return {"outputs": outputs, "steps": w.steps}
+    return {"outputs": outputs, "steps": w.steps, "memory": w.memory}

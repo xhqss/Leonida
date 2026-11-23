@@ -26,17 +26,24 @@ def bc_bpe(fmt_name):
     return BPE.get(fmt_name.split("_", 1)[0])
 
 
-def mip_bytes(w, h, bpe, align):
+def _tile_shape(tile_bytes: int, bpe: int) -> tuple[int, int]:
+    elements = tile_bytes // bpe
+    width = 1 << (elements.bit_length() // 2)
+    return width, elements // width
+
+
+def mip_bytes(w: int, h: int, bpe: int, align: int) -> int:
+    """Size of a mip in 4K/64K tiles, or its aligned linear size for other alignments."""
     bw, bh = max(1, (w + 3) // 4), max(1, (h + 3) // 4)
+    if align in (4096, 65536):
+        tw, th = _tile_shape(align, bpe)
+        return ((bw + tw - 1) // tw) * ((bh + th - 1) // th) * align
     n = bw * bh * bpe
     return (n + align - 1) // align * align
 
 
 def offsets_for(eq, bb, bpe, wb, hb):
-    elems = (1 << bb) // bpe
-    lb = elems.bit_length() - 1
-    bw = 1 << ((lb + 1) // 2)
-    bh = elems // bw
+    bw, bh = _tile_shape(1 << bb, bpe)
     y, x = np.mgrid[0:hb, 0:wb].astype(np.int64)
     o = np.zeros_like(x)
     for bit, (mx, my) in enumerate(eq):
@@ -76,10 +83,16 @@ def main():
     a = ap.parse_args()
     if bc_bpe(a.fmt) is None:
         ap.error(f"no color scorer for {a.fmt!r}; expected BC1, BC2, or BC3")
+    try:
+        with open(a.index, encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError) as error:
+        ap.error(f"cannot read texture index {a.index}: {error}")
+    if not isinstance(index, list):
+        ap.error(f"{a.index}: texture index must contain a list")
     nib, tab = load()
-    with open(a.index, encoding="utf-8") as f:
-        texs = [t for t in json.load(f) if t["fmt_name"].startswith(a.fmt)
-                and bc_bpe(t["fmt_name"]) is not None and t["w"] >= 256 and t["h"] >= 256]
+    texs = [t for t in index if t["fmt_name"].startswith(a.fmt)
+            and bc_bpe(t["fmt_name"]) is not None and t["w"] >= 256 and t["h"] >= 256]
     texs = texs[: a.n]
     cands = {}
     for tname, ents in tab.items():
@@ -101,7 +114,10 @@ def main():
             align = 1 << bb
             top = mip_bytes(t["w"], t["h"], bpe, align)
             chain = sum(mip_bytes(max(1, t["w"] >> i), max(1, t["h"] >> i), bpe, align) for i in range(max(1, mips)))
-            for place, start in (("first", t["data_off"]), ("last", t["data_off"] + chain - top)):
+            placements = [("first", t["data_off"])]
+            if chain != top:
+                placements.append(("last", t["data_off"] + chain - top))
+            for place, start in placements:
                 o = offsets_for(list(eq), bb, bpe, wb, hb)
                 seg = G[start:start + (int(o.max()) + 1) * bpe]
                 if len(seg) < (int(o.max()) + 1) * bpe:

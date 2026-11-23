@@ -6,6 +6,7 @@ entries, so these run on every CI leg including Windows without llvm-mc.
 """
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 
@@ -65,6 +66,22 @@ def test_pack_layout_unknown_type():
     assert dwords == [] and "unknown type" in error
 
 
+def test_cli_refuses_boolean_root_constant_count(tmp_path):
+    index_path = tmp_path / "index.json"
+    index_path.write_text(json.dumps({"synthetic": {
+        "user_sgpr_reads": [{"sgpr": 0, "kind": "const32"}],
+    }}), encoding="utf-8")
+    sig_path = tmp_path / "sig.json"
+    sig_path.write_text(json.dumps({
+        "params": [{"type": "constants", "count": True}],
+    }), encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-I", TOOL, str(index_path), "--rootsig", str(sig_path)],
+        capture_output=True, text=True)
+    assert result.returncode == 1
+    assert "root signature refused: param 0: constants need an integer count >= 1" in result.stdout
+
+
 def test_reconcile_compatible():
     dwords, _ = rsc.pack_layout(ROOT_SIG)
     reads = [{"sgpr": 0, "kind": "const32"},
@@ -112,6 +129,26 @@ def test_cli_hard_fail_on_contradiction(tmp_path):
         capture_output=True, text=True)
     assert r.returncode == 1
     assert "CONTRADICTION bad" in r.stdout
+
+
+@pytest.mark.parametrize(("sgpr", "status", "diagnostic"), [
+    (4, 0, "1 compatible"),
+    (5, 1, "s5 (ptr32_lo) reads the high half of the address"),
+    (6, 0, "1 compatible"),
+    (7, 1, "s7 (ptr32_lo) reads the high half of the address"),
+])
+def test_cli_32bit_pointer_must_use_low_address_slot(
+    tmp_path: Path, sgpr: int, status: int, diagnostic: str,
+) -> None:
+    index = {"shader": {"user_sgpr_reads": [{"sgpr": sgpr, "kind": "ptr32_lo"}]}}
+    index_path = tmp_path / "index.json"
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+    sig_path = tmp_path / "sig.json"
+    sig_path.write_text(json.dumps(ROOT_SIG), encoding="utf-8")
+    result = subprocess.run([sys.executable, "-I", TOOL, str(index_path), "--rootsig", str(sig_path)],
+                            capture_output=True, text=True)
+    assert result.returncode == status, result.stdout + result.stderr
+    assert diagnostic in result.stdout
 
 
 @pytest.mark.parametrize("bad_index", ["not json", "[]", '{"a": 1}'])

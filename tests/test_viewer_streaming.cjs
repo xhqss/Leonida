@@ -6,6 +6,7 @@ const { test } = require('node:test');
 
 // Exercise the viewer's actual loading and streaming code without WebGL, a network or game data.
 const html = readFileSync(join(__dirname, '..', 'viewer', 'index.html'), 'utf8');
+const viewerModule = html.match(/<script type="module">([\s\S]*?)<\/script>/)[1].replace(/^import .*;$/gm, '');
 const worldBegin = html.indexOf('// ---------- world description ----------');
 const worldEnd = html.indexOf('// Deterministic test terrain:', worldBegin);
 assert(worldBegin >= 0 && worldEnd > worldBegin, 'viewer world description section must exist');
@@ -42,6 +43,10 @@ test('malformed manifests keep the viewer usable and identify the invalid field'
         ['duplicate chunk ID', { spawn: [0, 0, 0], chunks: [worldChunk, worldChunk] }, /chunks\[1\]\.id/],
         ['LOD tier without a band', { spawn: [0, 0, 0], chunks: [{ ...worldChunk, lod: 'hd', cell: [0, 0, 1, 1] }] },
             /chunks\[0\]\.lod/],
+        ['LOD tier is an object', { spawn: [0, 0, 0], lod_bands: { hd: [0, 10] },
+            chunks: [{ ...worldChunk, lod: { toString: null }, cell: [0, 0, 1, 1] }] }, /chunks\[0\]\.lod/],
+        ['LOD tier is an array', { spawn: [0, 0, 0], lod_bands: { hd: [0, 10] },
+            chunks: [{ ...worldChunk, lod: ['hd'], cell: [0, 0, 1, 1] }] }, /chunks\[0\]\.lod/],
         ['LOD band out of order', { spawn: [0, 0, 0], lod_bands: { hd: [5, 1] },
             chunks: [{ ...worldChunk, lod: 'hd', cell: [0, 0, 1, 1] }] }, /chunks\[0\]\.lod/],
         ['LOD chunk without a cell', { spawn: [0, 0, 0], lod_bands: { hd: [0, 10] },
@@ -69,8 +74,188 @@ test('test mode, a missing manifest, and an unreadable manifest have distinct me
     assert.match(unreachable.reason, /could not be loaded/);
 });
 
+test('generated terrain shares vertex normals at both kinds of chunk border', () => {
+    class Attribute {
+        constructor(count) { this.count = count; this.array = new Float32Array(count * 3); }
+        getX(i) { return this.array[i * 3]; }
+        getY(i) { return this.array[i * 3 + 1]; }
+        getZ(i) { return this.array[i * 3 + 2]; }
+        setXYZ(i, x, y, z) { this.array.set([x, y, z], i * 3); }
+    }
+    class PlaneGeometry {
+        constructor(size, _, segments) {
+            this.segments = segments;
+            const stride = segments + 1;
+            const position = new Attribute(stride * stride);
+            this.attributes = { position, normal: new Attribute(position.count) };
+            for (let i = 0; i < position.count; i++) {
+                position.setXYZ(i, (i % stride) * size / segments - size / 2, 0,
+                    Math.floor(i / stride) * size / segments - size / 2);
+            }
+        }
+        // The fixture already uses the rotated ground plane.
+        rotateX() {}
+        setAttribute(name, attribute) { this.attributes[name] = attribute; }
+        computeVertexNormals() {
+            // Like a real mesh, this stand-in can only see neighbors on this tile.
+            const { position, normal } = this.attributes;
+            const stride = this.segments + 1;
+            for (let i = 0; i < position.count; i++) {
+                const col = i % stride, row = Math.floor(i / stride);
+                const left = col === 0 ? i : i - 1, right = col === this.segments ? i : i + 1;
+                const front = row === 0 ? i : i - stride, back = row === this.segments ? i : i + stride;
+                const nx = (position.getY(left) - position.getY(right)) / (position.getX(right) - position.getX(left));
+                const nz = (position.getY(front) - position.getY(back)) / (position.getZ(back) - position.getZ(front));
+                const length = Math.hypot(nx, 1, nz);
+                normal.setXYZ(i, nx / length, 1 / length, nz / length);
+            }
+        }
+    }
+
+    const terrainSource = html.slice(worldEnd, html.indexOf('// ---------- scene ----------', worldEnd));
+    const [center, east, south] = vm.runInNewContext(terrainSource + '\n' +
+        'height = (x, z) => (x * x + z * z) / 512;' +
+        '[[0,0,256], [1,0,256], [0,1,256]].map(buildTestChunk)', {
+        THREE: {
+            PlaneGeometry,
+            Group: class { children = []; add(obj) { this.children.push(obj); } },
+            Mesh: class { constructor(geometry) { this.geometry = geometry; } },
+            MathUtils: { clamp: (x, low, high) => Math.min(high, Math.max(low, x)) },
+            MeshStandardMaterial: class {}, Float32BufferAttribute: class {},
+            BoxGeometry: class { translate() {} }, InstancedMesh: class { setMatrixAt() {} },
+            Matrix4: class { compose() {} }, Vector3: class {}, Quaternion: class {},
+        },
+    });
+    const read = (chunk, name, row, col) => {
+        const start = (row * 33 + col) * 3;
+        return Array.from(chunk.children[0].geometry.attributes[name].array.slice(start, start + 3));
+    };
+    assert.deepEqual(read(center, 'position', 16, 32), read(east, 'position', 16, 0));
+    assert.deepEqual(read(center, 'normal', 16, 32), read(east, 'normal', 16, 0));
+    assert.deepEqual(read(center, 'normal', 16, 32), [-2/3, 2/3, -1/3].map(Math.fround));
+    assert.deepEqual(read(center, 'position', 32, 16), read(south, 'position', 0, 16));
+    assert.deepEqual(read(center, 'normal', 32, 16), read(south, 'normal', 0, 16));
+    assert.deepEqual(read(center, 'normal', 32, 16), [-1/3, 2/3, -2/3].map(Math.fround));
+});
+
+test('a WebGL startup error replaces the fly prompt and preserves the original error', async () => {
+    const error = new Error('Error creating WebGL context.');
+    const attributes = new Map();
+    const start = { textContent: 'Click to fly', style: {}, setAttribute: (name, value) => attributes.set(name, value) };
+    const startup = vm.runInNewContext(`(async () => { ${viewerModule} })()`, {
+        THREE: { WebGLRenderer: class { constructor() { throw error; } } },
+        document: { getElementById: id => { assert.equal(id, 'start'); return start; } },
+    });
+    await assert.rejects(startup, actual => actual === error);
+    assert.match(start.textContent, /Could not start WebGL/);
+    assert.equal(start.style.cursor, 'default');
+    assert.equal(attributes.get('role'), 'alert');
+});
+
+async function freecamFixture(requestPointerLock = async () => { throw new Error('pointer lock unavailable'); }) {
+    const windowEvents = new Map(), canvasEvents = new Map(), documentEvents = new Map();
+    const helpMessages = [];
+    const canvas = {
+        addEventListener: (type, handler) => canvasEvents.set(type, handler),
+        requestPointerLock,
+    };
+    const start = { classList: { add() {}, toggle() {} } };
+    const document = {
+        pointerLockElement: null,
+        getElementById: id => id === 'start' ? start : { insertAdjacentHTML: (_, message) => helpMessages.push(message) },
+        addEventListener: (type, handler) => documentEvents.set(type, handler),
+    };
+    const source = viewerModule.split('// ---------- freecam ----------')[1].split('// ---------- chunk streaming ----------')[0];
+    const state = await vm.runInNewContext(`(async () => { ${source}\nreturn { yaw: () => yaw, keys }; })()`, {
+        THREE: { MathUtils: { clamp: (x, min, max) => Math.min(Math.max(x, min), max) } },
+        renderer: { domElement: canvas }, document,
+        addEventListener: (type, handler) => windowEvents.set(type, handler),
+        loadWorld: async () => ({}),
+    });
+    return {
+        ...state,
+        helpMessages,
+        fallback: () => start.onclick(),
+        lockError: () => documentEvents.get('pointerlockerror')?.(),
+        lock() { document.pointerLockElement = canvas; documentEvents.get('pointerlockchange')(); },
+        down: button => canvasEvents.get('mousedown')({ button }),
+        up: button => windowEvents.get('mouseup')({ button }),
+        move: buttons => windowEvents.get('mousemove')({ buttons, movementX: 10, movementY: 0 }),
+        key: code => windowEvents.get('keydown')({ code }),
+        blur: () => windowEvents.get('blur')(),
+    };
+}
+
+test('a pointerlockerror without a rejected promise enables drag-to-look', async () => {
+    const cam = await freecamFixture(() => undefined);
+    await cam.fallback();
+    cam.lockError();
+    cam.down(0);
+    cam.move(1);
+    assert.ok(cam.yaw() < 0);
+    assert.equal(cam.helpMessages.length, 1);
+});
+
+test('a rejection and a pointerlockerror show the drag hint only once', async () => {
+    const cam = await freecamFixture();
+    await cam.fallback();
+    cam.lockError();
+    assert.equal(cam.helpMessages.length, 1);
+});
+
+test('drag-to-look requires a primary press and ignores a secondary release', async () => {
+    const cam = await freecamFixture();
+    await cam.fallback();
+    cam.down(2);
+    cam.move(2);
+    assert.equal(cam.yaw(), 0);
+    cam.down(0);
+    cam.move(1);
+    const afterDrag = cam.yaw();
+    assert.ok(afterDrag < 0);
+    cam.up(2);
+    cam.move(1);
+    assert.ok(cam.yaw() < afterDrag);
+    cam.up(0);
+    const afterRelease = cam.yaw();
+    cam.move(0);
+    assert.equal(cam.yaw(), afterRelease);
+});
+
+test('drag-to-look ends on the first move after a missed mouseup', async () => {
+    const cam = await freecamFixture();
+    await cam.fallback();
+    cam.down(0);
+    cam.move(1);
+    const yaw = cam.yaw();
+    cam.move(0);
+    assert.equal(cam.yaw(), yaw);
+    cam.move(1);
+    assert.equal(cam.yaw(), yaw, 'a new press must start on the canvas');
+});
+
+test('window blur clears pressed movement keys and ends drag-to-look', async () => {
+    const cam = await freecamFixture();
+    await cam.fallback();
+    cam.key('KeyW');
+    cam.down(0);
+    cam.move(1);
+    const yaw = cam.yaw();
+    assert.equal(cam.keys.has('KeyW'), true);
+    cam.blur();
+    assert.equal(cam.keys.size, 0);
+    cam.move(1);
+    assert.equal(cam.yaw(), yaw);
+});
+
+test('pointer lock turns the camera without a pressed mouse button', async () => {
+    const cam = await freecamFixture();
+    cam.lock();
+    cam.move(0);
+    assert.ok(cam.yaw() < 0);
+});
+
 test('the bounds overlay creates helpers on the first G press and reuses them', async () => {
-    const viewerModule = html.match(/<script type="module">([\s\S]*?)<\/script>/)[1].replace(/^import .*;$/gm, '');
     const chunks = [worldChunk, { id: 'other', url: 'other.glb', bounds: [5, 6, 7, 8, 9, 10] }];
     const handlers = new Map();
     const boundsGroup = await vm.runInNewContext(`(async () => { ${viewerModule}\nreturn boundsGroup; })()`, {
@@ -108,6 +293,62 @@ test('the bounds overlay creates helpers on the first G press and reuses them', 
     helpers.forEach((helper, i) => assert.equal(boundsGroup.children[i], helper));
 });
 
+test('Shift speeds the camera up and Ctrl slows it down, on either side of the keyboard', async () => {
+    class Vector3 {
+        constructor(x = 0, y = 0, z = 0) { Object.assign(this, { x, y, z }); }
+        set(x, y, z) { return Object.assign(this, { x, y, z }); }
+        fromArray([x, y, z]) { return this.set(x, y, z); }
+        add(v) { return this.set(this.x + v.x, this.y + v.y, this.z + v.z); }
+        sub(v) { return this.set(this.x - v.x, this.y - v.y, this.z - v.z); }
+        addScaledVector(v, s) { return this.set(this.x + v.x * s, this.y + v.y * s, this.z + v.z * s); }
+        crossVectors(a, b) { return this.set(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+        lengthSq() { return this.x * this.x + this.y * this.y + this.z * this.z; }
+        normalize() { const n = Math.sqrt(this.lengthSq()) || 1; return this.set(this.x / n, this.y / n, this.z / n); }
+    }
+    const handlers = new Map();
+    let frame;
+    const camera = await vm.runInNewContext(`(async () => { ${viewerModule}\nreturn camera; })()`, {
+        THREE: {
+            WebGLRenderer: class {
+                domElement = { addEventListener() {} };
+                info = { render: { calls: 0, triangles: 0 } };
+                setPixelRatio() {} setSize() {} render() {}
+                setAnimationLoop(callback) { frame = callback; }
+            },
+            Scene: class { add() {} },
+            PerspectiveCamera: class {
+                position = new Vector3();
+                quaternion = { setFromEuler() {} };
+                getWorldDirection(v) { return v.set(0, 0, -1); }
+            },
+            DirectionalLight: class { position = { set() {} }; },
+            Clock: class { getDelta() { return 0.1; } },
+            Color: class {}, Fog: class {}, HemisphereLight: class {}, MeshStandardMaterial: class {}, Euler: class {},
+            Group: class { add() {} },
+            Vector3,
+        },
+        document: { body: { prepend() {} }, getElementById: () => ({}), addEventListener() {} },
+        addEventListener: (type, handler) => handlers.set(type, handler),
+        devicePixelRatio: 1, innerWidth: 800, innerHeight: 600, URLSearchParams, location: { search: '' },
+        performance: { now: () => 0 },
+        fetch: manifestResponse({ spawn: [0, 0, 0], chunks: [] }), GLTFLoader: class {},
+    });
+    // One frame is 0.1 s at the default 40 m/s, so E alone climbs 4 m.
+    const climb = (...modifiers) => {
+        for (const code of ['KeyE', ...modifiers]) handlers.get('keydown')({ code });
+        const before = camera.position.y;
+        frame();
+        for (const code of ['KeyE', ...modifiers]) handlers.get('keyup')({ code });
+        return camera.position.y - before;
+    };
+    const close = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-9, `${actual} is not ${expected}`);
+    close(climb(), 4);
+    close(climb('ShiftLeft'), 20);
+    close(climb('ShiftRight'), 20);
+    close(climb('ControlLeft'), 0.8);
+    close(climb('ControlRight'), 0.8);
+});
+
 const begin = html.indexOf('// ---------- chunk streaming ----------');
 const end = html.indexOf('// ---------- main loop ----------', begin);
 assert(begin >= 0 && end > begin, 'viewer streaming section must exist');
@@ -115,10 +356,17 @@ const source = html.slice(begin, end);
 const settle = () => new Promise(setImmediate);
 function fixture(count = 1) {
     const requests = [], added = [], disposed = [];
-    let now = 0;
+    const timers = new Map();
+    let now = 0, nextTimer = 0;
     class Group { add() {} }
     const context = vm.createContext({
         performance: { now: () => now },
+        setTimeout(callback, delay) {
+            const id = ++nextTimer;
+            timers.set(id, { at: now + delay, callback });
+            return id;
+        },
+        clearTimeout: id => timers.delete(id),
         THREE: { MeshStandardMaterial: class {}, Group, DoubleSide: 2,
             LoaderUtils: { extractUrlBase: url => url.slice(0, url.lastIndexOf('/') + 1) || './' } },
         AbortController,
@@ -150,6 +398,15 @@ function fixture(count = 1) {
     const object = () => ({ traverse(fn) { fn({ geometry: { dispose() { disposed.push(this); } } }); } });
     return { context, requests, added, disposed, state: context.state, object,
         frame(time = now) { now = time; context.state.stream(); },
+        async advanceTimers(time) {
+            now = time;
+            for (const [id, { at, callback }] of timers) {
+                if (at > now) continue;
+                timers.delete(id);
+                callback();
+            }
+            await settle();
+        },
         async fail(index, time = now) {
             now = time; requests[index].reject(new Error('synthetic load failure')); await settle();
         },
@@ -197,6 +454,60 @@ test('a transient failure retries only after backoff, then loads the chunk', asy
     assert.deepEqual(f.added, [obj]);
     f.frame(100000);
     assert.equal(f.requests.length, 2);
+});
+
+test('stalled chunk headers and bodies release their slots at the download deadline', async () => {
+    const f = fixture(5);
+    f.frame();
+    await f.advanceTimers(20000);
+    f.requests[0].headers(); // Receiving headers does not restart the deadline.
+    await settle();
+    assert(f.requests[0].completeBody);
+    await f.advanceTimers(29999);
+    assert.equal(f.state.inflight, 4);
+    assert.equal(f.state.failed, 0);
+
+    await f.advanceTimers(30000);
+    assert(f.requests.every(request => request.signal.aborted));
+    assert.equal(f.requests[0].parse, undefined);
+    assert.equal(f.state.inflight, 0);
+    assert.equal(f.state.failed, 4);
+    f.frame();
+    assert.deepEqual(f.requests.slice(4).map(request => request.url), ['4.glb']);
+    f.frame(30999);
+    assert.equal(f.requests.length, 5);
+    f.frame(31000);
+    assert.deepEqual(f.requests.slice(5).map(request => request.url), ['0.glb', '1.glb', '2.glb']);
+});
+
+test('repeated download timeouts use the existing attempt budget', async () => {
+    const f = fixture();
+    f.frame();
+    await f.advanceTimers(30000);
+    f.frame(31000);
+    await f.advanceTimers(61000);
+    f.frame(62999);
+    assert.equal(f.requests.length, 2);
+    f.frame(63000);
+    await f.advanceTimers(93000);
+    f.frame(100000);
+    assert.equal(f.state.failed, 3);
+    assert.equal(f.state.inflight, 0);
+    assert.equal(f.requests.length, 3);
+});
+
+test('a completed download clears its deadline before GLB parsing finishes', async () => {
+    const f = fixture();
+    f.frame();
+    await f.receive(0);
+    await f.advanceTimers(30000);
+    assert.equal(f.requests[0].signal.aborted, false);
+    assert.equal(f.state.inflight, 1);
+    const obj = f.object();
+    await f.finish(0, obj);
+    assert.deepEqual(f.added, [obj]);
+    assert.equal(f.state.inflight, 0);
+    assert.equal(f.state.failed, 0);
 });
 
 test('permanent failure stops after three attempts with increasing delays', async () => {
@@ -433,12 +744,38 @@ test('a valid LOD manifest is accepted', async () => {
     assert.equal(world.test, false);
 });
 
+test('orphan HD draws independently of the LOD chain in its cell', async () => {
+    const f = fixture(0);
+    f.context.world = {
+        test: false,
+        lod_bands: { hd: [0, 130], orphan_hd: [0, 100] },
+        chunks: [
+            { ...worldChunk, id: 'hd', url: 'hd.glb', lod: 'hd', cell: [0, 0, 256, 256] },
+            { ...worldChunk, id: 'orphan', url: 'orphan.glb', lod: 'orphan_hd', cell: [0, 0, 256, 256] },
+        ],
+    };
+    const hd = Object.assign(f.object(), { visible: true });
+    const orphan = Object.assign(f.object(), { visible: true });
+    f.frame();
+    await f.succeed(0, hd);
+    await f.succeed(1, orphan);
+    f.frame();
+    assert.equal(hd.visible, true);
+    assert.equal(orphan.visible, true);
+
+    f.context.camera.position.x = 366; // 110 m from the cell, inside the orphan's unload slack.
+    f.frame();
+    assert.equal(hd.visible, true);
+    assert.equal(orphan.visible, false);
+    assert.ok(f.state.live.has('orphan'));
+});
+
 test('LOD sets show one tier per cell by horizontal distance, with slack before unloading', async () => {
     const f = fixture(0);
     const cell = [0, 0, 256, 256];
     f.context.world = { test: false, lod_bands: { hd: [0, 130], lod: [130, 450], slod1: [450, 1000] }, chunks: [
         { id: 'hd', url: 'hd.glb', bounds: [0, 0, 0, 256, 50, 256], lod: 'hd', cell },
-        { id: 'lod', url: 'lod.glb', bounds: [0, 0, 0, 256, 80, 256], lod: 'lod', cell },
+        { id: 'lod', url: 'lod.glb', bounds: [0, 0, 0, 256, 80, 256], lod: 'lod', cell: [...cell] },
         { id: 'slod1', url: 'slod1.glb', bounds: [0, 0, 0, 256, 90, 256], lod: 'slod1', cell },
     ] };
     const pos = f.context.camera.position;
@@ -452,7 +789,11 @@ test('LOD sets show one tier per cell by horizontal distance, with slack before 
     f.frame();
     assert.deepEqual(f.requests.map(r => r.url), ['hd.glb', 'lod.glb']);
     assert.ok(f.state.live.has('hd'));
-    await f.succeed(1, lod);
+    assert.equal(hd.visible, true, 'HD fills the cell while LOD is fetching');
+    await f.receive(1);
+    f.frame();
+    assert.equal(hd.visible, true, 'HD fills the cell while LOD is parsing');
+    await f.finish(1, lod);
     f.frame();
     assert.equal(hd.visible, false);
     assert.equal(lod.visible, true);
@@ -471,3 +812,18 @@ test('LOD sets show one tier per cell by horizontal distance, with slack before 
     assert.equal(f.requests.at(-1).url, 'slod1.glb');
 });
 
+
+// The camera link in the URL hash (#cam=x,y,z,yaw,pitch) must round-trip and reject anything malformed.
+const helperSource = html.slice(html.indexOf('// Camera in the URL hash'), html.indexOf('async function loadWorld()'));
+const camHelpers = vm.runInNewContext(helperSource + '\n({ parseCamHash, formatCamHash })');
+
+test('camera hash round-trips and malformed hashes are ignored', () => {
+    const hash = camHelpers.formatCamHash([12.34, -5, 600], 1.5, -0.25);
+    assert.equal(hash, '#cam=12.3,-5.0,600.0,1.500,-0.250');
+    const cam = camHelpers.parseCamHash(hash);
+    assert.deepEqual(JSON.parse(JSON.stringify(cam)), { pos: [12.3, -5, 600], yaw: 1.5, pitch: -0.25 });
+    for (const bad of ['', '#', '#cam=', '#cam=1,2,3', '#cam=1,2,3,4,x', '#cam=1,2,3,4,Infinity',
+                       '#cam=1,2,,4,5', '#cam=1,2,3,4,5,6', '#other=1,2,3,4,5', undefined, null]) {
+        assert.equal(camHelpers.parseCamHash(bad), null, String(bad));
+    }
+});

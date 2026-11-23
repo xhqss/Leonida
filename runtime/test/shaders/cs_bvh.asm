@@ -1,6 +1,8 @@
 ; image_bvh64_intersect_ray emulation: vk_compute_test writes an AMD-format BVH into the heap (box32 root 0x100 -> triangle
-; z=10 node 0x40, triangle z=5 node 0x48, missed box, NaN box). Ray (0.25,0.25,0) +z. Run: vk_compute_test cs_bvh.spv 1 bvh
-; -> box result 0x48 0x40 0xffffffff 0xffffffff (sorted), triangle result -10 -1 -0.25 -0.25 (t = 10, bary 0.25/0.25).
+; z=10 node 0x40, triangle z=5 node 0x48, missed box, box 0x68 with a NaN min.x). Ray (0.25,0.25,0) +z. Run:
+; vk_compute_test cs_bvh.spv 1 bvh
+; -> box result 0x68 0x48 0x40 0xffffffff (sorted; RDNA2 skips the NaN plane and enters box 0x68 at t = 0, SHADER-650),
+; triangle result -10 -1 -0.25 -0.25 (t = 10, bary 0.25/0.25).
 v_cmpx_eq_u32_e32 0, v0
 v_mov_b32_e32 v1, 0x25
 v_mov_b32_e32 v2, 0

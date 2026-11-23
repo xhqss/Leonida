@@ -131,16 +131,64 @@ def structure(succ):
         else:
             children[member(idom[x], region)].append(("b", x))
 
-    def emit(m):
+    # Flatten dominated tail continuations out of enclosing guards and build iteratively so long sequential
+    # diamond/loop chains stay O(1) deep instead of nesting O(N) OpSelectionMerge constructs (and never hit
+    # Python's recursion limit on multi-thousand-block shaders).
+    # Hoisting the last child c_last of a guarded member m into m's enclosing list is exact: m's head strictly
+    # dominates c_last's head, so no block outside m's subtree can jump to c_last's head. When m's guard is skipped
+    # (pc != m_head), pc cannot equal c_last_head either, so c_last's guard is skipped too; when m's guard runs,
+    # c_last runs right after m's earlier children, in the same order as before.
+    max_guard_depth = 16
+    root = []
+    start = ("l", 0) if 0 in bodies else ("b", 0)
+    stack = [("emit", root, None, start, 0)]
+    while stack:
+        task = stack.pop()
+        if task[0] == "open_guard":
+            _, parent_list, m, depth = task
+            gbody = []
+            parent_list.append(("guard", m[1], gbody))
+            stack.append(("emit", gbody, parent_list, m, depth))
+            continue
+        _, out_list, parent_list, m, depth = task
         kind, x = m
-        items = [("loop", x, emit(("b", x)))] if kind == "l" else [("block", x)]
         below = sorted(children[m], key=lambda c: pos[c[1]])
+        if kind == "l":
+            lbody = []
+            out_list.append(("loop", x, lbody))
+        else:
+            out_list.append(("block", x))
         if kind == "b" and len(below) == 1 and list(succ[x]) == [below[0][1]]:
-            return items + emit(below[0])             # the only way on, and nothing else leads there: no test
-        return items + [("guard", c[1], emit(c)) for c in below]
+            stack.append(("emit", out_list, parent_list, below[0], depth))
+        else:
+            hoist = (parent_list is not None and below
+                     and (len(below) >= 2 or kind == "l" or depth >= max_guard_depth))
+            if hoist:
+                stack.append(("open_guard", parent_list, below[-1], depth))
+                inner = below[:-1]
+            else:
+                inner = below
+            for c in reversed(inner):
+                stack.append(("open_guard", out_list, c, depth + 1))
+        if kind == "l":
+            stack.append(("emit", lbody, None, ("b", x), 0))
+    return root
 
-    return emit(("l", 0) if 0 in bodies else ("b", 0))
 
+
+def depth(tree):
+    """Nesting depth of a tree from structure(): a block is depth 0 and each guard or loop adds one."""
+    best = 0
+    stack = [(tree, 0)]
+    while stack:
+        items, d = stack.pop()
+        for it in items:
+            if it[0] == "block":
+                best = max(best, d)
+            else:
+                best = max(best, d + 1)
+                stack.append((it[2], d + 1))
+    return best
 
 
 def _sccs(nodes, adj):
@@ -271,28 +319,31 @@ def run(tree, choose, limit):
     """Interpret a tree: the blocks it executes, in order, stopping after `limit`. `choose(b)` gives the block
     that b goes to next (END to finish) and stands for whatever b stores in pc."""
     trace, pc = [], [0]
-
-    class Stop(Exception):
-        pass
-
-    def go(items):
-        for it in items:
+    stack = [("items", tree, 0)]
+    while stack:
+        frame = stack[-1]
+        if frame[0] == "items":
+            _, items, idx = frame
+            if idx >= len(items):
+                stack.pop()
+                continue
+            stack[-1] = ("items", items, idx + 1)
+            it = items[idx]
             if it[0] == "block":
-                trace.append(it[1])
                 if len(trace) >= limit:
-                    raise Stop
+                    break
+                trace.append(it[1])
                 pc[0] = choose(it[1])
             elif it[0] == "guard":
                 if pc[0] == it[1]:
-                    go(it[2])
+                    stack.append(("items", it[2], 0))
             else:
-                while True:
-                    go(it[2])
-                    if pc[0] != it[1]:
-                        break
-
-    try:
-        go(tree)
-    except Stop:
-        pass
+                stack.append(("loop", it[1], it[2]))
+                stack.append(("items", it[2], 0))
+        else:
+            _, head, body = frame
+            if pc[0] == head:
+                stack.append(("items", body, 0))
+            else:
+                stack.pop()
     return trace

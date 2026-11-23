@@ -54,12 +54,12 @@ The exporters use three tag types:
 | `0x48` | streamed-music descriptor |
 
 `tools/rsc8_audio.py` additionally decodes the speech companions `0x36` (peaks), `0xa3` (seek
-table), `0xb2` (loudness), `0xbd` (marker) and the two structural tags below; every other tag type
+table), `0xb2` (loudness), `0xbd` (cue records) and the two structural tags below; every other tag type
 is skipped.
 
 | Tag | Meaning |
 |---|---|
-| `0x5a` | 20-byte-entry grid table (`12345678` marker; see [rsc8_audio.md](rsc8_audio.md#the-undocumented-0x5a0xd9-companion-tags)) |
+| `0x5a` | 20-byte entries, a sample position and a pitch each (`12345678` marker; see [rsc8_audio.md](rsc8_audio.md#the-undocumented-0x5a0xd9-companion-tags)) |
 | `0xd9` | grouped ascending index runs into the sibling `0x5a` entries |
 
 Both appear only in `audio.rpf`, on 1,185 streams (32,000 Hz; 804 of them carry both).
@@ -88,15 +88,23 @@ The exporters ignore the remaining bytes.
 | `5` | XMA2 | `.xma.wav`, RIFF XMA2; ffmpeg decodes it to PCM WAV |
 
 Opus data is stored in 2048-byte blocks. Each block is a sequence of `[u16 length][packet]`; a zero length pads
-the rest of the block. The first 312 decoded samples are the encoder's lookahead (libopus at 48 kHz); the AWC does
-not store it, so the exporter writes that value as `OpusHead` pre-skip and sets the last page's granule to
-`pre-skip + declared samples`. Decoders then drop the priming and stop at the real end instead of the padded final
-frame. `--pre-skip` overrides the 312 default for a stream encoded with a different lookahead.
+the rest of the block. The first 312 decoded samples are the encoder's lookahead. Measured on 30 real streams from
+four banks: decoded with pre-skip 0, the 5% and 10% attack points are at 312 samples (median 312; the 10% point
+ranges 278..868, none near 1920), so 312 is the exporter's default. The AWC does not store the value, so
+`--pre-skip` overrides it for a stream encoded with a different lookahead.
+
+The exporter writes that value as `OpusHead` pre-skip and emits the EOS page at the first packet that reaches
+`pre-skip + declared samples`; later packets are encoder padding and are dropped. Clamping only the last page
+would let its granule go backwards when the trim point falls before that page starts, and decoders would keep the
+excess: a 27-packet real-libopus fixture decoded 24,960 frames for 24,000 declared, while the reaching-packet
+form decodes exactly 24,000. An oversized `--pre-skip` is clamped to the stream length so the final granule never
+falls below it.
 
 The format tag's sample count is already in 48 kHz frames even when its rate field is 32 kHz, and `+0x0C` is the
-per-channel frame count (equal to `+0` for mono and half of it for stereo in all 7,451 measured streams). The
-exporter uses `+0x0C` and falls back to `+0 / channels` when a block leaves it zero; it never scales either count
-by the rate field, because scaling a 32 kHz stream by 48000/32000 leaves up to a frame of padding untrimmed.
+per-channel frame count (equal to `+0` for mono and half of it for stereo in all 7,451 measured streams, 0.5% of
+the 1.6M-stream corpus). The exporter uses `+0x0C` only when it agrees with `+0` (`frames * channels == samples`)
+and otherwise falls back to `+0 / channels`, so a malformed block cannot silently truncate audio. It never scales
+either count by the rate field, because scaling a 32 kHz stream by 48000/32000 leaves padding untrimmed.
 
 Codec `5` is not handled by `tools/awc_opus.py`. `rpf9dump xma` writes it as RIFF XMA2, and ffmpeg does the decode.
 
@@ -117,8 +125,12 @@ then 16 bytes per channel:
 
 At the `0x55` data offset, each chunk starts with a 24-byte record per channel. The record's `+4` word is the
 channel's subblock count and `+8` is a repeated-prefix sample count to skip. The channel data are its run of
-2048-byte subblocks after the 2048-aligned header. The skipped samples repeat the previous chunk's tail, so the
-exporter drops whole packets until the count is consumed. Each descriptor channel becomes one Ogg Opus file.
+2048-byte subblocks after the 2048-aligned header. The skipped samples repeat the previous chunk's tail. The
+exporter verifies that the skip ends on a packet boundary and that the repeated packets match the previous
+packets for that channel group, then writes each verified overlap once. Each descriptor channel becomes one Ogg
+Opus file. Invalid repeat counts or payloads reject that music descriptor so independent streams can still export.
+The chunk size gives the distance between blocks. The final block may use fewer bytes. The channel table and
+all declared subblocks must fit within their own block and the `0x55` tag's data range.
 
 The descriptor's `channels` field is the number of channel groups, not necessarily the packet channel count.
 An Opus packet's TOC stereo bit (`packet[0] & 0x04`) gives the real count, and the descriptor's `samples` field
@@ -203,9 +215,26 @@ layout and the station-content references.
 The credited "Burn This Shit Down" is not a radio-station track. It is the song for the
 **Home Sweet Home** mission (Chapter 1, mission 21/25): Lucia at Jason's house in Key Lento
 during the house fire and the escape. The mission and its localized objective/fail strings are
-present in `data.rpf`; the song audio is not.
+present in `data.rpf`.
 
-Measured coverage on the Xbox Series 1.0.2.1 package:
+The song audio is in 1.0.2.1 too, as stems, not as one stream (found by @jefftern4 in the coordination thread,
+PROC-178). It is the plain (not streamed) `audio.rpf` bank at offset `0x300695000`, 9,481,280 bytes, bank 5,573 of
+7,162 in the exporter's `audio_manifest.json` order:
+
+| Field | Value |
+|---|---|
+| Streams | 73, all stereo, all codec `0x0B` (Opus, 48 kHz) |
+| Common length | 47 streams declare 771,213 samples (16.067 s); the manifest's rounded `DurationSeconds` gives 771,213 for 32 of them and 771,214 for 15 |
+| Other lengths | 6 × 1,156,820, 2 × 2,313,640 and 2 × 385,607 samples (1.5, 3 and 0.5 times the loop), and one 24,100-sample stream |
+| Range | 0.439 s to 114.477 s, 1,297.2 s in total |
+
+The 47 equal-length streams are loop stems meant to play together (vocals, melodic, sub-bass and ad-lib layers per
+slot, by the finder's listening), so no single stream is the song and a whole-file fingerprint of each stream
+misses it. That is why the searches below came back empty. The bank's shape (field values above) was re-measured
+from `audio_manifest.json` on a second 1.0.2.1 copy; the stem roles are the finder's and were not re-checked here.
+
+Measured coverage of the earlier search, which looked for the song as one stream. The `audio.rpf` all-banks row
+is the one the stems fall under:
 
 | Container | Searched | Result |
 |---|---|---|
@@ -214,7 +243,7 @@ Measured coverage on the Xbox Series 1.0.2.1 package:
 | `story000.rpf` Bink | 264 streams / 162 with audio / 165 tracks / 5,090 s | none |
 | `movies.rpf` Bink | 229 tracks / 12,401 s | none |
 | `audio.rpf` streamed cues under 30 s | 1,149 channels / 5.78 h | none |
-| `audio.rpf` all banks | 7,162 banks, all streams | none |
+| `audio.rpf` all banks | 7,162 banks, all streams | none as a single stream; the stems are bank `0x300695000` (above) |
 | loop/chunked banks | 1,099 banks / 118,180 streams | none |
 | `packs.rpf` inflated | 144,364 files / 9.74 GB | 0 AWC, 0 Bink2 |
 | `data.rpf` inflated | 28,509 files / 1.41 GB | mission text, 0 song strings |
@@ -230,11 +259,21 @@ A `data.rpf` hash table contains 12 occurrences of `joaat("burn")`, but it is no
 config blob has none, no AWC stream ID matches its low 29 bits, and the table has no audio
 reference.
 
-Residual uncertainty: `levels.rpf` (76 GB) was not fully inflated, and a custom RSC8 audio
-resource is the only mission-side container not decoded; the retail track may be a third master
-or patch content not covered by the public references; sub-30 s stings were not exhaustively
+Residual uncertainty: `levels.rpf` (76 GB) was not fully inflated; the retail track may be a third
+master or patch content not covered by the public references; sub-30 s stings were not exhaustively
 fingerprinted. No game audio is stored in the repository; the searches ran on a local copy and
 `radio-dump-v3` was not modified.
+Residual uncertainty: how the game sequences the stems (which layers play in which slot, and the
+order of the longer streams) is not decoded; the mission's audio config is the likely place (a
+hypothesis, not measured). No game audio is stored in the repository; the searches ran on a local
+copy and `radio-dump-v3` was not modified.
+
+This search first listed the `RSC8` resources of the story and minigame archives as the only
+mission-side container not decoded. They are decoded in [rsc8_audio.md](rsc8_audio.md), and none of
+them holds the song: all 641,428 raw `RSC8` headers in the package (225,281 in `story000.rpf`, 1,957
+in `shared_minigame000.rpf`, 9 in `story000_restofworld.rpf` and 414,181 in `audio.rpf`) are AWC tag
+`0x5c` facial/lip-sync clips. Each sits in an `ADAT` bank next to the 48 kHz mono Opus dialogue line
+it animates, none lies outside a bank, and none contains an `ADAT`, Ogg Opus or RIFF WAVE header.
 
 ## Stream names
 
@@ -287,6 +326,10 @@ Each positional source is reported and thresholded on its own. A source is a dir
 bank, or an `audio_manifest.json` from `rpf9dump audio` (read without opening the banks). Pure Python; the run above
 took about 3 minutes on one core.
 
+You can also pass the JSON inventory written by `awc_manifest.py --out inventory.json`. The naming tool reads
+the plain stream IDs and streamed-music channel IDs directly from its rows. Bank labels keep the nested path
+and drop the `.awc` extension to match the export folders. Banks with no stream rows have no names in this inventory.
+
 ## Tags: names and subtitles
 
 `awc_opus.py` writes an empty `OpusTags` header, so a player shows only the stream id. `tools/opus_tags.py` fills
@@ -331,7 +374,10 @@ the audio itself is not. See the ground rules in [design.md](design.md#ground-ru
 
 ## What has been checked
 
-- 300 random Opus streams decode with ffmpeg with no errors; their lengths match the declared sample counts.
+- 20 real Opus streams (6 at 48 kHz, 14 at 32 kHz) decode with ffmpeg to exactly their declared
+  per-channel frame counts after the EOS fix; 300 random streams decode with no errors. The earlier
+  "lengths match" check read the granule-derived duration, not decoded frames, so it did not catch
+  the backwards-EOS case.
 - All 1,818 XMA2 streams decode after `rpf9dump xma`.
 - A 4-channel streamed-music bank gives four 42.0 s mono channels with real levels and no decoder errors.
 - A 1-channel streamed-music descriptor can carry stereo Opus packets; it exports as one stereo Ogg with the

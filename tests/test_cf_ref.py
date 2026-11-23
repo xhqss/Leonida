@@ -424,6 +424,37 @@ class BranchTests(CfRefTestCase):
         self.assertEqual(r_exec["sgpr"][0], 2)
         self.assertEqual(r_exec["exec"], 0)
 
+    def test_wave32_vcc_mask_writes_preserve_vcc_hi_and_scalar_ops_ignore_exec_hi(self):
+        res_vcc = self.run_items([
+            "s_mov_b32 vcc_hi, 0xdeadbeef",
+            "s_mov_b32 vcc, 5",
+            "s_mov_b32 s0, vcc_hi",
+            "s_and_b32 vcc, vcc, 1",
+            "s_mov_b32 s1, vcc_hi",
+            "s_and_saveexec_b32 vcc, 3",
+            "s_mov_b32 s2, vcc_hi",
+            "s_mov_b32 s3, vcc_lo",
+            "s_endpgm",
+        ], wave=32)
+        self.assertEqual(res_vcc["sgpr"][0], 0xDEADBEEF)
+        self.assertEqual(res_vcc["sgpr"][1], 0xDEADBEEF)
+        self.assertEqual(res_vcc["sgpr"][2], 0xDEADBEEF)
+        self.assertEqual(res_vcc["sgpr"][3], 0xFFFFFFFF)
+
+        res_exec = self.run_items([
+            "s_add_u32 exec_hi, 1, 0",
+            "s_lshl_b32 exec_hi, 1, 2",
+            "s_cselect_b32 exec_hi, 7, 9",
+            "s_mov_b32 s0, exec_hi",
+            "s_add_u32 s1, exec_hi, 5",
+            "v_mov_b32 v0, 1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ], wave=32)
+        self.assertEqual(res_exec["sgpr"][0], 0)
+        self.assertEqual(res_exec["sgpr"][1], 5)
+        self.assertEqual(sorted(res_exec["exports"]), list(range(32)))
+
 
 class CompareAndFlagTests(CfRefTestCase):
     def test_v_cmp_predicates_u32_and_i32_and_inactive_lanes_write_zero(self):
@@ -815,12 +846,15 @@ class ExportHaltStepAndErrorTests(CfRefTestCase):
             (["exp mrt0 off, off, off, off done vm", "s_endpgm"], 32),
             (["s_branch L_missing", "s_endpgm"], 32),
             (["s_branch s0", "s_endpgm"], 32),
-            (["s_mov_b32 exec_hi, 0", "s_endpgm"], 64),
-            (["s_and_b32 s0, exec_hi, 1", "s_endpgm"], 32),
             (["s_mov_saveexec_b32 s0, vcc_lo", "s_endpgm"], 32),
             (["s_and_b32 vcc_lo, vcc_lo, scc", "s_endpgm"], 32),
             (["v_cmp_eq_u32_e64 v0, v0, 0", "s_endpgm"], 32),
             (["v_cmp_eq_u32_e32 vcc, v0", "s_endpgm"], 32),
+            (["v_add_nc_u32_e64 v2, v1, 1 clamp", "s_endpgm"], 32),
+            (["exp mrt0 v0, v0, v1, v1 done compr vm", "s_endpgm"], 32),
+            (["v_cmp_eq_u32_e32 vcc_lo, v0, v1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf", "s_endpgm"], 32),
+            (["s_mov_b32 vcc, 1", "s_endpgm"], 64),
+            (["s_mov_b32 exec, 1", "s_endpgm"], 64),
         ]
         for insns, wave in unsupported_programs:
             with self.subTest(insn=insns[0], wave=wave):

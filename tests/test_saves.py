@@ -5,6 +5,7 @@ save data is used or quoted.
     python -I tests/test_saves.py
 """
 import contextlib
+import errno
 import io
 import json
 import os
@@ -206,6 +207,199 @@ class JsavTest(unittest.TestCase):
         self.assertNotIn("changed:", out)
 
 
+class AtomicPackTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        self.source = os.path.join(self.root, "source.jsav")
+        self.extracted = os.path.join(self.root, "extracted")
+        self.out = os.path.join(self.root, "packed.jsav")
+        self.old, _, _ = make_jsav(seed=0)
+        self.new, _, _ = make_jsav(seed=1)
+        write(self.source, self.new)
+        quiet(saves.extract, self.source, self.extracted)
+        write(self.out, self.old)
+
+    def fail_writes(self, error, on_close=False):
+        # Inject a failure after real bytes have been written, both for main's direct output and for staging.
+        real_open, real_temporary = open, tempfile.NamedTemporaryFile
+
+        class BrokenWrite:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                result = self.stream.__exit__(*args)
+                if on_close and args[0] is None:
+                    raise error
+                return result
+
+            def write(self, data):
+                if on_close:
+                    return self.stream.write(data)
+                self.stream.write(data[:4])
+                raise error
+
+        def opened(path, mode="r", *args, **kwargs):
+            stream = real_open(path, mode, *args, **kwargs)
+            return BrokenWrite(stream) if mode == "wb" else stream
+
+        def staged(*args, **kwargs):
+            return BrokenWrite(real_temporary(*args, **kwargs))
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(saves, "open", side_effect=opened, create=True))
+        stack.enter_context(mock.patch.object(tempfile, "NamedTemporaryFile", side_effect=staged))
+        return stack
+
+    def test_partial_write_preserves_previous_save_and_removes_staging(self):
+        before = sorted(os.listdir(self.root))
+        with self.fail_writes(OSError(errno.ENOSPC, "simulated disk full")):
+            with self.assertRaises(OSError):
+                quiet(saves.pack, self.extracted, self.out)
+        self.assertEqual(rd(self.out), self.old)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    def test_failed_new_output_leaves_no_partial_save(self):
+        os.remove(self.out)
+        before = sorted(os.listdir(self.root))
+        with self.fail_writes(OSError(errno.ENOSPC, "simulated disk full")):
+            with self.assertRaises(OSError):
+                quiet(saves.pack, self.extracted, self.out)
+        self.assertFalse(os.path.exists(self.out))
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    def test_failed_close_preserves_previous_save_and_removes_staging(self):
+        before = sorted(os.listdir(self.root))
+        with self.fail_writes(OSError(errno.ENOSPC, "simulated flush failure"), on_close=True):
+            with self.assertRaises(OSError):
+                quiet(saves.pack, self.extracted, self.out)
+        self.assertEqual(rd(self.out), self.old)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    def test_interruption_preserves_previous_save_and_removes_staging(self):
+        before = sorted(os.listdir(self.root))
+        with self.fail_writes(KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                quiet(saves.pack, self.extracted, self.out)
+        self.assertEqual(rd(self.out), self.old)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    def test_replace_failure_preserves_previous_save_and_removes_staging(self):
+        before = sorted(os.listdir(self.root))
+        with mock.patch.object(saves.os, "replace", side_effect=PermissionError("destination locked")):
+            with self.assertRaises(PermissionError):
+                quiet(saves.pack, self.extracted, self.out)
+        self.assertEqual(rd(self.out), self.old)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    def test_readonly_staging_is_removed_if_replacement_fails(self):
+        before = sorted(os.listdir(self.root))
+        with mock.patch.object(saves, "published_mode", return_value=0o444), \
+                mock.patch.object(saves.os, "replace", side_effect=PermissionError("destination locked")):
+            with self.assertRaises(PermissionError):
+                quiet(saves.pack, self.extracted, self.out)
+        self.assertEqual(rd(self.out), self.old)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    def test_new_save_is_byte_exact_and_gets_normal_creation_permissions(self):
+        os.remove(self.out)
+        quiet(saves.pack, self.extracted, self.out)
+        self.assertEqual(rd(self.out), self.new)
+        self.assertEqual(os.stat(self.out).st_mode & 0o777, os.stat(self.source).st_mode & 0o777)
+
+    def test_hard_linked_destination_is_refused_without_splitting_aliases(self):
+        alias = os.path.join(self.root, "alias.jsav")
+        try:
+            os.link(self.out, alias)
+        except OSError as exc:
+            self.skipTest(f"cannot create hard links: {exc}")
+        before = sorted(os.listdir(self.root))
+        with self.assertRaisesRegex(ValueError, "hard link"):
+            quiet(saves.pack, self.extracted, self.out)
+        result = subprocess.run([sys.executable, "-I", TOOL, "pack", self.extracted, self.out],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("hard link", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertTrue(os.path.samefile(self.out, alias))
+        self.assertEqual(rd(alias), self.old)
+        self.assertEqual(rd(self.out), self.old)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    def symlink(self, target, link):
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"cannot create symbolic links: {exc}")
+
+    def test_destination_symlinks_update_the_target_and_remain_links(self):
+        probe = os.path.join(self.root, "symlink-probe")
+        self.symlink("missing-probe-target", probe)
+        os.unlink(probe)
+        for relative in (False, True):
+            for dangling in (False, True):
+                with self.subTest(relative=relative, dangling=dangling):
+                    label = f"{relative}-{dangling}"
+                    target_dir = os.path.join(self.root, "target-" + label)
+                    os.mkdir(target_dir)
+                    target = os.path.join(target_dir, "save.jsav")
+                    if not dangling:
+                        write(target, self.old)
+                    link = os.path.join(self.root, "link-" + label)
+                    spelling = os.path.relpath(target, self.root) if relative else target
+                    self.symlink(spelling, link)
+                    quiet(saves.pack, self.extracted, link)
+                    self.assertTrue(os.path.islink(link))
+                    self.assertEqual(os.readlink(link), spelling)
+                    self.assertEqual(rd(target), self.new)
+                    self.assertEqual(os.listdir(target_dir), ["save.jsav"])
+
+    def test_failed_publication_through_symlink_preserves_link_and_target(self):
+        link = os.path.join(self.root, "link.jsav")
+        self.symlink(os.path.basename(self.out), link)
+        before = sorted(os.listdir(self.root))
+        with mock.patch.object(saves.os, "replace", side_effect=PermissionError("destination locked")):
+            with self.assertRaises(PermissionError):
+                quiet(saves.pack, self.extracted, link)
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.readlink(link), os.path.basename(self.out))
+        self.assertEqual(rd(self.out), self.old)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    @unittest.skipUnless(os.name == "nt", "Windows directory junction")
+    def test_destination_through_directory_junction_updates_the_target(self):
+        target_dir = os.path.join(self.root, "target")
+        os.mkdir(target_dir)
+        junction = os.path.join(self.root, "junction")
+        result = subprocess.run(["cmd", "/c", "mklink", "/J", junction, target_dir],
+                                capture_output=True, text=True)
+        if result.returncode:
+            self.skipTest("cannot create junction: " + result.stderr)
+        self.addCleanup(os.rmdir, junction)
+        target = os.path.join(target_dir, "save.jsav")
+        write(target, self.old)
+        quiet(saves.pack, self.extracted, os.path.join(junction, "save.jsav"))
+        self.assertTrue(os.path.isdir(junction))
+        self.assertEqual(rd(target), self.new)
+        self.assertEqual(os.listdir(target_dir), ["save.jsav"])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits")
+    def test_replacement_preserves_existing_permission_bits(self):
+        os.chmod(self.out, 0o640)
+        quiet(saves.pack, self.extracted, self.out)
+        self.assertEqual(rd(self.out), self.new)
+        self.assertEqual(os.stat(self.out).st_mode & 0o777, 0o640)
+
+
 class AsavTest(unittest.TestCase):
     def test_header_fields(self):
         d = make_asav(kind=2, title="Profile", slot="SettingsX", payload=b'{"$v": 2.0}')
@@ -322,7 +516,7 @@ class MalformedSlayerTest(unittest.TestCase):
 
 class ImportTest(unittest.TestCase):
     def test_encoding_matches_the_shim(self):
-        # Same rule as encode_name() in runtime/shims/xgameruntime_services.cpp.
+        # Same rule as encode_name() in runtime/shims/xgameruntime_gamesave.cpp.
         self.assertEqual(saves.xgs_encode("slot 1/main"), "slot%201%2Fmain")
         self.assertEqual(saves.xgs_encode("world.dat"), "world.dat")
         self.assertEqual(saves.xgs_encode(".hidden"), "%2Ehidden")
@@ -377,6 +571,24 @@ class ImportTest(unittest.TestCase):
                 quiet(saves.import_saves, [story, prof, "--out", out, "--force",
                                            "--map", "SLOT3=Same/blob", "--map", "Player=same/BLOB"])
 
+    def test_container_names_follow_the_runtime_rule(self):
+        # The same rule as valid_container_name() in runtime/shims/xgameruntime_gamesave.cpp.
+        for good in ("SLOT3", "slots/SAVE_00.sav-1", "a/b/c"):
+            self.assertTrue(saves.valid_container_name(good), good)
+        for bad in ("slot 0", "a..b", "x.", "dir/", "a/b-c/d", "", "é", "a" * 257):
+            self.assertFalse(saves.valid_container_name(bad), bad)
+        with tempfile.TemporaryDirectory() as tmp:
+            story, _, _ = self._folders(tmp)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                quiet(saves.import_saves, [story, "--out", os.path.join(tmp, "o"), "--map", "SLOT3=slot 0/story",
+                                           "--dry-run"])
+            self.assertIn("'slot 0' breaks XGameSaveCreateContainer's naming rule", err.getvalue())
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                quiet(saves.import_saves, [story, "--out", os.path.join(tmp, "o"), "--dry-run"])
+            self.assertEqual(err.getvalue(), "")
+
     def test_folder_with_two_payloads_is_refused(self):
         # A folder holding a save and an older backup with the same signature must not import either silently.
         with tempfile.TemporaryDirectory() as tmp:
@@ -413,9 +625,136 @@ class ImportTest(unittest.TestCase):
         self.assertEqual(reader.call_args_list,
                          [mock.call(payload, 8), mock.call(other, 8), mock.call(payload)])
 
+    def test_info_directory_reads_only_eight_bytes_per_candidate(self):
+        # The info directory loop probes each candidate with eight bytes and only reads the chosen save in full,
+        # so an unrelated large text file next to it is never read in full (mirrors save_slot's probe, #1556).
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "story")
+            jsav, _, _ = make_jsav()
+            write(os.path.join(folder, "SLOT0"), jsav)
+            write(os.path.join(folder, "notes.txt"), b"just text" * 1000)
+            with mock.patch.object(saves, "read", wraps=saves.read) as reader:
+                quiet(saves.info, [folder])
+        payload = os.path.join(folder, "SLOT0")
+        other = os.path.join(folder, "notes.txt")
+        # read(cj) opens the chives.json path only when it exists (it does not here); each candidate is an
+        # eight-byte probe and the selected save is then read in full by info_file.
+        self.assertEqual(reader.call_args_list,
+                         [mock.call(payload, 8), mock.call(payload), mock.call(other, 8)])
+
 
 class MalformedJsavTest(unittest.TestCase):
     """A truncated or lying JSAV is one error line, not a struct.error traceback."""
+
+    def test_excessive_json_body_nesting_is_a_validation_error(self):
+        # Linux CPython 3.12 can accept 6,000 levels; exercise the C decoder's higher limit too.
+        block = b'{"nested":' + b'[' * 100_000 + b'0' + b']' * 100_000 + b'}'
+        data = saves.build_jsav(3, 1, [1], [1], [block])
+        with self.assertRaisesRegex(ValueError, r"JSAV body is not valid UTF-8 JSON"):
+            saves.parse_jsav(data)
+
+    def test_all_read_commands_refuse_excessive_nesting_without_changing_exports(self):
+        block = b'{"nested":' + b'[' * 100_000 + b'0' + b']' * 100_000 + b'}'
+        data = saves.build_jsav(3, 1, [1], [1], [block])
+        with tempfile.TemporaryDirectory() as tmp:
+            source, out = os.path.join(tmp, "deep.jsav"), os.path.join(tmp, "export")
+            index = os.path.join(out, "index.json")
+            prior_block = os.path.join(out, "blocks", "previous.json")
+            write(source, data)
+            write(index, b"previous complete index")
+            write(prior_block, b"previous complete block")
+            for args in (("info", source), ("verify", source),
+                         ("diff", source, source), ("extract", source, out)):
+                with self.subTest(command=args[0]):
+                    result = subprocess.run([sys.executable, "-I", TOOL, *args],
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("ERROR: JSAV body is not valid UTF-8 JSON", result.stderr)
+                    self.assertEqual(len(result.stderr.splitlines()), 1)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual(rd(source), data)
+                    self.assertEqual(rd(index), b"previous complete index")
+                    self.assertEqual(rd(prior_block), b"previous complete block")
+                    self.assertEqual(sorted(os.listdir(out)), ["blocks", "index.json"])
+                    self.assertEqual(os.listdir(os.path.join(out, "blocks")), ["previous.json"])
+
+    def test_entry_ranges_must_stay_inside_the_json_body(self):
+        original, _, _ = make_jsav()
+        header, entries = saves.parse_jsav(original)
+        cases = {
+            "header": (0, 2),
+            "entry table": (saves.JSAV_HDR, 2),
+            "alignment padding": (header["table_end"], 1),
+            "past EOF": (len(original) + 16, 1),
+            "truncated block": (entries[0]["offset"], len(original)),
+            "trailing padding": (header["body_end"] - 1, 2),
+            "uint32 extent": (0xFFFFFFFF, 0xFFFFFFFF),
+        }
+        for name, (offset, size) in cases.items():
+            with self.subTest(name=name):
+                data = bytearray(original)
+                struct.pack_into("<II", data, saves.JSAV_HDR + 12, offset, size)
+                with self.assertRaisesRegex(ValueError, r"JSAV entry 0.*outside.*body"):
+                    saves.parse_jsav(bytes(data))
+
+    def test_all_read_commands_refuse_a_bad_entry_before_using_blocks(self):
+        data, _, _ = make_jsav()
+        bad = bytearray(data)
+        struct.pack_into("<I", bad, saves.JSAV_HDR + 12, len(data) + 16)
+        with tempfile.TemporaryDirectory() as tmp:
+            source, out = os.path.join(tmp, "bad.jsav"), os.path.join(tmp, "extract")
+            write(source, bad)
+            for args in (("info", source), ("extract", source, out),
+                         ("diff", source, source), ("verify", source)):
+                with self.subTest(command=args[0]):
+                    result = subprocess.run([sys.executable, "-I", TOOL, *args],
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("ERROR: JSAV entry 0", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertNotIn("blocks identical", result.stdout)
+            self.assertFalse(os.path.exists(os.path.join(out, "blocks")))
+            self.assertEqual(rd(source), bytes(bad))
+
+    def test_appended_block_is_not_part_of_the_outer_json_body(self):
+        original, _, blocks = make_jsav()
+        data = bytearray(original + blocks[0])
+        struct.pack_into("<I", data, saves.JSAV_HDR + 12, len(original))
+        with self.assertRaisesRegex(ValueError, r"JSAV entry 0.*outside.*body"):
+            saves.parse_jsav(bytes(data))
+
+    def test_invalid_json_and_trailing_data_produce_no_partial_exports(self):
+        original, _, _ = make_jsav()
+        body_end = len(original.rstrip(b"\0"))
+        cases = {
+            "second document": original + b'{"extra":1}',
+            "malformed document": original[:body_end - 1] + b"]",
+            "invalid UTF-8": original + b"\xff",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, data in cases.items():
+                with self.subTest(name=name):
+                    source = os.path.join(tmp, "bad.jsav")
+                    out = os.path.join(tmp, name)
+                    index = os.path.join(out, "index.json")
+                    write(source, data)
+                    write(index, b"previous complete export")
+                    for command in (("extract", source, out), ("diff", source, source)):
+                        result = subprocess.run([sys.executable, "-I", TOOL, *command],
+                                                capture_output=True, text=True, timeout=10)
+                        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                        self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual(rd(index), b"previous complete export")
+                    self.assertFalse(os.path.exists(os.path.join(out, "blocks")))
+
+    def test_json_end_uses_utf8_bytes_and_allows_whitespace_before_padding(self):
+        block = json.dumps({"message": "\u0105\u6f22"}, ensure_ascii=False).encode("utf-8")
+        original = saves.build_jsav(3, 1, [1], [1], [block])
+        end = len(original.rstrip(b"\0"))
+        data = original[:end] + b"\r\n\t " + b"\0" * 16
+        header, entries = saves.parse_jsav(data)
+        self.assertEqual(header["body_end"], end)
+        self.assertEqual(saves.jsav_blocks(data, entries), [block])
 
     def test_header_shorter_than_16_bytes_is_rejected(self):
         with self.assertRaises(ValueError) as ctx:
@@ -452,6 +791,116 @@ class MalformedJsavTest(unittest.TestCase):
         self.assertIn("ERROR:", p.stderr)
         self.assertIn("declares 4 entries", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
+
+
+class PackIndexValidationTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.source = os.path.join(self.tmp.name, "source.jsav")
+        self.extracted = os.path.join(self.tmp.name, "extracted")
+        self.index_path = os.path.join(self.extracted, "index.json")
+        self.original, _, _ = make_jsav(1, 1)
+        write(self.source, self.original)
+        quiet(saves.extract, self.source, self.extracted)
+        self.index = rd_json(self.index_path)
+
+    def invalid_indexes(self):
+        yield None, "object"
+        yield [], "object"
+        fields = [
+            (("header",), (None, [], 42), "header"),
+            (("entries",), (None, {}, 42), "entries"),
+            (("header", "version"), (None, "3", True, -1, 0x100000000), "header.version"),
+            (("header", "code_blocks"), (None, "1", True, -1, 3), "header.code_blocks"),
+            (("entries", 0), (None, [], 42), "entries[0]"),
+            (("entries", 0, "file"), (None, [], 42, ""), "entries[0].file"),
+            (("entries", 0, "hash"), (None, 1, True, "not-hex", "-1", "100000000"), "entries[0].hash"),
+            (("entries", 0, "flags"), (None, "1", True, -1, 0x100000000), "entries[0].flags"),
+        ]
+        for path, values, field in fields:
+            for value in values:
+                doc = json.loads(json.dumps(self.index))
+                node = doc
+                for key in path[:-1]:
+                    node = node[key]
+                node[path[-1]] = value
+                yield doc, field
+        for path, field in [(("header",), "header"), (("entries",), "entries"),
+                            (("header", "version"), "header.version"),
+                            (("header", "code_blocks"), "header.code_blocks"),
+                            (("entries", 0, "file"), "entries[0].file"),
+                            (("entries", 0, "hash"), "entries[0].hash"),
+                            (("entries", 0, "flags"), "entries[0].flags")]:
+            doc = json.loads(json.dumps(self.index))
+            node = doc
+            for key in path[:-1]:
+                node = node[key]
+            del node[path[-1]]
+            yield doc, field
+
+    def test_malformed_indexes_name_the_index_and_invalid_field(self):
+        for doc, field in self.invalid_indexes():
+            with self.subTest(field=field, doc=doc):
+                write(self.index_path, json.dumps(doc).encode("utf-8"))
+                with self.assertRaises(ValueError) as error:
+                    saves.pack_from_dir(self.extracted)
+                self.assertIn(self.index_path, str(error.exception))
+                self.assertIn(field, str(error.exception))
+
+    def test_cli_errors_leave_existing_output_untouched(self):
+        out = os.path.join(self.tmp.name, "packed.jsav")
+        write(out, b"previous complete output")
+        for doc in (None, {}, {"header": None, "entries": []},
+                    {"header": {"version": 3, "code_blocks": 0}, "entries": [None]}):
+            with self.subTest(doc=doc):
+                write(self.index_path, json.dumps(doc).encode("utf-8"))
+                result = subprocess.run([sys.executable, "-I", TOOL, "pack", self.extracted, out],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("ERROR:", result.stderr)
+                self.assertIn(self.index_path, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(rd(out), b"previous complete output")
+
+    def test_json_syntax_and_encoding_errors_name_the_index(self):
+        for data in (b"{", b"\xff"):
+            with self.subTest(data=data):
+                write(self.index_path, data)
+                with self.assertRaises(ValueError) as error:
+                    saves.pack_from_dir(self.extracted)
+                self.assertIn(self.index_path, str(error.exception))
+                self.assertIn("invalid JSON", str(error.exception))
+
+    def test_excessive_json_nesting_names_the_index(self):
+        # The C decoder's limit differs by platform; Linux CPython 3.12 accepts 6,000 levels.
+        write(self.index_path, b"[" * 100_000 + b"0" + b"]" * 100_000)
+        with self.assertRaises(ValueError) as error:
+            saves.pack_from_dir(self.extracted)
+        self.assertIn(self.index_path, str(error.exception))
+        self.assertIn("invalid JSON", str(error.exception))
+
+    def test_cli_excessive_json_nesting_preserves_existing_output(self):
+        write(self.index_path, b"[" * 100_000 + b"0" + b"]" * 100_000)
+        out = os.path.join(self.tmp.name, "packed.jsav")
+        write(out, b"previous complete output")
+        result = subprocess.run([sys.executable, "-I", TOOL, "pack", self.extracted, out],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("ERROR:", result.stderr)
+        self.assertIn(self.index_path, result.stderr)
+        self.assertIn("invalid JSON", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(rd(out), b"previous complete output")
+
+    def test_valid_editable_metadata_still_round_trips(self):
+        self.index["header"]["note"] = "extra metadata is ignored"
+        self.index["entries"][0]["hash"] = "0X" + self.index["entries"][0]["hash"]
+        write(self.index_path, json.dumps(self.index).encode("utf-8"))
+        self.assertEqual(saves.pack_from_dir(self.extracted), self.original)
+        write(self.index_path, json.dumps({"header": {"version": 3, "code_blocks": 0},
+                                         "entries": []}).encode("utf-8"))
+        self.assertEqual(saves.pack_from_dir(self.extracted), saves.build_jsav(3, 0, [], [], []))
 
 
 if __name__ == "__main__":

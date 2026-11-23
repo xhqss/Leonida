@@ -71,7 +71,9 @@ vérifie les prérequis et l'espace libre, et liste d'un coup tout ce qui manque
 
 ```powershell
 python -I make_game.py --find                          # liste les copies trouvées sur ce PC
+python -I make_game.py --pick                          # ouvre une fenêtre pour choisir le dossier du jeu
 python -I make_game.py --check                         # vérifie votre copie, sans rien compiler
+python -I make_game.py --check --full-check            # vérifie aussi le SHA-256 de chaque fichier (lent)
 python -I make_game.py --game "D:\chemin\vers\le\paquet" --out "D:\Games\Leonida" --work "E:\leonida-work"
 python -I make_game.py --stages shaders,assets         # seulement certaines étapes
 python -I make_game.py --game "D:\chemin\vers\le\paquet" --wav  # décode aussi l'Opus en WAV PCM (volumineux)

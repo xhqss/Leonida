@@ -22,7 +22,7 @@ With --oracle hw (or translator,hw) the same programs also run natively on an AM
 the hardware is judged against F32Model: match / mismatch where the model has an answer, "known deviation" where the
 hardware equals an analysed alternative (omod turns -0 into +0), and informational tables where the model declines
 (denormals under four MODE settings, NaN payloads, clamp of NaN, omod under IEEE/denormal modes). GFX10.1-only opcodes
-(v_mad_f32, v_mac_f32, v_madak_f32, v_mad_legacy_f32) are skipped on gfx1030/GFX11 with a reason, never substituted.
+(v_mad_f32, v_mac_f32, v_madak_f32, v_madmk_f32, v_mad_legacy_f32) are skipped on gfx1030/GFX11 with a reason, never substituted.
 v_min/max/min3/max3/med3_f32 are hardware-only ops. Exit 77 when the hardware tools are missing. See
 docs/shader_validation.md ("32-bit float VALU on the GPU").
 
@@ -304,7 +304,8 @@ def cube(op, x, y, z):
         return {"z": neg(x) if lt0(z) else x, "y": x, "x": z if lt0(x) else neg(z)}[major]
     if op == "v_cubetc_f32":
         return {"z": neg(y), "y": neg(z) if lt0(y) else z, "x": neg(y)}[major]
-    return mul(bits(2.0), {"z": z, "y": y, "x": x}[major])
+    m = {"z": z, "y": y, "x": x}[major]
+    return 0 if is_zero(m) else mul(bits(2.0), m)
 
 
 def cmp_class(x, mask):
@@ -398,7 +399,7 @@ def apply_out_mods(r, mods):
 
 
 # ---- op table: name -> (sources, kind, model) ----
-# kinds: "f" float source (takes neg/abs), "u" integer source, "k" literal float constant (fmaak/madak).
+# kinds: "f" float source (takes neg/abs), "u" integer source, "k" literal float constant (fmaak/fmamk/madak/madmk).
 
 def _op(srcs, fn, mods=True, sel="any", hw_only=False):
     return {"srcs": srcs, "fn": fn, "mods": mods, "sel": sel, "hw_only": hw_only}
@@ -449,7 +450,9 @@ ALL_OPS = {
     "v_fmac_f32": _op("ffd", fma),                       # D = S0 * S1 + D
     "v_mac_f32": _op("ffd", lambda x, y, z: add(mul(x, y), z)),
     "v_fmaak_f32": _op("ffk", fma, mods=False),
+    "v_fmamk_f32": _op("fkf", fma, mods=False),
     "v_madak_f32": _op("ffk", lambda x, y, z: add(mul(x, y), z), mods=False),
+    "v_madmk_f32": _op("fkf", lambda x, y, z: add(mul(x, y), z), mods=False),
     "v_cvt_f32_i32": _op("u", lambda x: cvt_int_to_f32(x - (1 << 32) if x >> 31 else x)),
     "v_cvt_f32_u32": _op("u", lambda x: cvt_int_to_f32(x)),
     "v_cvt_f32_ubyte0": _op("u", lambda x: cvt_int_to_f32(x & 0xFF)),
@@ -490,10 +493,11 @@ VOP3_ONLY = {"v_mad_legacy_f32", "v_mad_f32", "v_fma_f32", "v_cubeid_f32", "v_cu
              "v_cubema_f32", "v_cvt_pk_u8_f32", "v_cvt_pkrtz_f16_f32", "v_min3_f32", "v_max3_f32", "v_med3_f32"}
 OPS = {k: v for k, v in ALL_OPS.items() if not v["hw_only"]}   # what the translator comparison covers
 HW_ONLY_OPS = tuple(k for k, v in ALL_OPS.items() if v["hw_only"])
+LITERAL_CONST_OPS = {"v_fmaak_f32", "v_fmamk_f32", "v_madak_f32", "v_madmk_f32"}
+
 # Ops the hardware gives an output modifier in their VOP3 form but whose float output is an integer or packed
 # value: no omod/clamp generated for them.
-NO_OUT_MODS = {"v_cvt_f16_f32", "v_cvt_pkrtz_f16_f32", "v_cvt_pk_u8_f32", "v_cmp_class_f32", "v_fmaak_f32",
-               "v_madak_f32"}
+NO_OUT_MODS = {"v_cvt_f16_f32", "v_cvt_pkrtz_f16_f32", "v_cvt_pk_u8_f32", "v_cmp_class_f32"} | LITERAL_CONST_OPS
 
 # ---- operand values ----
 
@@ -632,13 +636,13 @@ def model(op, vals, srcs, out_mods, denorm="skip", translator=True):
         r, vcc = vals[8], cmp_class(ins[0], ins[1])
     else:
         r = spec["fn"](*ins)
-        floaty = spec["mods"] or op in ("v_fmaak_f32", "v_madak_f32")
+        floaty = spec["mods"] or op in LITERAL_CONST_OPS
         if floaty and is_denorm(r):
             if denorm == "skip":
                 raise Denormal("result")
             if out_flush:
                 r = flush(r)
-        if op in ("v_mad_f32", "v_mac_f32", "v_madak_f32", "v_mad_legacy_f32"):
+        if op in ("v_mad_f32", "v_mac_f32", "v_madak_f32", "v_madmk_f32", "v_mad_legacy_f32"):
             prod = legacy_mul(ins[0], ins[1]) if op == "v_mad_legacy_f32" else mul(ins[0], ins[1])
             if is_denorm(prod) and denorm == "skip":
                 raise Denormal("intermediate product")
@@ -660,9 +664,9 @@ def line(op, vals, srcs, e64, out_mods):
     if op == "v_cmp_class_f32":
         name += "_e64" if e64 else "_e32"
         return f"{name} vcc_lo, " + ", ".join(parts) if e64 else f"{name} vcc_lo, " + ", ".join(parts)
-    if op not in VOP3_ONLY and op not in ("v_fmaak_f32", "v_madak_f32"):
+    if op not in VOP3_ONLY and op not in LITERAL_CONST_OPS:
         name += "_e64" if e64 else "_e32"
-    if not e64 and op not in ("v_fmaak_f32", "v_madak_f32"):
+    if not e64 and op not in LITERAL_CONST_OPS:
         # VOP1/VOP2: src1 must be a VGPR, already true; no modifiers
         pass
     del spec
@@ -687,7 +691,7 @@ def run_translated(text, name="ps_f32_fuzz"):
         dis = os.path.join(tmp, "disasm")
         os.mkdir(dis)
         path = os.path.join(dis, name + ".s")
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         with open(os.path.join(tmp, name + ".dxbc"), "wb") as f:
             f.write(STUB_DXBC)
@@ -824,15 +828,15 @@ HW_PRIMARY = "flush"
 
 
 # Ops whose omod does not depend on the f32 denormal mode: the transcendental unit and the cube ops flush or select
-# whatever MODE says, and gfx1150 applies their omod with denormals kept (measured, 'omod' table).
+# whatever MODE says, and gfx1150 and gfx1031 (RDNA2) apply their omod with denormals kept (measured, 'omod' table).
 OMOD_IGNORES_DENORM_MODE = ("v_rcp_f32", "v_rcp_iflag_f32", "v_rsq_f32", "v_sqrt_f32", "v_exp_f32", "v_log_f32",
                             "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32", "v_cubema_f32")
 
 
 def omod_active(mode, op=None):
-    """Whether mul:2 / mul:4 / div:2 act in this mode (measured on gfx1150): never with MODE.IEEE = 1 (LLVM's
-    SIFoldOperands.cpp: "omod is ignored by hardware if IEEE bit is enabled" and, for f32, if output denormals are
-    enabled), and for the ALU ops only with f32 denormals flushed."""
+    """Whether mul:2 / mul:4 / div:2 act in this mode (measured on gfx1150 and gfx1031): never with MODE.IEEE = 1
+    (LLVM's SIFoldOperands.cpp: "omod is ignored by hardware if IEEE bit is enabled" and, for f32, if output denormals
+    are enabled), and for the ALU ops only with f32 denormals flushed."""
     m = HW_MODES[mode]
     return not m["ieee"] and (op in OMOD_IGNORES_DENORM_MODE or not m["denorm32"])
 
@@ -912,10 +916,11 @@ def is_nan16(h):
 
 
 def hw_same(want, got, op=None):
-    """Model [v8, vcc] against the hardware's: NaN matches any NaN (an f16 NaN in a result half too), everything else
-    bit for bit."""
+    """Compare hardware v8 and VCC, requiring byte equality for packed u8 results."""
     if want[1] != got[1]:
         return False
+    if op == "v_cvt_pk_u8_f32":
+        return want[0] == got[0]
     halves = F16_HALVES.get(op)
     if halves is None:
         return same(want[0], got[0])
@@ -931,9 +936,10 @@ def hw_same(want, got, op=None):
 # that equals the deviation's words is filed under "known deviation", not "match"; anything else stays a mismatch.
 
 def dev_omod_neg_zero(case, want, mode=None):
-    """On gfx1150 VOP3 omod (mul:2, mul:4, div:2) turns a -0 result into +0 (RDNA2 unmeasured). LLVM notes that omod
-    mishandles signed zeros (SIFoldOperands.cpp) and D30209 describes -0 being forced to +0 before the modifier. Only
-    where the omod was active: not with MODE.IEEE = 1, not for ALU ops with f32 denormals kept (omod_active)."""
+    """VOP3 omod (mul:2, mul:4, div:2) turns a -0 result into +0, on gfx1150 and on RDNA2 (gfx1031, gfx1036). LLVM
+    notes that omod mishandles signed zeros (SIFoldOperands.cpp) and D30209 describes -0 being forced to +0 before the
+    modifier. Only where the omod was active: not with MODE.IEEE = 1, not for ALU ops with f32 denormals kept
+    (omod_active)."""
     if mode is None:
         mode = HW_PRIMARY
     if want[0] == 0x80000000 and any(m in OMOD for m in case.out_mods) and omod_active(mode, case.op):
@@ -1104,6 +1110,8 @@ def omod_label(case, got):
         return None
     if hw_same(with_, without, case.op) and with_[0] != 0x80000000:
         return None
+    if hw_same(with_, without, case.op) and hw_same(with_, got, case.op):
+        return "-0 result kept (applied or ignored, same word)"     # neither applied nor ignored is shown
     if hw_same(with_, got, case.op):
         return "applied"
     alt = dev_omod_neg_zero(case, with_)
@@ -1136,8 +1144,8 @@ def clamp_label(case, got):
 FAMILIES = [
     ("add / sub / mul", ("v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32")),
     ("DX9 legacy mul / mad", ("v_mul_legacy_f32", "v_mad_legacy_f32")),
-    ("mad / mac / madak", ("v_mad_f32", "v_mac_f32", "v_madak_f32")),
-    ("fma / fmac / fmaak", ("v_fma_f32", "v_fmac_f32", "v_fmaak_f32")),
+    ("mad / mac / madak / madmk", ("v_mad_f32", "v_mac_f32", "v_madak_f32", "v_madmk_f32")),
+    ("fma / fmac / fmaak / fmamk", ("v_fma_f32", "v_fmac_f32", "v_fmaak_f32", "v_fmamk_f32")),
     ("int -> f32 convert", ("v_cvt_f32_i32", "v_cvt_f32_u32", "v_cvt_f32_ubyte0", "v_cvt_f32_ubyte1",
                             "v_cvt_f32_ubyte2", "v_cvt_f32_ubyte3")),
     ("f16 convert", ("v_cvt_f32_f16", "v_cvt_f16_f32", "v_cvt_pkrtz_f16_f32")),
@@ -1237,7 +1245,7 @@ def gen_probe(rng, op, kind):
         return case
     if kind == "cancel":
         # z = -round(x * y): a fused multiply-add keeps the rounding residue of the product, an unfused one gives 0
-        if op not in ("v_fma_f32", "v_fmac_f32", "v_fmaak_f32"):
+        if op not in ("v_fma_f32", "v_fmac_f32", "v_fmaak_f32", "v_fmamk_f32"):
             return None
         x = (rng.getrandbits(1) << 31) | (rng.randrange(120, 135) << 23) | rng.getrandbits(23)
         y = (rng.getrandbits(1) << 31) | (rng.randrange(120, 135) << 23) | rng.getrandbits(23)
@@ -1511,7 +1519,7 @@ def info_print(rep):
         for (mode, label), n in rep.omod.items():
             tab.setdefault(label, {})[mode] = n
         for label, by in sorted(tab.items()):
-            print(f"    {label:40s} " + "  ".join(f"{m}={by.get(m, 0)}" for m in modes))
+            print(f"    {label:47s} " + "  ".join(f"{m}={by.get(m, 0)}" for m in modes))
     if rep.nan:
         print("\n  NaN handling (programs without clamp or omod; same program counts in every mode, so a column that "
               "differs is a mode effect)")
@@ -1653,6 +1661,10 @@ def main(argv=None):
     ap.add_argument("--fma", choices=("glsl", "khr"), default="glsl",
                     help="with the translator oracle: emit the fused multiply-adds as GLSL Fma (default) or OpFmaKHR")
     ap.add_argument("--keep", help="write the kernel body of every hardware mismatch to this folder")
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        ap.error("no arguments given; pass --help for the available options")
     a = ap.parse_args(argv)
     rdna2spirv.FMA_KHR = a.fma == "khr"
     if a.programs < 1:
@@ -1727,7 +1739,7 @@ def main(argv=None):
             if a.keep and rep.mismatches:
                 os.makedirs(a.keep, exist_ok=True)
                 for k, (c, _, _) in enumerate(rep.mismatches):
-                    with open(os.path.join(a.keep, f"{c.group}_{c.index}_{c.op}_{k}.asm"), "w", encoding="utf-8") as f:
+                    with open(os.path.join(a.keep, f"{c.group}_{c.index}_{c.op}_{k}.asm"), "w", encoding="utf-8", newline="\n") as f:
                         f.write("\n".join(hw_lines(c, oracle.arch, not a.no_hw_guard)) + "\n")
             if a.perturb:
                 print(f"perturbed model '{a.perturb}': {n_mis} mismatches" + ("" if n_mis else " -- NOT DETECTED"))

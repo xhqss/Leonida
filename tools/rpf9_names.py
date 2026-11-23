@@ -27,14 +27,18 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from file_mode import published_mode  # noqa: E402
+from zero_span import gap_split  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter, then u32 size-8).
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
 
-# Cap on the transient output a single decompress() call may produce, and the feed
-# quantum read from the map per decompress() call. ``max_inflate`` remains the bound on
+# Cap on the transient output a single decompress() call may produce, and the largest
+# input feed read from the map. ``max_inflate`` remains the bound on
 # how much of the inflated stream is kept for name extraction.
 DECOMPRESS_MAX = 1 << 20
+# Most short streams end in the first read. zlib copies any bytes beyond EOF
+# into unused_data, so reading a full MiB up front copies the next streams too.
+INITIAL_FEED = 4096
 NAME = re.compile(rb"(?<![A-Za-z0-9_\-])([A-Za-z0-9_\-]{2,120})\.#([A-Za-z0-9]{1,8})(?![A-Za-z0-9_\-])")
 
 
@@ -111,11 +115,9 @@ def scan_archive(archive, start=None, limit=None, max_inflate=1 << 20, types=("d
                     if not (64 <= blen <= end - s and 16 <= w <= 8192 and 16 <= h <= 8192):
                         pos = s + 1
                         continue
-                    gap = m[last:s]
-                    if gap.count(0) == len(gap):
-                        zero += len(gap)
-                    else:
-                        unread += len(gap)
+                    gap_zero, gap_unread = gap_split(m, last, s)
+                    zero += gap_zero
+                    unread += gap_unread
                     bink2_files += 1
                     bink2_bytes += blen
                     last = pos = s + blen
@@ -125,14 +127,16 @@ def scan_archive(archive, start=None, limit=None, max_inflate=1 << 20, types=("d
                 total = 0
                 p = s
                 pending = b""
+                feed_size = min(INITIAL_FEED, DECOMPRESS_MAX)
                 try:
                     # Bound each decompress() call's transient output with max_length and
                     # re-feed unconsumed_tail before pulling more input, so a stream cannot
                     # balloon memory regardless of how large it inflates.
                     while not d.eof and (pending or p < end):
                         if not pending:
-                            pending = m[p:p + min(DECOMPRESS_MAX, end - p)]
+                            pending = m[p:p + min(feed_size, end - p)]
                             p += len(pending)
+                            feed_size = min(feed_size * 2, DECOMPRESS_MAX)
                         data = d.decompress(pending, DECOMPRESS_MAX)
                         total += len(data)
                         if len(prefix) < max_inflate:
@@ -148,13 +152,11 @@ def scan_archive(archive, start=None, limit=None, max_inflate=1 << 20, types=("d
                 if used <= 0:
                     pos = s + 1
                     continue
-                gap = m[last:s]
-                if gap.count(0) == len(gap):
-                    zero += len(gap)
-                else:
-                    unread += len(gap)
+                gap_zero, gap_unread = gap_split(m, last, s)
+                zero += gap_zero
+                unread += gap_unread
                 streams += 1
-                names = extract_names(bytes(prefix), types)
+                names = extract_names(prefix, types) if b".#" in prefix else []
                 if names:
                     name_hits += len(names)
                     for name, suffix in names:
@@ -167,11 +169,9 @@ def scan_archive(archive, start=None, limit=None, max_inflate=1 << 20, types=("d
                     progress(f"{streams} streams, {len(rows)} with names, "
                              f"{(pos - (data_start if start is None else start)) / span:.1%}, "
                              f"{time.time() - t0:.0f}s")
-            tail = m[last:end]
-            if tail.count(0) == len(tail):
-                zero += len(tail)
-            else:
-                unread += len(tail)
+            gap_zero, gap_unread = gap_split(m, last, end)
+            zero += gap_zero
+            unread += gap_unread
             span = end - (data_start if start is None else start)
             by_type = {}
             for suffix in unique.values():
@@ -207,7 +207,7 @@ def publish_report(path, rows, summary):
     os.makedirs(directory, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=directory, prefix=".rpf9_names-") as stage_dir:
         temp = os.path.join(stage_dir, "report.json")
-        with open(temp, "w", encoding="utf-8") as f:
+        with open(temp, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "files": rows}, f, indent=1)
             f.write("\n")
         os.chmod(temp, published_mode(path))

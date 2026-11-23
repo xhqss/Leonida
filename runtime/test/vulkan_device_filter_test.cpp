@@ -1,7 +1,8 @@
-// Unit tests for LEONIDA_VK_DEVICE name matching (runtime/src/vulkan_device_filter.h). No Vulkan instance and no GPU:
-// the filter is a pure function of the environment and a device name.
+// Unit tests for LEONIDA_VK_DEVICE name matching and the device rank (runtime/src/vulkan_device_filter.h). No Vulkan
+// instance and no GPU: the filter is a pure function of the environment and a device name, the rank of type and vendor.
 #include "vulkan_device_filter.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -59,6 +60,21 @@ int main() {
     expect(vulkan_device_wanted("AMD Radeon RX 7900 XTX"), "model number matches");
     expect(!vulkan_device_wanted(nullptr), "a filter never matches a null name");
     expect(!vulkan_device_wanted(""), "a filter never matches an empty name");
+
+    // The rank the runtime and every harness pick by (VkPhysicalDeviceType values: OTHER 0, INTEGRATED 1, DISCRETE 2,
+    // VIRTUAL 3, CPU 4). A native driver beats Microsoft's layers of any type, so Dozen ("Microsoft Direct3D12 (...)",
+    // reported as discrete) never wins over the GPU it wraps, nor over a native integrated GPU (#915).
+    using leonida::vulkan_device_rank;
+    constexpr std::uint32_t amd = 0x1002, nvidia = 0x10de, microsoft = leonida::microsoft_vulkan_vendor_id;
+    expect(microsoft == 0x1414, "Microsoft's PCI vendor id");
+    expect(vulkan_device_rank(2, amd) > vulkan_device_rank(1, amd), "discrete over integrated");
+    expect(vulkan_device_rank(1, amd) > vulkan_device_rank(3, amd), "integrated over virtual");
+    expect(vulkan_device_rank(3, amd) > vulkan_device_rank(4, amd), "virtual over CPU");
+    expect(vulkan_device_rank(4, amd) > vulkan_device_rank(0, amd), "CPU over other");
+    expect(vulkan_device_rank(0, amd) > vulkan_device_rank(2, microsoft), "any native device over Dozen");
+    expect(vulkan_device_rank(2, microsoft) > vulkan_device_rank(4, microsoft), "among Microsoft's, discrete first");
+    expect(vulkan_device_rank(2, amd) == vulkan_device_rank(2, nvidia), "vendors other than Microsoft tie");
+    expect(vulkan_device_rank(99, amd) == vulkan_device_rank(0, amd), "an unknown type ranks as other");
 
     // Do not leak the test's value into anything that runs later in this process.
 #ifdef _WIN32

@@ -16,6 +16,10 @@ import sys
 import tempfile
 from collections import Counter
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 
 def entropy(b: bytes) -> float:
     if not b:
@@ -42,15 +46,6 @@ def probe(path: str) -> dict:
     }
 
 
-def _same_report_path(first: str, second: str) -> bool:
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("game_dir")
@@ -68,7 +63,7 @@ def main() -> int:
                 if name.lower().endswith(".rpf"):
                     archives.append(os.path.join(root, name))
         for path in archives:
-            if _same_report_path(a.out, path):
+            if same_report_path(a.out, path):
                 print(f"ERROR: --out would overwrite an input archive: {path}", file=sys.stderr)
                 return 2
         for path in archives:
@@ -84,7 +79,7 @@ def main() -> int:
         os.makedirs(out_dir, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=out_dir) as staging:
             staged = os.path.join(staging, "rpf_probe.json")
-            with open(staged, "w", encoding="utf-8") as f:
+            with open(staged, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(rows, f, indent=1)
             os.replace(staged, a.out)
     except OSError as error:

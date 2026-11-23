@@ -595,6 +595,13 @@ def main() -> int:
         if os.path.isdir(args.json):
             parser.error(f"--json is a directory: {args.json}")
         for target in args.targets:
+            if (os.path.isdir(target) and os.path.isfile(args.json)
+                    and not os.path.isfile(os.path.join(target, "index.json"))):
+                # Directory mode without index.json reads every nested *.xml; none may be the
+                # report we are about to open for writing.
+                for source in gx.xml_files(target):
+                    if gx.same_report_path(args.json, source):
+                        parser.error(f"--json would overwrite the input {source}")
             source = os.path.join(target, "index.json") if os.path.isdir(target) else target
             if gx.same_report_path(args.json, source):
                 parser.error(f"--json would overwrite the input {source}")
@@ -624,7 +631,7 @@ def main() -> int:
     print_summary(graph)
     if args.json:
         try:
-            with open(args.json, "w", encoding="utf-8") as f:
+            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(graph, f, indent=1)
         except OSError as exc:
             print(f"cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)

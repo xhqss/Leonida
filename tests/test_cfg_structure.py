@@ -83,9 +83,28 @@ def random_graph(rng):
 
 def blocks_in(tree):
     out = []
-    for it in tree:
-        out += [it[1]] if it[0] == "block" else blocks_in(it[2])
+    stack = [tree]
+    while stack:
+        for it in reversed(stack.pop()):
+            if it[0] == "block":
+                out.append(it[1])
+            else:
+                stack.append(it[2])
+    out.reverse()
     return out
+
+
+def max_depth(tree):
+    best = 0
+    stack = [(tree, 0)]
+    while stack:
+        items, depth = stack.pop()
+        if depth > best:
+            best = depth
+        for it in items:
+            if it[0] in ("guard", "loop"):
+                stack.append((it[2], depth + 1))
+    return best
 
 
 def _check_random_graphs():
@@ -140,6 +159,13 @@ def test_random_graphs():
     _check_random_graphs()
 
 
+def test_depth():
+    assert S.depth([("block", 0)]) == 0
+    assert S.depth([("block", 0), ("loop", 1, [("block", 1), ("guard", 2, [("block", 2)])])]) == 2
+    assert S.depth([]) == 0
+    assert S.depth(S.structure([[1, 2], [3], [3], []])) == 1     # a diamond is one guard deep
+
+
 def test_shapes():
     assert S.structure([[]]) == [("block", 0)]
     assert S.structure([[1], [2], []]) == [("block", 0), ("block", 1), ("block", 2)]          # no tests needed
@@ -177,8 +203,54 @@ def test_shapes():
     assert S.split_irreducible([[1, 2], [2], [1]], max_splits=0) is None
 
 
+def test_deep_sequential_chains_stay_flat_and_iterative():
+    """Long chains of sequential if/else diamonds, sequential loops, and early-exit chains must structure without
+    hitting Python's recursion limit and keep bounded OpSelectionMerge nesting depth."""
+    # 1. 2,000 sequential if/else diamonds (6,001 blocks): previously nested 2,000 levels deep and raised RecursionError.
+    n_diamonds = 2000
+    diamonds = []
+    for k in range(n_diamonds):
+        b = 3 * k
+        diamonds.extend([[b + 1, b + 2], [b + 3], [b + 3]])
+    diamonds.append([])
+    tree = S.structure(diamonds)
+    assert tree is not None
+    assert len(blocks_in(tree)) == len(diamonds)
+    assert max_depth(tree) <= 2, f"expected O(1) depth on sequential diamonds, got {max_depth(tree)}"
+    for seed in range(3):
+        want = walk(diamonds, chooser(diamonds, seed), len(diamonds) + 5)
+        got = S.run(tree, chooser(diamonds, seed), len(diamonds) + 5)
+        assert got == want
+
+    # 2. 1,200 sequential single-block loops: previously nested 1,200 levels deep.
+    n_loops = 1200
+    loops = [[k, k + 1] for k in range(n_loops)] + [[]]
+    ltree = S.structure(loops)
+    assert ltree is not None
+    assert len(blocks_in(ltree)) == len(loops)
+    assert max_depth(ltree) <= 2, f"expected O(1) depth on sequential loops, got {max_depth(ltree)}"
+    for seed in range(3):
+        want = walk(loops, chooser(loops, seed), 5000)
+        got = S.run(ltree, chooser(loops, seed), 5000)
+        assert got == want
+
+    # 3. 1,500 sequential early-exit guards (b -> {b+1, END}): stays bounded by max_guard_depth without recursion.
+    n_exits = 1500
+    exits = [[k + 1, n_exits] for k in range(n_exits)] + [[]]
+    etree = S.structure(exits)
+    assert etree is not None
+    assert len(blocks_in(etree)) == len(exits)
+    assert max_depth(etree) <= 17, f"expected bounded depth on early-exit chain, got {max_depth(etree)}"
+    for seed in range(3):
+        want = walk(exits, chooser(exits, seed), len(exits) + 5)
+        got = S.run(etree, chooser(exits, seed), len(exits) + 5)
+        assert got == want
+
+
 if __name__ == "__main__":
+    test_depth()
     test_shapes()
+    test_deep_sequential_chains_stay_flat_and_iterative()
     structured, refused, loops, split_ok, split_cap = _check_random_graphs()
     print(f"ok: {structured} graphs structured and run, {refused} irreducible "
           f"({split_ok} split-structured, {split_cap} capped), {loops} with loops")

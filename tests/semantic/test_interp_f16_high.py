@@ -59,6 +59,17 @@ class InterpF16High(unittest.TestCase):
         _, words = run(SHADER)
         self.assertEqual(words[3], 0x101)
 
+    def test_p2_f16_keeps_the_high_half_of_vdst(self):
+        """v_interp_p2_f16 writes only the low half, like the other f16 results; the high half of vdst is kept
+        (SHADER-430: measured on gfx1036 with a preset 0xdead high half, which survived every case)."""
+        asm = SHADER.replace("exp mrt0 v2, v3, v4, v5 done vm",
+                             "v_mov_b32_e32 v6, 0xdead0000\n"
+                             "v_interp_p1ll_f16 v7, v0, attr0.x high\n"
+                             "v_interp_p2_f16 v6, v1, attr0.x, v7 high\n"
+                             "exp mrt0 v2, v3, v4, v6 done vm")
+        _, words = run(asm)
+        self.assertEqual(f"{words[3]:#010x}", "0xdead4880")            # 9.0 under the kept 0xdead
+
     def test_without_high_both_reads_are_the_low_half(self):
         _, words = run(SHADER.replace(" high", ""))
         self.assertEqual([f"{w & 0xFFFF:#06x}" for w in words[:2]], ["0x3f00", "0x3f00"])

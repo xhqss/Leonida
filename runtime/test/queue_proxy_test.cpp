@@ -999,12 +999,15 @@ int run_runner_child(const char* mode, unsigned long bytes) {
 int check_child_runner() {
     const char* label = "child runner";
     ChildResult report;
-    ChildRun run = run_self(L"--child-flood 0", 30000);
-    EXPECT(run.end == ChildEnd::exited && run.exit_code == 0 && parse_diff_report(run.tail, report));
-    EXPECT(report.ran == 1 && report.hr == 0 && report.removed == 0 && report.validation == 0);
-    // The first start and the first failed start make Windows load what it keeps for them (a failed CreateProcessW
-    // leaves 42 handles the first time on Windows 11 26200, none on every later one): both run once before the handle
-    // count is taken, and every case after it must leave the count as it was.
+    ChildRun run;
+    // The first two successful starts and the first failed start make Windows load and cache their persistent process
+    // handles (on Windows 11 26200, a second CreateProcessW caches the HKCU root key and a failed CreateProcessW keeps
+    // 41-42 AppCompat/PCA handles; later starts add none). Warm up both before reading handles_before.
+    for (int warmup = 0; warmup < 2; ++warmup) {
+        run = run_self(L"--child-flood 0", 30000);
+        EXPECT(run.end == ChildEnd::exited && run.exit_code == 0 && parse_diff_report(run.tail, report));
+        EXPECT(report.ran == 1 && report.hr == 0 && report.removed == 0 && report.validation == 0);
+    }
     std::fprintf(stderr, "child runner: the next four errors are expected\n");
     const std::wstring missing = self_path() + L".missing.exe";
     run = run_process(missing.c_str(), L"", 5000);
@@ -1067,26 +1070,77 @@ unsigned differential_jobs() {
     return half < 1 ? 1 : half > 8 ? 8 : half;
 }
 
+// Cases that fault in the PC runtime (17..20, 25), modify device residency (1, 2, 26..29), or touch the shared
+// handle subsystem (30, 31) are isolated in child processes so the host device remains completely clean and intact.
+// Non-destructive argument-validation and proxy-wrapping cases run in-process for speed (<1 ms each).
+bool is_isolated_diff_case(int index) {
+    if (index == 1 || index == 2) return true;         // residency (descriptor heap)
+    if (index >= 17 && index <= 20) return true;       // faults on PC runtime (queue null args)
+    if (index == 25) return true;                      // faults on PC runtime (null fence entry)
+    if (index >= 26 && index <= 29) return true;       // residency (MakeResident/Evict/Priority/Enqueue)
+    if (index == 30 || index == 31) return true;       // shared handle creation
+    return false;
+}
+
+ChildResult run_in_process(const char* label, ID3D12Device* target_device, int index, bool through_proxy,
+                           unsigned long validation_errors = 0) {
+    ChildResult r{};
+    Event event;
+    DiffContext context{};
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12Fence> fence, second;
+    if (make_context(label, target_device, context, queue, fence, second)) return r;
+    if (xs::is_queue_proxy(context.queue) != through_proxy || xs::is_fence_proxy(context.fence) != through_proxy) {
+        return r;
+    }
+    context.event = event.h;
+    HRESULT result = S_OK;
+    const bool ran = run_guarded(kDiffCases[index].run, &context, &result);
+    const HRESULT removed = ran ? target_device->GetDeviceRemovedReason() : S_OK;
+    r.ok = true;
+    r.ran = ran ? 1 : 0;
+    r.hr = static_cast<unsigned long>(result);
+    r.removed = static_cast<unsigned long>(removed);
+    r.validation = validation_errors;
+    return r;
+}
+
 // Each case, in a child process for the real object and in another for the proxy: the same HRESULT, the device
 // removed (or not) alike, and no validation errors. A case the real runtime faults on is reported, not compared.
-// The children run differential_jobs() at a time; the results are judged afterwards in case order, so the report is
-// the same as one child after another would give (a proxy child whose real one faulted is run but not judged).
+// Non-destructive argument-validation and proxy cases run in-process (<1 ms each instead of ~5 s per device creation).
+// Faulting, residency, or shared cases run in isolated child processes using differential_jobs() workers.
 int check_differential(const Backend& b) {
     const char* label = b.label;
     int compared = 0, faulting = 0;
     constexpr int kCases = static_cast<int>(std::size(kDiffCases));
     std::vector<ChildResult> results(2 * kCases);  // [2 * case] real, [2 * case + 1] proxy
-    {
-        std::atomic<int> next{0};
+
+    const bool force_isolate_all = GetEnvironmentVariableA("LEONIDA_QUEUE_PROXY_ISOLATE_ALL", nullptr, 0) > 0;
+
+    std::vector<int> child_jobs;
+    for (int i = 0; i < kCases; ++i) {
+        if (force_isolate_all || is_isolated_diff_case(i)) {
+            child_jobs.push_back(2 * i);      // real
+            child_jobs.push_back(2 * i + 1);  // proxy
+        } else {
+            results[2 * i] = run_in_process(label, b.real, i, false);
+            results[2 * i + 1] = run_in_process(label, b.device, i, true);
+        }
+    }
+
+    if (!child_jobs.empty()) {
+        std::atomic<size_t> next{0};
         const auto work = [&] {
-            for (int job; (job = next.fetch_add(1)) < 2 * kCases;)
+            for (size_t idx; (idx = next.fetch_add(1)) < child_jobs.size();) {
+                const int job = child_jobs[idx];
                 results[job] = run_child(b.kind, job / 2, job % 2 == 1);
+            }
         };
         const unsigned jobs = differential_jobs();
         std::vector<std::thread> pool;
         try {
-            for (unsigned t = 1; t < jobs; ++t) pool.emplace_back(work);
-        } catch (const std::system_error& e) {  // fewer helpers; this thread still runs every job left
+            for (unsigned t = 1; t < jobs && t < child_jobs.size(); ++t) pool.emplace_back(work);
+        } catch (const std::system_error& e) {
             std::fprintf(stderr, "%s: %zu of %u differential runner threads (%s)\n", label, pool.size() + 1, jobs,
                          e.what());
         }

@@ -249,6 +249,16 @@ class PeInspectTest(unittest.TestCase):
             self.assertEqual(report["exports"], ["Alpha", "#12"])
             self.assertEqual(report["export_count"], 2)
 
+    def test_named_exports_require_a_populated_address_table_slot(self) -> None:
+        for is64 in (True, False):
+            with self.subTest(is64=is64):
+                data = bytearray(with_exports([0x1000, 0, FORWARDER, 0x1010],
+                                              {0: "Alpha", 1: "Empty", 2: "Forwarded", 4: "Outside"},
+                                              is64=is64))
+                # The bytes after AddressOfFunctions are not part of its declared four slots.
+                place(data, EXPORT_FUNCS + 16, struct.pack("<I", 0x1020))
+                self.assertEqual(self.exports_of(bytes(data)), ["Alpha", "Forwarded", "#13"])
+
     def test_unused_slots_in_a_table_without_names(self):
         data = with_exports([0, 0x1000, 0, 0x1010, 0], {})
         self.assertEqual(self.exports_of(data), ["#11", "#13"])
@@ -304,6 +314,33 @@ class PeInspectTest(unittest.TestCase):
         self.assertIn("| xmem.dll | normal | shim | 1 |", md)
         self.assertIn("## Needs checking or a shim", md)
         self.assertIn("`XMemAlloc`", md)
+
+    def test_runtime_load_candidates(self):
+        """DLL names held as strings but not imported: what a run-time LoadLibrary* reaches
+        (docs/runtime_imports.md)."""
+        base = {d["name"] for d in self.report["runtime_load_candidates"]}
+        self.assertEqual(base, {"d3d12_xs.dll"}, "the 64-bit fixture names d3d12_xs.dll without importing it")
+        buf = bytearray(build_image())
+        place(buf, 0x1E00, "XGameRuntime.dll".encode("utf-16-le") + b"\0\0")
+        place(buf, 0x1E40, b"gameplatformservices.dll\0xmem.dll\0")
+        path = os.path.join(self.dir, "loads.dll")
+        with open(path, "wb") as f:
+            f.write(buf)
+        r = pe_inspect.inspect(path, self.dir)
+        found = {d["name"]: d for d in r["runtime_load_candidates"]}
+        self.assertEqual(set(found) - base, {"gameplatformservices.dll", "xgameruntime.dll"}, "xmem.dll is imported")
+        self.assertEqual(found["xgameruntime.dll"]["encoding"], "utf-16")
+        self.assertEqual(found["gameplatformservices.dll"]["encoding"], "ascii")
+        self.assertIn(found["xgameruntime.dll"]["where"], ("system", "shim"))
+        md = pe_inspect.to_markdown(r)
+        self.assertIn("## Run-time load candidates", md)
+        self.assertIn("| xgameruntime.dll | utf-16 |", md)
+
+    def test_dll_strings_encodings_own_name_and_near_misses(self):
+        data = (b"a.dll\0" + "b.dll".encode("utf-16-le") + b"\0\0" + "a.dll".encode("utf-16-le") +
+                b" self.DLL x.dllz .dll y.dll")
+        got = pe_inspect.dll_strings(data, {"y.dll"}, "Self.dll")
+        self.assertEqual(got, [{"name": "a.dll", "encoding": "both"}, {"name": "b.dll", "encoding": "utf-16"}])
 
     def test_non_pe_input_is_rejected(self):
         bad = os.path.join(self.dir, "not_pe.bin")
@@ -513,6 +550,36 @@ class DirectoryCountTest(unittest.TestCase):
         self.assertEqual((r["imports"], r["exports"], r["has_relocs"]), ([], [], False))
 
 
+class ImportDescriptorBoundsTest(unittest.TestCase):
+    DIRECTORIES = (
+        ("normal", pe_inspect.DIR_IMPORT, 20, ["kernel32.dll", "xmem.dll"]),
+        ("delay", pe_inspect.DIR_DELAY_IMPORT, 32, ["xmem.dll", "d3d12_xs.dll"]),
+    )
+
+    def test_import_descriptors_fit_the_declared_directory(self):
+        for kind, index, step, dlls in self.DIRECTORIES:
+            for size, count in ((step - 1, 0), (2 * step - 1, 1), (2 * step, 2)):
+                with self.subTest(kind=kind, size=size):
+                    data = bytearray(build_image(is64=False))
+                    struct.pack_into("<I", data, OPT + 96 + index * 8 + 4, size)
+                    imports = pe_inspect._imports(pe_inspect.PeImage(data), kind, index, delay=kind == "delay")
+                    self.assertEqual([entry["dll"] for entry in imports], dlls[:count])
+
+    def test_import_descriptors_fit_the_file_backed_section(self):
+        for kind, index, step, dlls in self.DIRECTORIES:
+            for extra in (0, 1):
+                with self.subTest(kind=kind, extra=extra):
+                    data = bytearray(build_image(is64=False)) + b"\0"
+                    directory = OPT + 96 + index * 8
+                    source_rva = struct.unpack_from("<I", data, directory)[0]
+                    source = TEXT_RAW + source_rva - TEXT_RVA
+                    rva = TEXT_RVA + TEXT_SIZE - step + extra
+                    place(data, rva, data[source:source + step])
+                    struct.pack_into("<II", data, directory, rva, step)
+                    imports = pe_inspect._imports(pe_inspect.PeImage(data), kind, index, delay=kind == "delay")
+                    self.assertEqual([entry["dll"] for entry in imports], dlls[:1 - extra])
+
+
 class SectionSpanTest(unittest.TestCase):
     """An RVA belongs to the section whose virtual span holds it, not to an earlier section's raw tail."""
 
@@ -634,6 +701,102 @@ class TruncatedImageTest(unittest.TestCase):
         path = self.write("huge_exports.dll", bytes(full))
         exports = pe_inspect.inspect(path, None)["exports"]
         self.assertLessEqual(len(exports), pe_inspect.MAX_ENTRIES + 2)
+
+
+class DeclaredOptionalHeaderSizeTest(unittest.TestCase):
+    """Reject optional headers smaller than the fields the parser reads."""
+
+    def test_declared_optional_header_too_small(self):
+        for is64 in (False, True):
+            for declared_size in (0, 2, 71):
+                with self.subTest(is64=is64, declared_size=declared_size):
+                    data = bytearray(build_image(is64=is64))
+                    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+                    struct.pack_into("<H", data, pe_offset + 20, declared_size)
+
+                    with self.assertRaisesRegex(
+                        pe_inspect.PeFormatError, "truncated optional header"
+                    ):
+                        pe_inspect.PeImage(bytes(data))
+
+    def test_declared_optional_header_extends_beyond_file(self):
+        for is64 in (False, True):
+            with self.subTest(is64=is64):
+                data = bytearray(build_image(is64=is64))
+                pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+                struct.pack_into("<H", data, pe_offset + 20, 0xFFFF)
+
+                with self.assertRaisesRegex(
+                    pe_inspect.PeFormatError, "truncated optional header"
+                ):
+                    pe_inspect.PeImage(bytes(data))
+
+
+class ShortHeaderTest(unittest.TestCase):
+    """A file too short for a header names the header it stops short of, not a signature that is present."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+
+    def write(self, name: str, data: bytes) -> str:
+        path = os.path.join(self.dir, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def dos_header(self, size: int, nt: int | None = None) -> bytes:
+        """`size` bytes starting with MZ, optionally with e_lfanew at 0x3c pointing at `nt`."""
+        data = bytearray(size)
+        data[0:2] = b"MZ"
+        if nt is not None:
+            struct.pack_into("<I", data, 0x3C, nt)
+        return bytes(data)
+
+    def check_rejected(self, name: str, data: bytes, expected: str, not_expected: str = "") -> None:
+        """PeImage raises the message, and the CLI prints it to stderr and exits 1; no traceback on either path."""
+        with self.assertRaisesRegex(pe_inspect.PeFormatError, expected):
+            pe_inspect.PeImage(data)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(pe_inspect.main([self.write(name, data), "--out", os.path.join(self.dir, "reports")]), 1)
+        self.assertIn(expected, err.getvalue())
+        if not_expected:
+            self.assertNotIn(not_expected, err.getvalue())
+
+    def test_mz_shorter_than_the_msdos_header_reports_the_length(self):
+        # a 4-byte truncated copy: the signature is there, the 64-byte MS-DOS header (e_lfanew lives at 0x3c) is not
+        self.check_rejected("short4.bin", self.dos_header(4),
+                            "file is 4 bytes, shorter than the 64-byte MS-DOS header", not_expected="no MZ header")
+
+    def test_mz_one_byte_short_of_the_msdos_header_reports_the_length(self):
+        self.check_rejected("short63.bin", self.dos_header(63),
+                            "file is 63 bytes, shorter than the 64-byte MS-DOS header", not_expected="no MZ header")
+
+    def test_file_without_the_mz_signature_still_reports_no_mz_header(self):
+        for name, data in (("aaaa.bin", b"AAAA"), ("empty.bin", b""), ("one_byte.bin", b"A"), ("m.bin", b"M")):
+            with self.subTest(name=name):
+                self.check_rejected(name, data, "no MZ header")
+
+    def test_e_lfanew_past_the_end_reports_a_short_file_not_a_missing_signature(self):
+        # 64 bytes: the MS-DOS header fits, the PE header it points at at 0x40 does not
+        self.check_rejected("nt_past.bin", self.dos_header(64, 0x40),
+                            "file is 64 bytes, too short to hold the PE header at 0x40",
+                            not_expected="no PE signature")
+
+    def test_pe_header_cut_after_the_signature_reports_a_short_file(self):
+        # PE\0\0 at 0x40 is there, the 20 bytes of file header after it are cut off
+        data = bytearray(self.dos_header(68, 0x40))
+        data[0x40:0x44] = b"PE\0\0"
+        self.check_rejected("coff_cut.bin", bytes(data),
+                            "file is 68 bytes, too short to hold the PE header at 0x40",
+                            not_expected="no PE signature")
+
+    def test_a_long_enough_file_with_a_wrong_signature_still_reports_no_pe_signature(self):
+        data = bytearray(self.dos_header(88, 0x40))
+        data[0x40:0x44] = b"XX\0\0"
+        self.check_rejected("bad_sig.bin", bytes(data), "no PE signature")
 
 
 if __name__ == "__main__":

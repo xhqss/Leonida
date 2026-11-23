@@ -119,6 +119,16 @@ class QsadTests(unittest.TestCase):
             with self.subTest(op=op, x=hex(x), y=hex(y), acc=hex(acc)):
                 self.assertEqual(run_op(op, x, y, acc), ref(op, x, y, acc))
 
+    def test_null_pixel_source_and_null_accumulator(self) -> None:
+        x, y, acc = 0x0807060504030201, 0x04000201, 0x0004000300020001
+        setup = [f"v_mov_b32 v2, {x & 0xffffffff:#x}", f"v_mov_b32 v3, {x >> 32:#x}", f"v_mov_b32 v4, {y:#x}",
+                 f"v_mov_b32 v6, {acc & 0xffffffff:#x}", f"v_mov_b32 v7, {acc >> 32:#x}"]
+        for op in OPS:
+            for source, accumulator, expected in (("null", "v[6:7]", ref(op, 0, y, acc)),
+                                                   ("v[2:3]", "null", ref(op, x, y, 0))):
+                with self.subTest(op=op, source=source, accumulator=accumulator):
+                    self.assertEqual(run_lines(setup + [f"{op} v[0:1], {source}, v4, {accumulator}"]), expected)
+
     def test_sgpr_pair_and_inline_accumulator(self):
         got = run_lines(["s_mov_b32 s2, 0x04030201", "s_mov_b32 s3, 0x08070605", "v_mov_b32 v4, 0x04030201",
                          "v_qsad_pk_u16_u8 v[0:1], s[2:3], v4, 1"])

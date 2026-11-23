@@ -179,7 +179,7 @@ def build_navmesh(
     poly_sizes=(3, 4),
     n_links=2,
     n_link_idx=3,
-    n_volumes=1,
+    n_volumes=2,
     water_poly=False,
     tiny_bm_cont=False,
     corrupt_checksum=False,
@@ -243,6 +243,19 @@ def build_navmesh(
     if n_volumes and not corrupt_null_vol:
         vo = alloc(96 * n_volumes)
         struct.pack_into("<Q", buf, 0xB8, BASE + vo)
+        for p in range(n_volumes // 2):
+            o0 = vo + (2 * p) * 96
+            o1 = o0 + 96
+            hdr = struct.pack("<Q3f", 0x1122334455667788 + p, x0 + 16.0, y0 + 16.0, 0.3)
+            buf[o0:o0 + 20] = hdr
+            buf[o1:o1 + 20] = hdr
+            buf[o0 + 0x14], buf[o0 + 0x15] = 0, 8
+            buf[o1 + 0x14], buf[o1 + 0x15] = 8, 4
+            struct.pack_into("<16h", buf, o0 + 0x16, 410, 616, -408, 616, -536, 488, -536, -491,
+                             -408, -619, 410, -619, 538, -491, 538, 488)
+            struct.pack_into("<8h", buf, o1 + 0x16, -408, 488, -408, -491, 410, -491, 410, 488)
+            struct.pack_into("<2H", buf, o0 + 0x56, 2006, 1095)
+            struct.pack_into("<2H", buf, o1 + 0x56, 2006, 1095)
 
     def put_split(hdr_at, stride, data_bytes, total):
         per = nd.SPLIT_BLOCK // stride
@@ -324,8 +337,19 @@ def build_grid(
     two_streams=False,
     bad_ctrl=False,
     dup_value=False,
+    keys=None,
+    words=None,
 ):
-    """Build a synthetic Band-3 grid resource (0x60 header + 16-way SwissTable + u32[entries])."""
+    """Build a synthetic Band-3 grid resource (0x60 header + 16-way SwissTable + u32[entries]).
+
+    By default the keys are an octree written by hand (root 1, its children 8.. in order, then the children of
+    8 from 64): every key with a child gets 0x0000ff00, every other key a 0x01 leaf word."""
+    if keys is None:
+        keys = [1] + list(range(8, 8 + min(entries - 1, 8))) + list(range(64, 64 + max(entries - 9, 0)))
+        keys = keys[:entries]
+    if words is None:
+        parents = {k >> 3 for k in keys if k != 1}
+        words = [0x0000FF00 if k in parents else 0x00020001 for k in keys]
     table_end = 0x60 + nd.GRID_GROUP * groups
     bm_off = (table_end + 15) & ~15
     payload_off = (bm_off + 32 + 15) & ~15
@@ -351,11 +375,11 @@ def build_grid(
         base = 0x60 + nd.GRID_GROUP * g
         buf[base + slot] = (k * 7) & 0x7F
         val = 0 if (dup_value and k == 1) else k
-        struct.pack_into("<QQ", buf, base + 16 + 16 * slot, 0x10000 + k, val)
+        struct.pack_into("<QQ", buf, base + 16 + 16 * slot, keys[k], val)
     if bad_ctrl:
         buf[0x60 + 15] = 0xFF
     for k in range(entries):
-        struct.pack_into("<I", buf, payload_off + 4 * k, 0x00010001)
+        struct.pack_into("<I", buf, payload_off + 4 * k, words[k])
 
     if two_streams:
         if total - payload_off < 64:
@@ -452,11 +476,54 @@ class NavmeshDecodeTest(unittest.TestCase):
         self.assertEqual(doc["0drp"]["first_node"]["id1_index_ffffffff"], 3)
         self.assertEqual(doc["navmesh"]["static_sectors"], 4)
         self.assertEqual(doc["navmesh"]["quadtree"], {"nodes": 12, "leaves": 6, "max_depth": 1})
+        self.assertEqual(doc["navmesh"]["volumes"],
+                         {"pairs": 2, "flags": {"0": 2, "8": 2}, "vertex_counts": {"4": 2, "8": 2}})
         self.assertEqual(doc["navmesh"]["water_bit3"], {"b3_0_w_0": 4, "b3_1_w_1": 2})
         self.assertEqual(doc["grid"]["sectors"], 4)
         self.assertEqual(doc["grid"]["sectors_not_in_navmesh"], 0)
         self.assertEqual(doc["grid"]["navmesh_sectors_not_in_grid"], 0)
+        # 16 keys: the 4 roots have children, the 12 others are 0x01 leaves one level down.
+        self.assertEqual(doc["grid"]["key_depth"], {"1": 12, "0": 4})
+        self.assertEqual(doc["grid"]["inner_nodes"], 4)
+        self.assertEqual(doc["grid"]["leaf_payload"], {"low_byte_01": 12})
+        self.assertEqual(doc["checks"]["grid"]["keys_octree"], {"pass": 4, "fail": 0})
+        self.assertEqual(doc["checks"]["grid"]["inner_payload_ff00"], {"pass": 4, "fail": 0})
         self.assertEqual(doc["psin"]["complete"], 1)
+
+    def test_grid_octree_keys_and_payload_words(self):
+        # Root 1 -> 8 -> 64 -> 512 (depths 0..3), plus leaves 9, 10, 65.
+        keys = [1, 8, 64, 512, 9, 10, 65]
+        words = [0xFF00, 0xFF00, 0xFF00, 0x00007803, 0xFF00, 0x00060F01, 0x00000002]
+        good = build_grid(entries=7, keys=keys, words=words)
+        bad = [
+            build_grid(entries=3, keys=[8, 9, 10]),                       # no root
+            build_grid(entries=3, keys=[1, 8, 72]),                       # 72 >> 3 == 9 is absent
+            build_grid(entries=3, keys=[1, 8, 16]),                       # 16 has its top bit at 4, not 3 or 6
+            build_grid(entries=3, keys=[1, 0, 8]),                        # 0 is not a key
+            build_grid(entries=3, keys=[1, 8, 8]),                        # two slots share key 8
+            build_grid(entries=3, keys=[1, 8, 9], words=[0x01, 0x01, 0x01]),  # inner root without 0xff00
+            build_grid(entries=3, keys=[1, 8, 64], words=[0xFF00, 0x01, 0x01]),  # inner 8 without 0xff00
+        ]
+        # 17 keys over two groups: 8 sits in slot 15 of group 0 and 9 in group 1, both parents of other keys.
+        two_groups = build_grid(groups=2, entries=17, keys=[1] + list(range(64, 78)) + [8, 9])
+        # Payload pointer past the end: the table is accepted but the words are not read.
+        oob = bytearray(build_grid(entries=3)[0])
+        struct.pack_into("<Q", oob, 0x20, BASE + len(oob))
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "grid.rpf")
+            make_rpf(arc, good + two_groups + [s for g in bad for s in g] + [bytes(oob)])
+            doc = nd.scan(arc, deep=True)
+            shallow = nd.scan(arc)
+        cg = doc["checks"]["grid"]
+        self.assertEqual(cg["payload_in_bounds"]["fail"], 1)
+        self.assertEqual(cg["values_bijective"], {"pass": 10, "fail": 0})
+        self.assertEqual(cg["keys_octree"], {"pass": 4, "fail": 5})
+        self.assertEqual(cg["inner_payload_ff00"], {"pass": 2, "fail": 2})
+        self.assertEqual(doc["grid"]["key_depth"], {"2": 16, "1": 5, "0": 2, "3": 1})
+        self.assertEqual(doc["grid"]["inner_nodes"], 6)
+        self.assertEqual(doc["grid"]["leaf_payload"], {"low_byte_01": 15, "ff00": 1, "low_byte_03": 1, "other": 1})
+        self.assertNotIn("keys_octree", shallow["checks"]["grid"])
+        self.assertEqual(shallow["grid"]["key_depth"], {})
 
     def test_multiblock_split_array(self):
         # 380 polygons exceeds one 16 KiB block (floor(16384 / 44) == 372), exercising nblocks == 2.
@@ -523,8 +590,20 @@ class NavmeshDecodeTest(unittest.TestCase):
         self.assertEqual(cn["indices_below_vertices"]["fail"], 1)
         self.assertEqual(cn["links_in_bounds"]["fail"], 1)
         self.assertEqual(cn["volumes_in_bounds"]["fail"], 1)
+        self.assertEqual(cn["volumes_valid"]["fail"], 1)
         self.assertEqual(cn["polygons_chain"]["fail"], 1)
         self.assertEqual(cn["quadtree_valid"]["fail"], 1)
+
+        # A malformed second volume pair must not partially increment navmesh.volumes counters.
+        tile = bytearray(build_navmesh(n_volumes=4)[0])
+        vstart = nd.offset_of(struct.unpack_from("<Q", tile, 0xB8)[0])
+        tile[vstart + 3 * 96 + 0x14] = 7
+        st = nd.new_stats()["navmesh"]
+        _, chk = nd.decode_navmesh(bytes(tile), 1, st, True)
+        self.assertFalse(chk["volumes_valid"])
+        self.assertEqual(st["volumes"]["pairs"], 0)
+        self.assertEqual(dict(st["volumes"]["flags"]), {})
+        self.assertEqual(dict(st["volumes"]["vertex_counts"]), {})
 
         cg = doc["checks"]["grid"]
         self.assertEqual(cg["control_bytes"]["fail"], 1)
@@ -670,6 +749,36 @@ class NavmeshDecodeTest(unittest.TestCase):
                 with open(archive, "rb") as f:
                     self.assertEqual(f.read(), original, f"{flag} touched the input")
 
+    def test_cli_protects_carved_inputs_from_reports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            source = os.path.join(carve, "000000.bin")
+            original = build_navmesh()[0]
+            with open(source, "wb") as f:
+                f.write(original)
+            alias = os.path.join(tmp, "alias.csv")
+            os.link(source, alias)
+
+            out = os.path.join(carve, "report.json")
+            csv_path = os.path.join(carve, "report.csv")
+            command = [sys.executable, "-I", TOOL, carve, "--quiet"]
+            for _ in range(2):
+                result = subprocess.run([*command, "--out", out, "--csv", csv_path],
+                                        capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            for flag, target in (("--out", source), ("--csv", source), ("--csv", alias)):
+                with self.subTest(flag=flag, target=target):
+                    with open(source, "wb") as f:
+                        f.write(original)
+                    result = subprocess.run([*command, flag, target], cwd=tmp,
+                                            capture_output=True, text=True, check=False)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("would overwrite the input", result.stderr)
+                    with open(source, "rb") as f:
+                        self.assertEqual(f.read(), original)
+
     def test_cli_rejects_bad_arguments_and_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             empty = os.path.join(tmp, "empty.rpf")
@@ -697,6 +806,21 @@ class NavmeshDecodeTest(unittest.TestCase):
                 proc = subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
                 self.assertNotEqual(proc.returncode, 0, f"expected failure for {args}")
                 self.assertNotIn("Traceback", proc.stderr)
+
+
+class OutputPathTest(unittest.TestCase):
+    """A report path that is already a folder is a usage error, not a PermissionError traceback."""
+
+    def test_out_that_is_a_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, out = os.path.join(tmp, "carved"), os.path.join(tmp, "reports")
+            os.makedirs(source)
+            os.makedirs(out)
+            r = subprocess.run([sys.executable, "-I", TOOL, source, "--out", out],
+                               capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("--out is a directory", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
 
 
 if __name__ == "__main__":

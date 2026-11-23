@@ -1,12 +1,14 @@
 """amd_swizzle.load: parses addrlib's pattern tables without evaluating them as Python.
 
-    python -I tests/test_amd_swizzle.py
+    python -m pytest tests/test_amd_swizzle.py
 """
 import pytest  # noqa: E402 (keeps the CI bash loop from running this file)
 
 import os
+import pathlib
 import sys
 import tempfile
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 
@@ -106,6 +108,40 @@ def test_uncompressed_feature_uses_raw_rgb_bytes():
     assert got.tolist() == [[0, 1, 2], [4, 5, 6]]
 
 
+@pytest.mark.parametrize(("bpe", "texels", "pixels"), [
+    (1, bytes((17, 63, 129, 245)), [(17, 17, 17), (63, 63, 63), (129, 129, 129), (245, 245, 245)]),
+    (2, bytes((17, 33, 63, 94, 129, 159, 245, 200)), [(17, 33, 0), (63, 94, 0), (129, 159, 0), (245, 200, 0)]),
+], ids=["r8", "rg8"])
+def test_cli_previews_uncompressed_r8_and_rg8(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, bpe: int, texels: bytes, pixels: list[tuple[int, int, int]],
+) -> None:
+    image = pytest.importorskip("PIL.Image")
+    # A synthetic 4 KiB row-major tile, 64 elements per row in both formats.
+    bits = ["0"] * (bpe - 1) + [f"X{i}" for i in range(6)] + [f"Y{i}" for i in range(7 - bpe)]
+    rows = {"NIBBLE01": bits[:8], "NIBBLE2": bits[8:], "NIBBLE3": ["0"] * 4, "NIBBLE4": ["0"] * 4}
+    header_path = tmp_path / "swizzle.h"
+    header_path.write_text(
+        "".join(table(name, [row]) for name, row in rows.items())
+        + "const ADDR_SW_PATINFO GFX10_SW_4K_S_PATINFO[] =\n{\n"
+        + f"    {{   0,    0,    0,    0,    0, }} , // synthetic {bpe} bpe\n}};\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    monkeypatch.setenv("AMD_SWIZZLE_HEADER", str(header_path))
+    tile = bytearray(4096)
+    tile[:2 * bpe] = texels[:2 * bpe]
+    tile[64 * bpe:66 * bpe] = texels[2 * bpe:]
+    (tmp_path / "blob.bin").write_bytes(tile)
+    output = tmp_path / "preview.png"
+
+    result = cli(tmp_path, "--bpe", str(bpe), "--width", "2", "--height", "2", "--modes", "4K", "--out", str(output))
+
+    assert result.returncode == 0, result.stderr
+    with image.open(output) as png:
+        assert png.size == (2, 2)
+        assert png.tobytes() == bytes(channel for pixel in pixels for channel in pixel)
+
+
 def test_cli_detiles_4k_tables_with_4k_blocks():
     # A 128x128 RGBA gradient tiled in 4 KB blocks (32x32 elements, row-major). The same pattern entry under
     # a 64K table name must not be picked by --modes 4K, and the 4K table must detile with 12-bit, 4 KB blocks.
@@ -141,3 +177,46 @@ def test_cli_detiles_4k_tables_with_4k_blocks():
     lines = p.stdout.splitlines()
     assert [ln.split()[1] for ln in lines] == ["GFX10_SW_4K_S_PATINFO"], p.stdout
     assert float(lines[0].split()[0]) == round(score(linear[..., :3].astype(np.float32)), 2), p.stdout
+
+
+def test_preview_keeps_partial_bc_blocks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import struct
+
+    image = pytest.importorskip("PIL.Image")
+    preview = tmp_path / "preview.png"
+    tile = bytearray(4096)
+    colors = (
+        (0xF800, 0xF800, 0x07E0),
+        (0xF800, 0xF800, 0x07E0),
+        (0x001F, 0x001F, 0xFFFF),
+    )
+    for y, row in enumerate(colors):
+        for x, color in enumerate(row):
+            struct.pack_into("<HHI", tile, 8 * (32 * y + x), color, color, 0)
+    (tmp_path / "blob.bin").write_bytes(tile)
+
+    # A 4 KiB tile with 32 blocks per row and 16 rows.
+    rows = {
+        "NIBBLE01": ["0", "0", "0", "X0", "X1", "X2", "X3", "X4"],
+        "NIBBLE2": ["Y0", "Y1", "Y2", "Y3"],
+        "NIBBLE3": ["0"] * 4,
+        "NIBBLE4": ["0"] * 4,
+    }
+    header_path = tmp_path / "swizzle.h"
+    header_path.write_text(
+        "".join(table(name, [row]) for name, row in rows.items())
+        + "const ADDR_SW_PATINFO GFX10_SW_4K_S_PATINFO[] =\n{\n"
+        "    {   0,    0,    0,    0,    0, } , // synthetic 8 bpe\n};\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AMD_SWIZZLE_HEADER", str(header_path))
+
+    result = cli(tmp_path, "--width", "9", "--height", "9", "--modes", "4K", "--out", str(preview))
+
+    assert result.returncode == 0, result.stderr
+    with image.open(preview) as png:
+        assert png.size == (9, 9)
+        assert png.getpixel((7, 7)) == (255, 0, 0)
+        assert png.getpixel((8, 7)) == (0, 255, 0)
+        assert png.getpixel((7, 8)) == (0, 0, 255)
+        assert png.getpixel((8, 8)) == (255, 255, 255)

@@ -9,12 +9,13 @@ Usage:
 """
 import argparse
 import itertools
+import os
 import sys
 
 import numpy as np
 
-sys.path.insert(0, __import__("os").path.dirname(__file__))
-from tile_probe import block_feature, score  # noqa: E402
+sys.path.insert(0, os.path.dirname(__file__))
+from tile_probe import block_feature, score, same_report_path  # noqa: E402
 
 
 def positions(seq, nblocks, tw, th, wblocks):
@@ -48,10 +49,11 @@ def search(data, bpe, tile_bytes, widths, ntiles):
             if wb % tw:
                 continue
             tiles_x = wb // tw
-            rows = max(1, ntiles // tiles_x)
-            n = tiles_x * rows * tw * th
-            if n > len(raw):
+            blocks_per_row = tiles_x * tw * th
+            rows = min(max(1, ntiles // tiles_x), len(raw) // blocks_per_row)
+            if not rows:
                 continue
+            n = blocks_per_row * rows
             for xs in itertools.combinations(range(bits), xbits):
                 seq = ["x" if k in xs else "y" for k in range(bits)]
                 pos = positions(seq, n, tw, th, wb)
@@ -89,17 +91,47 @@ def render(data, bpe, tile_bytes, wpx, seq, out):
     Image.open(io.BytesIO(body + lin.tobytes())).convert("RGB").save(out)
 
 
-def main():
+def validate_out_path(path):
+    """Return an error string if `path` cannot be used as a --out image file, or None."""
+    if not path or not path.strip():
+        return "--out path must not be empty"
+    if "\x00" in path:
+        return "--out path contains a NUL byte"
+    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)) or os.path.isdir(path):
+        return f"--out path is a directory: {path}"
+    cur = os.path.dirname(os.path.abspath(path))
+    while cur:
+        if os.path.isdir(cur):
+            break
+        if os.path.lexists(cur):
+            return f"--out parent is not a directory: {cur}"
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return None
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("blob")
     ap.add_argument("--bpe", type=int, default=8)
     ap.add_argument("--tile", type=int, default=65536)
     ap.add_argument("--widths", default="1024,2048")
-    ap.add_argument("--tiles", type=int, default=48)
+    ap.add_argument("--tiles", type=int, default=48, help="target number of tiles to score (default: 48)")
     ap.add_argument("--out")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
+    if a.out is not None:
+        out_err = validate_out_path(a.out)
+        if out_err:
+            print(f"ERROR: {out_err}", file=sys.stderr)
+            return 2
+        if same_report_path(a.out, a.blob):
+            ap.error("--out would overwrite the input blob")
     if a.bpe < 1:
         ap.error("--bpe must be at least 1")
+    if a.bpe not in (8, 16):
+        ap.error("--bpe must be 8 or 16")
     if a.tile < a.bpe or a.tile % a.bpe:
         ap.error("--tile must be a multiple of --bpe and at least --bpe")
     blocks = a.tile // a.bpe
@@ -122,11 +154,19 @@ def main():
     res = search(data, a.bpe, a.tile, widths, a.tiles)
     for s, w, seq in res[:8]:
         print(f"score {s:7.2f}  width {w:5}  bits(low->high) {seq}")
-    if a.out:
+    if a.out is not None:
         if not res:
             print("ERROR: no layout fits the input, tile size and requested widths", file=sys.stderr)
             return 1
-        render(data, a.bpe, a.tile, res[0][1], res[0][2], a.out)
+        parent = os.path.dirname(os.path.abspath(a.out))
+        try:
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            render(data, a.bpe, a.tile, res[0][1], res[0][2], a.out)
+        except (OSError, ValueError) as e:
+            detail = getattr(e, "strerror", None) or str(e)
+            print(f"ERROR: cannot write {a.out}: {detail}", file=sys.stderr)
+            return 2
         print("preview ->", a.out)
 
 

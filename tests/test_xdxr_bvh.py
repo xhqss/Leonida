@@ -48,7 +48,7 @@ class Layout(unittest.TestCase):
         data, info = X.build_blas([TRI])
         flags, units, crc, n, *rest = struct.unpack_from("<4I6fIiIIII", data, 0)
         self.assertEqual(flags, X.FLAG_BOTTOM_LEVEL | X.VERSION_2403)
-        self.assertEqual(units * 64, len(data))
+        self.assertEqual((units + 1) * 64, len(data))
         self.assertEqual(n, 1)
         self.assertEqual(rest[0:6], [0.0, 0.0, 0.0, 1.0, 1.0, 0.0])
         nodes, _remap, root, elements, parents, cp = rest[6:]
@@ -109,6 +109,35 @@ class Step(unittest.TestCase):
         self.assertAlmostEqual(bary[0][1], 0.3)
         self.assertAlmostEqual(bary[1][0], 0.3)
         self.assertAlmostEqual(bary[2][0], 0.6)
+
+    def test_triangle_barycentrics_independent_of_ray_scale_and_direction(self):
+        # Non-unit and diagonal rays (and scaled TLAS rays) have |dd[2]| != 1; i_num/t_den and j_num/t_den
+        # must still equal the true barycentrics (0.25, 0.25) and reconstruct the 3D hit point org + t * d.
+        target = [0.25, 0.25, 0.0]
+        for d in ([0.0, 0.0, 2.0], [0.0, 0.0, -2.0], [0.5, 0.5, 0.5], [-0.4, -0.3, -0.5], [1.0, 2.0, -3.0]):
+            org = [target[c] - 1.5 * d[c] for c in range(3)]
+            with self.subTest(d=d):
+                t_num, t_den, i_num, j_num = X.triangle_test(TRI, org, d)
+                self.assertNotEqual(t_num, math.inf)
+                t = t_num / t_den
+                b1, b2 = i_num / t_den, j_num / t_den
+                self.assertAlmostEqual(t, 1.5, places=12)
+                self.assertAlmostEqual(b1, 0.25, places=12)
+                self.assertAlmostEqual(b2, 0.25, places=12)
+                b0 = 1.0 - b1 - b2
+                for c in range(3):
+                    rebuilt = b0 * TRI[0][c] + b1 * TRI[1][c] + b2 * TRI[2][c]
+                    self.assertAlmostEqual(rebuilt, org[c] + t * d[c], places=12)
+
+    def test_triangle_edge_hit_with_zero_i_and_negative_major_axis_keeps_positive_j(self):
+        # Point (0.0, 0.25, 0.0) lies on edge v0-v2 (b1 == 0, b2 == 0.25). With dd[2] < 0, t_den < 0;
+        # j_num must share t_den's sign even when i_num == 0 so j_num / t_den is +0.25, not -0.25.
+        for dz in (-1.0, -2.5):
+            with self.subTest(dz=dz):
+                t_num, t_den, i_num, j_num = X.triangle_test(TRI, [0.0, 0.25, 1.0], [0.0, 0.0, dz])
+                self.assertNotEqual(t_num, math.inf)
+                self.assertAlmostEqual(i_num / t_den, 0.0, places=12)
+                self.assertAlmostEqual(j_num / t_den, 0.25, places=12)
 
     def test_tri1_reads_slots_1_3_2(self):
         quad = [[[0, 0, 0], [1, 0, 0], [1, 1, 0]], [[0, 0, 0], [1, 1, 0], [0, 1, 0]]]
@@ -208,6 +237,29 @@ class ClosestHit(unittest.TestCase):
         self.assertGreater(hits, 50)
         self.assertGreater(rec, 0)
 
+    def test_tlas_bounds_and_inverse_use_the_stored_transform(self) -> None:
+        triangles = [[(1, 0, 0), (2, 0, 0), (1, 1, 0)]]
+        blas, info = X.build_blas(triangles)
+        mem = X.Memory()
+        blas_va = mem.place(0x100000, blas)
+        # The x scale rounds down in float32. Its translation then places
+        # the triangle's left edge at x = 0 rather than x = 1.
+        matrix = [[16777217, 0, 0, -16777216], [0, 1, 0, 0], [0, 0, 1, 0]]
+        instance = X.Instance(matrix, blas_va, info["root"], info["bounds"])
+        tlas, metadata = X.build_tlas([instance])
+        root = X.ptr_offset(metadata["root"])
+        instance_offset = X.ptr_offset(struct.unpack_from("<I", tlas, root)[0])
+        stored_x = struct.unpack_from("<4f", tlas, instance_offset)
+        self.assertEqual(stored_x, (16777216.0, 0.0, 0.0, -16777216.0))
+        self.assertEqual(struct.unpack_from("<6f", tlas, root + 16),
+                         (0.0, 0.0, 0.0, 16777216.0, 1.0, 0.0))
+        self.assertEqual(struct.unpack_from("<4f", tlas, instance_offset + 64),
+                         (2.0 ** -24, 0.0, 0.0, 1.0))
+        tlas_va = mem.place(0x200000, tlas)
+        hit = X.trace(mem, tlas_va, (0.25, 0.25, -1.0), (0.0, 0.0, 1.0))
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["primitive"], 0)
+
     def test_instance_record(self):
         data, info = X.build_blas([TRI])
         inst = X.Instance([[1, 0, 0, 5], [0, 1, 0, 0], [0, 0, 1, 0]], 0x12300, info["root"], info["bounds"],
@@ -253,6 +305,11 @@ class Validate(unittest.TestCase):
             struct.pack_into("<I", b, self.info["parents"] + 4 * u, 0x1234)
             self.assertTrue(any("parent table" in e for e in X.validate(bytes(b))))
 
+    def test_parent_entry_outside_buffer_is_reported(self) -> None:
+        # offsetToParents is the signed offset at +56 in the runtime header.
+        errors = self.corrupt(56, "<i", len(self.data))
+        self.assertTrue(any("parent table entry" in error and "outside the buffer" in error for error in errors))
+
     def test_dehydrated_refused(self):
         errs = self.corrupt(0, "<I", 0x81020006 | X.FLAG_DEHYDRATED)
         self.assertTrue(any("dehydrated" in e for e in errs))
@@ -260,6 +317,63 @@ class Validate(unittest.TestCase):
     def test_short_buffer(self):
         self.assertEqual(X.validate(b"\0" * 10), ["buffer shorter than the 64-byte header"])
 
+
+
+def console_layout(data, k):
+    """The same structure with the parent table laid out as the console writes it: offsetToParents negative, the entries
+    of the first k units (the leaves) before the header and not stored, the rest stored from the header end on."""
+    flags, units, crc, n, *rest = struct.unpack_from("<4I6fIiIIiI", data, 0)
+    nodes, remap, root, elements, parents, cp = rest[6:]
+    out = bytearray(data)
+    slots = (elements - parents) // 4
+    entries = [struct.unpack_from("<I", data, parents + 4 * u)[0] for u in range(slots)]
+    kept = entries[k:] + [0] * k
+    for i, e in enumerate(kept):
+        struct.pack_into("<I", out, parents + 4 * i, e)
+    struct.pack_into("<4I6fIiIIiI", out, 0, flags, units, crc, n, *rest[0:6], nodes, remap, root, elements,
+                     parents - 4 * k, cp)
+    return bytes(out), parents - 4 * k
+
+
+class ConsoleParentTable(unittest.TestCase):
+    """RT-151 review: real console structures have offsetToParents negative and store only the entries from the header
+    end on (docs/bvh.md 3.1); validate() used to raise struct.error on them."""
+
+    def build(self):
+        tris = [((i * 0.1, 0, 0), (i * 0.1 + 1, 0, 0), (i * 0.1, 1, 0)) for i in range(20)]
+        data, info = X.build_blas(tris)
+        return data, info
+
+    def test_a_negative_offset_to_parents_validates(self):
+        data, info = self.build()
+        k = (info["node_offset"] - info["elements"]) // 64           # the leaf units
+        con, off = console_layout(data, k)
+        self.assertLess(off, 0)
+        self.assertEqual(X.validate(con), [])
+
+    def test_a_wrong_stored_entry_is_still_caught(self):
+        data, info = self.build()
+        k = (info["node_offset"] - info["elements"]) // 64
+        con, off = console_layout(data, k)
+        bad = bytearray(con)
+        for entry in range(64, info["elements"], 4):                # every stored entry
+            struct.pack_into("<I", bad, entry, struct.unpack_from("<I", bad, entry)[0] ^ 0x10)
+        self.assertTrue(any("parent table entry" in e for e in X.validate(bytes(bad))))
+
+    def test_unstored_entries_are_not_compared(self):
+        data, info = self.build()
+        k = (info["node_offset"] - info["elements"]) // 64
+        con, off = console_layout(data, k)
+        self.assertLess(off + 4 * (k - 1), 64)                      # the last leaf entry lies before the header end
+        self.assertEqual(X.validate(con), [])
+
+    def test_a_runtime_build_keeps_its_offset_and_is_still_checked(self):
+        data, info = self.build()
+        self.assertEqual(X.validate(data), [])
+        bad = bytearray(data)
+        for entry in range(64, info["elements"], 4):
+            struct.pack_into("<I", bad, entry, struct.unpack_from("<I", bad, entry)[0] ^ 0x10)
+        self.assertTrue(any("parent table entry" in e for e in X.validate(bytes(bad))))
 
 class CheckBuild(unittest.TestCase):
     """check-build on cases written the way vk_xdxr_build_test writes them, built here by the reference."""
@@ -299,6 +413,19 @@ class CheckBuild(unittest.TestCase):
     def test_corrupted_leaves_fail(self):
         self.assertTrue(self.run_check(True))
 
+    def test_literal_bracket_path_via_main(self):
+        # a directory with '[' and ']' in its name must not be treated as a glob: main must
+        # discover the cases and run validation rather than silently returning the 77 skip code.
+        with tempfile.TemporaryDirectory() as root:
+            d = os.path.join(root, "cases[1]")
+            os.mkdir(d)
+            self.write_cases(d, corrupt=False)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = X.main(["check-build", d])
+            self.assertEqual(rc, 0, out.getvalue())
+            self.assertIn("all cases match", out.getvalue())
+
     def test_empty_directory(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(X.check_build(d), [f"no cases in {d}"])
@@ -318,6 +445,23 @@ class Cli(unittest.TestCase):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 self.assertEqual(X.main(["validate", os.path.join(d, "missing.bin")]), 2)
+
+    def test_validate_rejects_a_root_with_a_parent(self) -> None:
+        data, info = X.build_blas(X.grid_mesh(3), box16=True)
+        self.assertEqual(X.validate(data), [])
+        corrupt = bytearray(data)
+        root_unit = (X.ptr_offset(info["root"]) - info["elements"]) // X.UNIT
+        struct.pack_into("<I", corrupt, info["parents"] + 4 * root_unit, info["root"])
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "root-parent.bin")
+            with open(path, "wb") as f:
+                f.write(corrupt)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(X.main(["validate", path]), 1)
+            self.assertIn("parent table entry", output.getvalue())
+            self.assertIn(f"expected {X.INVALID:#x}", output.getvalue())
 
     def test_selftest(self):
         with contextlib.redirect_stdout(io.StringIO()):

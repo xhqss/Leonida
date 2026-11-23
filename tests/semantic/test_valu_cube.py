@@ -63,17 +63,19 @@ def ref_cube(x: float, y: float, z: float) -> tuple[float, float, float, float]:
     """Independent RDNA2 ISA reference returning binary32 (face_id, sc, tc, ma)."""
     x, y, z = f32(x), f32(y), f32(z)
     ax, ay, az = abs(x), abs(y), abs(z)
+    # Measured natively on RDNA2 (gfx1036): v_cubema_f32 returns +0.0 (never -0.0) when the major axis is ±0.0.
+    ma = lambda v: 0.0 if v == 0.0 else f32(2.0 * v)  # noqa: E731
     if az >= ax and az >= ay:
         if z < 0.0:
-            return (5.0, f32(-x), f32(-y), f32(2.0 * z))
-        return (4.0, x, f32(-y), f32(2.0 * z))
+            return (5.0, f32(-x), f32(-y), ma(z))
+        return (4.0, x, f32(-y), ma(z))
     if ay >= ax:
         if y < 0.0:
-            return (3.0, x, f32(-z), f32(2.0 * y))
-        return (2.0, x, z, f32(2.0 * y))
+            return (3.0, x, f32(-z), ma(y))
+        return (2.0, x, z, ma(y))
     if x < 0.0:
-        return (1.0, z, f32(-y), f32(2.0 * x))
-    return (0.0, f32(-z), f32(-y), f32(2.0 * x))
+        return (1.0, z, f32(-y), ma(x))
+    return (0.0, f32(-z), f32(-y), ma(x))
 
 
 def ref_cube_words(x: float, y: float, z: float) -> tuple[int, int, int, int]:
@@ -254,6 +256,22 @@ class CubeValuTests(unittest.TestCase):
         for x, y, z in cases:
             with self.subTest(x=x, y=y, z=z):
                 self.assert_cube(x, y, z)
+
+    def test_signed_zero_triples_and_nan_cubema(self):
+        # Measured natively on RDNA2 (gfx1036, wave32 & wave64, all 4 IEEE/DX10_CLAMP modes):
+        # v_cubema_f32 returns +0.0 (0x00000000) for every (±0.0, ±0.0, ±0.0) triple, including
+        # when z is -0.0 (or negated from +0.0 via -v4) and with output modifiers like mul:2.
+        for xb, yb, zb in itertools.product((0x00000000, 0x80000000), repeat=3):
+            with self.subTest(bits=(hex(xb), hex(yb), hex(zb))):
+                got = run_cube(xb, yb, zb)
+                want = ref_cube_words(bits_f32(xb), bits_f32(yb), bits_f32(zb))
+                self.assertEqual(got, want)
+                self.assertEqual(got[3], 0x00000000)
+        self.assertEqual(run_cube(0x00000000, 0x00000000, 0x00000000, srcs="v2, v3, -v4")[3], 0x00000000)
+        self.assertEqual(run_cube(0x00000000, 0x00000000, 0x80000000, mods="mul:2")[3], 0x00000000)
+        # NaN on the selected major axis is preserved; -0.0 selected with NaN on other axes still gives +0.0.
+        self.assertEqual(run_cube(0xFFC00000, 0x3F800000, 0x3F800000)[3], 0xFFC00000)
+        self.assertEqual(run_cube(0x80000000, 0x7FC00000, 0x7FC00000)[3], 0x00000000)
 
     def test_vop3_e64_suffix_and_source_modifiers(self):
         # _e64 form matches unsuffixed VOP3 form.

@@ -31,17 +31,21 @@ def tag(typ, offset, size):
     return (typ << 56) | (size << 28) | offset
 
 
-def build_music_bank(toc, samples, rate=48000):
-    """One 0x48 stream with one descriptor channel and one 2048-byte block."""
-    desc = bytearray(28)
-    struct.pack_into("<III", desc, 0, 1, 2048, 1)
-    struct.pack_into("<II", desc, 12, 0x1234, samples)
-    struct.pack_into("<H", desc, 22, rate)
-    desc[24] = 0x0B
-    data = bytearray(4096)
-    struct.pack_into("<I", data, 4, 1)       # one subblock
-    struct.pack_into("<H", data, 2048, 1)
-    data[2050] = toc
+def build_music_bank(toc: int, samples: int, rate: int = 48000, *, duplicate_toc: int | None = None) -> bytes:
+    """One descriptor and one block, with one packet subblock per channel."""
+    tocs = (toc,) if duplicate_toc is None else (toc, duplicate_toc)
+    desc = bytearray(12 + 16 * len(tocs))
+    struct.pack_into("<III", desc, 0, 1, 2048 * (1 + len(tocs)), len(tocs))
+    data = bytearray(2048 * (1 + len(tocs)))
+    for i, packet in enumerate(tocs):
+        channel = 12 + 16 * i
+        struct.pack_into("<II", desc, channel, 0x1234, samples)
+        struct.pack_into("<H", desc, channel + 10, rate)
+        desc[channel + 12] = 0x0B
+        struct.pack_into("<I", data, 24 * i + 4, 1)
+        subblock = 2048 * (i + 1)
+        struct.pack_into("<H", data, subblock, 1)
+        data[subblock + 2] = packet
     header = 16 + 4 + 2 * 8
     out = bytearray(b"ADAT" + struct.pack("<III", 0, 1, header))
     out += struct.pack("<I", 0x1234 | (2 << 29))
@@ -99,6 +103,22 @@ class ShortsTest(unittest.TestCase):
         path = self.write("mono.awc", 0x78, 480000)      # 10 s mono
         self.assertEqual(shorts.export_bank(path, self.out, 9, 11)[0]["channels"], 1)
         self.assertEqual(shorts.export_bank(path, self.out, 4, 6), [])
+
+    def test_duplicate_selected_channels_keep_both_packet_streams(self) -> None:
+        path = os.path.join(self.tmp.name, "duplicate.awc")
+        with open(path, "wb") as bank:
+            bank.write(build_music_bank(0x78, 960, duplicate_toc=0xFC))
+
+        rows = shorts.export_bank(path, self.out, 0, 1)
+        self.assertEqual([row["stream"] for row in rows], ["00001234", "00001234"])
+        self.assertEqual([row["file"] for row in rows], [
+            "duplicate/00001234.ogg", "duplicate/00001234~2.ogg",
+        ])
+        for row, toc, channels in zip(rows, (0x78, 0xFC), (1, 2)):
+            with open(os.path.join(self.out, row["file"]), "rb") as clip:
+                ogg = clip.read()
+            self.assertEqual(ogg[-1:], bytes([toc]))
+            self.assertEqual(ogg_head_and_last_granule(ogg)[0], channels)
 
     def test_cli_writes_csv(self):
         path = self.write("cli.awc", 0xFC, 480000)

@@ -141,9 +141,31 @@ def gfx10_spelling(line):
     return _GFX10_NAMES.get(op, op) + sep + rest
 
 
+_REG = re.compile(r"(?<![\w.])([vs])(?:(\d+)|\[\d+:(\d+)\])(?![\w.])")
+
+
+def regs_used(lines):
+    """(VGPRs, SGPRs) the lines name: one past the highest v<N> / v[a:b] and s<N> / s[a:b], 0 when there are none."""
+    top = {"v": 0, "s": 0}
+    for line in lines:
+        for kind, single, last in _REG.findall(line.split(";", 1)[0]):
+            top[kind] = max(top[kind], int(last or single) + 1)
+    return top["v"], top["s"]
+
+
+def register_counts(lines, vgprs, sgprs):
+    """The .amdhsa_next_free_vgpr / _sgpr a kernel gets: what was asked for, raised to cover every register the lines
+    name (at most 256 VGPRs and 104 SGPRs; a program past that is the assembler's to reject). A descriptor that
+    allocates fewer leaves the program registers that read back 0: measured on gfx1036, v16 and up under the wrapped
+    kernels' old fixed `.amdhsa_next_free_vgpr 16`."""
+    v, s = regs_used(lines)
+    return min(max(vgprs, v), 256), min(max(sgprs, s), 104)
+
+
 def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32, sgprs=40):
     """A kernel whose body does its own stores. s[0:1] is the kernarg pointer, s[2:3] gets the output pointer."""
     fam = family(arch)
+    vgprs, sgprs = register_counts(lines, vgprs, sgprs)
     if int(arch[3:], 16) >= 0x1170:
         unsupported = sorted(set(mode or {}) & set(_MODE_FIELDS_GONE_ON_GFX1170))
         if unsupported:
@@ -178,9 +200,12 @@ def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32, sgpr
 """
 
 
-def kernel_text(name, lines, arch):
-    """Assembly for one kernel."""
+def kernel_text(name, lines, arch, wave=32, vgprs=16, sgprs=32):
+    """Assembly for one kernel. The descriptor takes the wave size and the register counts (raised to the registers
+    the lines name, register_counts). It used to be fixed at wave32, 16 VGPRs and 32 SGPRs: on gfx1036 v16 and up
+    read back 0 and a Kernel(wave=64) ran as wave32 (the lane ids of a full EXEC had 32 lanes)."""
     fam = family(arch)
+    vgprs, sgprs = register_counts(lines, vgprs, sgprs)
     load = "s_load_dwordx2" if fam == "gfx10" else "s_load_b64"
     store = "global_store_dwordx4" if fam == "gfx10" else "global_store_b128"
     body = "\n".join("  " + line for line in lines)
@@ -199,9 +224,9 @@ def kernel_text(name, lines, arch):
 .p2align 6
 .amdhsa_kernel {name}
   .amdhsa_user_sgpr_kernarg_segment_ptr 1
-  .amdhsa_next_free_vgpr 16
-  .amdhsa_next_free_sgpr 32
-  .amdhsa_wavefront_size32 1
+  .amdhsa_next_free_vgpr {vgprs}
+  .amdhsa_next_free_sgpr {sgprs}
+  .amdhsa_wavefront_size32 {1 if wave == 32 else 0}
   .amdhsa_system_vgpr_workitem_id 0
 .end_amdhsa_kernel
 .text
@@ -230,13 +255,15 @@ def module_text(programs, arch, prefix="k", wave=32):
     for i, prog in enumerate(programs):
         name = f"{prefix}{i}"
         lds.append(prog.lds if isinstance(prog, Kernel) else 0)
-        vgprs.append(prog.vgprs if isinstance(prog, Kernel) else 32)
-        sgprs.append(prog.sgprs if isinstance(prog, Kernel) else 40)
         if isinstance(prog, Kernel):
-            text = (raw_kernel_text(name, prog.lines, arch, prog.wave, prog.mode, prog.lds, prog.vgprs, prog.sgprs) if prog.raw
-                    else kernel_text(name, prog.lines, arch))
+            vg, sg = register_counts(prog.lines, prog.vgprs, prog.sgprs)
+            text = (raw_kernel_text(name, prog.lines, arch, prog.wave, prog.mode, prog.lds, vg, sg) if prog.raw
+                    else kernel_text(name, prog.lines, arch, prog.wave, vg, sg))
         else:
-            text = kernel_text(name, prog, arch)
+            vg, sg = register_counts(prog, 16, 32)
+            text = kernel_text(name, prog, arch, wave, vg, sg)
+        vgprs.append(vg)
+        sgprs.append(sg)
         names.append(name)
         starts.append(line_no + 1)
         parts.append(text.rstrip("\n"))
@@ -256,6 +283,7 @@ VALU_REMOVED = {
     "v_mad_f32": _MAD_GONE.format("v_fma_f32"),
     "v_mac_f32": _MAD_GONE.format("v_fmac_f32"),
     "v_madak_f32": _MAD_GONE.format("v_fmaak_f32"),
+    "v_madmk_f32": _MAD_GONE.format("v_fmamk_f32"),
     "v_mad_legacy_f32": _MAD_GONE.format("v_fma_dx9_zero_f32"),
 }
 # Same instruction, new mnemonic: the assembler takes the GFX10 spelling for GFX11 and encodes the GFX11 name.
@@ -305,6 +333,17 @@ def ds_line(line, arch):
             raise ValueError(f"cannot swap the operands of {line!r}")
         dst, addr, cmp_, store, tail = m.groups()
         rest = f"{dst}, {addr}, {store}, {cmp_}{tail}"
+    elif op == "ds_cmpst_b32" and family(arch) == "gfx11":
+        # The non-returning form is renamed as well, and its two data operands swap the same way: GFX10's
+        # ds_cmpst_b32 vaddr, cmp, store is GFX11's ds_cmpstore_b32 vaddr, store, cmp (measured on gfx1100: with
+        # M = 7, vaddr = 0 and data v1 = 9, v2 = 7 the dword becomes 9, so the store operand is v1). The rename is
+        # done here rather than in DS_RENAMED_GFX11 because the swap is only measured on GFX11, and renaming
+        # without swapping on GFX12 would silently compare and store the wrong way round.
+        m = re.fullmatch(r"(v\d+),\s*(v\d+),\s*(v\d+)(.*)", rest)
+        if not m:
+            raise ValueError(f"cannot swap the operands of {line!r}")
+        addr, cmp_, store, tail = m.groups()
+        return f"ds_cmpstore_b32 {addr}, {store}, {cmp_}{tail}"
     return ds_mnemonic(op, arch) + sep + rest
 
 

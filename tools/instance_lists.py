@@ -117,6 +117,11 @@ def member(structs, name, field):
     return m[0] if m else None
 
 
+def member_or(structs, name, field, default):
+    off = member(structs, name, field)
+    return default if off is None else off
+
+
 def measure(V, P, T):
     sc = schema(V)
     if sc is None:
@@ -187,11 +192,11 @@ def prop_list(V, P, blocks, structs, buf, lo, R):
         return
     ib, io, n = ref
     isz = structs.get(PROP_INST, (0x40, {}))[0] or 0x40
-    mat = member(structs, PROP_INST, "InstMat") or 0
+    mat = member_or(structs, PROP_INST, "InstMat", 0)
     add(R, "instances", n)
     for i in range(n):
         o = io + i * isz
-        if o + 48 > len(ib):
+        if mat < 0 or o + max(48, mat + 48) > len(ib):
             add(R, "instances_truncated")
             break
         m = _f(ib, o + mat, 12)
@@ -233,14 +238,15 @@ def grass_list(V, P, blocks, structs, buf, lo, R):
         return
     ib, io, n = ref
     isz = structs.get(GRASS_INST, (0x10, {}))[0] or 0x10
-    nx, ny = member(structs, GRASS_INST, "NormalX") or 6, member(structs, GRASS_INST, "NormalY") or 7
-    sz, rot = member(structs, GRASS_INST, "ScaleZ") or 0xC, member(structs, GRASS_INST, "RotationIdx") or 0xD
-    sc = member(structs, GRASS_INST, "Scale") or 0xB
+    nx, ny = member_or(structs, GRASS_INST, "NormalX", 6), member_or(structs, GRASS_INST, "NormalY", 7)
+    sz, rot = member_or(structs, GRASS_INST, "ScaleZ", 0xC), member_or(structs, GRASS_INST, "RotationIdx", 0xD)
+    sc = member_or(structs, GRASS_INST, "Scale", 0xB)
+    need = max(isz, nx + 1, ny + 1, sc + 1, sz + 1, rot + 1)
     add(R, "instances", n)
     rmax = 0
     for i in range(n):
         o = io + i * isz
-        if o + isz > len(ib):
+        if min(nx, ny, sc, sz, rot) < 0 or o + need > len(ib):
             add(R, "instances_truncated")
             break
         x, y = ib[o + nx] / 127.5 - 1, ib[o + ny] / 127.5 - 1
@@ -277,41 +283,48 @@ def resource_buffers(m, s, size):
 
 
 def scan(path, T, start=None, limit=None):
-    with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
-        size = len(m)
-        data_start = wi._u32(m[:8], 4)
-        if start is not None and not data_start <= start < size:
-            raise ValueError(f"--start 0x{start:x} is outside the data area of {path}")
-        pos = start if start is not None else data_start
-        end = min(size, pos + limit) if limit is not None else size
-        while pos < end:
-            found = wi.ZHDR.search(m, pos, end)
-            if not found:
-                break
-            s = found.start()
-            if s % 16:
-                pos = s + 1
-                continue
-            try:
-                head = zlib.decompressobj().decompress(m[s:s + 4096], 0x15)
-            except zlib.error:
-                pos = s + 1
-                continue
-            if head[0x10:0x15] != b"0DRPz":
-                pos = s + 1
-                continue
-            try:
-                V, P, used = resource_buffers(m, s, size)
-            except zlib.error:
-                pos = s + 1
-                continue
-            add(T, "map_resources_read")
-            if V is not None:
+    with open(path, "rb") as f:
+        if os.fstat(f.fileno()).st_size < 8:
+            raise ValueError(f"{path}: not an RPF9 archive")
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+            size = len(m)
+            if m[:4] not in (b"RPF9", b"9FPR"):
+                raise ValueError(f"{path}: not an RPF9 archive")
+            data_start = wi._u32(m[:8], 4)
+            if not 8 <= data_start <= size:
+                raise ValueError(f"{path}: RPF9 data start is outside the archive")
+            if start is not None and not data_start <= start < size:
+                raise ValueError(f"--start 0x{start:x} is outside the data area of {path}")
+            pos = start if start is not None else data_start
+            end = min(size, pos + limit) if limit is not None else size
+            while pos < end:
+                found = wi.ZHDR.search(m, pos, end)
+                if not found:
+                    break
+                s = found.start()
+                if s % 16:
+                    pos = s + 1
+                    continue
                 try:
-                    measure(V, P, T)
-                except (struct.error, IndexError):
-                    add(T, "resources_truncated")
-            pos = s + max(used, 1)
+                    head = zlib.decompressobj().decompress(m[s:s + 4096], 0x15)
+                except zlib.error:
+                    pos = s + 1
+                    continue
+                if head[0x10:0x15] != b"0DRPz":
+                    pos = s + 1
+                    continue
+                try:
+                    V, P, used = resource_buffers(m, s, size)
+                except zlib.error:
+                    pos = s + 1
+                    continue
+                add(T, "map_resources_read")
+                if V is not None:
+                    try:
+                        measure(V, P, T)
+                    except (struct.error, IndexError):
+                        add(T, "resources_truncated")
+                pos = s + max(used, 1)
 
 
 def same_output_path(first, second):
@@ -323,13 +336,23 @@ def same_output_path(first, second):
         return False
 
 
+def _int_arg(text):
+    try:
+        return int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("inputs", nargs="+", help=".rpf archives")
-    ap.add_argument("--start", type=lambda v: int(v, 0))
-    ap.add_argument("--limit", type=lambda v: int(v, 0))
+    ap.add_argument("--start", type=_int_arg)
+    ap.add_argument("--limit", type=_int_arg)
     ap.add_argument("--json")
     args = ap.parse_args(argv)
+    if args.start is not None and args.start < 0:
+        print("error: --start must be >= 0", file=sys.stderr)
+        return 2
     if args.limit is not None and args.limit <= 0:
         print("error: --limit must be > 0", file=sys.stderr)
         return 2
@@ -350,14 +373,14 @@ def main(argv=None):
             return 2
         try:
             scan(path, T, args.start, args.limit)
-        except ValueError as exc:
+        except (ValueError, OSError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
     print(json.dumps(T, indent=1, sort_keys=True))
     if args.json:
         try:
             os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
-            with open(args.json, "w", encoding="utf-8") as fh:
+            with open(args.json, "w", encoding="utf-8", newline="\n") as fh:
                 json.dump(T, fh, indent=1, sort_keys=True)
         except OSError as exc:
             print(f"error: cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)

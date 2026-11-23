@@ -1,7 +1,9 @@
 """scripts/run_gpu_tests.py: how it judges the output of a compute "dump" test (no device needed)."""
 import contextlib
 import io
+import os
 from pathlib import Path
+import struct
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -61,24 +63,58 @@ class PackedFormatFixture(unittest.TestCase):
             self.assertIn("0/1 passed", output.getvalue())
 
 
+class FrameReadbackTest(unittest.TestCase):
+    def test_only_a_frame_written_by_this_run_can_pass(self):
+        name = "ps_ops"
+        pixels = struct.pack("<4I", 0x48804300, 5, 7, 0xBFFFFFFC) * 4096
+        for existing, writes_frame, expected in ((True, False, 1), (False, False, 1), (True, True, 0)):
+            with self.subTest(existing=existing, writes_frame=writes_frame), tempfile.TemporaryDirectory() as tmp:
+                raw = Path(tmp, "raw", f"{name}.raw")
+                if existing:
+                    raw.parent.mkdir()
+                    raw.write_bytes(pixels)
+                args = SimpleNamespace(filter="ps_ops.asm", build=tmp, llvm_mc="unused")
+
+                def launch(cmd, **kwargs):
+                    if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
+                        (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                    elif writes_frame:
+                        raw.write_bytes(pixels)
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                output = io.StringIO()
+                with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                      patch.object(rgt, "spirv_as"),
+                      patch.object(rgt, "bary_fallback", return_value=False),
+                      patch.object(rgt, "f16_interp_fallback", return_value=False),
+                      patch.object(rgt.subprocess, "run", side_effect=launch),
+                      contextlib.redirect_stdout(output)):
+                    self.assertEqual(rgt.run_suite(args, tmp), expected, output.getvalue())
+                if expected:
+                    self.assertIn("missing readback", output.getvalue())
+                    self.assertFalse(raw.exists())
+                else:
+                    self.assertEqual(raw.read_bytes(), pixels)
+
+
 class TextureTestOnASmallPushConstantDevice(unittest.TestCase):
     """vk_texture_test exits 77 on a device with 128 push constant bytes: a SKIP, not a FAIL."""
     UNSUPPORTED_MSG = "unsupported: need 144 push constant bytes, device has 128\n"
 
-    def run_one(self, name):
+    def run_one(self, name, require_pass=False):
         with tempfile.TemporaryDirectory() as tmp:
-            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused", require_pass=require_pass)
 
-            def translate(_cmd, env=None, gpu=True):
-                (Path(tmp) / "spirv" / f"{name}.spv").touch()
-                return 0, ""
+            def launch(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+                if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
+                    (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                return SimpleNamespace(returncode=77, stdout="", stderr=self.UNSUPPORTED_MSG)
 
             output = io.StringIO()
-            texture = SimpleNamespace(returncode=77, stdout="", stderr=self.UNSUPPORTED_MSG)
             with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
                   patch.object(rgt, "spirv_as"),
-                  patch.object(rgt, "run_cmd", side_effect=translate),
-                  patch.object(rgt.subprocess, "run", return_value=texture),
+                  patch.object(rgt.subprocess, "run", side_effect=launch),
                   contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
                 rc = rgt.run_suite(args, tmp)
             return rc, output.getvalue()
@@ -91,6 +127,12 @@ class TextureTestOnASmallPushConstantDevice(unittest.TestCase):
                 self.assertIn("SKIP (unsupported: need 144 push constant bytes, device has 128)", out)
                 self.assertIn("0/1 passed, 1 skipped", out)
                 self.assertNotIn("no runnable", out)
+
+    def test_require_pass_rejects_a_skip_only_run(self):
+        rc, out = self.run_one("ps_gather_wrap", require_pass=True)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("0/1 passed, 1 skipped", out)
+        self.assertIn("--require-pass: no GPU tests passed", out)
 
 
 class BindlessTestOnASmallPushConstantDevice(unittest.TestCase):
@@ -293,6 +335,14 @@ class Wave32LaneDumps(unittest.TestCase):
         self.assertEqual(rgt.wave32_lane_skip("device: X (subgroup 8..32)\ncompute subgroup size: 32 not available\n"),
                          "SKIP (the device can't run this shader at 32 lanes on request)")
         self.assertIsNone(rgt.wave32_lane_skip("device: X (subgroup 8..32)\ncompute subgroup size: 32\n"))
+        observed = "compute subgroup size: 32 (observed: all 20 invocations of a 20x1x1 group)\n"
+        self.assertIsNone(rgt.wave32_lane_skip("device: Apple M3 Max (subgroup 4..32)\n" + observed))
+        wrong = "compute subgroup size: 32 observed wrong in 4 of 64 invocations; invocation 60 has SubgroupSize 32\n"
+        self.assertIsNone(rgt.wave32_lane_skip("device: X (subgroup 4..32)\n" + wrong))
+        ok, detail = rgt.judge_cs_dump(1, "device: X (subgroup 4..32)\n" + wrong, [1], wave64=False, partial=False,
+                                       emulated=False)
+        self.assertIs(ok, False)
+        self.assertIn("observed wrong", detail)
 
     def test_rule(self):
         self.assertEqual(rgt.narrow_subgroup_skip("device: llvmpipe (subgroup 8..8)\n"),
@@ -301,6 +351,36 @@ class Wave32LaneDumps(unittest.TestCase):
                     "no device line\n"):
             with self.subTest(out=out):
                 self.assertIsNone(rgt.narrow_subgroup_skip(out))
+
+
+class SubgroupPinSkip(unittest.TestCase):
+    """A device that cannot pin the wave size a shader was translated for skips, not fails. GCN3/GCN4 report
+    64..64, so cs_barrier_loop's wave32 fixture runs at 64 lanes and its words say nothing; check.py skips it
+    already (unpinned_subgroup_skip), the runner used to judge it and report a failure."""
+    MSG = "device: X (subgroup 64..64)\ncompute subgroup size: 32 not available\n" + dump(WANT)
+
+    def test_unpinned_size_is_a_skip(self):
+        self.assertEqual(rgt.subgroup_pin_skip(self.MSG, {"VKC_SUBGROUP_SIZE": "32"}),
+                         "SKIP (the device can't run this shader at 32 lanes on request)")
+
+    def test_no_pin_requested_is_judged(self):
+        for env in (None, {}, {"VKC_SGPRS": "0x1"}, {"VKH_SUBGROUP_SIZE": "64"}):
+            with self.subTest(env=env):
+                self.assertIsNone(rgt.subgroup_pin_skip(self.MSG, env))
+
+    def test_a_honoured_pin_is_judged(self):
+        out = "device: X (subgroup 32..64)\ncompute subgroup size: 32\n" + dump(WANT)
+        self.assertIsNone(rgt.subgroup_pin_skip(out, {"VKC_SUBGROUP_SIZE": "32"}))
+        self.assertIsNone(rgt.subgroup_pin_skip("device: X (subgroup 32..64)\n" + dump(WANT),
+                                                {"VKC_SUBGROUP_SIZE": "32"}))
+
+    def test_only_wave_width_fixtures_carry_the_rule(self):
+        self.assertIn("cs_barrier_loop", rgt.WAVE32_PIN_DUMPS)
+        # everything else is judged at the device's own width, as before, so a 64-only device keeps testing it
+        for name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_int_ext", "cs_barrier_divergent",
+                     "cs_barrier_early_end", "cs_w32_lds_u8_d16"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, rgt.WAVE32_PIN_DUMPS)
 
 
 class ComputedIJWithoutPerVertexInputs(unittest.TestCase):
@@ -345,6 +425,120 @@ class ComputedIJWithoutPerVertexInputs(unittest.TestCase):
                     self.assertIsInstance(check.pixel_test("unused", tmp, self.NAME), check.Skip)
             with patch.object(check, "BARY_FALLBACK", False), patch.object(check, "F16_HALVES", False):
                 self.assertEqual(check.pixel_test("unused", tmp, self.NAME), f"missing {self.NAME}.spv")
+
+
+class F16InterpUnderBaryFallback(unittest.TestCase):
+    """ps_interp_f16_high and ms_f16_pack under LEONIDA_BARY_FALLBACK=1. --bary-fallback alone has no PerVertexKHR
+    inputs, so the f16 halves can't be interpolated and both are skipped. With --f16-interp-fallback as well (on by
+    itself where the device has no fragmentShaderBarycentric, the usual reason for the bary fallback) the pixel shader
+    reads the decoded halves its producer exports, so both run (llvmpipe, which has neither: both pass)."""
+    SKIP = "SKIP (per-vertex f16 interpolants need barycentrics)"
+    DRAWN = "unsupported: drawn by the stub harness"
+
+    def run_suite(self, name, bary, f16):
+        drawn = []
+
+        def run_cmd(cmd, env=None, gpu=True):
+            if rgt.TRANSLATOR in cmd:   # the translator publishes a module for every input
+                out = cmd[cmd.index("--out") + 1]
+                for s in os.listdir(cmd[cmd.index(rgt.TRANSLATOR) + 1]):
+                    Path(out, Path(s).stem + ".spv").touch()
+                return 0, ""
+            if os.path.basename(cmd[0]).startswith("vk_harness"):
+                drawn.append(cmd)
+                return rgt.UNSUPPORTED, self.DRAWN
+            return 0, ""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+            env = {"LEONIDA_BARY_FALLBACK": "1" if bary else "0", "LEONIDA_F16_INTERP_FALLBACK": "1" if f16 else "0"}
+            out = io.StringIO()
+            with (patch.dict(rgt.os.environ, env),
+                  patch.dict(sys.modules, {"bary_fallback_gs": SimpleNamespace(build_for_index=lambda _d: [])}),
+                  patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=run_cmd),
+                  contextlib.redirect_stdout(out), contextlib.redirect_stderr(out)):
+                rc = rgt.run_suite(args, tmp)
+        return rc, out.getvalue(), drawn
+
+    def test_run_gpu_tests_draws_them_with_the_f16_fallback(self):
+        for name in ("ps_interp_f16_high", "ms_f16_pack"):
+            with self.subTest(name=name):
+                rc, out, drawn = self.run_suite(name, bary=True, f16=True)
+                self.assertNotIn(self.SKIP, out)
+                self.assertIn(self.DRAWN, out)
+                self.assertEqual(len(drawn), 1, out)
+                self.assertTrue(drawn[0][2].endswith("ps_interp_f16_high.spv"), drawn)
+                self.assertEqual(rc, 0, out)
+
+    def test_run_gpu_tests_skips_them_under_the_bary_fallback_alone(self):
+        for name in ("ps_interp_f16_high", "ms_f16_pack"):
+            with self.subTest(name=name):
+                rc, out, drawn = self.run_suite(name, bary=True, f16=False)
+                self.assertIn(self.SKIP, out)
+                self.assertEqual(drawn, [], out)
+                self.assertEqual(rc, 0, out)
+
+    def test_check_py_draws_it_with_the_f16_fallback(self):
+        import check
+        name = "ps_interp_f16_high"
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, name + ".spv").touch()
+            with patch.object(check, "pixels", return_value=(check.Skip("x"), self.DRAWN)):
+                for bary, f16, want in ((True, True, f"SKIP ({self.DRAWN})"),
+                                        (True, False, "SKIP (per-vertex interpolants need "
+                                                      "VK_KHR_fragment_shader_barycentric)"),
+                                        (False, True, f"SKIP ({self.DRAWN})")):
+                    with self.subTest(bary=bary, f16=f16), \
+                            patch.object(check, "BARY_FALLBACK", bary), patch.object(check, "F16_HALVES", f16):
+                        self.assertEqual(check.pixel_test("unused", tmp, name), want)
+
+
+class FmaFusedSuite(unittest.TestCase):
+    """run_gpu_tests.py runs cs_fma_fused under --filter, honoring LEONIDA_FMA=khr vs default glsl."""
+    RADV_SPLIT = [0x00000000, 0xA8800000, 0x3A000000, 0x00000000, 0x00000000, 0x00000000, 0x28800000, 0x00007351]
+
+    def run_fma(self, rc, msg, fma_env=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter="cs_fma_fused", build=tmp, llvm_mc="unused")
+
+            def fake_run(cmd, env=None, gpu=True):
+                if Path(cmd[0]).stem == "vk_compute_test":
+                    self.assertEqual((env or {}).get("VKC_SGPRS"), rgt.FMA_FUSED_ENV["VKC_SGPRS"])
+                    return rc, msg
+                (Path(tmp) / "spirv" / "cs_fma_fused.spv").touch()
+                return 0, ""
+
+            output = io.StringIO()
+            env_patch = {"LEONIDA_FMA": fma_env} if fma_env is not None else {}
+            with (patch.dict(rgt.os.environ, env_patch, clear=False),
+                  patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=fake_run),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                if fma_env is None:
+                    rgt.os.environ.pop("LEONIDA_FMA", None)
+                code = rgt.run_suite(args, tmp)
+            return code, output.getvalue()
+
+    def test_glsl_accepts_radv_split_and_khr_rejects_it(self):
+        rc, out = self.run_fma(0, dump(self.RADV_SPLIT), fma_env=None)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PASS  cs_fma_fused", out)
+        self.assertIn("5/7 split", out)
+        rc, out = self.run_fma(0, dump(self.RADV_SPLIT), fma_env="khr")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL  cs_fma_fused", out)
+
+    def test_khr_fused_passes_and_exit_77_skips(self):
+        import check
+        rc, out = self.run_fma(0, dump(check.FMA_FUSED), fma_env="khr")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("8/8 fused exact (OpFmaKHR)", out)
+        rc, out = self.run_fma(77, "unsupported: no VK_KHR_shader_fma", fma_env="khr")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("SKIP (unsupported: no VK_KHR_shader_fma)", out)
 
 
 if __name__ == "__main__":

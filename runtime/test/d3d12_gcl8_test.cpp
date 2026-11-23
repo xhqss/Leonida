@@ -36,6 +36,10 @@ int main(int argc, char** argv) {
     EXPECT(SUCCEEDED(create_command_allocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
     EXPECT(SUCCEEDED(create_command_list(D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, IID_PPV_ARGS(&list7.p))));
 
+    // Null bindings exercise the public entry points without creating a pipeline or loading Vulkan.
+    list7.p->SetPipelineState(nullptr);
+    list7.p->SetGraphicsRootSignature(nullptr);
+
     // AddRef through the GCL7 pointer gives the count this test expects while the QueryInterface reference is held.
     const ULONG held = list7.p->AddRef();
     list7.p->Release();
@@ -83,6 +87,10 @@ int main(int argc, char** argv) {
     list7.p->Release();
 
     // Calls made before pipeline setup still belong in the trace. They invalidate this list without needing a GPU.
+    list7.p->SetDescriptorHeaps(0, nullptr);
+    list7.p->SetGraphicsRootDescriptorTable(0, {});
+    list7.p->SetComputeRootSignature(nullptr);
+    list7.p->Dispatch(1, 1, 1);
     list7.p->DrawInstanced(3, 1, 0, 0);
     list7.p->DrawIndexedInstanced(3, 1, 0, 0, 0);
     EXPECT(list7.p->Close() == E_INVALIDARG);

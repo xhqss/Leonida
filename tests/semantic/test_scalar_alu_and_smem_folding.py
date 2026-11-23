@@ -188,6 +188,33 @@ class ScalarAluAndSmemFoldingTests(unittest.TestCase):
         # Only base lo is masked with %cfffffffc; offset s2 is not dynamically masked
         self.assertEqual(text.count("%cfffffffc"), 1)
 
+    def test_s_buffer_load_constant_negative_sgpr_offset_does_not_wrap(self):
+        # SHADER-328: s8 = -4 with offset:20 is 0xFFFFFFFC + 20 in 64 bits (RDNA2 reads 0, measured in #1686), not
+        # 16 after a 32-bit wrap. The constant must give what the run-time path gives: out of bounds, 0.
+        g = rdna2spirv.Gen("ps")
+        g.sgpr_imm.update({0: 0x1000, 1: 0, 2: 64, 3: 0x31000FAC, 8: 0xFFFFFFFC})   # raw V#, limit 64 bytes
+        ins = parse_line("s_buffer_load_dword s10, s[0:3], s8 offset:20")
+        g.scalar_load(ins["op"], ins["args"], ins["mods"])
+        text = "\n".join(g.body)
+        self.assertNotIn("OpAccessChain %_ptr_PSB_uint", text)     # no read: the dword is out of bounds
+        self.assertTrue(any(ln.strip().startswith("OpStore %t") and ln.strip().endswith(g.cu(0)) for ln in g.body))
+
+        # The same offsets inside the limit still read memory.
+        g = rdna2spirv.Gen("ps")
+        g.sgpr_imm.update({0: 0x1000, 1: 0, 2: 64, 3: 0x31000FAC, 8: 4})
+        ins = parse_line("s_buffer_load_dword s10, s[0:3], s8 offset:20")
+        g.scalar_load(ins["op"], ins["args"], ins["mods"])
+        self.assertIn("OpAccessChain %_ptr_PSB_uint", "\n".join(g.body))
+
+    def test_s_load_constant_sgpr_offset_is_not_sign_extended(self):
+        # The run-time path adds zext(sOFF & ~3) to the 21-bit immediate; a constant sOFF of 2^20 must not pass
+        # through the immediate's 21-bit sign extension (it would become -2^20).
+        g = rdna2spirv.Gen("ps")
+        g.sgpr_imm[2] = 0x100000
+        ins = parse_line("s_load_dword s0, s[4:5], s2 offset:0x10")
+        g.scalar_load(ins["op"], ins["args"], ins["mods"])
+        self.assertIn("%cl100010", "\n".join(g.body))
+
 
 if __name__ == "__main__":
     unittest.main()

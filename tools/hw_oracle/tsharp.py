@@ -18,7 +18,7 @@ Where the layout comes from (facts only; Mesa is MIT-licensed, the code here is 
   LLVM's AMDGPU::UfmtGFX11::UnifiedFormat (SIDefines.h), which Mesa's GFX11_FORMAT follows.
 GFX11 renumbers the formats (8_8_8_8_UNORM is 56 on GFX10 and 42 on GFX11), narrows FORMAT to [27:20], moves MAX_MIP
 into WORD1 and drops WORD2's RESOURCE_LEVEL bit (GFX10 needs it set). A GFX11 part (the Radeon 880M is gfx1150, RDNA3.5)
-runs these descriptors; RDNA2 (gfx1030) takes the GFX10 ones, which no GPU in the lab has run yet.
+runs these descriptors; RDNA2 (gfx1030) takes the GFX10 ones; a gfx1036 (RDNA2) ran them for tools/texoff_probe.py (2D and 3D, R32_SFLOAT).
 """
 import re
 

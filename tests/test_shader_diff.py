@@ -4,6 +4,7 @@ Run from the repository root:
     python -m pytest tests/test_shader_diff.py -v
 """
 import os
+import random
 import sys
 
 import pytest
@@ -14,11 +15,73 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import shader_diff as sd
 
 
-def test_program_generation_is_deterministic():
-    import random
-    rng1, rng2 = random.Random(99), random.Random(99)
-    assert (sd.generate_program(rng1, 6)[0] ==
-            sd.generate_program(rng2, 6)[0])
+@pytest.mark.parametrize("seed", [1, 17, 99])
+def test_program_generation_is_deterministic(seed):
+    lines, writers = sd.generate_program(random.Random(seed), 6)
+    assert (lines, writers) == sd.generate_program(random.Random(seed), 6)
+    dst = int(lines[-1].split()[1].strip("v,"))
+    assert dst in sd.EXPORT_REGS
+    assert writers[dst] == ("v_mov_b32/sgpr-copy", len(lines))
+    for reg in sd.EXPORT_REGS:
+        op, index = writers[reg]
+        assert lines[index - 1].startswith(f"{op.split('/')[0]} v{reg},")
+        assert not any(line.split()[1] == f"v{reg}," for line in lines[index:])
+
+
+@pytest.mark.parametrize("seed, n_ops, expected_reg, seed_only", [
+    pytest.param(24, 6, 10, True, id="preserve-three-alu-results"),
+    pytest.param(3, 18, 11, False, id="replace-oldest-last-alu-write"),
+])
+def test_scalar_copy_destination_from_write_history(seed, n_ops, expected_reg, seed_only):
+    lines, writers = sd.generate_program(random.Random(seed), n_ops)
+    history = {f"v{reg},": [] for reg in sd.EXPORT_REGS}
+    for index, line in enumerate(lines[:-1], 1):
+        op, dst, operands = line.split(maxsplit=2)
+        if dst in history:
+            history[dst].append((op, index))
+
+    selected = history[f"v{expected_reg},"]
+    others = [writes for dst, writes in history.items() if dst != f"v{expected_reg},"]
+    for writes in history.values():
+        assert writes[0][0] == "v_mov_b32"
+        assert all(op != "v_mov_b32" for op, _ in writes[1:])
+    assert all(len(writes) >= 2 for writes in others)
+    if seed_only:
+        assert len(selected) == 1
+    else:
+        assert len(selected) >= 2
+        # Another output received an ALU result earlier but was rewritten later.
+        assert any(writes[1][1] < selected[1][1] for writes in others)
+        assert all(selected[-1][1] < writes[-1][1] for writes in others)
+
+    op, dst, src = lines[-1].split()
+    assert (op, dst) == ("v_mov_b32", f"v{expected_reg},")
+    assert src.startswith("s") and src[1:].isdigit()
+    assert writers[expected_reg] == ("v_mov_b32/sgpr-copy", len(lines))
+    for reg in sd.EXPORT_REGS:
+        if reg != expected_reg:
+            assert writers[reg] == history[f"v{reg},"][-1]
+
+
+def test_run_one_observes_scalar_copy(monkeypatch):
+    lines, writers = sd.generate_program(random.Random(17), 1)
+    assert sd.run_one("ps_scalar_copy", lines, writers) == ("match", "")
+    write_listing = sd._write_listing
+    opcode, dst, src = lines[-1].split()
+    assert opcode == "v_mov_b32" and src.startswith("s")
+
+    def corrupt_scalar_copy(path, body, with_export):
+        if with_export:
+            # Only the translated listing gets the wrong scalar (seeds are under 256).
+            body = body[:-1] + [f"{opcode} {dst} 12345"]
+        write_listing(path, body, with_export)
+
+    monkeypatch.setattr(sd, "_write_listing", corrupt_scalar_copy)
+    status, detail = sd.run_one("ps_scalar_copy", lines, writers)
+    assert status == "mismatch", detail
+    reg = int(dst.strip("v,"))
+    assert f"lane word {sd.EXPORT_REGS.index(reg)}" in detail
+    assert f"last writer v_mov_b32/sgpr-copy at body line {len(lines)} for v{reg}" in detail
 
 
 def test_compare_pair_flags_known_bad():

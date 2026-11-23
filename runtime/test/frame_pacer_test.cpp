@@ -441,6 +441,31 @@ int main() {
         EXPECT(stats[0].time_us == 5 * period && stats[0].percent_scanned == 0.0f);
     }
 
+    // Rescheduling changes future origins but not the vblank an issued token was due at.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 1, period / 4));
+        clock.advance_us(period + period / 4);
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok);
+        EXPECT(pacer.schedule_frame_event(frame_event_origin, period / 2, 0) == pacer_hr::ok);
+
+        clock.advance_us(3 * period / 4);  // vblank 2, still the deadline of the original token
+        EXPECT(pacer.present_timing(token).late_us == 0);
+        clock.advance_us(period / 4);
+        const auto timing = pacer.present_timing(token);
+        EXPECT(timing.late_us == period / 4);
+        const auto sync = decide_present_sync(timing.late_us, timing.period_us, 30.0f);
+        EXPECT(sync == PresentSync::immediate);
+        pacer.commit_present_token(token, 1, sync);
+
+        FrameStatistic display{};
+        std::uint32_t count = 1;
+        EXPECT(pacer.get_frame_statistics(token, stat_display, &count, &display) == pacer_hr::ok);
+        EXPECT(count == 1 && display.percent_scanned == 25.0f);
+    }
+
     // A frame behind one that still waits for its vblank cannot be shown at once (it would overtake it): not late.
     {
         ManualFrameClock clock;

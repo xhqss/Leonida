@@ -1,10 +1,11 @@
-; Swizzled MUBUF addressing and ADD_TID_ENABLE (docs/design.md, Buffer bounds checking). RDNA2 ISA 8.1.5 "Swizzled
-; Buffer Addressing", element_size fixed at 4 bytes; fields from Mesa gfx10-rsrc.json: SWIZZLE_ENABLE = word1 bit 31,
-; STRIDE = word1 [29:16], INDEX_STRIDE = word3 [22:21] (8 << n), ADD_TID_ENABLE = word3 bit 23:
-;   index = (idxen ? vindex : 0) + (ADD_TID_ENABLE ? lane : 0), offset = (offen ? vaddr : 0) + inst_offset
-;   buffer_offset = (index / IS * stride + offset / 4 * 4) * IS + index % IS * 4 + offset % 4, address = base +
-;   soffset + buffer_offset (IS = index_stride). OOB_SELECT 3 with swizzle and stride != 0 checks index >= NUM_RECORDS
-;   or offset + payload > stride (ISA table 35); ADD_TID_ENABLE also adds the lane in a linear V# (table 36's ring).
+; Swizzled MUBUF addressing and ADD_TID_ENABLE (docs/design.md, Swizzled buffer addressing). Measured natively on
+; RDNA2 (gfx1036, wave32 & wave64): SWIZZLE_ENABLE = word1 bit 31, STRIDE = word1 [29:16], INDEX_STRIDE = word3 [22:21]
+; (IS = 8 << n), ADD_TID_ENABLE = word3 bit 23:
+;   index = idxen ? vindex : (ADD_TID_ENABLE ? lane : 0), offset = uint32((offen ? vaddr : 0) + inst_offset)
+;   buffer_offset = (index / IS * stride + (offset & ~3)) * IS + (index % IS) * 4 + (offset & 3), address = base +
+;   soffset + buffer_offset (IS = index_stride). With idxen=1, multi-dword accesses step linearly by +4 bytes; with
+;   idxen=0 and ADD_TID_ENABLE=1 (scratch swizzle), raw multi-dword accesses step by 4 * IS. OOB_SELECT 3 with active
+;   swizzle and stride != 0 checks (index + soffset) >= NUM_RECORDS or offset + payload > stride.
 ; Thread 0 seeds heap bytes 0x40..0x8f (region offset X = byte 0x40 + X) with 0x5eed0000 + X; the heap is 0xee-filled,
 ; so an in-range access past the seed reads 0xeeeeeeee. V# A (s[4:7], literal): base 0x40, swizzled, stride 8, NR 16,
 ; IS 8, OOB_SELECT 3. V# B (s[8:11], words 1 and 3 or-ed at run time): base 0x40, swizzled, stride 8, NR 8, IS 16,
@@ -14,13 +15,13 @@
 ;   1 A, idx 9, off 0:          (1 * 8 + 0) * 8 + 1 * 4 = X 0x44: 0x5eed0044           [X 0x48]
 ;   2 B, idx 3, off 4:          (0 * 8 + 4) * 16 + 3 * 4 = X 0x4c: 0x5eed004c          [X 0x1c]
 ;   3 A x2, idx 2, off 0, dword 0: 0 * 8 + 2 * 4 = X 0x8: 0x5eed0008                   [X 0x10]
-;   4 A x2, idx 2, dword 1 (offset 4): (0 * 8 + 4) * 8 + 2 * 4 = X 0x28: 0x5eed0028    [X 0x14]
+;   4 A x2, idx 2, dword 1 (idxen=1 steps linearly +4): X 0x8 + 4 = X 0xc: 0x5eed000c  [X 0x14]
 ;   5 A, idx 16, off 0:         16 >= NR 16 -> 0     (the raw check, 4 <= 16, reads X 0x80 past the seed: 0xeeeeeeee)
 ;   6, 7 lanes 0 and 1 store 0xbeef0000 + lane through C: address 0x18 + lane * 4 -> 0xbeef0000 0xbeef0001
 ;        (without ADD_TID both lanes store to out[6], and out[7] keeps 0xeeeeeeee)
 ; Lanes 0 and 1 only store (no lane reads what another wrote); thread 0 alone seeds and loads. No wave64 requirement.
 ; Run: vk_compute_test cs_buf_swizzle.spv 1 dump -> out[0..7] = 0x5eed0024 0x5eed0044 0x5eed004c 0x5eed0008
-; 0x5eed0028 0x00000000 0xbeef0000 0xbeef0001 (1592590372 1592590404 1592590412 1592590344 1592590376 0 3203334144
+; 0x5eed000c 0x00000000 0xbeef0000 0xbeef0001 (1592590372 1592590404 1592590412 1592590344 1592590348 0 3203334144
 ; 3203334145).
 v_cmpx_gt_u32_e32 2, v0
 s_mov_b32 s12, 0x18

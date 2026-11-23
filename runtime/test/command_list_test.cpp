@@ -223,6 +223,24 @@ int main() {
     CHECK(std::get<CopyResource>(parent.commands()[1]).src == 4);
     CHECK(!parent.execute_bundle(bundle));  // parent is closed
 
+    // The range form: [first, last) of the bundle, with last clamped to its size.
+    {
+        CommandList source, target, other;
+        CHECK(source.copy_resource({1, 2}) && source.copy_resource({3, 4}) && source.copy_resource({5, 6}));
+        CHECK(source.close());
+        CHECK(target.execute_bundle(source, 1, 2));  // the middle command only
+        CHECK(target.commands().size() == 1 && std::get<CopyResource>(target.commands()[0]).src == 4);
+        CHECK(target.execute_bundle(source, 2, 100));  // last beyond the size is clamped
+        CHECK(target.commands().size() == 2 && std::get<CopyResource>(target.commands()[1]).src == 6);
+        CHECK(target.execute_bundle(source, 1, 1) && target.commands().size() == 2);  // first == last: nothing
+        CHECK(target.execute_bundle(source, 3, 3) && target.execute_bundle(source, 7, 9));  // first beyond the size
+        CHECK(target.execute_bundle(source, 2, 1) && target.commands().size() == 2);  // first after last: nothing
+        CHECK(target.commands().size() == 2);
+        CHECK(other.execute_bundle(source));  // the default arguments copy all of it, as before
+        CHECK(other.commands().size() == 3 && std::get<CopyResource>(other.commands()[0]).src == 2 &&
+              std::get<CopyResource>(other.commands()[2]).src == 6);
+    }
+
     CommandList open_parent, open_bundle;
     CHECK(!open_parent.execute_bundle(open_bundle));  // bundle must be closed
     CHECK(!open_parent.execute_bundle(open_parent));  // a list cannot execute itself
@@ -288,6 +306,6 @@ int main() {
     CHECK(query_fits_heap(h::copy_queue_timestamp, q::timestamp) && !query_fits_heap(h::timestamp, q::occlusion));
     CHECK(query_fits_heap(h::so_statistics, q::so_statistics_stream3) && !query_fits_heap(6, q::occlusion));
     CHECK(query_result_size(q::occlusion) == 8 && query_result_size(q::timestamp) == 8);
-    CHECK(query_result_size(q::pipeline_statistics) == 88 && query_result_size(q::so_statistics_stream0) == 0);
+    CHECK(query_result_size(q::pipeline_statistics) == 88 && query_result_size(q::so_statistics_stream0) == 16);
     return 0;
 }

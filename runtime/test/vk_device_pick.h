@@ -21,18 +21,16 @@ namespace leonida::vk_test {
 
 // Microsoft is the vendor of the D3D12 translation layers Windows adds (Dozen and the Basic Render Driver); no
 // native GPU driver uses it. Checking the vendor avoids depending on VkPhysicalDeviceDriverProperties.
-inline constexpr std::uint32_t microsoft_vendor_id = 0x1414;
+inline constexpr std::uint32_t microsoft_vendor_id = leonida::microsoft_vulkan_vendor_id;
 
+static_assert(VK_PHYSICAL_DEVICE_TYPE_OTHER == 0 && VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU == 1 &&
+                  VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU == 2 && VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU == 3 &&
+                  VK_PHYSICAL_DEVICE_TYPE_CPU == 4,
+              "vulkan_device_rank takes VkPhysicalDeviceType by value");
+
+// The runtime's rank (runtime/src/vulkan_device_filter.h), so the harnesses and the runtime take the same GPU.
 inline int device_rank(VkPhysicalDeviceType type, std::uint32_t vendor_id) {
-    int type_rank = 0;
-    switch (type) {
-        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: type_rank = 4; break;
-        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: type_rank = 3; break;
-        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: type_rank = 2; break;
-        case VK_PHYSICAL_DEVICE_TYPE_CPU: type_rank = 1; break;
-        default: type_rank = 0; break;
-    }
-    return (vendor_id == microsoft_vendor_id ? 0 : 10) + type_rank;
+    return leonida::vulkan_device_rank(static_cast<int>(type), vendor_id);
 }
 
 // Index of the best candidate, or candidates.size() when there are none. Ties keep the earlier device.

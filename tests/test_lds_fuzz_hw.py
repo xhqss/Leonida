@@ -122,11 +122,13 @@ class OpMix(unittest.TestCase):
         progs = f.programs(3, 40, (64, 32), permute=True)
         perm = [p for p in progs if any(op["kind"] == "permute" for op in p.ops)]
         self.assertTrue(perm)
+        parities = set()
         for p in perm:
             for i, op in enumerate(p.ops):
                 self.assertEqual(i in p.hyp_ops, op["kind"] == "permute")
                 if op["kind"] == "permute":
-                    self.assertEqual(op["mul"] % 2, 1)           # a bijection: no two lanes send to one lane
+                    parities.add(op["mul"] % 2)
+        self.assertEqual(parities, {0, 1})               # generates both colliding and bijective multipliers
 
     def test_swizzle_exec_hypothesis_only_under_a_mask(self):
         progs = f.programs(3, 60, (32,), swizzle_exec=True)

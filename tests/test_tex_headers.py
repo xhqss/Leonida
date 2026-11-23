@@ -603,6 +603,21 @@ class TestDDSHeaderSynthesis(unittest.TestCase):
                 self.assertEqual(len(dds) - 148, array_size * 6 * 4)
                 self.assertEqual(dds[148:], payload)
 
+    def test_dds_bytes_describes_the_top_subresource(self) -> None:
+        cases = (
+            # 6x5 RGBA8 top level (120 bytes) and 3x2 next level (24 bytes).
+            (6, 5, 28, bytes(range(144)), 0x8, 24),
+            # 9x5 BC1 top level (six blocks) and 4x2 next level (one block).
+            (9, 5, 71, bytes(range(56)), 0x80000, 48),
+        )
+        for width, height, fmt, payload, expected_flags, expected_size in cases:
+            with self.subTest(dxgi_format=fmt):
+                dds = tex_headers.dds_bytes(width, height, fmt, payload, mips=2)
+                self.assertEqual(dds[148:], payload)
+                _, flags, got_height, got_width, pitch_or_size, _, mips = struct.unpack_from("<7I", dds, 4)
+                self.assertEqual((got_width, got_height, mips), (width, height, 2))
+                self.assertEqual((flags & (0x8 | 0x80000), pitch_or_size), (expected_flags, expected_size))
+
     def test_dds_header_2d_array(self):
         hdr = tex_headers.dds_header(256, 256, depth=1, mips=1, fmt=83, is_cube=False, array_size=5)
         info = tex_headers.parse_dds_header(hdr)
@@ -615,7 +630,7 @@ class TestDDSHeaderSynthesis(unittest.TestCase):
         self.assertEqual(tex_headers.parse_dds_header(blob)["array_size"], 4)
 
     def test_dds_bytes_payload(self):
-        payload = b"\xAA\xBB\xCC\xDD" * 64
+        payload = b"\xAA\xBB\xCC\xDD" * 32  # Sixteen BC1 blocks at eight bytes each.
         data = tex_headers.dds_bytes(16, 16, fmt=71, payload=payload)
         self.assertEqual(len(data), 148 + len(payload))
         self.assertEqual(data[148:], payload)
@@ -663,7 +678,7 @@ class TestTextureDescriptorParsing(unittest.TestCase):
         self.arch_dir = os.path.join(self.carve, self.arch)
         os.makedirs(self.arch_dir, exist_ok=True)
 
-    def _make_synthetic_texture_blobs(self, w=512, h=256, depth=1, fmt=71, data_off=0x1000, mips=9):
+    def _make_synthetic_texture_blobs(self, w=512, h=256, depth=1, fmt=71, data_off=0x1000, mips=9, *, dtype: int = 0x980):
         cpu_off = 0x1000
         gpu_off = 0x2000
 
@@ -681,7 +696,7 @@ class TestTextureDescriptorParsing(unittest.TestCase):
 
         k = 10
         qwords[k - 2] = 0xCAFEBABE00000001
-        qwords[k - 1] = 0x980
+        qwords[k - 1] = dtype
         qwords[k] = 0x60000000 + data_off
         d_bytes = struct.pack("<HHHBB", w, h, depth, 0x42, fmt)
         qwords[k + 4] = struct.unpack("<Q", d_bytes)[0]
@@ -736,9 +751,30 @@ class TestTextureDescriptorParsing(unittest.TestCase):
         results = tex_headers.scan_archive(self.carve, self.arch)
         self.assertEqual(len(results), 0)
 
+    def test_cli_indexes_a_small_texture_with_its_gpu_location(self) -> None:
+        cpu_off, gpu_off, index = self._make_synthetic_texture_blobs(w=2, h=3, fmt=28, mips=2)
+        output = os.path.join(self.carve, "textures.json")
+        with mock.patch.object(sys, "argv", ["tex_headers.py", self.carve, "--out", output]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            tex_headers.main()
+        with open(output, encoding="utf-8") as handle:
+            entries = json.load(handle)
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual((entry["w"], entry["h"], entry["depth"], entry["mips"]), (2, 3, 1, 2))
+        self.assertEqual(entry["fmt_name"], "R8G8B8A8_UNORM")
+        self.assertEqual((entry["cpu"], entry["gpu"], entry["data_off"], entry["q_index"]),
+                         (cpu_off, gpu_off, 0x1000, index))
+
+    def test_narrow_texture_requires_a_known_type_and_valid_mips(self) -> None:
+        for dtype, mips in ((0x900, 1), (0x980, 0), (0x980, 3)):
+            with self.subTest(dtype=dtype, mips=mips):
+                self._make_synthetic_texture_blobs(w=1, h=2, fmt=28, mips=mips, dtype=dtype)
+                self.assertEqual(tex_headers.scan_archive(self.carve, self.arch), [])
+
     def test_scan_archive_invalid_dimensions_rejected(self):
-        # Width < 4
-        self._make_synthetic_texture_blobs(w=2, h=256)
+        # Zero width
+        self._make_synthetic_texture_blobs(w=0, h=256)
         self.assertEqual(len(tex_headers.scan_archive(self.carve, self.arch)), 0)
 
         # Height > 16384
@@ -926,6 +962,21 @@ class CliInputTest(unittest.TestCase):
             with open(manifest, "r", encoding="utf-8") as f:
                 self.assertEqual(json.load(f), {"files": []})
 
+    def test_output_parent_creation_failure_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            archive = os.path.join(carve, "a")
+            os.makedirs(archive)
+            with open(os.path.join(archive, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"files": []}, f)
+            blocker = os.path.join(tmp, "not-a-directory")
+            with open(blocker, "w", encoding="utf-8", newline="\n") as f:
+                f.write("existing file")
+            result = self.run_tool(carve, "--out", os.path.join(blocker, "out.json"))
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("ERROR: cannot write", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
     def test_out_that_is_a_directory_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "carve", "a"))
@@ -935,6 +986,207 @@ class CliInputTest(unittest.TestCase):
             self.assertEqual(p.returncode, 2, p.stderr)
             self.assertIn("is a directory", p.stderr)
             self.assertNotIn("Traceback", p.stderr)
+
+
+class TestTextureDictionaryParsing(unittest.TestCase):
+    def _create_synthetic_page(self, name0=b"waterfog2", name1=b"waterfog", fmt=95, w=128, h=128, mips=1, b6=7):
+        buf = bytearray(400)
+        names_chunk = name0 + b"\x00" + name1 + b"\x00"
+        buf[0x140:0x140 + len(names_chunk)] = names_chunk
+        struct.pack_into("<QQ", buf, 0x170, 0x50000040, 0x50000090)
+        struct.pack_into("<II", buf, 0x180, 0x9b9b31df, 0xf1389e16)
+
+        # desc 0
+        struct.pack_into("<Q", buf, 0x40 + 0x10, 0x980)
+        struct.pack_into("<Q", buf, 0x40 + 0x18, 0x60000000)
+        struct.pack_into("<HHHBB", buf, 0x40 + 0x38, w, h, 1, b6, fmt)
+        struct.pack_into("<Q", buf, 0x40 + 0x40, (mips << 16) | 0x1)
+
+        # desc 1
+        struct.pack_into("<Q", buf, 0x90 + 0x10, 0x980)
+        struct.pack_into("<Q", buf, 0x90 + 0x18, 0x60004000)
+        struct.pack_into("<HHHBB", buf, 0x90 + 0x38, w, h, 1, b6, fmt)
+        struct.pack_into("<Q", buf, 0x90 + 0x40, (mips << 16) | 0x1)
+        return bytes(buf)
+
+    def test_parse_valid_texture_dict_page(self):
+        data = self._create_synthetic_page(mips=1, b6=7)
+        res = tex_headers.parse_texture_dict_page(data)
+        self.assertEqual(len(res), 2)
+
+        t0 = res[0]
+        self.assertEqual(t0["name"], "waterfog2")
+        self.assertEqual(t0["hash"], 0x9b9b31df)
+        self.assertEqual(t0["width"], 128)
+        self.assertEqual(t0["height"], 128)
+        self.assertEqual(t0["b6"], 7)
+        self.assertEqual(t0["mips"], 1)
+        self.assertEqual(t0["format"], 95)
+        self.assertEqual(t0["format_name"], "BC6H_UF16")
+        self.assertEqual(t0["data_offset"], 0)
+        self.assertEqual(t0["dtype"], 0x980)
+
+        t1 = res[1]
+        self.assertEqual(t1["name"], "waterfog")
+        self.assertEqual(t1["hash"], 0xf1389e16)
+        self.assertEqual(t1["width"], 128)
+        self.assertEqual(t1["height"], 128)
+        self.assertEqual(t1["b6"], 7)
+        self.assertEqual(t1["mips"], 1)
+        self.assertEqual(t1["format"], 95)
+        self.assertEqual(t1["format_name"], "BC6H_UF16")
+        self.assertEqual(t1["data_offset"], 0x4000)
+
+    def test_mips_and_b6_offsets_differ(self):
+        # b6 at +0x3e is 42, mips at +0x42 (flags >> 16) is 5
+        data = self._create_synthetic_page(mips=5, b6=42)
+        res = tex_headers.parse_texture_dict_page(data)
+        self.assertEqual(len(res), 2)
+        self.assertEqual(res[0]["b6"], 42)
+        self.assertEqual(res[0]["mips"], 5)
+        self.assertEqual(res[1]["b6"], 42)
+        self.assertEqual(res[1]["mips"], 5)
+
+    def test_truncated_buffer_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            tex_headers.parse_texture_dict_page(b"\x00" * 399)
+
+    def test_all_zeros_returns_empty_list(self):
+        # Null pointers return no texture records
+        res = tex_headers.parse_texture_dict_page(b"\x00" * 400)
+        self.assertEqual(res, [])
+
+    def test_invalid_pointer_tag_skipped(self):
+        buf = bytearray(self._create_synthetic_page())
+        # Pointer without 0x5... tag (e.g. 0x10000040)
+        struct.pack_into("<Q", buf, 0x170, 0x10000040)
+        res = tex_headers.parse_texture_dict_page(bytes(buf))
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0]["name"], "waterfog")
+
+    def test_reversed_names_order_matched_by_joaat_hash(self):
+        # Even if name1 is placed first in the string table, joaat matching maps each name to its hash
+        buf = bytearray(self._create_synthetic_page(name0=b"waterfog", name1=b"waterfog2"))
+        res = tex_headers.parse_texture_dict_page(bytes(buf))
+        self.assertEqual(len(res), 2)
+        self.assertEqual(res[0]["name"], "waterfog2")
+        self.assertEqual(res[0]["hash"], 0x9b9b31df)
+        self.assertEqual(res[1]["name"], "waterfog")
+        self.assertEqual(res[1]["hash"], 0xf1389e16)
+
+    def test_missing_first_name_does_not_shift_second(self):
+        # Only waterfog is in the names table, waterfog2 is omitted
+        buf = bytearray(400)
+        buf[0x140:0x140 + len(b"waterfog\x00")] = b"waterfog\x00"
+        struct.pack_into("<QQ", buf, 0x170, 0x50000040, 0x50000090)
+        struct.pack_into("<II", buf, 0x180, 0x9b9b31df, 0xf1389e16)
+        struct.pack_into("<Q", buf, 0x40 + 0x10, 0x980)
+        struct.pack_into("<HHHBB", buf, 0x40 + 0x38, 128, 128, 1, 0, 95)
+        struct.pack_into("<Q", buf, 0x40 + 0x40, 1 << 16)
+        struct.pack_into("<Q", buf, 0x90 + 0x10, 0x980)
+        struct.pack_into("<HHHBB", buf, 0x90 + 0x38, 128, 128, 1, 0, 95)
+        struct.pack_into("<Q", buf, 0x90 + 0x40, 1 << 16)
+
+        res = tex_headers.parse_texture_dict_page(bytes(buf))
+        self.assertEqual(len(res), 2)
+        # First texture has hash 0x9b9b31df (waterfog2), falls back to hex name
+        self.assertEqual(res[0]["name"], f"tex_{0x9b9b31df:08x}")
+        # Second texture has hash 0xf1389e16, gets correctly matched to "waterfog"
+        self.assertEqual(res[1]["name"], "waterfog")
+
+    def test_missing_names_fallback_to_hash(self):
+        buf = bytearray(self._create_synthetic_page())
+        buf[0x140:0x170] = b"\x00" * 0x30
+        res = tex_headers.parse_texture_dict_page(bytes(buf))
+        self.assertEqual(len(res), 2)
+        self.assertEqual(res[0]["name"], f"tex_{0x9b9b31df:08x}")
+        self.assertEqual(res[1]["name"], f"tex_{0xf1389e16:08x}")
+
+    def test_out_of_bounds_pointer_skipped(self):
+        buf = bytearray(self._create_synthetic_page())
+        struct.pack_into("<Q", buf, 0x178, 0x50000300)
+        res = tex_headers.parse_texture_dict_page(bytes(buf))
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0]["name"], "waterfog2")
+
+    def test_tag_validation_rejects_synthetic_0x150000000_offset_zero(self):
+        buf = bytearray(self._create_synthetic_page())
+        # 0x150000000 has high nibble 5 if masked with & 0xF, but high tag is 0x15 != 5
+        struct.pack_into("<Q", buf, 0x170, 0x150000000)
+        res = tex_headers.parse_texture_dict_page(bytes(buf))
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0]["name"], "waterfog")
+
+    def test_shifted_table_mixed_dimensions_bc3(self):
+        # 400-byte stream with longer names in 0x140..0x178 shifting table by 8 bytes:
+        # pointers at +0x178 and +0x180, hashes at +0x188 and +0x18C.
+        # mixed dimensions: 64x64 and 512x512 with format 77 (BC3_UNORM).
+        buf = bytearray(400)
+        names = b"water_deep_caustic\x00water_foam\x00"
+        buf[0x140:0x140 + len(names)] = names
+
+        h0 = tex_headers.joaat("water_deep_caustic")
+        h1 = tex_headers.joaat("water_foam")
+        struct.pack_into("<QQ", buf, 0x178, 0x50000040, 0x50000090)
+        struct.pack_into("<II", buf, 0x188, h0, h1)
+
+        # desc 0: 64x64 format 77 (BC3_UNORM)
+        struct.pack_into("<Q", buf, 0x40 + 0x10, 0x980)
+        struct.pack_into("<Q", buf, 0x40 + 0x18, 0x60000000)
+        struct.pack_into("<HHHBB", buf, 0x40 + 0x38, 64, 64, 1, 0, 77)
+        struct.pack_into("<Q", buf, 0x40 + 0x40, (1 << 16) | 0x1)
+
+        # desc 1: 512x512 format 77 (BC3_UNORM)
+        struct.pack_into("<Q", buf, 0x90 + 0x10, 0x980)
+        struct.pack_into("<Q", buf, 0x90 + 0x18, 0x60001000)
+        struct.pack_into("<HHHBB", buf, 0x90 + 0x38, 512, 512, 1, 0, 77)
+        struct.pack_into("<Q", buf, 0x90 + 0x40, (1 << 16) | 0x1)
+
+        res = tex_headers.parse_texture_dict_page(bytes(buf))
+        self.assertEqual(len(res), 2)
+        self.assertEqual(res[0]["name"], "water_deep_caustic")
+        self.assertEqual(res[0]["hash"], h0)
+        self.assertEqual(res[0]["width"], 64)
+        self.assertEqual(res[0]["height"], 64)
+        self.assertEqual(res[0]["format"], 77)
+        self.assertEqual(res[0]["format_name"], "BC3_UNORM")
+
+        self.assertEqual(res[1]["name"], "water_foam")
+        self.assertEqual(res[1]["hash"], h1)
+        self.assertEqual(res[1]["width"], 512)
+        self.assertEqual(res[1]["height"], 512)
+        self.assertEqual(res[1]["format"], 77)
+        self.assertEqual(res[1]["format_name"], "BC3_UNORM")
+
+    def test_header_pointers_used_when_present(self):
+        # Header with pointers explicitly defined in pgDictionary header at +0x20 and +0x30
+        buf = bytearray(400)
+        names = b"water_deep_caustic\x00water_foam\x00"
+        buf[0x140:0x140 + len(names)] = names
+
+        h0 = tex_headers.joaat("water_deep_caustic")
+        h1 = tex_headers.joaat("water_foam")
+        struct.pack_into("<Q", buf, 0x20, 0x50000188)  # hashes at 0x188
+        struct.pack_into("<Q", buf, 0x30, 0x50000178)  # pointers at 0x178
+        struct.pack_into("<H", buf, 0x38, 2)           # count = 2
+
+        struct.pack_into("<QQ", buf, 0x178, 0x50000040, 0x50000090)
+        struct.pack_into("<II", buf, 0x188, h0, h1)
+
+        struct.pack_into("<Q", buf, 0x40 + 0x10, 0x980)
+        struct.pack_into("<Q", buf, 0x40 + 0x18, 0x60000000)
+        struct.pack_into("<HHHBB", buf, 0x40 + 0x38, 64, 64, 1, 0, 77)
+        struct.pack_into("<Q", buf, 0x40 + 0x40, (1 << 16) | 0x1)
+
+        struct.pack_into("<Q", buf, 0x90 + 0x10, 0x980)
+        struct.pack_into("<Q", buf, 0x90 + 0x18, 0x60001000)
+        struct.pack_into("<HHHBB", buf, 0x90 + 0x38, 512, 512, 1, 0, 77)
+        struct.pack_into("<Q", buf, 0x90 + 0x40, (1 << 16) | 0x1)
+
+        res = tex_headers.parse_texture_dict_page(bytes(buf))
+        self.assertEqual(len(res), 2)
+        self.assertEqual(res[0]["width"], 64)
+        self.assertEqual(res[1]["width"], 512)
 
 
 if __name__ == "__main__":

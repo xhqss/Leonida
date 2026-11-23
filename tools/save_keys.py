@@ -257,7 +257,9 @@ def compose(strings, keys, n_words):
         for w in WORD.findall(s.decode("latin-1")):
             if len(w) >= 2 or w.isdigit():
                 words[w.lower()] += 1
-    vocab = [w for w, _ in words.most_common(n_words)]
+    # Ties are broken by the word, not by the order it was counted: `strings` is a set, so most_common()
+    # followed hash iteration and the same input reported a different composed count from run to run.
+    vocab = [w for w, _ in sorted(words.items(), key=lambda kv: (-kv[1], kv[0]))][:n_words]
     pascal = [w.capitalize().encode() for w in vocab]
     lower = [w.encode() for w in vocab]
     hits, tried = collections.defaultdict(set), 0
@@ -317,7 +319,7 @@ def cmd_resolve(a):
     print(f"  total (joaat)    {len(resolved):6} of {len(keys)} keys ({100 * len(resolved) / max(1, len(keys)):.1f}%)")
     if a.out:
         try:
-            with open(a.out, "w", encoding="utf-8") as f:
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
                 json.dump({"%08x" % k: sorted(x.decode("latin-1") for x in v) for k, v in sorted(resolved.items())},
                           f, indent=1)
         except OSError as e:
@@ -337,7 +339,16 @@ def main(argv=None):
     r.add_argument("--compose", type=int, default=0, metavar="N")
     r.add_argument("--out")
     a = ap.parse_args(argv)
-    return {"collect": cmd_collect, "resolve": cmd_resolve}[a.cmd](a) or 0
+    if a.cmd == "resolve" and a.compose < 0:
+        r.error("--compose must be 0 or more")
+    try:
+        return {"collect": cmd_collect, "resolve": cmd_resolve}[a.cmd](a) or 0
+    except OSError as e:
+        if e.filename is None:                    # not a file we were asked to read (a closed pipe, say)
+            raise
+        # A missing or unreadable input or --dict file is one line naming it, not a traceback.
+        print(f"error: {e.filename}: {e.strerror or e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

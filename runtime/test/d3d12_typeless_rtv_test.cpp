@@ -213,19 +213,36 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT whole_format, DXGI_FORMAT 
     return true;
 }
 bool rejects_view(ID3D12Device* device, DXGI_FORMAT resource_format, const D3D12_RENDER_TARGET_VIEW_DESC* view,
-                  UINT16 mips = 1, UINT16 layers = 1) {
+                  UINT16 mips = 1, UINT16 layers = 1, UINT samples = 1,
+                  const DXGI_FORMAT* cast_list = nullptr, UINT32 cast_count = 0) {
     Ref<ID3D12Resource> resource;
     D3D12_HEAP_PROPERTIES heap_properties{D3D12_HEAP_TYPE_DEFAULT};
-    D3D12_RESOURCE_DESC texture{};
-    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    texture.Width = texture.Height = 4;
-    texture.DepthOrArraySize = layers;
-    texture.MipLevels = mips;
-    texture.Format = resource_format;
-    texture.SampleDesc.Count = 1;
-    texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    CHECK(SUCCEEDED(device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &texture,
-        D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&resource.p))));
+    if (cast_count) {
+        Ref<ID3D12Device10> device10;
+        CHECK(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device10.p))));
+        D3D12_RESOURCE_DESC1 tex1{};
+        tex1.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        tex1.Width = tex1.Height = 4;
+        tex1.DepthOrArraySize = layers;
+        tex1.MipLevels = mips;
+        tex1.Format = resource_format;
+        tex1.SampleDesc.Count = samples;
+        tex1.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        CHECK(SUCCEEDED(device10->CreateCommittedResource3(&heap_properties, D3D12_HEAP_FLAG_NONE, &tex1,
+            D3D12_BARRIER_LAYOUT_RENDER_TARGET, nullptr, nullptr, cast_count, cast_list,
+            IID_PPV_ARGS(&resource.p))));
+    } else {
+        D3D12_RESOURCE_DESC texture{};
+        texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texture.Width = texture.Height = 4;
+        texture.DepthOrArraySize = layers;
+        texture.MipLevels = mips;
+        texture.Format = resource_format;
+        texture.SampleDesc.Count = samples;
+        texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        CHECK(SUCCEEDED(device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &texture,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&resource.p))));
+    }
     Ref<ID3D12DescriptorHeap> heap;
     const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     CHECK(SUCCEEDED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap.p))));
@@ -237,13 +254,157 @@ bool rejects_view(ID3D12Device* device, DXGI_FORMAT resource_format, const D3D12
     const auto handle = heap->GetCPUDescriptorHandleForHeapStart();
     // For the supported shape, overwrite a valid slot too: rejection must not leave its old RTV active.
     D3D12_RENDER_TARGET_VIEW_DESC seed{};
-    seed.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    seed.ViewDimension = samples > 1 ? D3D12_RTV_DIMENSION_TEXTURE2DMS : D3D12_RTV_DIMENSION_TEXTURE2D;
     seed.Format = resource_format == DXGI_FORMAT_R8G8B8A8_TYPELESS ? DXGI_FORMAT_R8G8B8A8_UNORM : resource_format;
     device->CreateRenderTargetView(resource.p, &seed, handle);
     device->CreateRenderTargetView(resource.p, view, handle);
     const FLOAT color[] = {1, 1, 1, 1};
     list->ClearRenderTargetView(handle, color, 0, nullptr);
     CHECK(list->Close() == E_INVALIDARG); // The invalid list is never sent to the GPU.
+    return true;
+}
+
+bool clear_and_read_msaa(ID3D12Device* device, DXGI_FORMAT resource_format,
+                         const DXGI_FORMAT* cast_list, UINT32 cast_count,
+                         DXGI_FORMAT whole_format, DXGI_FORMAT rect_format, bool partial,
+                         bool array, UINT first_layer, UINT layer_count,
+                         std::vector<unsigned char>& pixels) {
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    CHECK(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+    CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                             IID_PPV_ARGS(&list.p))));
+    CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+
+    constexpr UINT width = 5, height = 3;
+    const UINT16 layers = array ? 4 : 1;
+    Ref<ID3D12Resource> msaa, resolved, readback;
+    D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    if (cast_count) {
+        Ref<ID3D12Device10> device10;
+        CHECK(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device10.p))));
+        D3D12_RESOURCE_DESC1 tex1{};
+        tex1.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        tex1.Width = width;
+        tex1.Height = height;
+        tex1.DepthOrArraySize = layers;
+        tex1.MipLevels = 1;
+        tex1.Format = resource_format;
+        tex1.SampleDesc.Count = 4;
+        tex1.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        CHECK(SUCCEEDED(device10->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &tex1,
+            D3D12_BARRIER_LAYOUT_RENDER_TARGET, nullptr, nullptr, cast_count, cast_list,
+            IID_PPV_ARGS(&msaa.p))));
+    } else {
+        D3D12_RESOURCE_DESC tex{};
+        tex.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        tex.Width = width;
+        tex.Height = height;
+        tex.DepthOrArraySize = layers;
+        tex.MipLevels = 1;
+        tex.Format = resource_format;
+        tex.SampleDesc.Count = 4;
+        tex.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        CHECK(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &tex,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&msaa.p))));
+    }
+    D3D12_RESOURCE_DESC resolved_desc{};
+    resolved_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    resolved_desc.Width = width;
+    resolved_desc.Height = height;
+    resolved_desc.DepthOrArraySize = layers;
+    resolved_desc.MipLevels = 1;
+    resolved_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    resolved_desc.SampleDesc.Count = 1;
+    CHECK(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &resolved_desc,
+        D3D12_RESOURCE_STATE_RESOLVE_DEST, nullptr, IID_PPV_ARGS(&resolved.p))));
+
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> placed(layers);
+    UINT64 total = 0;
+    device->GetCopyableFootprints(&resolved_desc, 0, layers, 0, placed.data(), nullptr, nullptr, &total);
+    D3D12_RESOURCE_DESC buf{};
+    buf.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buf.Width = total;
+    buf.Height = buf.SampleDesc.Count = 1;
+    buf.DepthOrArraySize = buf.MipLevels = 1;
+    buf.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES rb_heap{D3D12_HEAP_TYPE_READBACK};
+    CHECK(SUCCEEDED(device->CreateCommittedResource(&rb_heap, D3D12_HEAP_FLAG_NONE, &buf,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback.p))));
+
+    Ref<ID3D12DescriptorHeap> rtv_heap;
+    const D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    CHECK(SUCCEEDED(device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&rtv_heap.p))));
+    const auto h0 = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE h1{h0.ptr + device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
+
+    D3D12_RENDER_TARGET_VIEW_DESC view{};
+    view.ViewDimension = array ? D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY : D3D12_RTV_DIMENSION_TEXTURE2DMS;
+    if (array) {
+        view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        for (UINT layer = 0; layer < layers; ++layer) {
+            view.Texture2DMSArray = {layer, 1};
+            device->CreateRenderTargetView(msaa.p, &view, h0);
+            const FLOAT seed[] = {FLOAT(layer + 1) * 0.1f, 0.2f, 0.3f, 1.0f};
+            list->ClearRenderTargetView(h0, seed, 0, nullptr);
+        }
+        view.Texture2DMSArray = {first_layer, layer_count};
+    }
+    view.Format = whole_format;
+    device->CreateRenderTargetView(msaa.p, &view, h0);
+    view.Format = rect_format;
+    device->CreateRenderTargetView(msaa.p, &view, h1);
+    const FLOAT full[4] = {0.25f, 0.5f, 0.75f, 0.25f};
+    const FLOAT part[4] = {0.0031308f, 0.18f, 0.5f, 0.75f};
+    list->ClearRenderTargetView(h0, full, 0, nullptr);
+    const D3D12_RECT rect{1, 1, 4, 3};
+    if (partial) list->ClearRenderTargetView(h1, part, 1, &rect);
+
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition = {msaa.p, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE};
+    list->ResourceBarrier(1, &b);
+    for (UINT layer = 0; layer < layers; ++layer)
+        list->ResolveSubresource(resolved.p, layer, msaa.p, layer, DXGI_FORMAT_R8G8B8A8_UNORM);
+    b.Transition = {resolved.p, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE};
+    list->ResourceBarrier(1, &b);
+    D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+    src.pResource = resolved.p;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.pResource = readback.p;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    for (UINT layer = 0; layer < layers; ++layer) {
+        src.SubresourceIndex = layer;
+        dst.PlacedFootprint = placed[layer];
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    CHECK(SUCCEEDED(list->Close()));
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    CHECK(SUCCEEDED(queue->Signal(fence.p, 1)));
+    Event event;
+    CHECK(event.handle);
+    CHECK(SUCCEEDED(fence->SetEventOnCompletion(1, event.handle)));
+    CHECK(WaitForSingleObject(event.handle, 5000) == WAIT_OBJECT_0);
+    void* mapped = nullptr;
+    const D3D12_RANGE range{0, SIZE_T(total)};
+    CHECK(SUCCEEDED(readback->Map(0, &range, &mapped)) && mapped);
+    pixels.clear();
+    for (const auto& footprint : placed) {
+        const auto& f = footprint.Footprint;
+        for (UINT y = 0; y < f.Height; ++y) {
+            const auto* row = static_cast<unsigned char*>(mapped) + footprint.Offset + y * f.RowPitch;
+            pixels.insert(pixels.end(), row, row + f.Width * 4);
+        }
+    }
+    const D3D12_RANGE none{};
+    readback->Unmap(0, &none);
     return true;
 }
 } // namespace
@@ -452,8 +613,10 @@ int main() {
                     regressions, vk.conditional_rendering ? "enabled" : "unavailable (predicated cases skipped)");
         if (mismatches) return 1;
         const auto rejects = [&](DXGI_FORMAT resource_format, const D3D12_RENDER_TARGET_VIEW_DESC* view,
-                                 UINT16 mips = 1, UINT16 layers = 1) {
-            if (!rejects_view(ours.p, resource_format, view, mips, layers)) return false;
+                                 UINT16 mips = 1, UINT16 layers = 1, UINT samples = 1,
+                                 const DXGI_FORMAT* cast_list = nullptr, UINT32 cast_count = 0) {
+            if (!rejects_view(ours.p, resource_format, view, mips, layers, samples, cast_list, cast_count))
+                return false;
             ++rejected;
             return true;
         };
@@ -501,6 +664,64 @@ int main() {
         invalid.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
         invalid.Texture2DArray = {1, 1, 2, 1};
         if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &invalid, 3, 4)) return 1;
+
+        // 4x MSAA typeless and castable RGBA8 RTVs (TEXTURE2DMS / TEXTURE2DMSARRAY) compared against WARP.
+        {
+            const DXGI_FORMAT srgb_list[] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB};
+            const auto compare_msaa = [&](DXGI_FORMAT resource_format, const DXGI_FORMAT* cast_list,
+                                          UINT32 cast_count, DXGI_FORMAT full, DXGI_FORMAT rect, bool partial,
+                                          bool array, UINT first_layer, UINT layer_count) {
+                std::vector<unsigned char> actual, expected;
+                if (!clear_and_read_msaa(ours.p, resource_format, cast_list, cast_count, full, rect, partial, array,
+                                         first_layer, layer_count, actual) ||
+                    !clear_and_read_msaa(host.p, resource_format, cast_list, cast_count, full, rect, partial, array,
+                                         first_layer, layer_count, expected))
+                    return false;
+                ++comparisons;
+                if (actual.size() != expected.size()) return false;
+                for (std::size_t i = 0; i < actual.size(); ++i) {
+                    if (std::abs(int(actual[i]) - int(expected[i])) > 1) {
+                        std::fprintf(stderr, "MSAA RTV mismatch fmt %d full %d rect %d array %d byte %zu: ours %u WARP %u\n",
+                                     int(resource_format), int(full), int(rect), int(array), i, unsigned(actual[i]),
+                                     unsigned(expected[i]));
+                        ++mismatches;
+                        return false;
+                    }
+                }
+                return true;
+            };
+            if (!compare_msaa(DXGI_FORMAT_R8G8B8A8_TYPELESS, nullptr, 0, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                              DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, false, false, 0, 1))
+                return 1;
+            if (!compare_msaa(DXGI_FORMAT_R8G8B8A8_TYPELESS, nullptr, 0, DXGI_FORMAT_R8G8B8A8_UNORM,
+                              DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, true, false, 0, 1))
+                return 1;
+            if (!compare_msaa(DXGI_FORMAT_R8G8B8A8_TYPELESS, nullptr, 0, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                              DXGI_FORMAT_R8G8B8A8_UNORM, true, true, 1, 2))
+                return 1;
+            Ref<ID3D12Device10> host10;
+            if (SUCCEEDED(host->QueryInterface(IID_PPV_ARGS(&host10.p)))) {
+                if (!compare_msaa(DXGI_FORMAT_R8G8B8A8_UNORM, srgb_list, 2, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                                  DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, false, false, 0, 1))
+                    return 1;
+                if (!compare_msaa(DXGI_FORMAT_R8G8B8A8_UNORM, srgb_list, 2, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                                  DXGI_FORMAT_R8G8B8A8_UNORM, true, true, 1, 2))
+                    return 1;
+            }
+            // MSAA vs 1x view-dimension mismatches, out-of-range MSAA array slices, and unlisted castable formats.
+            D3D12_RENDER_TARGET_VIEW_DESC bad_msaa{};
+            bad_msaa.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+            bad_msaa.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &bad_msaa, 1, 1, 4)) return 1;
+            bad_msaa.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
+            if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &bad_msaa, 1, 1, 1)) return 1;
+            bad_msaa.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+            bad_msaa.Texture2DMSArray = {3, 2};
+            if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &bad_msaa, 1, 4, 4)) return 1;
+            bad_msaa.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
+            bad_msaa.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+            if (!rejects(DXGI_FORMAT_R8G8B8A8_UNORM, &bad_msaa, 1, 1, 4, srgb_list, 2)) return 1;
+        }
     }
     if (vk.validation_errors()) return 1;
     std::printf("typeless RTV: %u WARP readbacks matched, descriptor snapshots and format-cache order checked; %u unsupported/invalid views rejected\n",

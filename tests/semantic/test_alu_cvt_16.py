@@ -164,7 +164,7 @@ class F16ToIntTests(unittest.TestCase):
         self.assertEqual(run("v_cvt_i16_f16_e64 v0, |v1|", 0xC248), merge(OLD, 3, 0))
 
     def test_output_modifiers_are_rejected(self):
-        for line in ("v_cvt_u16_f16_e64 v0, v1 clamp", "v_cvt_i16_f16_e64 v0, v1 mul:2", "v_cvt_f16_u16_e64 v0, v1 clamp"):
+        for line in ("v_cvt_u16_f16_e64 v0, v1 clamp", "v_cvt_i16_f16_e64 v0, v1 mul:2"):
             with self.subTest(line=line), self.assertRaises(rdna2spirv.Unsupported):
                 run(line, 0x4248)
 

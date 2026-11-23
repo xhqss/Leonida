@@ -143,6 +143,11 @@ class Resolve(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
         self.assertEqual(r.stdout, "")      # refused before the resolve ran
 
+    def test_rejects_negative_compose_count(self):
+        result = self.resolve_cli(self.dir, "--dict", self.dict, "--compose", "-1")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--compose must be 0 or more", result.stderr)
+
     def test_compose_finds_two_word_names(self):
         text = run(["resolve", self.jsav, "--dict", self.dict, "--compose", "50"])
         self.assertIn("joaat, composed       1 more keys", text)       # SprocketCount from Sprocket + Count
@@ -209,6 +214,58 @@ class MalformedJsavTest(unittest.TestCase):
         self.assertIn("JSAV header declares 4 entries", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
         self.assertIn("0 distinct keys", r.stdout)
+
+
+class MissingFilesTest(unittest.TestCase):
+    """A path that can't be read is one error line naming it and exit code 1, for both commands."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.save = os.path.join(self.tmp.name, "save.json")
+        with open(self.save, "w", encoding="utf-8") as f:
+            json.dump({key("health"): 1}, f)
+        self.words = os.path.join(self.tmp.name, "words.txt")
+        with open(self.words, "wb") as f:
+            f.write(b"health\0")
+        self.missing = os.path.join(self.tmp.name, "nope.jsav")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def cli(self, *args):
+        tool = os.path.join(ROOT, "tools", "save_keys.py")
+        return subprocess.run([sys.executable, "-I", tool, *args], cwd=ROOT, capture_output=True, text=True)
+
+    def assert_one_error_line(self, r, path):
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
+        self.assertTrue(r.stderr.startswith("error: "), r.stderr)
+        self.assertIn(path, r.stderr)
+
+    def test_collect_names_a_missing_input(self):
+        self.assert_one_error_line(self.cli("collect", self.missing), self.missing)
+
+    def test_collect_names_the_missing_one_of_several(self):
+        self.assert_one_error_line(self.cli("collect", self.save, self.missing), self.missing)
+
+    def test_resolve_names_a_missing_input(self):
+        self.assert_one_error_line(self.cli("resolve", self.missing, "--dict", self.words), self.missing)
+
+    def test_resolve_names_a_missing_dictionary(self):
+        r = self.cli("resolve", self.save, "--dict", self.missing)
+        self.assert_one_error_line(r, self.missing)
+
+    def test_resolve_with_a_missing_dictionary_writes_no_report(self):
+        out = os.path.join(self.tmp.name, "names.json")
+        r = self.cli("resolve", self.save, "--dict", self.missing, "--out", out)
+        self.assert_one_error_line(r, self.missing)
+        self.assertFalse(os.path.exists(out))
+
+    def test_readable_files_still_resolve(self):
+        r = self.cli("resolve", self.save, "--dict", self.words)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("1 distinct keys", r.stdout)
 
 
 class DirectoryScanTest(unittest.TestCase):
@@ -285,6 +342,55 @@ class LongIdentifiers(unittest.TestCase):
     def test_a_127_character_name_is_harvested(self):
         name = b"Vehicle" + b"Part" * 30
         self.assertEqual(self.harvest(name), {name})
+
+
+class ComposeDeterminism(unittest.TestCase):
+    """`--compose` must report one answer for one input: tied word counts used to pick words in hash order."""
+
+    WORDS = ["Widget", "Gadget", "Sprocket", "Colour", "Spin", "Rate", "Mystery", "Field", "Alpha",
+             "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel", "India", "Juliet", "Kilo",
+             "Lima"]
+
+    def keys(self):
+        return {sk.joaat(b"Alpha"), sk.joaat(b"Gadget")}
+
+    def test_the_vocabulary_does_not_depend_on_the_input_order(self):
+        # compose() builds its Counter by iterating a set, so the words it chose followed hash order: the same
+        # twenty words in reverse picked a different six. The six are now the alphabetically first, so Alpha is
+        # one of them and Gadget, far down the list, is not.
+        forward = sk.compose([w.encode() for w in self.WORDS], self.keys(), 6)
+        reverse = sk.compose([w.encode() for w in reversed(self.WORDS)], self.keys(), 6)
+        self.assertEqual(forward, reverse)
+        self.assertEqual(set(forward[0]), {sk.joaat(b"Alpha")})
+        self.assertNotIn(sk.joaat(b"Gadget"), forward[0])
+
+    def test_a_tie_is_broken_by_the_word(self):
+        keys = {sk.joaat(b"Alpha"), sk.joaat(b"Zulu")}
+        hits, tried = sk.compose({b"Alpha", b"Bravo", b"Zulu"}, keys, 2)
+        self.assertEqual(tried, 18)                        # 6 one-word and 3 x 4 two-word candidates
+        self.assertEqual(set(hits), {sk.joaat(b"Alpha")})  # Alpha and Bravo win; Zulu is out of the six
+
+    def test_the_cli_report_is_identical_across_runs(self):
+        # Hash randomisation already varies per process, so the same command disagreed with itself.
+        with tempfile.TemporaryDirectory() as tmp:
+            save = os.path.join(tmp, "k.json")
+            with open(save, "w", encoding="utf-8") as f:
+                f.write('{"%s": 1}' % key("AlphaBravo"))
+            dic = os.path.join(tmp, "words.bin")
+            with open(dic, "wb") as f:
+                for w in self.WORDS:
+                    f.write(b"\0" + w.encode() + b"\0")
+            tool = os.path.join(ROOT, "tools", "save_keys.py")
+            runs = [subprocess.run([sys.executable, "-I", tool, "resolve", save, "--dict", dic,
+                                    "--compose", "6"], cwd=ROOT, capture_output=True, text=True)
+                    for _ in range(5)]
+            for r in runs:
+                self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(len({r.stdout for r in runs}), 1, [r.stdout for r in runs])
+        composed = [ln for ln in runs[0].stdout.splitlines() if "composed" in ln][0]
+        # AlphaBravo is not a harvested string, so only the two-word pass can resolve it; Alpha and Bravo are
+        # both inside the six ties that used to be chosen in hash order.
+        self.assertEqual(composed.split()[2], "1")
 
 
 if __name__ == "__main__":

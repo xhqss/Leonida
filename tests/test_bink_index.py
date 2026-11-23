@@ -209,6 +209,23 @@ class TestCommandLine(unittest.TestCase):
             self.assertEqual(bink.main([missing]), 2)
         self.assertIn("no such file or directory", err.getvalue())
 
+    def test_unreadable_directory_entry_reports_the_file_without_writing_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "inputs")
+            os.mkdir(target)
+            source = os.path.join(target, "movie.bk2")
+            with open(source, "wb") as fh:
+                fh.write(make_stream())
+            out = os.path.join(tmp, "report.json")
+            stderr = io.StringIO()
+            error = PermissionError(13, "input is locked", source)
+            with (mock.patch.object(bink, "open", create=True, side_effect=error),
+                  contextlib.redirect_stderr(stderr)):
+                self.assertEqual(bink.main([target, "--out", out]), 2)
+            self.assertEqual(stderr.getvalue().splitlines(),
+                             [f"bink_index: error: cannot read {source}: input is locked"])
+            self.assertFalse(os.path.exists(out))
+
     def test_output_write_failure_is_an_error(self):
         for extension in ("csv", "json"):
             with self.subTest(extension=extension):

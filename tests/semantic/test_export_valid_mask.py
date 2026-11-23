@@ -4,6 +4,7 @@ RDNA2 ISA reference guide (30-November-2020), 11.1 and 11.2.1: with VM set EXEC 
 sent is used, and an export to NULL may carry only the mask. Not measured on hardware; docs/design.md, EXEC.
 Hand-written programs, no tools needed.
 """
+from pathlib import Path
 import unittest
 
 import support
@@ -45,6 +46,28 @@ def dwords(lines):
 class StraightLine(unittest.TestCase):
     def check(self, lines, want):
         self.assertEqual(run_fragment(translate(SEED + lines + END)), want)
+
+    def test_disjoint_color_exports_accumulate_per_target(self) -> None:
+        fixture = Path(__file__).with_name("fixtures") / "partial_color_exports.asm"
+        shader = support.translate_lines("ps_partial_exports", fixture.read_text(encoding="ascii").splitlines())
+        self.assertEqual(run_fragment(shader), {
+            "%out_mrt0": (0x3F800000, 0x40000000, 0x40400000, 0x40800000),
+            "%out_mrt1": (0x40A00000, 0x40C00000, 0x40E00000, 0x41000000),
+        })
+
+    def test_first_partial_color_export_has_zero_unwritten_channels(self) -> None:
+        lines = ["exp mrt0 off, v2, off, v2 done vm"]
+        shader = translate(SEED + lines + END)
+        self.assertEqual(run_fragment(shader), {"%out_mrt0": (0, ONE, 0, ONE)})
+        # The interpreter defaults unwritten outputs to zero. Vulkan needs an explicit initializer here.
+        self.assertIn("%initial_mrt = OpConstantNull %v4float", shader)
+        self.assertIn("%out_mrt0 = OpVariable %_ptr_Output_v4 Output %initial_mrt", shader)
+
+    def test_partial_export_obeys_exec_and_replaces_enabled_channels(self) -> None:
+        lines = ["v_mov_b32_e32 v3, 0x40000000", "exp mrt0 v2, v2, v2, v2", "s_waitcnt expcnt(0)"] + OFF
+        lines += ["exp mrt0 off, v3, v3, off", "s_waitcnt expcnt(0)"] + ON
+        lines += ["exp mrt0 off, off, v3, off done vm"]
+        self.check(lines, {"%out_mrt0": (ONE, ONE, 0x40000000, ONE)})
 
     def test_exec_unchanged_after_the_export(self):
         self.check(EXP, MRT0)

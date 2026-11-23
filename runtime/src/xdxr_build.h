@@ -15,6 +15,7 @@
 // device addresses are wider (llvmpipe's are host pointers), the layer must present a narrower window and a bias.
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -41,9 +42,10 @@ struct XdxrLayout {
     std::uint32_t size = 0;            // result data size in bytes, a multiple of 64
     std::uint32_t parent_entries = 0;  // one per 64-byte unit from elements_off on
     std::uint32_t sort_size = 0;       // keys the radix sort orders: one per element
-    static constexpr std::uint32_t radix_tile = 2048;  // xdxr_build.comp RADIX_TILE
+    static constexpr std::uint32_t radix_tile = 256;  // xdxr_build.comp RADIX_TILE
     static constexpr std::uint32_t radix_bins = 16;
     static constexpr std::uint32_t radix_passes = 8;
+    static constexpr std::uint32_t small_sort_max = 1024;  // xdxr_build.comp SMALL_SORT_MAX: one-workgroup sort
     std::uint64_t scratch = 0;         // scratch bytes
 
     // False when the count would overflow the 32-bit offsets of the format.
@@ -72,8 +74,9 @@ struct XdxrLayout {
         size = std::uint32_t(end);
         parent_entries = std::uint32_t(body_units);
         sort_size = count;
-        // centroid bounds, keys and element indices twice, digit counts per tile, a box per element and per node
-        scratch = 64 + 16ull * sort_size + 4ull * radix_bins * tiles() + 24ull * (std::uint64_t(count) + nodes);
+        // centroid bounds, keys and element indices twice, digit counts per tile and their prefix sums, a box per
+        // element and per node
+        scratch = 64 + 16ull * sort_size + 8ull * radix_bins * tiles() + 24ull * (std::uint64_t(count) + nodes);
         return true;
     }
     std::uint32_t root() const { return nodes - 1; }
@@ -108,11 +111,16 @@ public:
 
     // Records a bottom-level build into `dst` (layout.size bytes) using `scratch` (layout.scratch bytes). `layout`
     // must come from compute() with the sum of the geometries' triangle counts.
+    //
+    // With `update_from` set, an update (D3D12 PERFORM_UPDATE) instead: the structure at `update_from` (the
+    // destination itself, or another one, which is copied first) was built from the same topology, and is refitted
+    // to the new positions. Its tree is kept and only its boxes change, which is valid for any motion and costs no
+    // sort, though a refitted tree traverses more slowly as the geometry moves away from where it was built.
     bool record_blas(VkCommandBuffer cb, const XdxrLayout& layout, const std::vector<XdxrTriangles>& geometries,
-                     std::uint64_t dst, std::uint64_t scratch) {
+                     std::uint64_t dst, std::uint64_t scratch, std::uint64_t update_from = 0) {
         if (!loaded_ || layout.tlas) return false;
         Push p = base(layout, dst, scratch);
-        begin(cb, layout, p);
+        if (update_from) refit_begin(cb, layout, p, update_from); else begin(cb, layout, p);
         std::uint32_t first = 0;
         for (std::size_t g = 0; g < geometries.size(); ++g) {
             const auto& geo = geometries[g];
@@ -132,17 +140,18 @@ public:
             first += geo.triangle_count;
         }
         if (first != layout.elements) return false;
-        finish(cb, layout, p);
+        if (update_from) refit_finish(cb, layout, p); else finish(cb, layout, p);
         return true;
     }
 
     // Records a top-level build from `count` D3D12_RAYTRACING_INSTANCE_DESCs at `instances`.
+    // `update_from`: as for record_blas; the instances may move, and name other BLASes.
     bool record_tlas(VkCommandBuffer cb, const XdxrLayout& layout, std::uint64_t instances, std::uint64_t dst,
-                     std::uint64_t scratch, std::uint64_t bias = 0) {
+                     std::uint64_t scratch, std::uint64_t bias = 0, std::uint64_t update_from = 0) {
         if (!loaded_ || !layout.tlas) return false;
         Push p = base(layout, dst, scratch);
         p.bias = split(bias);
-        begin(cb, layout, p);
+        if (update_from) refit_begin(cb, layout, p, update_from); else begin(cb, layout, p);
         if (layout.elements) {
             Push t = p;
             t.mode = mode_instances;
@@ -150,14 +159,48 @@ public:
             t.src0 = split(instances);
             dispatch(cb, t, t.count);
         }
-        finish(cb, layout, p);
+        if (update_from) refit_finish(cb, layout, p); else finish(cb, layout, p);
+        return true;
+    }
+
+    // CopyRaytracingAccelerationStructure CLONE or COMPACT: the structure at `src` to `dst`, as many bytes as its
+    // header says, at most `max_bytes` (the room the destination has). The structures are position-independent.
+    bool record_copy(VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst, std::uint64_t max_bytes) {
+        if (!loaded_ || !src || !dst || max_bytes < XdxrLayout::header_size) return false;
+        if (src == dst) return true;
+        vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+        Push p{};
+        p.mode = mode_copy_as;
+        p.src0 = split(src);
+        p.dst = split(dst);
+        p.count = std::uint32_t(std::min<std::uint64_t>(max_bytes, 0xffffffffull) / 4);
+        dispatch(cb, p, p.count, false);
+        return true;
+    }
+
+    // One postbuild value (COMPACTED_SIZE or CURRENT_SIZE, the same for these builds): 8 bytes at `dst` for the
+    // structure at `src`. A barrier first: a build or copy recorded just before writes the header it reads.
+    bool record_postbuild(VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst) {
+        if (!loaded_ || !src || !dst) return false;
+        VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT,
+                          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+        vk_.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                                 &b, 0, nullptr, 0, nullptr);
+        vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+        Push p{};
+        p.mode = mode_postbuild;
+        p.src0 = split(src);
+        p.dst = split(dst);
+        p.count = 1;
+        dispatch(cb, p, 1, false);
         return true;
     }
 
 private:
     enum : std::uint32_t {
         mode_init = 0, mode_triangles = 1, mode_instances = 2, mode_morton = 3, mode_level = 5, mode_header = 6,
-        mode_radix_count = 7, mode_radix_scan = 8, mode_radix_scatter = 9
+        mode_radix_count = 7, mode_radix_scan = 8, mode_radix_scatter = 9, mode_small_sort = 10, mode_copy = 11,
+        mode_copy_as = 12, mode_postbuild = 13
     };
     struct Addr { std::uint32_t lo = 0, hi = 0; };
     struct Push {  // xdxr_build.comp `Push`, std430 push-constant layout
@@ -191,6 +234,36 @@ private:
         dispatch(cb, init, init.count);
     }
 
+    // An update: the source's tree is copied unless it is the destination. Its parent table stays as it is, so there
+    // is no MODE_INIT.
+    void refit_begin(VkCommandBuffer cb, const XdxrLayout& l, const Push& p, std::uint64_t source) {
+        vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+        const std::uint64_t dst = std::uint64_t(p.dst.hi) << 32 | p.dst.lo;
+        if (source == dst) return;
+        Push c = p;
+        c.mode = mode_copy;
+        c.count = l.size / 4;
+        c.src0 = split(source);
+        dispatch(cb, c, c.count);
+    }
+
+    // Boxes bottom-up through the existing nodes, then the header (its bounds change; nothing else does).
+    void refit_finish(VkCommandBuffer cb, const XdxrLayout& l, const Push& p) {
+        for (std::size_t level = 0; level < l.level_counts.size(); ++level) {
+            Push n = p;
+            n.mode = mode_level;
+            n.count = l.level_counts[level];
+            n.first = l.level_first[level];
+            n.arg2 = 1;                                 // refit: read each node's children from the node
+            dispatch(cb, n, n.count);
+        }
+        Push h = p;
+        h.mode = mode_header;
+        h.count = 1;
+        h.first = l.root();
+        dispatch(cb, h, 1, false);
+    }
+
     void finish(VkCommandBuffer cb, const XdxrLayout& l, const Push& p) {
         Push m = p;
         m.mode = mode_morton;
@@ -198,7 +271,11 @@ private:
         dispatch(cb, m, m.count);
         // stable LSD radix sort, 4 bits a pass; an even pass count leaves the result where the keys started
         static_assert(XdxrLayout::radix_passes % 2 == 0, "the sorted keys must end in the first buffer");
-        if (l.sort_size > 1) {
+        if (l.sort_size > 1 && l.sort_size <= XdxrLayout::small_sort_max) {
+            Push s = p;
+            s.mode = mode_small_sort;
+            dispatch(cb, s, 64);                       // one workgroup, shared memory
+        } else if (l.sort_size > 1) {
             for (std::uint32_t pass = 0; pass < XdxrLayout::radix_passes; ++pass) {
                 Push s = p;
                 s.first = pass;

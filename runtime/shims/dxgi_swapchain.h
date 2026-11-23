@@ -166,7 +166,7 @@ public:
         }
         allow_tearing_ = allow_tearing;
         const VkFormat fmt = (preferred_format != VK_FORMAT_UNDEFINED) ? preferred_format : format_;
-        const std::uint32_t count = buffer_count ? buffer_count : static_cast<std::uint32_t>(images_.size());
+        const std::uint32_t count = buffer_count ? buffer_count : exposed_count_;
         return rebuild(width, height, fmt, count ? count : 2u);
     }
 
@@ -177,11 +177,21 @@ public:
                                                   &out_index);
         if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) return false;
         if (fn_.wait_for_fences(device_, 1, &acquire_fence_, VK_TRUE, timeout_ns) != VK_SUCCESS) return false;
-        current_index_ = out_index;
+        acquired_index_ = out_index;
+        if (is_offscreen()) {
+            // The native image count may differ from the DXGI BufferCount (Vulkan is free to return more
+            // images than minImageCount, and caps.minImageCount can exceed the app's request). The app's
+            // backbuffers are the stable offscreen ring; each present blits the current slot into whichever
+            // native image was acquired, so the exposed index never follows the native one.
+            current_index_ = next_back_buffer_;
+            next_back_buffer_ = (next_back_buffer_ + 1) % exposed_count_;
+        } else {
+            current_index_ = out_index;
+        }
         // D3D12 swapchain backbuffers begin in D3D12_RESOURCE_STATE_PRESENT; transition each newly acquired
         // native swapchain image once from UNDEFINED -> PRESENT_SRC_KHR so presenting an untouched backbuffer
         // or transitioning from PRESENT matches the tracked layout.
-        if (offscreen_images_.empty() && out_index < image_initialized_.size() && !image_initialized_[out_index]) {
+        if (!is_offscreen() && out_index < image_initialized_.size() && !image_initialized_[out_index]) {
             if (!transition_image_layout(images_[out_index], VK_IMAGE_LAYOUT_UNDEFINED,
                                          VK_IMAGE_LAYOUT_PRESENT_SRC_KHR))
                 return false;
@@ -190,10 +200,12 @@ public:
         return true;
     }
 
-    bool present(std::uint32_t image_index) {
-        if (!swapchain_ || image_index >= images_.size()) return false;
-        if (!offscreen_images_.empty()) {
-            if (!blit_to_swapchain(image_index)) return false;
+    bool present(std::uint32_t back_buffer_index) {
+        if (!swapchain_ || back_buffer_index >= exposed_count_ || acquired_index_ >= images_.size()) return false;
+        std::uint32_t image_index = back_buffer_index;
+        if (is_offscreen()) {
+            if (!blit_to_swapchain(back_buffer_index)) return false;
+            image_index = acquired_index_;
         }
         VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         pi.swapchainCount = 1;
@@ -204,21 +216,24 @@ public:
         return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
     }
 
-    std::uint32_t image_count() const { return static_cast<std::uint32_t>(images_.size()); }
+    // DXGI exposes exactly the BufferCount the app asked for (GetDesc/GetDesc1 and GetCurrentBackBufferIndex
+    // stay inside it). When Vulkan supplies a different number of native images the extra ones are hidden
+    // behind a stable offscreen ring (is_offscreen()).
+    std::uint32_t image_count() const { return exposed_count_; }
     std::uint32_t current_back_buffer_index() const { return current_index_; }
     VkFormat format() const { return format_; }
     VkExtent2D extent() const { return extent_; }
     bool is_offscreen() const { return !offscreen_images_.empty(); }
     VkPresentModeKHR present_mode() const { return present_mode_; }
     VkImage image(std::uint32_t i) const {
-        if (i >= images_.size()) return VK_NULL_HANDLE;
-        return !offscreen_images_.empty() ? offscreen_images_[i] : images_[i];
+        if (i >= exposed_count_) return VK_NULL_HANDLE;
+        return is_offscreen() ? offscreen_images_[i] : images_[i];
     }
 
     ResourceBinding resource_binding(std::uint32_t i) const {
         ResourceBinding b{};
-        if (i >= images_.size()) return b;
-        const bool offscreen = !offscreen_images_.empty();
+        if (i >= exposed_count_) return b;
+        const bool offscreen = is_offscreen();
         b.image = offscreen ? offscreen_images_[i] : images_[i];
         b.format = format_;
         b.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -280,6 +295,7 @@ private:
             }
         }
         images_.clear();
+        exposed_count_ = 0;
     }
 
     bool create_offscreen_backbuffers(std::uint32_t count) {
@@ -383,7 +399,10 @@ private:
     }
 
     bool blit_to_swapchain(std::uint32_t image_index) {
-        if (!blit_cmd_ || !blit_fence_ || image_index >= offscreen_images_.size()) return false;
+        if (!blit_cmd_ || !blit_fence_ || image_index >= offscreen_images_.size() ||
+            acquired_index_ >= images_.size())
+            return false;
+        const VkImage dst_image = images_[acquired_index_];
         std::lock_guard lock(submit_mutex_);
         if (fn_.reset_fences(device_, 1, &blit_fence_) != VK_SUCCESS) return false;
         if (fn_.reset_cmd_buf(blit_cmd_, 0) != VK_SUCCESS) return false;
@@ -409,7 +428,7 @@ private:
         pre[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         pre[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         pre[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        pre[1].image = images_[image_index];
+        pre[1].image = dst_image;
         pre[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
         fn_.cmd_barrier(blit_cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
@@ -422,7 +441,7 @@ private:
         region.dstOffsets[1] = {static_cast<std::int32_t>(surface_extent_.width),
                                 static_cast<std::int32_t>(surface_extent_.height), 1};
         fn_.cmd_blit(blit_cmd_, offscreen_images_[image_index], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                     images_[image_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
+                     dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
 
         VkImageMemoryBarrier post[2]{};
         post[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -442,7 +461,7 @@ private:
         post[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         post[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         post[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        post[1].image = images_[image_index];
+        post[1].image = dst_image;
         post[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
         fn_.cmd_barrier(blit_cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
@@ -532,15 +551,27 @@ private:
 
         std::uint32_t img_count = 0;
         fn_.get_images(device_, swapchain_, &img_count, nullptr);
+        if (img_count == 0) return false;
         images_.resize(img_count);
         fn_.get_images(device_, swapchain_, &img_count, images_.data());
         image_initialized_.assign(img_count, false);
-        if (extent_.width != surface_extent_.width || extent_.height != surface_extent_.height ||
-            format_ != chosen.format) {
-            if (!create_offscreen_backbuffers(img_count)) return false;
+        const std::uint32_t requested = buffer_count ? buffer_count : 2u;
+        const bool blit_needed = extent_.width != surface_extent_.width || extent_.height != surface_extent_.height ||
+                                 format_ != chosen.format;
+        if (blit_needed || img_count != requested) {
+            // A varying native count (Vulkan may return more images than minImageCount, and minImageCount may
+            // exceed the app's request) cannot be mapped one-to-one onto DXGI backbuffers: the app owns one
+            // persistent resource per BufferCount index. Expose the requested count as offscreen images and
+            // blit the presented slot into the acquired native image instead.
+            if (!create_offscreen_backbuffers(requested)) return false;
+            exposed_count_ = requested;
+        } else {
+            exposed_count_ = img_count;
         }
         current_index_ = 0;
-        return !images_.empty();
+        next_back_buffer_ = 0;
+        acquired_index_ = 0;
+        return true;
     }
 
     SwapchainFunctions fn_{};
@@ -566,7 +597,10 @@ private:
     std::vector<bool> image_initialized_;
     std::vector<VkImage> offscreen_images_;
     std::vector<VkDeviceMemory> offscreen_memory_;
+    std::uint32_t exposed_count_ = 0;
     std::uint32_t current_index_ = 0;
+    std::uint32_t acquired_index_ = 0;
+    std::uint32_t next_back_buffer_ = 0;
 };
 
 }  // namespace leonida

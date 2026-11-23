@@ -27,6 +27,7 @@
 
 #include "../shims/shims.h"
 #include "../src/pe_loader.h"
+#include "free_image_base.h"
 
 namespace {
 
@@ -73,7 +74,7 @@ std::vector<uint8_t> make_image() {
     nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
     nt->FileHeader.Characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_DLL | IMAGE_FILE_LARGE_ADDRESS_AWARE;
     nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
-    nt->OptionalHeader.ImageBase = 0x180000000;
+    nt->OptionalHeader.ImageBase = leonida_test::free_image_base(0x180000000);
     nt->OptionalHeader.AddressOfEntryPoint = 0;
     nt->OptionalHeader.SizeOfHeaders = 0x200;
     nt->OptionalHeader.SizeOfImage = 0x2000;
@@ -220,6 +221,18 @@ void test_classification() {
     check(cls("d3d12.dll", "D3D12SerializeRootSignature") == ReturnClass::HResult, "D3D12Serialize* is hresult");
     check(cls("dxgi.dll", "CreateDXGIFactory2") == ReturnClass::HResult, "CreateDXGIFactory2 is hresult");
     check(cls("dxgi.dll", "DXGIGetDebugInterface1") == ReturnClass::HResult, "DXGIGetDebugInterface1 is hresult");
+    check(cls("d3d12_xs.dll", "D3D12XboxCreateSyntheticDevice") == ReturnClass::HResult,
+          "the console CreateSyntheticDevice is hresult");
+    check(cls("d3d12_xs.dll", "D3D12XboxSetProcessDebugFlags") == ReturnClass::Other,
+          "unmeasured console function is other");
+    check(cls("xaudio2_9.dll", "XAudio2Create") == ReturnClass::HResult, "XAudio2Create is hresult");
+    check(cls("xaudio2_9redist.dll", "XAudio2Create") == ReturnClass::HResult,
+          "the redist name gets the same class");
+    check(cls("gameinput.dll", "GameInputCreate") == ReturnClass::HResult, "GameInputCreate is hresult");
+    check(cls("dstorage_xs.dll", "DStorageGetFactory") == ReturnClass::HResult,
+          "the console dstorage name is hresult");
+    check(cls("xg_xs.dll", "XGCreateTexture2DComputer") == ReturnClass::Other, "unmeasured xg_xs import is other");
+    check(cls("acphal.dll", "AcpHalCreate") == ReturnClass::Other, "unmeasured acphal import is other");
     check(cls("xgameruntime.dll", "XGameRuntimeInitialize") == ReturnClass::HResult, "XGameRuntimeInitialize");
     check(cls("xgameruntime.dll", "XUserAddAsync") == ReturnClass::HResult, "XUser* is hresult");
     check(cls("xgameruntime.dll", "XTaskQueueCreate") == ReturnClass::HResult, "XTaskQueueCreate is hresult");

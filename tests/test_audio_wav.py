@@ -5,6 +5,7 @@
 The decode tests use synthetic audio and skip when ffmpeg is not on PATH.
 """
 import contextlib
+import errno
 import io
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import wave
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -264,6 +266,61 @@ class CliArgumentTest(unittest.TestCase):
                     self.assertIn("--jobs must be at least 1", result.stderr)
 
 
+class OpusInputSelectionTest(unittest.TestCase):
+    def test_collect_requires_an_opus_id_packet(self) -> None:
+        opus_id = b"OpusHead" + struct.pack("<BBHIhB", 1, 1, 312, 48000, 0, 0)
+        opus_bos = awc_opus.ogg_page(10, 0, 0, [opus_id], 2)
+        vorbis_id = b"\x01vorbis" + struct.pack("<IBIIII2B", 0, 1, 48000, 0, 0, 0, 0xB8, 1)
+        vorbis_bos = awc_opus.ogg_page(11, 0, 0, [vorbis_id], 2)
+        comment = b"COMMENT=OpusHead"
+        vorbis_comment = b"\x03vorbis" + struct.pack("<III", 0, 1, len(comment)) + comment + b"\x01"
+        vorbis_tags = awc_opus.ogg_page(11, 1, 0, [vorbis_comment], 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "opus.ogg").write_bytes(opus_bos)
+            (root / "vorbis.ogg").write_bytes(vorbis_bos + vorbis_tags)
+            (root / "incomplete.opus").write_bytes(opus_bos[:-1])
+
+            found, skipped = audio_wav.collect(directory)
+
+        self.assertEqual([stem for _, stem in found], ["opus"])
+        self.assertEqual(skipped, 2)
+
+    def test_plan_outputs_does_not_reserve_rejected_wav_slots_for_later_inputs(self) -> None:
+        from collections import Counter
+        from unittest.mock import patch
+
+        src = os.path.join("fake_src")
+        out = os.path.join("fake_out")
+        p0 = os.path.join(src, "a.ogg.opus")
+        p1 = os.path.join(src, "a.ogg~2.opus")
+        items = [(p0, "a.ogg"), (p1, "a.ogg~2")]
+        src_dig = {p0: "D0", p1: "D1"}
+        wav_dig = {
+            os.path.join(out, "a.ogg.wav"): "DX",
+            os.path.join(out, "a.ogg~2.wav"): "DY",
+            os.path.join(out, "a.ogg~3.wav"): "D1",
+            os.path.join(out, "a.ogg~4.wav"): "D0",
+        }
+        dst_calls = Counter()
+
+        def fake_digest(_ff, p, source=False):
+            if source:
+                return src_dig[p]
+            dst_calls[p] += 1
+            return wav_dig.get(p)
+
+        with patch.object(audio_wav, "audio_digest", side_effect=fake_digest), \
+                patch("os.path.lexists", side_effect=lambda p: p in wav_dig), \
+                patch("os.path.isfile", side_effect=lambda p: p in wav_dig):
+            planned, renamed, moved = audio_wav.plan_outputs(items, src, out, "ffmpeg")
+        self.assertEqual([(os.path.basename(p), stem) for p, stem in planned],
+                         [("a.ogg.opus", "a.ogg~4"), ("a.ogg~2.opus", "a.ogg~3")])
+        self.assertEqual((renamed, moved), (0, 2))
+        self.assertEqual(max(dst_calls.values()), 1)
+
+
 class GranuleTest(unittest.TestCase):
     def test_trim_requires_identifiable_matching_endpoints(self):
         # A 240-channel family-255 header occupies two laces. Every output maps to the same mono stream.
@@ -371,11 +428,13 @@ def write_fake_ffmpeg(directory, source=FAKE_FFMPEG):
 
 
 def write_fake_opus_inputs(directory, names=("x.ogg", "x.opus", "y.ogg")):
-    """Ogg Opus look-alikes: enough for the tool to accept them; the fake ffmpeg never parses them."""
+    """Write only the Opus ID page because the fake ffmpeg never parses audio."""
     os.makedirs(directory)
+    head = b"OpusHead" + struct.pack("<BBHIhB", 1, 1, 312, 48000, 0, 0)
+    page = awc_opus.ogg_page(10, 0, 0, [head], 2)
     for name in names:
         with open(os.path.join(directory, name), "wb") as f:
-            f.write(b"OggS" + b"\0" * 24 + b"OpusHead" + bytes(64))
+            f.write(page)
 
 
 class SameStemTest(unittest.TestCase):
@@ -541,6 +600,31 @@ class FakeFfmpegDecodeTest(unittest.TestCase):
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertIn("0 WAV written, 3 already present", p.stdout)
 
+    def test_directory_at_wav_destination_counts_as_failed_conversion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in")
+            out = os.path.join(tmp, "out")
+            blocker = os.path.join(out, "blocked.wav")
+            write_fake_opus_inputs(src, ("blocked.ogg", "existing.ogg", "new.ogg"))
+            os.makedirs(blocker)
+            marker = os.path.join(blocker, "keep")
+            with open(marker, "wb") as f:
+                f.write(b"keep the directory")
+            with open(os.path.join(out, "existing.wav"), "wb") as f:
+                f.write(b"existing audio")
+
+            run = [sys.executable, "-I", TOOL, src, "--out", out, "--jobs", "1",
+                   "--ffmpeg", write_fake_ffmpeg(tmp)]
+            result = subprocess.run(run, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("1 WAV written, 1 already present, 1 failed", result.stdout)
+            self.assertIn("FAILED blocked: output path is not a file", result.stdout)
+            for filename, expected in ((marker, b"keep the directory"),
+                                       (os.path.join(out, "existing.wav"), b"existing audio"),
+                                       (os.path.join(out, "new.wav"), b"FAKE:new.ogg")):
+                with open(filename, "rb") as f:
+                    self.assertEqual(f.read(), expected)
+
     def test_ffmpeg_gets_no_stdin(self):
         # ffmpeg reads stdin for key commands. Given the caller's stdin, it stops a run in the background of a
         # terminal ("Stopped (tty output)") and swallows input piped to the caller, such as a shell loop's file list.
@@ -616,6 +700,22 @@ class AudioWavCliTest(unittest.TestCase):
             code = audio_wav.main([missing])
         self.assertEqual(code, 2)
         self.assertIn(f"source not found: {missing}", err.getvalue())
+
+    def test_cli_reports_unreadable_source_directory(self):
+        bank = os.path.join(self.src_dir, "bank")
+        os.mkdir(bank)
+        scandir = os.scandir
+
+        def list_directory(path):
+            if path == bank:
+                raise PermissionError(errno.EACCES, "permission denied", path)
+            return scandir(path)
+
+        err = io.StringIO()
+        with mock.patch.object(os, "scandir", list_directory), contextlib.redirect_stderr(err):
+            code = audio_wav.main([self.src_dir])
+        self.assertEqual(code, 2)
+        self.assertIn(bank, err.getvalue())
 
     def test_cli_rejects_non_opus_file_extension(self):
         txt_file = os.path.join(self.dir, "test.txt")

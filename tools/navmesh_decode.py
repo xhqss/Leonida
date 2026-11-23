@@ -52,6 +52,12 @@ import time
 import unicodedata
 import zlib
 from collections import Counter
+from collections.abc import Iterator
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from zero_span import gap_split  # noqa: E402
 
 BASE = 0x50000000
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
@@ -187,13 +193,18 @@ def walk(m, start, size):
         pos = s + used
 
 
+def carved_files(root: str) -> Iterator[os.DirEntry[str]]:
+    with os.scandir(root) as entries:
+        for entry in entries:
+            if not entry.name.lower().endswith((".json", ".csv")) and entry.is_file():
+                yield entry
+
+
 def walk_dir(root):
     """Yield (offset, None, data) from carved files sorted by leading hex offset, then name."""
     entries = []
-    for name in os.listdir(root):
-        full = os.path.join(root, name)
-        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
-            continue
+    for entry in carved_files(root):
+        name, full = entry.name, entry.path
         if os.path.getsize(full) > MAX_INFLATE:
             raise ValueError("%s exceeds %d-byte limit" % (full, MAX_INFLATE))
         mt = HEX_PREFIX.match(name)
@@ -593,6 +604,7 @@ def decode_navmesh(b, nstreams, stats, deep):
         stats["quadtree"]["nodes"] += qn
         stats["quadtree"]["leaves"] += ql
         stats["quadtree"]["max_depth"] = max(stats["quadtree"]["max_depth"], qd)
+        chk["volumes_valid"] = _walk_volumes(b, vol, dc, stats)
 
     stats["flags"][flags] += 1
     stats["build"][hx(e8)] += 1
@@ -617,6 +629,41 @@ def _poly_chain(b, blocks, owner, pool):
                 has_water = True
             nxt += packed & 0xF
     return nxt == pool, has_water
+
+
+def _walk_volumes(b, vol, dc, stats):
+    """Paired 96-byte obstacle footprint records at +0xB8 (count u32@0xDC, ASSET-281)."""
+    if dc == 0:
+        return vol is None
+    if vol is None or dc % 2 != 0 or vol + 96 * dc > len(b):
+        return False
+    flags = Counter()
+    vertex_counts = Counter()
+    for p in range(dc // 2):
+        o0 = vol + (2 * p) * 96
+        o1 = o0 + 96
+        if b[o0:o0 + 20] != b[o1:o1 + 20]:
+            return False
+        xyz = _f32s(b, o0 + 8, 3)
+        if xyz is None or not all(math.isfinite(v) for v in xyz):
+            return False
+        f0, vc0 = b[o0 + 0x14], b[o0 + 0x15]
+        f1, vc1 = b[o1 + 0x14], b[o1 + 0x15]
+        if f0 not in (0, 4) or f1 != 8 or vc0 not in (4, 8) or vc1 != 4:
+            return False
+        if not (_zero(b, o0 + 0x16 + 4 * vc0, o0 + 0x56) and _zero(b, o0 + 0x5A, o0 + 0x60)):
+            return False
+        if not (_zero(b, o1 + 0x16 + 4 * vc1, o1 + 0x56) and _zero(b, o1 + 0x5A, o1 + 0x60)):
+            return False
+        flags[f0] += 1
+        flags[f1] += 1
+        vertex_counts[vc0] += 1
+        vertex_counts[vc1] += 1
+    vstats = stats["volumes"]
+    vstats["pairs"] += dc // 2
+    vstats["flags"].update(flags)
+    vstats["vertex_counts"].update(vertex_counts)
+    return True
 
 
 # ------------------------------------------------------------------------------------------------------ grid
@@ -645,6 +692,11 @@ def decode_grid(b, nstreams, stats, deep):
         chk["occupied_equals_entries"] = valid_ctrl and used == entries
         if deep:
             chk["values_bijective"] = chk["occupied_equals_entries"] and _grid_values(b, groups, entries)
+            if chk["values_bijective"] and chk["payload_in_bounds"]:
+                keys = _grid_slots(b, groups)
+                chk["keys_octree"] = len(keys) == entries and _grid_octree(keys)
+                if chk["keys_octree"]:
+                    chk["inner_payload_ff00"] = _grid_payloads(b, payload, keys, stats)
     stats["groups"][groups] += 1
     stats["extent"][ex[0]] += 1
     oz = origin[2] if (origin and math.isfinite(origin[2])) else None
@@ -668,6 +720,47 @@ def _grid_values(b, groups, entries):
     return all(seen)
 
 
+def _grid_slots(b, groups):
+    """{key: value} of every occupied slot (call after _grid_values has accepted the table)."""
+    keys = {}
+    for g in range(groups):
+        base = 0x60 + GRID_GROUP * g
+        for k, c in enumerate(b[base:base + 16]):
+            if c < 0x80:
+                keys[_u64(b, base + 16 + 16 * k)] = _u64(b, base + 16 + 16 * k + 8)
+    return keys
+
+
+def _grid_octree(keys):
+    """Keys are sentinel-bit linear octree keys: 1 is the root, a child is (parent << 3) | octant."""
+    if 1 not in keys:
+        return False
+    for key in keys:
+        if key == 0 or (key.bit_length() - 1) % 3 or (key != 1 and key >> 3 not in keys):
+            return False
+    return True
+
+
+GRID_INNER = 0x0000FF00  # payload of every node that has children
+GRID_LEAF_KIND = {0x01: "low_byte_01", 0x03: "low_byte_03"}
+
+
+def _grid_payloads(b, payload, keys, stats):
+    """Inner nodes carry 0x0000ff00; count leaf payloads by low byte and every key by depth."""
+    inner = {key >> 3 for key in keys if key != 1}
+    words = {key: _u32(b, payload + 4 * value) for key, value in keys.items()}
+    if any(words[key] != GRID_INNER for key in inner):
+        return False
+    stats["inner_nodes"] += len(inner)
+    for key, word in words.items():
+        stats["key_depth"][(key.bit_length() - 1) // 3] += 1
+        if key in inner:
+            continue
+        kind = "ff00" if word == GRID_INNER else GRID_LEAF_KIND.get(word & 0xFF, "other")
+        stats["leaf_payload"][kind] += 1
+    return True
+
+
 # ------------------------------------------------------------------------------------------------------ scan
 
 def new_stats():
@@ -683,9 +776,10 @@ def new_stats():
         "navmesh": {"flags": Counter(), "build": Counter(), "totals": Counter(), "max": {}, "sectors": set(),
                     "sector_x": [inf, -inf], "sector_y": [inf, -inf], "split_blocks_max": {},
                     "tile_bounds": [[inf] * 3, [-inf] * 3], "water_bit3": Counter(),
-                    "quadtree": {"nodes": 0, "leaves": 0, "max_depth": 0}},
+                    "quadtree": {"nodes": 0, "leaves": 0, "max_depth": 0},
+                    "volumes": {"pairs": 0, "flags": Counter(), "vertex_counts": Counter()}},
         "grid": {"groups": Counter(), "extent": Counter(), "oz": Counter(), "sectors": set(), "entries_total": 0,
-                 "entries_max": 0},
+                 "entries_max": 0, "key_depth": Counter(), "inner_nodes": 0, "leaf_payload": Counter()},
         "psin": {"version": Counter(), "complete": 0},
     }
 
@@ -789,8 +883,8 @@ def _scan_rpf(path, start, limit, deep, rows):
                                 "checks_failed": " ".join(k for k, v in sorted(chk.items()) if not v)})
                     rows.append(row)
             if last < end:
-                gap = m[last:end]
-                carver["zero_padding" if gap.count(0) == len(gap) else "unread"] += len(gap)
+                gap_zero, gap_unread = gap_split(m, last, end)
+                carver["zero_padding" if not gap_unread else "unread"] += gap_zero + gap_unread
     return _summary(path, "rpf", start, end, carver, classes, checks, stats, time.time() - t0)
 
 
@@ -805,8 +899,8 @@ def _account(m, carver, last, s, used, inflated, end):
         carver["past_window_stored"] += used
         return last
     if s > last and last < end:
-        gap = m[last:min(s, end)]
-        carver["zero_padding" if gap.count(0) == len(gap) else "unread"] += len(gap)
+        gap_zero, gap_unread = gap_split(m, last, min(s, end))
+        carver["zero_padding" if not gap_unread else "unread"] += gap_zero + gap_unread
     carver["streams"] += 1
     carver["stored"] += used
     carver["inflated"] += inflated
@@ -900,6 +994,8 @@ def _summary(path, mode, start, end, carver, classes, checks, stats, elapsed):
             "tile_bounds": _box(n["tile_bounds"]),
             "water_bit3": dict(n["water_bit3"]),
             "quadtree": dict(n["quadtree"]),
+            "volumes": {"pairs": n["volumes"]["pairs"], "flags": _counter(n["volumes"]["flags"]),
+                        "vertex_counts": _counter(n["volumes"]["vertex_counts"])},
         },
         "grid": {
             "groups": _counter(g["groups"]),
@@ -910,6 +1006,9 @@ def _summary(path, mode, start, end, carver, classes, checks, stats, elapsed):
             "navmesh_sectors_not_in_grid": len(static - g["sectors"]),
             "entries_total": g["entries_total"],
             "entries_max": g["entries_max"],
+            "key_depth": _counter(g["key_depth"]),
+            "inner_nodes": g["inner_nodes"],
+            "leaf_payload": _counter(g["leaf_payload"]),
         },
         "psin": {"version": _counter(stats["psin"]["version"]), "complete": stats["psin"]["complete"]},
         "elapsed_s": round(elapsed, 1),
@@ -1002,8 +1101,16 @@ def main(argv=None):
     if a.csv and same_report_path(out, a.csv):
         ap.error("--out and --csv must use different paths")
     for flag, path in (("--out", out), ("--csv", a.csv)):
-        if path and same_report_path(path, a.input):
+        if not path:
+            continue
+        if os.path.isdir(path):              # open() on a folder ends the run in a PermissionError traceback
+            ap.error(f"{flag} is a directory: {path}")
+        if same_report_path(path, a.input):
             ap.error(f"{flag} would overwrite the input {a.input}")
+        if os.path.isfile(path) and os.path.isdir(a.input):
+            for entry in carved_files(a.input):
+                if same_report_path(path, entry.path):
+                    ap.error(f"{flag} would overwrite the input {entry.path}")
     rows = [] if a.csv else None
     try:
         summary = scan(a.input, a.start, a.limit, a.deep, rows)
@@ -1011,7 +1118,7 @@ def main(argv=None):
         print("error: %s" % exc, file=sys.stderr)
         return 2
     _make_parent(out)
-    with open(out, "w", encoding="utf-8") as f:
+    with open(out, "w", encoding="utf-8", newline="\n") as f:
         json.dump(summary, f, indent=1, allow_nan=False)
     if a.csv:
         write_csv(a.csv, rows)

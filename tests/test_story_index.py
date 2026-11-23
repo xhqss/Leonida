@@ -74,8 +74,16 @@ def chunks():
     return struct.pack("<III", 0x88560988, 8, 7) + bytes(52)
 
 
+def aux(entries, payload=None, trailing=b""):
+    """A synthetic auxiliary table: u32 count, {u32 tag, u32 size} pairs, payloads, then trailing bytes."""
+    data = struct.pack("<I", len(entries)) + b"".join(struct.pack("<II", t, n) for t, n in entries)
+    if payload is None:
+        payload = b"".join(bytes([i + 1]) * n for i, (_, n) in enumerate(entries))
+    return data + payload + trailing
+
+
 def clip():
-    return struct.pack("<I", 3) + b"\x01\x01\x00\x00" + bytes(56)
+    return aux([(0x101, 8), (0x113, 12), (0x207, 4)], trailing=b"\xee" * 36)
 
 
 def xml():
@@ -105,15 +113,66 @@ def bink():
     return bytes(data)
 
 
-PAYLOADS = [psin(), page(), rsc8(), nested(), rbf0(), chunks(), clip(), xml(), raw(), zero(), text(), bink()]
+PAYLOADS = [psin(), page(), rsc8(), nested(), rbf0(), chunks(), clip(), aux([(0x101, 40), (0x207, 20)]),
+            xml(), raw(), zero(), text(), bink()]
 EXPECTED = ["psin", "page-directory", "rsc8", "rpf9-nested", "rbf0", "typehash", "clip-stream",
-            "xml", "raw:11223344", "zero-prefix", "text", "bink2"]
+            "clip-stream", "xml", "raw:11223344", "zero-prefix", "text", "bink2"]
 
 
 class ClassifyTest(unittest.TestCase):
     def test_signatures(self):
         got = [story_index.classify(p, 0, len(p))["signature"] for p in PAYLOADS]
         self.assertEqual(got, EXPECTED)
+
+    def test_clip_header(self):
+        r = story_index.classify(clip(), 0x600, 70)
+        self.assertEqual((r["signature"], r["version"], r["count"], r["detail"]),
+                         ("clip-stream", None, 3, "aux-table tags=0x101,0x113,0x207 payload_end=52"))
+
+    def test_clip_record_matches_anim_index(self):
+        import anim_index
+        for data in (clip(), aux([(0x101, 40), (0x207, 20)])):
+            mine, theirs = story_index.classify(data, 0, len(data)), anim_index.classify(data, 0, len(data))
+            for key in ("signature", "version", "count", "detail"):
+                self.assertEqual(mine[key], theirs[key], key)
+
+    def test_aux_exact_fit_and_trailing_bytes(self):
+        exact = aux([(0x101, 40), (0x207, 20)])
+        r = story_index.classify(exact, 0, len(exact))
+        self.assertEqual((r["signature"], r["count"], r["detail"]),
+                         ("clip-stream", 2, f"aux-table tags=0x101,0x207 payload_end={len(exact)}"))
+        trailing = aux([(0x101, 16), (0x204, 8), (0x207, 8)], trailing=bytes(range(64)))
+        r = story_index.classify(trailing, 0, len(trailing))
+        self.assertEqual((r["signature"], r["detail"]),
+                         ("clip-stream", "aux-table tags=0x101,0x204,0x207 payload_end=60"))
+
+    def test_aux_payload_overrun_is_generic(self):
+        short = aux([(0x101, 40), (0x207, 30)])[:-1]   # last payload one byte short
+        self.assertEqual(story_index.classify(short, 0, len(short))["signature"], "raw:02000000")
+        big = aux([(0x101, 8), (0x113, 0xFFFFFFF0), (0x207, 8)], payload=bytes(64))
+        self.assertNotEqual(story_index.classify(big, 0, len(big))["signature"], "clip-stream")
+
+    def test_aux_old_prefix_alone_is_generic(self):
+        # The old eight-byte prefix check called each of these a clip stream with a version and a 24-byte header.
+        prefix = struct.pack("<I", 3) + b"\x01\x01\x00\x00"
+        for data in (prefix, prefix + bytes(12), prefix + b"\xff" * 56):   # bare, directory cut, sizes overrun
+            r = story_index.classify(data, 0, len(data))
+            self.assertEqual((r["signature"], r["version"], r["count"]), ("raw:03000000", None, None))
+            self.assertNotIn("24-byte", r["detail"])
+
+    def test_aux_wrong_count_or_first_tag_is_generic(self):
+        for entries in ([(0x101, 4)], [(0x101, 4)] * 4, [(0x113, 4), (0x207, 4)], [(0x207, 4), (0x101, 4)]):
+            data = aux(entries, trailing=b"\x5a" * 64)
+            self.assertNotEqual(story_index.classify(data, 0, len(data))["signature"], "clip-stream", entries)
+
+    def test_aux_table_in_an_archive_scan(self):
+        data = clip()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "a.rpf")
+            with open(path, "wb") as fh:
+                fh.write(struct.pack("<II", 0, 16) + bytes(8) + zlib.compress(data))
+            rows, _ = story_index.scan_rpf(path)
+        self.assertEqual([(r["signature"], r["count"]) for r in rows], [("clip-stream", 3)])
 
     def test_psin_section_chain(self):
         chain = story_index.psin_sections(psin())
@@ -288,6 +347,9 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["signatures"]["psin"]["files"], 1)
         self.assertEqual(doc["summary"]["signatures"]["page-directory"]["files"], 1)
         self.assertEqual(doc["summary"]["signatures"]["rsc8"]["files"], 1)
+        self.assertEqual(doc["summary"]["signatures"]["clip-stream"]["files"], 2)
+        clips = [row for row in doc["files"] if row["signature"] == "clip-stream"]
+        self.assertEqual([(row["count"], row["version"]) for row in clips], [(3, None), (2, None)])
 
     def test_cli_reports_a_report_write_error(self):
         out = os.path.join(self.root, "index.json")

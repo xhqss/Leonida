@@ -10,7 +10,9 @@ from collections import namedtuple
 import io
 import json
 import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -367,19 +369,20 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                  mock.patch("make_game.tool_available", return_value=True), \
-                 mock.patch("make_game.ensure_submodule", return_value=None), \
+                 mock.patch("make_game.ensure_submodule", return_value=None) as ensure_submodule, \
                  mock.patch("make_game.visual_cpp_tools_ok", return_value=True), \
                  mock.patch("shutil.disk_usage", return_value=Usage(1000 * 2**30, 200 * 2**30, 800 * 2**30)):
                 # off Windows runtime checks the cross-build instead (tests/test_make_game_platform.py)
                 stages = ["shaders", "assets"] + (["runtime"] if os.name == "nt" else [])
                 make_game.preflight(stages, tmp_work, wav=True)
+                ensure_submodule.assert_called_once_with()
 
     def test_preflight_aggregates_multiple_missing_tools_and_deduplicates(self):
         with tempfile.TemporaryDirectory() as tmp_work:
             with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("shutil.which", return_value=None), \
                  mock.patch("make_game.tool_available", return_value=False), \
-                 mock.patch("make_game.ensure_submodule", return_value=None), \
+                 mock.patch.object(make_game, "ROOT", tmp_work), \
                  mock.patch("os.path.isfile", return_value=False), \
                  mock.patch("os.name", "nt"):
                 err = self.assert_fails(make_game.preflight, ["shaders", "assets", "runtime"], tmp_work, wav=True,
@@ -391,15 +394,25 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 self.assertIn(".NET 8 SDK", err)
                 self.assertIn("Visual Studio 2022", err)
 
+    def test_preflight_accepts_spaced_llvm_mc_resolved_by_which(self):
+        with tempfile.TemporaryDirectory() as tmp_work:
+            mc = os.path.join(tmp_work, "LLVM Tools", "llvm-mc")
+            available = {mc: mc + ".exe", "spirv-as": "spirv-as", "spirv-val": "spirv-val"}
+            with mock.patch.dict(os.environ, {"LLVM_MC": mc}), \
+                 mock.patch("shutil.which", side_effect=available.get), \
+                 mock.patch("shutil.disk_usage", return_value=Usage(100 * 2**30, 0, 100 * 2**30)):
+                make_game.preflight(["shaders"], tmp_work)
+
     def test_preflight_explains_llvm_mc_hidden_in_appdata(self):
         env = {"LOCALAPPDATA": r"C:\Users\u\AppData\Local",
                "LLVM_MC": r"C:\Users\u\AppData\Local\Leonida\llvm-mc\llvm-mc.exe"}
+        available = {"spirv-as": "spirv-as", "spirv-val": "spirv-val"}
         with tempfile.TemporaryDirectory() as tmp_work, \
              mock.patch.dict(os.environ, env), \
              mock.patch("os.name", "nt"), \
              mock.patch("sys.version_info", (3, 12, 0)), \
-             mock.patch("shutil.which", return_value="/usr/bin/tool"), \
-             mock.patch("make_game.tool_available", return_value=False):
+             mock.patch("shutil.which", side_effect=available.get), \
+             mock.patch("os.path.isfile", return_value=False):
             err = self.assert_fails(make_game.preflight, ["shaders"], tmp_work,
                                     match="llvm-mc (LLVM 21+ with the AMDGPU target)")
         self.assertIn("LLVM_MC points into %LOCALAPPDATA%", err)
@@ -487,8 +500,8 @@ class PreflightPrerequisiteTest(PreflightTestBase):
         for name, changed, settings, legacy_layout, reusable in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as work:
                 files = {
-                    "dxbc/index.json": "{}",
-                    "dxbc/fssm_index.json": "{}",
+                    "dxbc/index.json": '[{"file": "shader.dxbc"}]',
+                    "dxbc/fssm_index.json": '[{"name": "shader"}]',
                     "dxbc/disasm.done": "test llvm-mc 21",
                     "spirv/index.json": "{}",
                     "spirv/translation_sources.sha256": fingerprint,
@@ -503,7 +516,10 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                         with open(path, "w", encoding="utf-8") as handle:
                             handle.write(content + "\n")
                 disasm_parts = ("disasm",) if legacy_layout else ("dxbc", "disasm")
-                os.makedirs(os.path.join(shader_root, *disasm_parts))
+                disasm = os.path.join(shader_root, *disasm_parts)
+                os.makedirs(disasm)
+                with open(os.path.join(disasm, "shader.s"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write("synthetic listing\n")
                 with mock.patch("sys.version_info", (3, 12, 0)), \
                      mock.patch("make_game.llvm_mc_signature", return_value="test llvm-mc 21"), \
                      mock.patch("make_game.tool_available", return_value=True), \
@@ -522,13 +538,102 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                  mock.patch("make_game.tool_available", return_value=True), \
-                 mock.patch("make_game.ensure_submodule", return_value=None), \
-                 mock.patch("os.path.isfile", return_value=True), \
+                 mock.patch("make_game.ensure_submodule", return_value=None) as ensure_submodule, \
                  mock.patch("shutil.disk_usage", return_value=Usage(500 * 2**30, 250 * 2**30, 250 * 2**30)):
                 # shaders (30) + assets (300) = 330 GB needed, only 250 GB free
                 err = self.assert_fails(make_game.preflight, ["shaders", "assets"], tmp_work, wav=False,
                                         match="about 330 GB is needed")
                 self.assertIn("250 GB free", err)
+                ensure_submodule.assert_not_called()
+
+    def test_preflight_suggests_loader_only_when_dropping_assets_makes_it_fit(self):
+        gib = 1 << 30
+        loader_build = ["check", "shaders", "runtime"]
+        full_build = [*loader_build, "assets"]
+        cases = (
+            ("reusable shader outputs", full_build, 10 * gib, True, False, True),
+            ("asset export only", ["assets"], 250 * gib, False, False, False),
+            ("shader and asset exports only", ["shaders", "assets"], 250 * gib, False, False, False),
+            ("WAV export requested", full_build, 250 * gib, False, True, False),
+        )
+        with mock.patch.multiple(
+            make_game,
+            mc_command=mock.Mock(return_value=["llvm-mc"]),
+            dotnet_sdk_ok=mock.Mock(return_value=True),
+            ensure_submodule=mock.Mock(),
+            visual_cpp_tools_ok=mock.Mock(return_value=True),
+            cross_build_missing=mock.Mock(return_value=[]),
+            assets_exported=mock.Mock(return_value=False),
+        ), mock.patch("shutil.which", return_value="/usr/bin/tool"):
+            for name, stages, free, reusable, wav, expect_hint in cases:
+                usage = Usage(500 * gib, 500 * gib - free, free)
+                with self.subTest(name=name), tempfile.TemporaryDirectory() as work, \
+                     mock.patch("shutil.disk_usage", return_value=usage), \
+                     mock.patch.object(make_game, "shader_outputs_reusable", return_value=reusable):
+                    err = self.assert_fails(make_game.preflight, stages, work, wav=wav,
+                                            match="is needed")
+                    self.assertEqual("--stages check,shaders,runtime" in err, expect_hint)
+
+    def test_low_disk_cli_suggests_a_working_stage_selection(self):
+        gib = 1 << 30
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.multiple(
+            make_game,
+            below_normal=mock.DEFAULT,
+            check=mock.Mock(return_value={"expected_exe": "synthetic.exe"}),
+            mc_command=mock.Mock(return_value=["llvm-mc"]),
+            dotnet_sdk_ok=mock.Mock(return_value=True),
+            ensure_submodule=mock.DEFAULT,
+            visual_cpp_tools_ok=mock.Mock(return_value=True),
+            cross_build_missing=mock.Mock(return_value=[]),
+            cross_configure=mock.DEFAULT,
+            pipeline_check_exe=mock.Mock(return_value="vk_pipeline_check"),
+            assets_exported=mock.Mock(return_value=False),
+            shader_outputs_reusable=mock.Mock(return_value=False),
+            wave64_settings=mock.Mock(return_value=(False, False)),
+            runtime_gpu_per_vertex=mock.Mock(return_value=True),
+            log=mock.DEFAULT,
+            shaders=mock.DEFAULT,
+            assets=mock.DEFAULT,
+            runtime=mock.DEFAULT,
+            pipelines=mock.DEFAULT,
+        ) as stages, mock.patch("shutil.which", return_value="available-tool"), \
+                mock.patch("shutil.disk_usage") as disk:
+            argv = ["make_game.py", "--game", os.path.join(tmp, "input"), "--out", os.path.join(tmp, "out")]
+            with mock.patch.object(sys, "argv", argv):
+                disk.return_value = Usage(500 * gib, 470 * gib + 1, 30 * gib - 1)
+                error = self.assert_fails(make_game.main, match="about 330 GB is needed")
+                self.assertNotIn("--stages", error)
+
+                disk.return_value = Usage(500 * gib, 470 * gib, 30 * gib)
+                error = self.assert_fails(make_game.main, match="about 330 GB is needed")
+                suggestion = re.search(r"--stages ([a-z,]+)", error)
+                self.assertIsNotNone(suggestion, error)
+                for stage in ("shaders", "assets", "runtime", "pipelines"):
+                    stages[stage].assert_not_called()
+
+            with mock.patch.object(sys, "argv", [*argv, "--stages", suggestion.group(1)]):
+                self.assertEqual(make_game.main(), 0)
+            stages["shaders"].assert_called_once()
+            stages["runtime"].assert_called_once()
+            stages["assets"].assert_not_called()
+            stages["pipelines"].assert_not_called()
+
+    def test_preflight_counts_assets_again_with_wav_even_when_exported(self):
+        # --wav decodes again over the exported audio (assets_exported says it is finished), so the 300 GB stays.
+        with tempfile.TemporaryDirectory() as tmp_work:
+            with mock.patch("sys.version_info", (3, 12, 0)), \
+                 mock.patch("make_game.assets_exported", return_value=True), \
+                 mock.patch("make_game.tool_available", return_value=True), \
+                 mock.patch("make_game.ensure_submodule", return_value=None), \
+                 mock.patch("shutil.which", return_value="/usr/bin/tool"), \
+                 mock.patch("os.path.isfile", return_value=True), \
+                 mock.patch("shutil.disk_usage", return_value=Usage(500 * 2**30, 250 * 2**30, 250 * 2**30)):
+                # Without --wav the exported assets are credited, so 250 GB free is enough for the asset tools.
+                make_game.preflight(["assets"], tmp_work, wav=False)
+                err = self.assert_fails(make_game.preflight, ["assets"], tmp_work, wav=True,
+                                        match="about 300 GB is needed")
+                # c506d00c: the loader-only hint is offered only when shaders and runtime are selected and not --wav
+                self.assertNotIn("without exporting assets", err)
 
     def test_ensure_submodule_present_is_noop(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -545,7 +650,29 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             with mock.patch.object(make_game, "ROOT", tmp), \
                  mock.patch("shutil.which", return_value=None):
                 self.assert_fails(make_game.ensure_submodule,
-                                  match="third_party/rpf9-explorer is missing. Download the project with:")
+                                  match="git clone --recursive https://github.com/ItsNotRexed/Leonida")
+
+    def test_ensure_submodule_zip_with_git_does_not_say_install_git(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            not_a_repo = subprocess.CompletedProcess([], 128)
+            with mock.patch.object(make_game, "ROOT", tmp), \
+                 mock.patch("shutil.which", return_value="/usr/bin/git"), \
+                 mock.patch("subprocess.run", return_value=not_a_repo):
+                err = self.assert_fails(make_game.ensure_submodule,
+                                        match="git clone --recursive https://github.com/ItsNotRexed/Leonida")
+                self.assertNotIn("Install Git", err)
+
+    def test_ensure_submodule_failed_fetch_in_clone_names_the_fetch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            results = [subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)]
+            with mock.patch.object(make_game, "ROOT", tmp), \
+                 mock.patch("shutil.which", return_value="/usr/bin/git"), \
+                 mock.patch("subprocess.run", side_effect=results), \
+                 mock.patch.object(make_game, "log"):
+                err = self.assert_fails(make_game.ensure_submodule,
+                                        match="fetching third_party/rpf9-explorer failed")
+                self.assertIn("git submodule update --init --recursive", err)
+                self.assertNotIn("Download ZIP", err)
 
 
 class GameDiscoveryTest(unittest.TestCase):
@@ -654,9 +781,41 @@ class PathAndGameSelectionTest(PreflightTestBase):
             self.assert_fails(make_game.choose_game,
                               match="More than one copy found: choose one with --game.")
 
+    def default_out_in(self, platform, icloud_documents, earlier_build=False, call=None):
+        """default_out() (or `call`) with a temporary home folder; icloud_documents makes the folder macOS keeps in
+        iCloud Drive when Desktop & Documents sync is on (~/Library/Mobile Documents/com~apple~CloudDocs/Documents),
+        earlier_build a ~/Documents/Leonida from before the change."""
+        with tempfile.TemporaryDirectory() as home:
+            if icloud_documents:
+                os.makedirs(os.path.join(home, "Library", "Mobile Documents", "com~apple~CloudDocs", "Documents"))
+            if earlier_build:
+                os.makedirs(os.path.join(home, "Documents", "Leonida", "work"))
+            with mock.patch.object(make_game.os.path, "expanduser", lambda p: home + p[1:] if p.startswith("~") else p), \
+                    mock.patch.object(make_game.sys, "platform", platform):
+                if call:
+                    return [note.replace(home, "~") for note in call()]
+                return os.path.relpath(make_game.default_out(), home)
+
+    def test_icloud_note_names_an_earlier_build_in_documents(self):
+        # A Mac that built into ~/Documents/Leonida before the default moved: say where that resumable build is.
+        notes = self.default_out_in("darwin", True, earlier_build=True, call=make_game.icloud_default_notes)
+        self.assertEqual(len(notes), 2, notes)
+        self.assertIn("off iCloud", notes[0])
+        self.assertIn(os.path.join("~", "Documents", "Leonida"), notes[1])
+        self.assertIn(os.path.join("~", "Leonida") + " to resume", notes[1])
+        self.assertIn("--out", notes[1])
+        self.assertEqual(len(self.default_out_in("darwin", True, call=make_game.icloud_default_notes)), 1)
+
     def test_default_out_matches_documents_folder(self):
-        expected = os.path.join(os.path.expanduser("~"), "Documents", "Leonida")
-        self.assertEqual(make_game.default_out(), expected)
+        for platform in ("win32", "linux", "darwin"):
+            self.assertEqual(self.default_out_in(platform, False), os.path.join("Documents", "Leonida"), platform)
+
+    def test_default_out_leaves_icloud_synced_documents_on_a_mac(self):
+        # Before: with iCloud Desktop & Documents sync on, ~/Documents/Leonida (and its work folder, hundreds of GB
+        # made from the game) went into iCloud Drive, which uploads it and can evict the work files from the disk.
+        self.assertEqual(self.default_out_in("darwin", True), "Leonida")
+        # Only macOS keeps Documents in iCloud Drive this way; elsewhere the folder means nothing.
+        self.assertEqual(self.default_out_in("linux", True), os.path.join("Documents", "Leonida"))
 
     def test_constants_definitions(self):
         self.assertEqual(make_game.STAGES, ["check", "shaders", "assets", "runtime", "pipelines"])
@@ -732,6 +891,23 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
             self.assertFalse(make_game.assets_exported(work))
             self.assert_fails(self.run_preflight, work, free_gb=220, match="about 330 GB is needed")
 
+    def test_stopped_export_counts_what_it_already_wrote(self):
+        # Before: a stopped export that had written 277 GB still asked for all 300 GB free, so it couldn't resume.
+        with tempfile.TemporaryDirectory() as work:
+            with mock.patch("make_game.tree_bytes", return_value=277 * 2**30):
+                self.run_preflight(work, free_gb=60)  # 30 for the shaders + 300 - 277
+                self.assert_fails(self.run_preflight, work, free_gb=40, match="about 53 GB is needed")
+
+    def test_tree_bytes_sums_files_under_the_folder(self):
+        with tempfile.TemporaryDirectory() as work:
+            sub = os.path.join(work, "a", "b")
+            os.makedirs(sub)
+            for p, n in ((os.path.join(work, "x"), 3), (os.path.join(sub, "y"), 5)):
+                with open(p, "wb") as f:
+                    f.write(b"\0" * n)
+            self.assertEqual(make_game.tree_bytes(work), 8)
+            self.assertEqual(make_game.tree_bytes(os.path.join(work, "missing")), 0)
+
     def test_marker_with_other_contents_does_not_count(self):
         for ogg, xma in (("", self.XMA), (self.OGG, "something else\n"), (self.XMA, self.OGG)):
             with self.subTest(ogg=ogg, xma=xma), tempfile.TemporaryDirectory() as work:
@@ -778,6 +954,135 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
         with tempfile.TemporaryDirectory() as work:
             self.write_markers(work)
             self.assert_fails(self.run_preflight, work, free_gb=220, wav=True, match="about 330 GB is needed")
+
+    # A stopped export: models, textures and most pools on disk, no xma.done yet.
+    def run_partial(self, work, free_gb, on_disk_gb, **kwargs):
+        with mock.patch("make_game.assets_bytes_on_disk", return_value=on_disk_gb * 2**30) as walk:
+            self.run_preflight(work, free_gb, **kwargs)
+        return walk
+
+    def test_stopped_export_counts_what_is_already_on_disk(self):
+        # The case this was found on: 270 GB already exported, 205 GB free, refused for 330 GB.
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work, xma=None)
+            self.run_partial(work, free_gb=205, on_disk_gb=270)  # 30 + 300 - 270 = 60 GB
+
+    def test_stopped_export_still_needs_what_is_left(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work, xma=None)
+            err = self.assert_fails(self.run_partial, work, free_gb=205, on_disk_gb=50,
+                                    match="about 280 GB is needed")
+            self.assertIn("205 GB free", err)
+
+    def test_more_on_disk_than_the_estimate_leaves_the_shader_space(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work, xma=None)
+            self.assert_fails(self.run_partial, work, free_gb=20, on_disk_gb=400, match="about 30 GB is needed")
+
+    def test_assets_folder_is_not_walked_when_there_is_room(self):
+        with tempfile.TemporaryDirectory() as work:
+            walk = self.run_partial(work, free_gb=500, on_disk_gb=270)
+            walk.assert_not_called()
+
+    def test_wav_still_counts_the_whole_asset_space_for_a_stopped_export(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work, xma=None)
+            self.assert_fails(self.run_partial, work, free_gb=205, on_disk_gb=270, wav=True,
+                              match="about 330 GB is needed")
+
+    # The walk itself: only the output of steps assets() would skip on a rerun is counted.
+    def put(self, work, rel, size):
+        path = os.path.join(work, "assets", *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"\0" * size)
+
+    def put_pool(self, work, rel, files, promised=None):
+        for name, size in files.items():
+            self.put(work, f"{rel}/{name}", size)
+        rows = [{"File": n} for n in (promised if promised is not None else files)]
+        path = os.path.join(work, "assets", *rel.split("/"), "manifest.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"Count": len(rows), "Textures": rows}, f)
+        return os.path.getsize(path)
+
+    def test_assets_bytes_on_disk_counts_only_finished_steps(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.assertEqual(make_game.assets_bytes_on_disk(work), 0)  # no assets folder yet
+            self.put(work, "levels/models/a.obj", 100)
+            self.put(work, "levels/models/manifest.json", 7)
+            self.put(work, "levels/textures/b.dds", 50)                 # no manifest: the step reruns
+            self.put(work, "common/models/c.obj", 30)
+            self.put(work, "common/models/manifest.json", 3)
+            pool = self.put_pool(work, "ttpf/pool", {"d.dds": 4096})
+            hashed = self.put_pool(work, "ttpf_pack/core/pool~0123456789ab/pool", {"e.dds": 200})
+            self.put_pool(work, "ttpf/half", {"f.dds": 900}, promised=["f.dds", "g.dds"])  # g.dds missing
+            self.put(work, "ttpf/stray/h.dds", 800)                      # no manifest at all
+            self.put(work, "audio/audio_manifest.json", 9)
+            self.put(work, "audio/awc/i.awc", 60)
+            self.put(work, "audio/ogg/j.ogg", 70)                        # no ogg.done yet
+            self.put(work, "audio/xma/k.xma", 80)
+            self.put(work, "audio/xma.done", 1)
+            self.put(work, "audio/wav/l.wav", 90)                        # --wav output: not in the estimate
+            self.put(work, "unrelated.bin", 5000)
+            with open(os.path.join(work, "outside.bin"), "wb") as f:     # not under assets
+                f.write(b"\0" * 999)
+            expected = (100 + 7) + (30 + 3) + (4096 + pool) + (200 + hashed) + (9 + 60 + 1) + 80
+            self.assertEqual(make_game.assets_bytes_on_disk(work), expected)
+
+    def test_unrelated_files_under_assets_are_not_credited(self):
+        # A large file the exporter didn't write must not let a short drive through.
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work, xma=None)
+            self.put(work, "big.bin", 4096)
+            self.put(work, "levels/textures/abandoned.dds", 4096)    # a step that stopped before its manifest
+            self.assertEqual(make_game.assets_bytes_on_disk(work), 0)
+            self.assert_fails(self.run_preflight, work, free_gb=10, match="about 330 GB is needed")
+
+    def test_assets_bytes_on_disk_does_not_follow_a_linked_folder(self):
+        with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as elsewhere:
+            with open(os.path.join(elsewhere, "big.bin"), "wb") as f:
+                f.write(b"\0" * 5000)
+            self.put(work, "levels/models/manifest.json", 7)
+            try:
+                os.symlink(elsewhere, os.path.join(work, "assets", "levels", "models", "link"),
+                           target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("symbolic links are not available here")
+            self.assertEqual(make_game.assets_bytes_on_disk(work), 7)
+
+    def test_assets_bytes_on_disk_does_not_follow_a_junction(self):
+        if os.name != "nt":
+            self.skipTest("NTFS junctions are Windows only")
+        import _winapi
+        with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as elsewhere:
+            with open(os.path.join(elsewhere, "big.bin"), "wb") as f:
+                f.write(b"\0" * 5000)
+            self.put(work, "levels/models/manifest.json", 7)
+            junction = os.path.join(work, "assets", "levels", "models", "junction")
+            _winapi.CreateJunction(elsewhere, junction)
+            try:
+                self.assertEqual(make_game.assets_bytes_on_disk(work), 7)
+            finally:
+                os.rmdir(junction)          # removes the junction, not its target
+
+    def test_a_linked_assets_folder_counts_nothing(self):
+        # <work>/assets pointing at another drive: what is there takes no room on the drive preflight measures.
+        with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as elsewhere:
+            os.makedirs(os.path.join(elsewhere, "levels", "models"))
+            with open(os.path.join(elsewhere, "levels", "models", "manifest.json"), "wb") as f:
+                f.write(b"\0" * 5000)
+            link = os.path.join(work, "assets")
+            if os.name == "nt":
+                import _winapi
+                _winapi.CreateJunction(elsewhere, link)
+            else:
+                os.symlink(elsewhere, link, target_is_directory=True)
+            try:
+                self.assertEqual(make_game.assets_bytes_on_disk(work), 0)
+            finally:
+                if os.name == "nt":
+                    os.rmdir(link)
 
 
 if __name__ == "__main__":

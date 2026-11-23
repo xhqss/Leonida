@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 import unittest.mock
+from unittest import mock
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 sys.path.insert(0, str(TOOLS))
@@ -100,6 +101,21 @@ class Text(unittest.TestCase):
         self.assertEqual(asm.failing_kernels(err2, starts), {1, 2})
 
 
+class DetectArch(unittest.TestCase):
+    def test_amdgpu_arch_target_features_are_dropped(self):
+        for printed, want in (("gfx1010:xnack-\n", "gfx1010"), ("gfx1150\n", "gfx1150"),
+                              ("gfx1030:sramecc+:xnack-\ngfx1150\n", "gfx1030")):
+            with self.subTest(printed=printed):
+                done = subprocess.CompletedProcess([], 0, stdout=printed)
+                with mock.patch.dict(os.environ, {}, clear=False), \
+                        mock.patch.object(os.path, "isfile", return_value=True), \
+                        mock.patch.object(subprocess, "run", return_value=done):
+                    os.environ.pop("LEONIDA_HW_ARCH", None)
+                    arch = runner.detect_arch(os.path.join("opt", "clang"))
+                self.assertEqual(arch, want)
+                asm.family(arch)   # what Oracle() does next must accept it
+
+
 class True16(unittest.TestCase):
     def test_the_low_half_is_named_only_on_the_f16_operand(self):
         for old, new in (
@@ -117,6 +133,18 @@ class True16(unittest.TestCase):
         for same in ("v_cvt_pkrtz_f16_f32 v8, v4, v5", "v_cvt_f32_f16 v8, s4", "v_cvt_f32_f16 v8, 0x3c00",
                      "v_cvt_f32_f16 v8, v4.h", "v_mov_b32 v8, v4"):
             self.assertEqual(asm.true16_spelling(same), same)
+
+    def test_the_non_returning_compare_and_store_is_respelled_and_swapped_on_gfx11(self):
+        """GFX11 has no ds_cmpst_b32, and ds_cmpstore_b32 takes the store value before the compare value."""
+        self.assertEqual(asm.ds_line("ds_cmpst_b32 v0, v1, v2", "gfx1150"),
+                         "ds_cmpstore_b32 v0, v2, v1")
+        self.assertEqual(asm.ds_line("ds_cmpst_b32 v0, v1, v2 offset:8", "gfx1100"),
+                         "ds_cmpstore_b32 v0, v2, v1 offset:8")
+        self.assertEqual(asm.ds_line("ds_cmpst_b32 v0, v1, v2", "gfx1030"),
+                         "ds_cmpst_b32 v0, v1, v2")
+        # Both changes are needed together: the rename alone would compare v2 and store v1.
+        with self.assertRaises(ValueError):
+            asm.ds_line("ds_cmpst_b32 v0, v1", "gfx1150")
 
     def test_error_lines_still_map_back(self):
         text = "v_mov_b32 v1, 0\nv_cvt_f32_f16 v8, 0x3c00\nv_cvt_f16_f32 v8, v1\nv_mov_b32 v9, 0\n"
@@ -269,6 +297,81 @@ class Filters(unittest.TestCase):
         self.assertEqual(len([op for op in asm.GFX12_REMOVED if op.startswith("s_cmpk_")]), 12)
 
 
+class VcvarsScript(unittest.TestCase):
+    """The .cmd that calls vcvars64.bat and cl holds the checkout, %TEMP% and Visual Studio paths. A character
+    outside ASCII in any of them (a user name, the Turkish default folder name) used to end in UnicodeEncodeError,
+    which is not the Unavailable that callers turn into a skip."""
+    NAME = "Ayşe Ğİı klasör"      # Turkish letters: none of them is ASCII
+
+    def build(self, tmp):
+        work = os.path.join(tmp, self.NAME)
+        os.makedirs(work)
+        src = os.path.join(work, "hw_oracle.c")
+        out = os.path.join(work, "hw_oracle.exe")
+        vcvars = os.path.join(work, "vcvars64.bat")
+        argv = runner.build_command("vcvars", vcvars, src, out, work)
+        with open(os.path.join(work, argv[-1]), "rb") as f:         # the script runs with cwd=work
+            return argv, f.read(), (src, out, vcvars)
+
+    def test_paths_outside_ascii_are_written_as_utf8(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            argv, raw, paths = self.build(tmp)
+        self.assertEqual(argv[:3], ["cmd.exe", "/d", "/c"])
+        text = raw.decode("utf-8")                       # strict: every byte is UTF-8
+        for path in paths:
+            self.assertIn(path, text)
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))   # cmd.exe would read a BOM as part of the first command
+
+    def test_the_code_page_is_set_before_any_path_is_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _argv, raw, _paths = self.build(tmp)
+        lines = raw.decode("utf-8").split("\r\n")
+        self.assertEqual(lines[0], "@echo off")
+        self.assertEqual(lines[1], "chcp 65001 >nul")
+        self.assertTrue(all(line.isascii() for line in lines[:2]))
+        self.assertTrue(lines[2].startswith('set "PATH='))
+        self.assertTrue(lines[3].startswith('call "'))
+
+    def test_ascii_paths_give_the_same_commands_as_before(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "work")
+            os.makedirs(work)
+            argv = runner.build_command("vcvars", "vcvars64.bat", "hw_oracle.c", "hw_oracle.exe", work)
+            with open(os.path.join(work, argv[-1]), "rb") as f:
+                lines = f.read().decode("ascii").split("\r\n")
+        self.assertEqual(lines[3], 'call "vcvars64.bat" >nul || exit /b 1')
+        self.assertTrue(lines[4].startswith("cl /nologo /O1 hw_oracle.c /Fehw_oracle.exe /Fo"))
+
+    def test_the_direct_compilers_write_no_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, self.NAME)
+            os.makedirs(work)
+            self.assertEqual(runner.build_command("gcc", "gcc", "a.c", "a.exe", work),
+                             ["gcc", "-O1", "a.c", "-o", "a.exe"])
+            self.assertEqual(runner.build_command("msvc", "cl.exe", "a.c", "a.exe", work)[0], "cl.exe")
+            self.assertEqual(os.listdir(work), [])
+
+    @unittest.skipUnless(sys.platform == "win32", "runs the script through cmd.exe")
+    def test_the_script_runs_from_any_work_folder(self):
+        # A full path through `cmd.exe /c` loses its quotes when the folder holds & or ^, and a bare name is not
+        # found with NoDefaultCurrentDirectoryInExePath set. A stub vcvars shows the script got that far.
+        broken = []
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = os.path.join(tmp, "stub_vcvars.bat")
+            with open(stub, "wb") as f:
+                f.write(b'@echo off\r\necho reached> "%LEONIDA_TEST_MARKER%"\r\nexit /b 0\r\n')
+            for name in ("plain", "sp (x)", "a & b", "a&b", "x^y", self.NAME):
+                work = os.path.join(tmp, name)
+                os.makedirs(work)
+                marker = os.path.join(work, "reached.txt")
+                argv = runner.build_command("vcvars", stub, "hw_oracle.c", "hw_oracle.exe", work)
+                env = dict(os.environ, LEONIDA_TEST_MARKER=marker, NoDefaultCurrentDirectoryInExePath="1")
+                subprocess.run(argv, cwd=work, env=env, capture_output=True, timeout=60)   # cl itself is absent
+                if not os.path.exists(marker):
+                    broken.append(name)
+        self.assertEqual(broken, [], "build_hw_oracle.cmd did not run from these work folders")
+
+
 class Unavailable(unittest.TestCase):
     def test_missing_tools_are_reported_not_raised_as_crashes(self):
         with unittest.mock.patch.dict(os.environ, {"LEONIDA_AMD_CLANG": str(TOOLS / "no-such-clang.exe")}):
@@ -316,7 +419,7 @@ class Unavailable(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             argv = runner.build_command("vcvars", r"C:\VS 2022\vcvars64.bat", "a.c", "o.exe", tmp)
             self.assertEqual(argv[:3], ["cmd.exe", "/d", "/c"])
-            script = Path(argv[3]).read_text(encoding="ascii")
+            script = (Path(tmp) / argv[3]).read_text(encoding="ascii")
             self.assertIn('call "C:\\VS 2022\\vcvars64.bat"', script)          # quoted: the path has a space
             self.assertIn("cl /nologo /O1 a.c /Feo.exe", script)
             self.assertIn("Installer", script)                                 # vcvars needs vswhere on PATH
@@ -542,6 +645,60 @@ class KernelResources(unittest.TestCase):
         self.assertIn(".amdhsa_next_free_vgpr 32", text)      # the second kernel keeps the defaults
         self.assertIn(".amdhsa_next_free_sgpr 40", text)
         self.assertEqual(names, ["k0", "k1"])
+
+    def test_registers_the_lines_name_are_allocated(self):
+        self.assertEqual(asm.regs_used(["v_mov_b32 v200, s7", "s_mov_b64 s[40:41], -1", "v_mad_u64_u32 v[8:9], "
+                                        "s20, v1, v1, v[2:3] ; v250 in a comment", "v_add_co_u32 v3, vcc_lo, v4, s0"]),
+                         (201, 42))
+        self.assertEqual(asm.regs_used(["s_endpgm"]), (0, 0))
+        self.assertEqual(asm.register_counts(["v_mov_b32 v1, 0"], 16, 32), (16, 32))     # never lowered
+        self.assertEqual(asm.register_counts(["v_mov_b32 v255, s103"], 16, 32), (256, 104))
+        k = asm.raw_kernel_text("k0", ["v_mov_b32 v40, 0", "s_endpgm"], "gfx1036", vgprs=8, sgprs=16)
+        self.assertIn(".amdhsa_next_free_vgpr 41", k)
+        self.assertIn(".amdhsa_next_free_sgpr 16", k)
+
+    def test_wrapped_kernels_take_the_wave_and_registers_of_the_kernel(self):
+        # The wrapped kernel's descriptor was fixed at wave32, 16 VGPRs and 32 SGPRs: on gfx1036 v16 and up read
+        # back 0 and Kernel(wave=64) ran as wave32.
+        lines = ["v_mov_b32 v40, 1", "s_mov_b32 s60, 2"] + PROG[-4:]
+        text, _, _ = asm.module_text([asm.Kernel(lines, wave=64)], "gfx1036", wave=64)
+        self.assertIn(".amdhsa_wavefront_size32 0", text)
+        self.assertIn(".amdhsa_next_free_vgpr 41", text)
+        self.assertIn(".amdhsa_next_free_sgpr 61", text)
+        self.assertIn(".vgpr_count: 41", text)          # the metadata says what the descriptor says
+        self.assertIn(".sgpr_count: 61", text)
+        text, _, _ = asm.module_text([asm.Kernel(PROG)], "gfx1036")
+        self.assertIn(".amdhsa_wavefront_size32 1", text)
+        self.assertIn(".amdhsa_next_free_vgpr 32", text)                # Kernel's default counts
+        text, _, _ = asm.module_text([PROG], "gfx1036")
+        self.assertIn(".amdhsa_next_free_vgpr 16", text)                # a plain program keeps the old ones
+        self.assertIn(".amdhsa_next_free_sgpr 32", text)
+
+
+class WrappedKernelsOnHardware(unittest.TestCase):
+    """A wrapped kernel runs at the wave size it asks for and keeps every register it names."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            cls.oracle = runner.open_oracle()
+        except runner.Unavailable as e:
+            raise unittest.SkipTest(f"hardware oracle unavailable: {e}") from None
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.oracle.close()
+
+    def test_wave_size_and_high_registers(self):
+        # Lane 40 of the lane ids of a full EXEC is 40 in a wave64 and lane 8 (40 mod 32) in a wave32.
+        ids = ["s_mov_b64 exec, -1", "v_mbcnt_lo_u32_b32 v1, -1, 0", "v_mbcnt_hi_u32_b32 v1, -1, v1",
+               "v_readlane_b32 s4, v1, 40", "s_mov_b64 exec, 1"]
+        regs = ["s_mov_b32 s90, 0x5a", "v_mov_b32 v16, 0x16", "v_mov_b32 v200, 0x200", "v_mov_b32 v9, s90",
+                "v_mov_b32 v10, v16", "v_mov_b32 v11, v200", "v_mov_b32 v8, s4"]
+        for wave, lane in ((32, 8), (64, 40)):
+            with self.subTest(wave=wave):
+                got = self.oracle.run([asm.Kernel(ids + regs, wave=wave)])
+                self.assertEqual(got, [[lane, 0x5A, 0x16, 0x200]])
 
 
 if __name__ == "__main__":

@@ -16,8 +16,8 @@ namespace {
 
 using namespace leonida;
 constexpr std::uint32_t side = 8;
-constexpr std::uint32_t query_count = 4;
-constexpr std::uint32_t statistics_count = 4;
+constexpr std::uint32_t query_count = 10;
+constexpr std::uint32_t statistics_count = 9;
 constexpr std::uint32_t statistics_words = 11;  // D3D12_QUERY_DATA_PIPELINE_STATISTICS
 
 VkShaderModule load_shader(vktest::Device& d, const char* path) {
@@ -135,13 +135,14 @@ struct Draws {
     std::vector<std::uint32_t> extents;
     std::size_t next = 0;
     bool overflow = false;
-    bool every = false;  // --bisect: one 1x1 draw before every end, no schedule
+    bool every = false;    // --bisect: one 1x1 draw before every end, no schedule
+    bool no_draw = false;  // --bisect --no-draw: no draws at all, every query stays empty
 };
 Draws* draws = nullptr;
 
 VKAPI_ATTR void VKAPI_CALL end_query_with_draw(VkCommandBuffer cb, VkQueryPool pool, std::uint32_t index) {
     if (draws->every) {
-        draws->fixture.draw(cb, 1);
+        if (!draws->no_draw) draws->fixture.draw(cb, 1);
     } else if (draws->next == draws->extents.size()) {
         draws->overflow = true;
     } else if (const auto extent = draws->extents[draws->next++]) {
@@ -159,9 +160,13 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device_proc(VkDevice device, const 
 // submission is waited for before the next, so the last "running" line before a hang or a lost device names the
 // pattern. --gated queues them all behind one semaphore the CPU signals afterwards, as the full test does. Named
 // phases run only those, in the order below. Only completion is checked, not values.
+// Two switches separate the draw from the resolve: --no-draw leaves every query empty (no rendering scope inside
+// it), --no-resolve records the queries but never copies or sums their results.
 struct Bisect {
     bool enabled = false;
     bool gated = false;
+    bool no_draw = false;
+    bool no_resolve = false;
     std::vector<std::string> phases;
     bool wants(const char* name) const {
         return phases.empty() || std::find(phases.begin(), phases.end(), name) != phases.end();
@@ -184,8 +189,13 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
     schedule.extents.insert(schedule.extents.end(), 2 * bursts + 1, 1);
     // The statistics lists below: a split query (two segments), two unsplit references and a second split query.
     if (d.pipeline_statistics_query) schedule.extents.insert(schedule.extents.end(), {3, 5, 3, 5, 3, 5});
-    schedule.extents.insert(schedule.extents.end(), {2, 0, 0, 0});
+    schedule.extents.insert(schedule.extents.end(), {2, 0, 0, 0, 1});
+    // The D3D-252 lists: three crossing statistics segment ends, three statistics references with the same draws,
+    // then the kind overlap's three segment ends and three occlusion references carrying the same draws.
+    if (d.pipeline_statistics_query) schedule.extents.insert(schedule.extents.end(), {7, 9, 11, 7, 9, 11});
+    schedule.extents.insert(schedule.extents.end(), {19, 21, 23, 19, 21, 23});
     schedule.every = bisect.enabled;
+    schedule.no_draw = bisect.no_draw;
     draws = &schedule;
     VulkanContext context(get_device_proc, d.device, true, d.conditional_rendering);
     EXPECT(context.loaded());
@@ -201,6 +211,10 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
     EXPECT(copy_control.create(d, context, properties.limits));
     VulkanQueue queue(context, d.queue, d.family);
     EXPECT(queue.ok() && gate.semaphore());
+    // The gate stalls the GPU while the queue replays (the point of this test). A Wait on a fence with no submitted
+    // Signal is held on the CPU instead (queue_holds.h), so the gate is declared as having one: its Signal is
+    // "submitted" and the CPU completes it later, as a GPU-side signal behind long work would be.
+    context.holds().signaled(gate.semaphore(), 1);
     struct OpenGate { VulkanFence& fence; ~OpenGate() { fence.signal(1); } } open_gate{gate};
     constexpr QueryHeapId a = 1, b = 2, stats = 3;
     constexpr auto occ = d3d12_query::occlusion;
@@ -210,7 +224,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
                                     std::vector<bool>(query_count, false)});
 
     constexpr ResourceId dst_id = 4, predicate_id = 5;
-    constexpr VkDeviceSize binding_offset = 24, size = 160;
+    constexpr VkDeviceSize binding_offset = 24, size = 256;
     void* mapping = nullptr;
     ResourceBinding dst{};
     dst.buffer = d.buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mapping);
@@ -236,30 +250,37 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
             if (!bisect.wants(name)) return nullptr;
             return &lists.emplace_back(name, CommandList{}).second;
         };
+        const auto resolve = [&](CommandList* l, const ResolveQueries& r) {
+            return bisect.no_resolve || l->resolve_queries(r);
+        };
         if (auto* l = add("crossing")) {  // two queries of one heap overlap; resolve while one is active
             EXPECT(l->begin_query({a, occ, 0}) && l->begin_query({a, occ, 1}) && l->end_query({a, occ, 0}));
-            EXPECT(l->resolve_queries({a, occ, 0, 1, dst_id, 8}) && l->end_query({a, occ, 1}));
-            EXPECT(l->resolve_queries({a, occ, 0, 2, dst_id, 24}));
+            EXPECT(resolve(l, {a, occ, 0, 1, dst_id, 8}) && l->end_query({a, occ, 1}));
+            EXPECT(resolve(l, {a, occ, 0, 2, dst_id, 24}));
+        }
+        if (auto* l = add("active")) {  // a resolve inside one active query, without an overlap
+            EXPECT(l->begin_query({a, occ, 0}) && l->end_query({a, occ, 0}) && l->begin_query({a, occ, 3}));
+            EXPECT(resolve(l, {a, occ, 0, 1, dst_id, 128}) && l->end_query({a, occ, 3}));
         }
         if (auto* l = add("nested")) {  // the same index in two heaps, one inside the other
             EXPECT(l->begin_query({a, occ, 2}) && l->begin_query({b, occ, 2}));
             EXPECT(l->end_query({b, occ, 2}) && l->end_query({a, occ, 2}));
-            EXPECT(l->resolve_queries({a, occ, 2, 1, dst_id, 40}) && l->resolve_queries({b, occ, 2, 1, dst_id, 48}));
+            EXPECT(resolve(l, {a, occ, 2, 1, dst_id, 40}) && resolve(l, {b, occ, 2, 1, dst_id, 48}));
         }
         if (auto* l = add("unwritten")) {  // a query never begun: zero fill
-            EXPECT(l->resolve_queries({b, occ, 0, 1, dst_id, 56}));
+            EXPECT(resolve(l, {b, occ, 0, 1, dst_id, 56}));
         }
         if (auto* l = add("binary")) {  // the binary-occlusion compute resolve
             EXPECT(l->begin_query({a, binary, 3}) && l->end_query({a, binary, 3}));
-            EXPECT(l->resolve_queries({a, binary, 3, 1, dst_id, 64}));
+            EXPECT(resolve(l, {a, binary, 3, 1, dst_id, 64}));
         }
         if (d.conditional_rendering) {
             if (auto* l = add("predicated")) {  // both compute resolves under a false predicate
                 EXPECT(l->begin_query({a, binary, 3}) && l->end_query({a, binary, 3}));
                 EXPECT(l->set_predication({predicate_id, 0, d3d12_predication::equal_zero}));
-                EXPECT(l->resolve_queries({a, binary, 3, 1, dst_id, 64}));
-                EXPECT(l->resolve_queries({a, occ, 0, 1, dst_id, 72}));
-                EXPECT(l->resolve_queries({a, binary, 3, 1, dst_id, 80}));
+                EXPECT(resolve(l, {a, binary, 3, 1, dst_id, 64}));
+                EXPECT(resolve(l, {a, occ, 0, 1, dst_id, 72}));
+                EXPECT(resolve(l, {a, binary, 3, 1, dst_id, 80}));
                 EXPECT(copy_control.record(*l));
             }
         }
@@ -267,14 +288,24 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
             EXPECT(l->begin_query({a, occ, 3}));
             for (std::uint32_t i = 0; i < bursts; ++i) EXPECT(l->begin_query({b, occ, 0}) && l->end_query({b, occ, 0}));
             EXPECT(l->end_query({a, occ, 3}));
-            EXPECT(l->resolve_queries({a, occ, 3, 1, dst_id, 88}) && l->resolve_queries({b, occ, 0, 1, dst_id, 96}));
+            EXPECT(resolve(l, {a, occ, 3, 1, dst_id, 88}) && resolve(l, {b, occ, 0, 1, dst_id, 96}));
         }
         if (auto* l = add("replace")) {  // every heap query begun and ended again, then resolved
             for (const auto& [heap, index] : {std::pair{a, 0u}, std::pair{a, 1u}, std::pair{a, 2u}, std::pair{b, 2u}})
                 EXPECT(l->begin_query({heap, occ, index}) && l->end_query({heap, occ, index}));
-            EXPECT(l->resolve_queries({a, occ, 0, 2, dst_id, 112}));
+            EXPECT(resolve(l, {a, occ, 0, 2, dst_id, 112}));
         }
         EXPECT(!lists.empty());
+        std::printf("bisect:%s%s%s\n", bisect.gated ? " gated" : " ungated", bisect.no_draw ? " no-draw" : " draws",
+                    bisect.no_resolve ? " no-resolve" : " resolves");
+        // After a TDR, AMD's Windows driver lets vkQueueWaitIdle succeed (#1540); every timeline semaphore then reads
+        // UINT64_MAX, so the gate's value is checked as well as what the context has seen.
+        const auto get_value = d.fn<PFN_vkGetSemaphoreCounterValue>("vkGetSemaphoreCounterValue");
+        const auto lost = [&] {
+            std::uint64_t value = 0;
+            return context.is_device_lost() || get_value(d.device, gate.semaphore(), &value) != VK_SUCCESS ||
+                   value == UINT64_MAX;
+        };
         if (bisect.gated) queue.wait(gate.semaphore(), 1);
         for (auto& [name, list] : lists) {
             EXPECT(list.close());
@@ -286,15 +317,15 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
                 std::printf("%s: execute returned %d\n", name, int(result));
                 return 1;
             }
-            if (!bisect.gated && !queue.idle()) {
-                std::printf("%s: vkQueueWaitIdle failed (device lost?)\n", name);
+            if (!bisect.gated && (!queue.idle() || lost())) {
+                std::printf("%s: device lost\n", name);
                 return 1;
             }
         }
         if (bisect.gated) {
             EXPECT(gate.signal(1));
-            if (!queue.idle()) {
-                std::printf("gated: vkQueueWaitIdle failed (device lost?)\n");
+            if (!queue.idle() || lost()) {
+                std::printf("gated: device lost\n");
                 return 1;
             }
         }
@@ -365,7 +396,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
     // gets one native draw before it ends (extents 3 and 5); two unsplit queries with the same draws are the
     // reference, and CSInvocations stays 0 because no application compute runs.
     constexpr ResourceId stats_dst_id = 6;
-    constexpr VkDeviceSize stats_result = statistics_words * sizeof(std::uint64_t), stats_slots = 5;
+    constexpr VkDeviceSize stats_result = statistics_words * sizeof(std::uint64_t), stats_slots = 10;
     void* stats_mapping = nullptr;
     ResourceBinding stats_dst{};
     if (fixture.statistics) {
@@ -414,15 +445,76 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
     EXPECT(replace.close());
     const CommandList* fourth[] = {&replace};
     EXPECT(queue.execute(fourth) == ReplayResult::success);
+
+    // A resolve inside one active query, with no overlap.
+    CommandList single;
+    EXPECT(single.begin_query({a, occ, 3}));
+    EXPECT(single.resolve_queries({a, occ, 0, 1, dst_id, 128}));
+    EXPECT(single.end_query({a, occ, 3}));
+    EXPECT(single.close());
+    const CommandList* fifth[] = {&single};
+    EXPECT(queue.execute(fifth) == ReplayResult::success);
+    // D3D-252: overlapping pipeline-statistics queries and overlapping occlusion kinds. The hook's draw lands in
+    // the segment that is about to close, so each crossing query's sum covers its own intervals plus the shared
+    // intersection; the reference queries carry the same draws unsplit, and the sums must match them.
+    CommandList crossing_stats, stats_references, kind_overlap, kind_references;
+    if (d.pipeline_statistics_query) {
+        EXPECT(crossing_stats.begin_query({stats, d3d12_query::pipeline_statistics, 4}));
+        EXPECT(crossing_stats.begin_query({stats, d3d12_query::pipeline_statistics, 5}));
+        EXPECT(crossing_stats.end_query({stats, d3d12_query::pipeline_statistics, 4}));
+        EXPECT(crossing_stats.end_query({stats, d3d12_query::pipeline_statistics, 5}));
+        EXPECT(crossing_stats.resolve_queries({stats, d3d12_query::pipeline_statistics, 4, 1, stats_dst_id,
+                                               5 * stats_result}));
+        EXPECT(crossing_stats.resolve_queries({stats, d3d12_query::pipeline_statistics, 5, 1, stats_dst_id,
+                                               6 * stats_result}));
+        EXPECT(crossing_stats.close());
+        for (std::uint32_t index : {6u, 7u, 8u}) {
+            EXPECT(stats_references.begin_query({stats, d3d12_query::pipeline_statistics, index}));
+            EXPECT(stats_references.end_query({stats, d3d12_query::pipeline_statistics, index}));
+        }
+        EXPECT(stats_references.resolve_queries({stats, d3d12_query::pipeline_statistics, 6, 3, stats_dst_id,
+                                                 7 * stats_result}));
+        EXPECT(stats_references.close());
+    }
+    EXPECT(kind_overlap.begin_query({a, occ, 4}));
+    EXPECT(kind_overlap.begin_query({a, binary, 5}));
+    EXPECT(kind_overlap.end_query({a, binary, 5}));
+    EXPECT(kind_overlap.end_query({a, occ, 4}));
+    EXPECT(kind_overlap.resolve_queries({a, occ, 4, 1, dst_id, 168}));
+    EXPECT(kind_overlap.resolve_queries({a, binary, 5, 1, dst_id, 176}));
+    EXPECT(kind_overlap.close());
+    for (std::uint32_t index : {6u, 7u, 8u}) {
+        EXPECT(kind_references.begin_query({b, occ, index}));
+        EXPECT(kind_references.end_query({b, occ, index}));
+    }
+    EXPECT(kind_references.resolve_queries({b, occ, 6, 3, dst_id, 184}));
+    EXPECT(kind_references.close());
+    const CommandList* overlap_lists[] = {&crossing_stats, &stats_references, &kind_overlap, &kind_references};
+    EXPECT(queue.execute(overlap_lists) == ReplayResult::success);
     EXPECT(!schedule.overflow && schedule.next == schedule.extents.size());
     EXPECT(gate.signal(1));
     EXPECT(queue.idle());
 
     std::map<VkDeviceSize, std::uint64_t> expected = {
         {8, 80}, {24, 80}, {32, 20}, {40, 84}, {48, 16}, {56, 0}, {64, 1}, {72, 80}, {80, 1},
-        {88, 2 * bursts + 1}, {96, 1}, {112, 4}, {120, 0},
+        {88, 2 * bursts + 1}, {96, 1}, {112, 4}, {120, 0}, {128, 4},
     };
     if (fixture.statistics) expected[0] = 2 * bursts + 1;  // the sum resolved inside the statistics query
+    {   // D3D-252: the ordinary result covers three segments (draws 19, 21 and 23); the binary result is the
+        // shared segment's count normalized to 1. The reference queries carry the same draws unsplit, and their
+        // own results at 184, 192 and 200 are the expectation for the sums.
+        const auto word_at = [&](VkDeviceSize at) {
+            std::uint64_t value = 0;
+            std::memcpy(&value, static_cast<const char*>(mapping) + binding_offset + at, sizeof(value));
+            return value;
+        };
+        const std::uint64_t first = word_at(184), shared = word_at(192), last = word_at(200);
+        expected[168] = first + shared + last;
+        expected[176] = 1;
+        expected[184] = first;
+        expected[192] = shared;
+        expected[200] = last;
+    }
     for (VkDeviceSize offset = 0; offset < size; offset += 8) {
         const auto it = expected.find(offset - binding_offset);
         const auto want = it == expected.end() ? 0xcdcdcdcdcdcdcdcdULL : it->second;
@@ -455,12 +547,28 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
             }
         }
         EXPECT(word(0, cs_invocations) == 0 && word(1, 0) != 0 && word(2, 0) != 0);
+        // D3D-252: the crossing statistics queries (slots 5 and 6) each cover one private interval plus the shared
+        // intersection; slots 7 to 9 are the references with the same draws unsplit.
+        for (std::uint32_t counter = 0; counter < statistics_words; ++counter) {
+            if (word(5, counter) != word(7, counter) + word(8, counter) ||
+                word(6, counter) != word(8, counter) + word(9, counter)) {
+                std::fprintf(stderr, "crossing statistics counter %u: got %llu/%llu, wanted %llu/%llu\n", counter,
+                             static_cast<unsigned long long>(word(5, counter)),
+                             static_cast<unsigned long long>(word(6, counter)),
+                             static_cast<unsigned long long>(word(7, counter) + word(8, counter)),
+                             static_cast<unsigned long long>(word(8, counter) + word(9, counter)));
+                return 1;
+            }
+        }
+        EXPECT(word(5, cs_invocations) == 0 && word(6, cs_invocations) == 0);
         std::printf("statistics split around a sum: IA vertices %llu, PS invocations %llu, CS invocations 0, "
                     "equal to two unsplit queries\n",
                     static_cast<unsigned long long>(word(0, 0)), static_cast<unsigned long long>(word(0, 7)));
+        std::printf("crossing statistics: IA vertices %llu/%llu, CS invocations 0, equal to the unsplit references\n",
+                    static_cast<unsigned long long>(word(5, 0)), static_cast<unsigned long long>(word(6, 0)));
     }
     std::printf("crossing 80/20; nested 84/16; %u segments summed; alternating binary results 1/1; "
-                "offsets and gated overwrites exact\n",
+                "resolve inside an active query 4; offsets and gated overwrites exact\n",
                 2 * bursts + 1);
     EXPECT(copy_control.check());
     return 0;
@@ -468,13 +576,15 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
 
 } // namespace
 
-// vk_overlapping_occlusion_test <vert.spv> <frag.spv> [--bisect [--gated] [phase...]]
+// vk_overlapping_occlusion_test <vert.spv> <frag.spv> [--bisect [--gated] [--no-draw] [--no-resolve] [phase...]]
 int main(int argc, char** argv) {
     EXPECT(argc >= 3);
     Bisect bisect;
     for (int i = 3; i < argc; ++i) {
         if (std::strcmp(argv[i], "--bisect") == 0) bisect.enabled = true;
         else if (std::strcmp(argv[i], "--gated") == 0) bisect.gated = true;
+        else if (std::strcmp(argv[i], "--no-draw") == 0) bisect.no_draw = true;
+        else if (std::strcmp(argv[i], "--no-resolve") == 0) bisect.no_resolve = true;
         else bisect.phases.emplace_back(argv[i]);
     }
     EXPECT(argc == 3 || bisect.enabled);

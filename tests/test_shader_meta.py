@@ -460,6 +460,133 @@ class OperandClassificationTests(unittest.TestCase):
         sgprs = [r["sgpr"] for r in meta["user_sgpr_reads"]]
         self.assertEqual(sgprs, [0, 1, 2, 3, 4, 5, 6, 7])
 
+    def test_global_atomic_ptr64_and_truncated_ptr32(self):
+        # global_atomic_add without glc (saddr at a[2]) and with glc (saddr at a[3]) must classify
+        # 64-bit user-SGPR pointers and 32-bit high-zeroed pointers the same way as global_load/store.
+        lines = [
+            "v_mov_b32_e32 v0, 0",
+            "v_mov_b32_e32 v1, 1",
+            "global_atomic_add v0, v1, s[0:1]",
+            "global_atomic_add v2, v0, v1, s[2:3] glc",
+            "s_mov_b32 s5, 0",
+            "global_atomic_add v3, v0, v1, s[4:5] glc",
+            "exp mrt0 v2, v3, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        _, meta = translate_synthetic("ps_global_atomic_meta", lines)
+        self.assertEqual(meta["user_sgpr_reads"], [
+            {"sgpr": 0, "kind": "ptr64_lo", "pair": [0, 1]},
+            {"sgpr": 1, "kind": "ptr64_hi", "pair": [0, 1]},
+            {"sgpr": 2, "kind": "ptr64_lo", "pair": [2, 3]},
+            {"sgpr": 3, "kind": "ptr64_hi", "pair": [2, 3]},
+            {"sgpr": 4, "kind": "ptr32_lo"},
+        ])
+        self.assertEqual(meta["descriptor_access"], {
+            "table_loads": False,
+            "truncates_table_ptr_high": True,
+        })
+
+    def test_s_mulk_i32_stride_and_constant_folding(self):
+        # s_mulk_i32 scales a descriptor index (32-byte stride) and folds signed 16-bit constants.
+        lines = [
+            "s_mov_b32 s4, s2",
+            "s_mulk_i32 s4, 32",
+            "s_load_dwordx8 s[16:23], s[0:1], s4",
+            "s_mov_b32 s12, 0x49",
+            "s_mulk_i32 s12, 2",
+            "s_mov_b32 s13, 1",
+            "s_mulk_i32 s13, -1",
+            "s_mov_b32 s14, 0",
+            "s_mov_b32 s15, 0",
+            "v_mov_b32_e32 v0, 0.5",
+            "v_mov_b32_e32 v1, 0.5",
+            "image_sample v[4:7], v[0:1], s[16:23], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "exp mrt0 v4, v5, v6, v7 done vm",
+            "s_endpgm",
+        ]
+        _, meta = translate_synthetic("ps_mulk_meta", lines)
+        self.assertEqual(meta["descriptor_strides"], [32])
+        self.assertEqual(meta["literal_samplers"], [[0x92, 0xFFFFFFFF, 0, 0]])
+
+    def test_scalar_store_pointer_and_vsharp(self):
+        # s_store_dword* classifies its 2-SGPR pointer pair without marking table_loads,
+        # and s_buffer_store_dword* classifies its 4-SGPR resource descriptor as vsharp.
+        insns = self._parse([
+            "s_store_dword s8, s[0:1], 0x0",
+            "s_mov_b32 s3, 0",
+            "s_store_dwordx4 s[8:11], s[2:3], 0x0",
+            "s_buffer_store_dword s8, s[4:7], 0x0",
+            "s_endpgm",
+        ])
+        got = M.analyse_instructions([insns], [[]])
+        self.assertEqual(got["user_sgpr_reads"], [
+            {"sgpr": 0, "kind": "ptr64_lo", "pair": [0, 1]},
+            {"sgpr": 1, "kind": "ptr64_hi", "pair": [0, 1]},
+            {"sgpr": 2, "kind": "ptr32_lo"},
+            {"sgpr": 4, "kind": "vsharp"},
+            {"sgpr": 5, "kind": "vsharp"},
+            {"sgpr": 6, "kind": "vsharp"},
+            {"sgpr": 7, "kind": "vsharp"},
+            {"sgpr": 8, "kind": "const32"},
+            {"sgpr": 9, "kind": "const32"},
+            {"sgpr": 10, "kind": "const32"},
+            {"sgpr": 11, "kind": "const32"},
+        ])
+        self.assertFalse(got["table_loads"])
+        self.assertTrue(got["truncates_high"])
+
+    def test_slist_operands_classify_pointers_and_descriptors(self):
+        # LLVM VCCTuple slist syntax ([s0, s1], [s4, s5, s6, s7], ...) must be classified
+        # identically to contiguous s[a:b] ranges.
+        lines = [
+            "s_load_dwordx4 s[16:19], [s0, s1], 0x0",
+            "v_mov_b32_e32 v0, 0",
+            "global_load_dword v1, v0, [s2, s3]",
+            "buffer_load_dword v2, v0, [s4, s5, s6, s7], 0 offen",
+            "v_add_nc_u32_e32 v1, v1, v2",
+            "v_add_nc_u32_e32 v1, s16, v1",
+            "exp mrt0 v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        _, meta = translate_synthetic("ps_slist_meta", lines)
+        self.assertEqual(meta["user_sgpr_reads"], [
+            {"sgpr": 0, "kind": "ptr64_lo", "pair": [0, 1]},
+            {"sgpr": 1, "kind": "ptr64_hi", "pair": [0, 1]},
+            {"sgpr": 2, "kind": "ptr64_lo", "pair": [2, 3]},
+            {"sgpr": 3, "kind": "ptr64_hi", "pair": [2, 3]},
+            {"sgpr": 4, "kind": "vsharp"},
+            {"sgpr": 5, "kind": "vsharp"},
+            {"sgpr": 6, "kind": "vsharp"},
+            {"sgpr": 7, "kind": "vsharp"},
+        ])
+        self.assertTrue(meta["descriptor_access"]["table_loads"])
+
+        # Also verify slist tsharp, ssharp, and literal sampler via analyse_instructions.
+        insns = self._parse([
+            "s_mov_b32 s20, 0x92",
+            "s_mov_b32 s21, 0",
+            "s_mov_b32 s22, 0",
+            "s_mov_b32 s23, 0",
+            "image_sample v[0:3], v[0:1], [s0, s1, s2, s3, s4, s5, s6, s7], [s20, s21, s22, s23] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "image_sample v[4:7], v[0:1], [s0, s1, s2, s3, s4, s5, s6, s7], [s8, s9, s10, s11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_endpgm",
+        ])
+        got = M.analyse_instructions([insns], [[]])
+        kinds = {r["sgpr"]: r["kind"] for r in got["user_sgpr_reads"]}
+        for r in range(8):
+            self.assertEqual(kinds[r], "tsharp")
+        for r in range(8, 12):
+            self.assertEqual(kinds[r], "ssharp")
+        self.assertEqual(got["literal_samplers"], [[0x92, 0, 0, 0]])
+
+        # A VCCTuple slist mixing a user SGPR with vcc_lo must classify the SGPR without crashing.
+        insns_vcc = self._parse([
+            "global_load_dword v0, v1, [s0, vcc_lo]",
+            "s_endpgm",
+        ])
+        got_vcc = M.analyse_instructions([insns_vcc], [[]])
+        self.assertEqual(got_vcc["user_sgpr_reads"], [{"sgpr": 0, "kind": "ptr64_lo"}])
+
 
 if __name__ == "__main__":
     unittest.main()

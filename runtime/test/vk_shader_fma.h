@@ -21,14 +21,14 @@ inline constexpr bool shader_fma_in_headers = true;
 inline constexpr bool shader_fma_in_headers = false;
 #endif
 
-// OpCapability (17) FMAKHR (6030; spirv/unified1/spirv.h).
-inline bool spirv_needs_fma(const void* data, std::size_t bytes) {
+// Find OpCapability (17) in a binary module.
+inline bool spirv_declares_capability(const void* data, std::size_t bytes, std::uint32_t capability) {
     if (bytes < 20 || bytes % 4) return false;
     std::vector<std::uint32_t> words(bytes / 4);
     std::memcpy(words.data(), data, bytes);
     for (std::size_t i = 5; i < words.size() && (words[i] >> 16);) {
         const std::uint32_t op = words[i] & 0xffff, count = words[i] >> 16;
-        if (op == 17 && count == 2 && i + 1 < words.size() && words[i + 1] == 6030) return true;
+        if (op == 17 && count == 2 && i + 1 < words.size() && words[i + 1] == capability) return true;
         i += count;
     }
     return false;
@@ -93,7 +93,7 @@ struct ShaderFma {
     // True when the module can be used: it does not need FMAKHR, or the device enables shaderFmaFloat32.
     // Otherwise says so and the caller returns 77.
     bool accepts(const void* code, std::size_t bytes, const char* name) const {
-        if (float32 || !spirv_needs_fma(code, bytes)) return true;
+        if (float32 || !spirv_declares_capability(code, bytes, 6030)) return true;  // FMAKHR
         std::fprintf(stderr, "unsupported: %s needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32) and the device "
                              "lacks it; translate with --fma glsl\n", name);
         return false;

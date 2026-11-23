@@ -56,12 +56,45 @@ class CTestRegistrationTest(unittest.TestCase):
         skips = []
         for i, line in enumerate(lines):
             if 'std::printf("SKIP:' in line:
-                window = "\n".join(lines[i:i + 6])
-                codes = re.findall(r"return (\d+);", window)
-                skips.append(int(codes[0]) if codes else None)
+                # The path's own return, not a conditional one inside it (a LEONIDA_VK_DEVICE filter that matches
+                # nothing fails with `if (!filter.empty()) return 1;` just before the skip's `return 77;`).
+                codes = [int(m) for l in lines[i:i + 7] if "if (" not in l for m in re.findall(r"return (\d+);", l)]
+                skips.append(codes[0] if codes else None)
         # no loader, no ICD, no Vulkan 1.3 GPU -- all three are a ctest SKIP, not a failure.
         self.assertEqual(len(skips), 3, f"expected three whole-test SKIP paths, got {len(skips)}")
         self.assertEqual(skips, [77, 77, 77], "SKIP paths must return 77 for SKIP_RETURN_CODE 77")
+
+    def test_whole_test_skips_return_the_skip_code(self):
+        # A test registered with SKIP_RETURN_CODE 77 that prints SKIP and returns 0 is counted as passed although it
+        # checked nothing: bink_audio_test did that for a movie without audio tracks after #1580.
+        wrong = whole_test_skips_not_77(self.cmake, ROOT / "runtime")
+        self.assertEqual(wrong, [], f"SKIP followed by a return code other than 77: {wrong}")
+
+
+def whole_test_skips_not_77(cmake_text, runtime_dir):
+    """[(source:line, code)] for a SKIP print directly followed by `return N;` (N != 77) in the sources of a test
+    registered with SKIP_RETURN_CODE 77. A SKIP print with no return right after it skips one section, not the test."""
+    skip_tests = set(re.findall(r"set_tests_properties\(\s*([A-Za-z0-9_]+)\s+PROPERTIES[^)]*SKIP_RETURN_CODE\s+77",
+                                cmake_text))
+    commands = dict(re.findall(r"add_test\(\s*NAME\s+([A-Za-z0-9_]+)\s+COMMAND\s+\"?([A-Za-z0-9_]+)", cmake_text))
+    wrong = []
+    for test in sorted(skip_tests):
+        exe = commands.get(test)
+        m = exe and re.search(r"add_executable\(\s*" + re.escape(exe) + r"\b([^)]*)\)", cmake_text)
+        if not m:
+            continue
+        for src in re.findall(r"(test/[A-Za-z0-9_./]+\.cpp)", m.group(1)):
+            path = runtime_dir / src
+            if not path.is_file():
+                continue
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            for i, line in enumerate(lines):
+                if not re.search(r'(printf|puts)\(\s*"SKIP', line):
+                    continue
+                after = re.match(r"\s*return\s+(\w+)\s*;", lines[i + 1]) if i + 1 < len(lines) else None
+                if after and after.group(1) != "77":
+                    wrong.append((f"{src}:{i + 2}", after.group(1)))
+    return wrong
 
 
 if __name__ == "__main__":

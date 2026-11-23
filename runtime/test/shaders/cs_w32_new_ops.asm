@@ -8,6 +8,8 @@
 ;   out[5] = ds_wrxchg2_rtn_b32 old word at offset0:2     = 0x77        (LDS seeded 0x77)
 ;   out[6] = LDS word at offset1:5 after the exchange     = 0x99        (DATA2)
 ;   out[7] = v7 after ds_nop and v_clrexcp                = 0x1234      (no effect)
+; EXEC is cut to lane 0 before the LDS ops: 32 lanes on one LDS address would race (which lane's
+; ds_cmpst / ds_wrxchg2 runs first is up to the hardware), as #1850 showed for ds_xor_b64.
 ; group: 32,1,1
 ; Run: vk_compute_test cs_w32_new_ops.spv 1 dump -> out[0..7] = 85 32769 3221225472 2147565568 1073807359 119 153 4660
 ; mattr: +wavefrontsize32,-wavefrontsize64
@@ -24,6 +26,7 @@ v_cvt_pknorm_i16_f32 v3, v1, v2
 v_mov_b32_e32 v1, 1.0
 v_mov_b32_e32 v2, 0.25
 v_cvt_pknorm_u16_f32 v4, v1, v2
+v_cmpx_eq_u32_e32 0, v0
 v_mov_b32_e32 v10, 0x20
 v_mov_b32_e32 v11, 0x28
 v_mov_b32_e32 v12, 0x34
@@ -41,7 +44,6 @@ s_waitcnt lgkmcnt(0)
 v_mov_b32_e32 v7, 0x1234
 ds_nop
 v_clrexcp
-v_cmpx_eq_u32_e32 0, v0
 v_mov_b32_e32 v24, s8
 v_mov_b32_e32 v25, 0
 buffer_store_dword v24, v25, s[0:3], 0 offen

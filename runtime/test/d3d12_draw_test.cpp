@@ -7,21 +7,27 @@
 //   - a render target cleared blue, two indexed draws with different root arguments (top-left red, bottom-right
 //     green), and one back-facing triangle (bottom-left) that culling must remove;
 //   - the image read back through CopyTextureRegion and compared pixel by pixel. Where the quadrants land also
-//     checks the viewport flip (D3D clip space is y-up) and the front-face winding.
+//     checks the viewport flip (D3D clip space is y-up) and the front-face winding;
+//   - full-screen blends that read destination alpha into B8G8R8X8 and B8G8R8A8 targets cleared with alpha 0.25:
+//     B8G8R8X8 has no alpha, so destination alpha reads 1 there, as on WARP and AMD's D3D12 driver.
 // The shaders are GLSL written to the translator's contract (test/glsl/vs_draw.vert, ps_draw.frag). No game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
+#include "shader_fixture_path.h"
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 
-#if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV)
-#error "LEONIDA_TEST_VS_SPV and LEONIDA_TEST_PS_SPV must name the compiled test shaders"
+#if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV) || !defined(LEONIDA_TEST_VS_INT_SPV)
+#error "LEONIDA_TEST_VS_SPV, LEONIDA_TEST_PS_SPV and LEONIDA_TEST_VS_INT_SPV must name the compiled test shaders"
 #endif
 
 #define EXPECT(condition) do { \
@@ -59,20 +65,29 @@ int main() {
     const auto vs_program = fssm_program({0x56530001, 0xbf810000});
     const auto ps_program = fssm_program({0x50530001, 0xbf810000});
     const auto fullscreen_program = fssm_program({0x56530002, 0xbf810000});
+    const auto vs_int_program = fssm_program({0x56530003, 0xbf810000});
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
     const auto fullscreen_container = shader_container(fullscreen_program);
-    const auto library = std::filesystem::temp_directory_path() / "leonida_draw_test";
-    std::filesystem::create_directories(library);
-    std::filesystem::copy_file(LEONIDA_TEST_VS_SPV, library / "vs_draw.spv", std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(LEONIDA_TEST_VS_FULLSCREEN_SPV, library / "vs_fullscreen.spv",
-                               std::filesystem::copy_options::overwrite_existing);
+    const auto vs_int_container = shader_container(vs_int_program);
+    const testfiles::ScratchDir scratch("leonida_draw_test");
+    const auto& library = scratch.path();
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_SPV), library / "vs_draw.spv"));
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_PS_SPV), library / "ps_draw.spv"));
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_FULLSCREEN_SPV),
+                                library / "vs_fullscreen.spv"));
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_INT_SPV), library / "vs_draw_int.spv"));
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         index << "{\"vs_draw\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": ["
                  "{\"semantic\": \"COLOR\", \"semantic_index\": 0, \"register\": 0, \"mask\": 15, \"rw_mask\": 15, "
                  "\"system_value\": 0, \"component_type\": \"float\"}, "
+                 "{\"semantic\": \"POSITION\", \"semantic_index\": 0, \"register\": 1, \"mask\": 3, \"rw_mask\": 3, "
+                 "\"system_value\": 0, \"component_type\": \"float\"}]},\n"
+                 " \"vs_draw_int\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_int_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": ["
+                 "{\"semantic\": \"COLOR\", \"semantic_index\": 0, \"register\": 0, \"mask\": 15, \"rw_mask\": 15, "
+                 "\"system_value\": 0, \"component_type\": \"int\"}, "
                  "{\"semantic\": \"POSITION\", \"semantic_index\": 0, \"register\": 1, \"mask\": 3, \"rw_mask\": 3, "
                  "\"system_value\": 0, \"component_type\": \"float\"}]},\n"
                  " \"vs_fullscreen\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(fullscreen_program)
@@ -86,7 +101,9 @@ int main() {
     std::vector<std::uint8_t> strip16_pixels(size * 256), strip32_pixels(size * 256), strip_nocut_pixels(size * 256);
     std::vector<std::uint8_t> msaa_full_pixels(size * 256), msaa_half_pixels(size * 256);
     bool ran_msaa = false;
+    std::vector<std::uint8_t> step2_pixels(size * 256), step1_pixels(size * 256);
     const bool logic_op = d.enabled.logicOp == VK_TRUE;
+    const bool has_divisor = d.vertex_attribute_divisor;
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -100,6 +117,7 @@ int main() {
         info.shader_dir = library.string();
         // Of the PSO features only logicOp is passed on, so the other feature refusals below still apply.
         info.features.logicOp = d.enabled.logicOp;
+        info.vertex_attribute_divisor = d.vertex_attribute_divisor;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -146,6 +164,23 @@ int main() {
         EXPECT(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&unfed.p)) == E_INVALIDARG && !unfed.p);
         pso_desc.InputLayout = {elements, 2};
 
+        // The narrow signed IA formats the draw path used to refuse; each maps to a Vulkan vertex format, so a PSO
+        // whose COLOR input uses one is created.
+        const DXGI_FORMAT narrow_signed_formats[] = {
+            DXGI_FORMAT_R16_SNORM, DXGI_FORMAT_R16_SINT, DXGI_FORMAT_R8G8_SNORM,
+            DXGI_FORMAT_R8G8_SINT, DXGI_FORMAT_R8_SNORM, DXGI_FORMAT_R8_SINT};
+        for (DXGI_FORMAT format : narrow_signed_formats) {
+            D3D12_INPUT_ELEMENT_DESC narrow_elements[2] = {elements[0], elements[1]};
+            narrow_elements[1].Format = format;
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC narrow_desc = pso_desc;
+            narrow_desc.InputLayout = {narrow_elements, 2};
+            // SINT formats feed an integer shader input; SNORM formats feed the float shader.
+            if (format == DXGI_FORMAT_R16_SINT || format == DXGI_FORMAT_R8G8_SINT || format == DXGI_FORMAT_R8_SINT)
+                narrow_desc.VS = {vs_int_container.data(), vs_int_container.size()};
+            Ref<ID3D12PipelineState> narrow;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&narrow_desc, IID_PPV_ARGS(&narrow.p))));
+        }
+
         // Two render-target formats and a depth format, of which draws bind only RTV 0: a variant with the other
         // formats undefined is used at draw time.
         // The unused R8 element ends at byte 13. An appended R8G8 color starts at 14, while rounding to
@@ -170,6 +205,40 @@ int main() {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC instance_desc = pso_desc;
         instance_desc.InputLayout = {instance_elements, 2};
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&instance_desc, IID_PPV_ARGS(&instanced.p))));
+
+        // CachedPSO on a graphics description: what the PC runtime matches, measured on an RTX 3060
+        // (src/cached_pso.h). Flags is not part of it; every state below is.
+        {
+            Ref<ID3DBlob> blob;
+            EXPECT(pso->GetCachedBlob(&blob.p) == S_OK && blob.p && blob->GetBufferSize());
+            auto with_blob = [&](D3D12_GRAPHICS_PIPELINE_STATE_DESC d) {
+                d.CachedPSO = {blob->GetBufferPointer(), blob->GetBufferSize()};
+                Ref<ID3D12PipelineState> made;
+                const HRESULT hr = device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&made.p));
+                return SUCCEEDED(hr) == (made.p != nullptr) ? hr : E_UNEXPECTED;
+            };
+            EXPECT(with_blob(pso_desc) == S_OK);
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC changed = pso_desc;
+            changed.Flags = D3D12_PIPELINE_STATE_FLAG_TOOL_DEBUG;
+            EXPECT(with_blob(changed) == S_OK);
+            EXPECT(with_blob(mrt_desc) == E_INVALIDARG);
+            EXPECT(with_blob(instance_desc) == E_INVALIDARG);
+            changed = pso_desc;
+            changed.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            EXPECT(with_blob(changed) == E_INVALIDARG);
+            changed = pso_desc;
+            changed.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED;
+            EXPECT(with_blob(changed) == E_INVALIDARG);
+            changed = pso_desc;
+            changed.SampleMask = 1;
+            EXPECT(with_blob(changed) == E_INVALIDARG);
+            changed = pso_desc;
+            changed.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
+            EXPECT(with_blob(changed) == E_INVALIDARG);
+            changed = pso_desc;
+            changed.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+            EXPECT(with_blob(changed) == E_INVALIDARG);
+        }
 
         // State that needs a Vulkan feature this test device does not enable is refused, not passed to the driver.
         D3D12_GRAPHICS_PIPELINE_STATE_DESC needs_feature = pso_desc;
@@ -630,7 +699,8 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 4)) && SUCCEEDED(fence->SetEventOnCompletion(4, nullptr)));
+            // Above line 580's 30: a lower value is already reached, so the wait would return at once.
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 31)) && SUCCEEDED(fence->SetEventOnCompletion(31, nullptr)));
             const auto* result = static_cast<const std::uint8_t*>(mapped);
             for (UINT row = 0; row < size; ++row) {
                 for (UINT col = 0; col < size; ++col) {
@@ -641,6 +711,166 @@ int main() {
                                  col, row, got[0], got[1], got[2], got[3], red);
                     return 1;
                 }
+            }
+        }
+
+        // B8G8R8X8 targets have no alpha, so the blend factors that read destination alpha read 1 there, as WARP and
+        // AMD's D3D12 driver blend; B8G8R8A8 with the same cleared bytes reads its stored alpha. Only red, green and
+        // blue are compared: what a draw leaves in the X byte differs between them (WARP writes 0, AMD the blended
+        // alpha), and no view reads it.
+        {
+            const float x8_tint[3] = {0.8f, 0.6f, 0.4f};  // with the full-screen VS's yellow: (0.8, 0.6, 0, 1)
+            void* x8_up = nullptr;
+            EXPECT(SUCCEEDED(upload->Map(0, nullptr, &x8_up)));
+            std::memcpy(static_cast<std::uint8_t*>(x8_up) + 2048, x8_tint, sizeof(x8_tint));
+            upload->Unmap(0, nullptr);
+            const FLOAT x8_clear[4] = {0.2f, 0.4f, 0.6f, 0.25f};
+            struct BlendCase {
+                const char* name;
+                D3D12_BLEND src, dst;
+            };
+            constexpr BlendCase x8_cases[] = {
+                {"src*DEST_ALPHA", D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_ZERO},
+                {"src*INV_DEST_ALPHA", D3D12_BLEND_INV_DEST_ALPHA, D3D12_BLEND_ZERO},
+                {"src*SRC_ALPHA_SAT", D3D12_BLEND_SRC_ALPHA_SAT, D3D12_BLEND_ZERO},
+                {"dst*DEST_ALPHA", D3D12_BLEND_ZERO, D3D12_BLEND_DEST_ALPHA},
+                {"dst*INV_DEST_ALPHA", D3D12_BLEND_ZERO, D3D12_BLEND_INV_DEST_ALPHA},
+            };
+            const D3D12_DESCRIPTOR_HEAP_DESC x8_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                                          D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            Ref<ID3D12DescriptorHeap> x8_heap;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&x8_heap_desc, IID_PPV_ARGS(&x8_heap.p))));
+            const D3D12_CPU_DESCRIPTOR_HANDLE x8_rtv{
+                SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(x8_heap.p, 9))(x8_heap.p))};
+            const D3D12_VIEWPORT x8_viewport{0, 0, 4, 4, 0, 1};
+            const D3D12_RECT x8_scissor{0, 0, 4, 4};
+            UINT64 x8_fence = 40;
+            for (const DXGI_FORMAT format : {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM}) {
+                D3D12_RESOURCE_DESC x8_desc = rt_desc;
+                x8_desc.Width = x8_desc.Height = 4;
+                x8_desc.Format = format;
+                Ref<ID3D12Resource> x8_target;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &x8_desc,
+                                                                 D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                                 IID_PPV_ARGS(&x8_target.p))));
+                device->CreateRenderTargetView(x8_target.p, nullptr, x8_rtv);
+                // The clear stores alpha 64 in both formats.
+                const float dest_alpha = format == DXGI_FORMAT_B8G8R8X8_UNORM ? 1.0f : 64 / 255.0f;
+                for (const BlendCase& c : x8_cases) {
+                    D3D12_GRAPHICS_PIPELINE_STATE_DESC x8_pso_desc = fullscreen_desc;
+                    x8_pso_desc.RTVFormats[0] = format;
+                    x8_pso_desc.BlendState.RenderTarget[0] = {
+                        TRUE, FALSE, c.src, c.dst, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO,
+                        D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
+                    Ref<ID3D12PipelineState> x8_pso;
+                    EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&x8_pso_desc, IID_PPV_ARGS(&x8_pso.p))));
+                    EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, x8_pso.p)));
+                    list->ClearRenderTargetView(x8_rtv, x8_clear, 0, nullptr);
+                    list->SetGraphicsRootSignature(root.p);
+                    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    list->RSSetViewports(1, &x8_viewport);
+                    list->RSSetScissorRects(1, &x8_scissor);
+                    list->OMSetRenderTargets(1, &x8_rtv, FALSE, nullptr);
+                    list->SetGraphicsRootConstantBufferView(1, upload_va + 2048);
+                    list->DrawInstanced(3, 1, 0, 0);
+                    const auto x8_to_copy = transition(x8_target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                       D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    list->ResourceBarrier(1, &x8_to_copy);
+                    D3D12_TEXTURE_COPY_LOCATION x8_dst{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+                    x8_dst.PlacedFootprint = {0, {format, 4, 4, 1, 256}};
+                    D3D12_TEXTURE_COPY_LOCATION x8_src{x8_target.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+                    list->CopyTextureRegion(&x8_dst, 0, 0, 0, &x8_src, nullptr);
+                    const auto x8_to_target = transition(x8_target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                         D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    list->ResourceBarrier(1, &x8_to_target);
+                    EXPECT(list->Close() == S_OK);
+                    queue->ExecuteCommandLists(1, lists);
+                    EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                    ++x8_fence;
+                    EXPECT(SUCCEEDED(queue->Signal(fence.p, x8_fence)) &&
+                           SUCCEEDED(fence->SetEventOnCompletion(x8_fence, nullptr)));
+                    // Source (0.8, 0.6, 0) with alpha 1, destination the cleared bytes; SRC_ALPHA_SAT is
+                    // min(1, 1 - dest alpha).
+                    const float source[3] = {0.8f, 0.6f, 0.0f}, dest[3] = {51 / 255.0f, 102 / 255.0f, 153 / 255.0f};
+                    const auto factor = [&](D3D12_BLEND b) {
+                        return b == D3D12_BLEND_DEST_ALPHA ? dest_alpha : b == D3D12_BLEND_ZERO ? 0.0f : 1 - dest_alpha;
+                    };
+                    const auto* got = static_cast<const std::uint8_t*>(mapped);
+                    for (UINT ch = 0; ch < 3; ++ch) {  // R, G, B, at bytes 2, 1, 0
+                        const float value = source[ch] * factor(c.src) + dest[ch] * factor(c.dst);
+                        const int want = int(std::min(1.0f, value) * 255 + 0.5f);
+                        if (std::abs(int(got[2 - ch]) - want) <= 1) continue;
+                        std::fprintf(stderr, "%s target, %s: got B,G,R %u,%u,%u, channel %u wants %d\n",
+                                     format == DXGI_FORMAT_B8G8R8X8_UNORM ? "B8G8R8X8" : "B8G8R8A8", c.name, got[0],
+                                     got[1], got[2], ch, want);
+                        return 1;
+                    }
+                }
+            }
+            std::printf("B8G8R8X8: %u blends that read destination alpha read 1, B8G8R8A8 its stored alpha\n",
+                        unsigned(std::size(x8_cases)));
+        }
+
+        // Instance step rate > 1 (VK_KHR/EXT_vertex_attribute_divisor): two per-instance colours in slot 1:
+        // entry 0 = red, entry 1 = magenta (both preserved by the {1,0,1} tint). With step rate 2:
+        // - Draw 1 (top-left, 2 instances from 0): instances 0 and 1 both read entry 0/2 = 0 (red).
+        // - Draw 2 (bottom-right, 3 instances from 0): instance 2 reads entry 2/2 = 1 (magenta) on top.
+        // Negative control (step rate 1, same 2-instance draw at top-left): instance 1 reads entry 1 (magenta) over
+        // instance 0, flipping all 1,024 top-left pixels from red to magenta.
+        if (has_divisor) {
+            const std::uint8_t inst_colors[2][4] = {{255, 0, 0, 255}, {255, 0, 255, 255}};
+            void* up_ptr = nullptr;
+            EXPECT(SUCCEEDED(upload->Map(0, nullptr, &up_ptr)));
+            std::memcpy(static_cast<std::uint8_t*>(up_ptr) + 1024, inst_colors, sizeof(inst_colors));
+            upload->Unmap(0, nullptr);
+
+            const D3D12_INPUT_ELEMENT_DESC step2_elements[2] = {
+                {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 2},
+            };
+            const D3D12_INPUT_ELEMENT_DESC step1_elements[2] = {
+                {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
+            };
+            auto step_desc = pso_desc;
+            Ref<ID3D12PipelineState> step2_pso, step1_pso;
+            step_desc.InputLayout = {step2_elements, 2};
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&step_desc, IID_PPV_ARGS(&step2_pso.p))));
+            step_desc.InputLayout = {step1_elements, 2};
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&step_desc, IID_PPV_ARGS(&step1_pso.p))));
+
+            const D3D12_VERTEX_BUFFER_VIEW step_vbvs[2] = {vbv, {upload_va + 1024, sizeof(inst_colors), 4}};
+            const float br_offset[2] = {1.0f, -1.0f};
+            UINT64 step_fence = 60;
+            for (UINT pass = 0; pass < 2; ++pass) {
+                EXPECT(SUCCEEDED(allocator->Reset()) &&
+                       SUCCEEDED(list->Reset(allocator.p, pass == 0 ? step2_pso.p : step1_pso.p)));
+                list->ResourceBarrier(1, &to_target);
+                list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+                list->SetGraphicsRootSignature(root.p);
+                list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                list->IASetVertexBuffers(0, 2, step_vbvs);
+                list->IASetIndexBuffer(&ibv);
+                list->RSSetViewports(1, &viewport);
+                list->RSSetScissorRects(1, &scissor);
+                list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+                list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+                list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+                list->DrawIndexedInstanced(6, 2, 0, 0, 0);
+                if (pass == 0) {
+                    list->SetGraphicsRoot32BitConstants(0, 2, br_offset, 0);
+                    list->DrawIndexedInstanced(6, 3, 0, 0, 0);
+                }
+                list->ResourceBarrier(1, &to_copy);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                EXPECT(list->Close() == S_OK);
+                queue->ExecuteCommandLists(1, lists);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                ++step_fence;
+                EXPECT(SUCCEEDED(queue->Signal(fence.p, step_fence)) &&
+                       SUCCEEDED(fence->SetEventOnCompletion(step_fence, nullptr)));
+                auto& dst_buf = pass == 0 ? step2_pixels : step1_pixels;
+                std::memcpy(dst_buf.data(), mapped, dst_buf.size());
             }
         }
 
@@ -665,7 +895,6 @@ int main() {
         fence.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
-    std::filesystem::remove_all(library);
 
     unsigned mismatches = 0;
     for (UINT row = 0; row < size; ++row) {
@@ -759,6 +988,35 @@ int main() {
         std::printf("4x MSAA graphics pipeline: 4096/4096 resolved pixels matched (SampleMask 0x5 changed %u/%u "
                     "top-left pixels to purple)\n",
                     half_changed, (size / 2) * (size / 2));
+    }
+    if (has_divisor) {
+        UINT step1_flipped = 0;
+        for (UINT row = 0; row < size; ++row) {
+            for (UINT col = 0; col < size; ++col) {
+                const bool top = row < size / 2, left = col < size / 2;
+                using Pixel = std::array<std::uint8_t, 4>;
+                const Pixel want2 = top && left     ? Pixel{255, 0, 0, 255}
+                                    : !top && !left ? Pixel{255, 0, 255, 255}
+                                                    : Pixel{0, 0, 255, 255};
+                const std::uint8_t* got2 = step2_pixels.data() + row * 256 + col * 4;
+                if (!std::equal(want2.begin(), want2.end(), got2) && mismatches++ < 6)
+                    std::fprintf(stderr, "step-rate 2 pixel (%u,%u): got %u,%u,%u,%u want %u,%u,%u,%u\n", col, row,
+                                 got2[0], got2[1], got2[2], got2[3], want2[0], want2[1], want2[2], want2[3]);
+                if (top && left) {
+                    const std::uint8_t* got1 = step1_pixels.data() + row * 256 + col * 4;
+                    const Pixel want1{255, 0, 255, 255};
+                    if (!std::equal(want1.begin(), want1.end(), got1) && mismatches++ < 6)
+                        std::fprintf(stderr, "step-rate 1 control (%u,%u): got %u,%u,%u,%u want 255,0,255,255\n", col,
+                                     row, got1[0], got1[1], got1[2], got1[3]);
+                    if (std::memcmp(got1, got2, 4) != 0) ++step1_flipped;
+                }
+            }
+        }
+        EXPECT(!mismatches);
+        EXPECT(step1_flipped == (size / 2) * (size / 2));
+        std::printf("instance step rate 2: 4096/4096 pixels matched (step-rate 1 control flipped %u/%u top-left "
+                    "pixels from red to magenta)\n",
+                    step1_flipped, (size / 2) * (size / 2));
     }
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());

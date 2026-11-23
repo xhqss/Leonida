@@ -10,6 +10,7 @@
 // Each case also prints a control run with the layer's size request switched off, to show what the request changes
 // on this GPU; the control is not judged. No game data. Set LEONIDA_VK_VALIDATION=1 to run under
 // VK_LAYER_KHRONOS_validation; validation errors fail the test.
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../src/shader_library.h"
@@ -313,14 +314,14 @@ struct LibraryEntry {
 
 // A translator-style folder with the entries' modules, every entry keyed by the fixture program's hash.
 std::filesystem::path make_library(const std::string& tag, const std::vector<LibraryEntry>& entries) {
-    const auto dir = std::filesystem::temp_directory_path() / ("leonida_subgroup_" + tag);
+    const auto dir = testfiles::process_temp_dir("leonida_subgroup_" + tag);
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
     std::ofstream index(dir / "index.json", std::ios::binary);
     index << "{";
     bool first = true;
     for (const LibraryEntry& e : entries) {
-        std::filesystem::copy_file(e.spv, dir / (e.name + ".spv"), std::filesystem::copy_options::overwrite_existing);
+        testfiles::copy_file(e.spv, dir / (e.name + ".spv"));  // a missing module is reported, and the PSO fails
         index << (first ? "" : ",\n") << "\"" << e.name << "\": {\"stage\": \"" << e.stage << "\", \"fssm_sha256\": \""
               << leonida::sha256_hex(fixture_fssm()) << "\", \"bindings\": [], \"push_constant_bytes\": 144, "
               << e.tail << "}";

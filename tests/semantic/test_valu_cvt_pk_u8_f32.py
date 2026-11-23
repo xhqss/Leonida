@@ -11,13 +11,11 @@ shaders via run_fragment and multi-lane compute shaders via run_workgroup), and 
 constants and an independent pure-Python binary32 Fraction/RTE reference oracle. Standard library only;
 hand-written RDNA2 disassembly listings only.
 
-Finding on NaN inputs (open item also listed in docs/design.md, "Multiply-add and output modifiers" row):
-  tools/rdna2spirv.py lowers `v_cvt_pk_u8_f32` via `OpExtInst %float %glsl FClamp {x} %f0 %f_255` without an
-  `OpIsNan` guard before `RoundEven` + `OpConvertFToU`. In SPIR-V / GLSL.std.450, `FClamp` with a NaN operand
-  is undefined, so tests/semantic/spirv_mini_interp.py raises `UnsupportedConstruct` for `qNaN`, `-qNaN`, and
-  `sNaN`. Accordingly, `OracleTests` verifies the RDNA2 ISA `NaN -> 0` rule, and `NaNHandlingTests` asserts
-  both the translated SPIR-V structure (`FClamp`, `RoundEven`, `OpConvertFToU`) and that `spirv_mini_interp.py`
-  rejects NaN inputs with `UnsupportedConstruct` rather than returning a fabricated value.
+NaN inputs (docs/design.md, "Float-to-byte pack" row): `FClamp` with a NaN operand is undefined in
+  GLSL.std.450, so tools/rdna2spirv.py finds a NaN from its bits and selects +0 before `FClamp`, then
+  `RoundEven` + `OpConvertFToU`. `OracleTests` verifies the RDNA2 ISA `NaN -> 0` rule (also measured on
+  hardware, #358), and `NaNHandlingTests` runs qNaN, -qNaN, sNaN and NaN under `abs`/`neg` through
+  `spirv_mini_interp.py` and checks byte 0.
 """
 import gc
 import os
@@ -662,16 +660,14 @@ class ExecMaskingTests(unittest.TestCase):
 
 
 # -----------------------------------------------------------------------------
-# 5. NaN Inputs (Documented Open Gap in Translator SPIR-V Lowering)
+# 5. NaN Inputs
 # -----------------------------------------------------------------------------
 
 class NaNHandlingTests(unittest.TestCase):
-    """v_cvt_pk_u8_f32 emits FClamp without an OpIsNan guard (docs/design.md line 287).
+    """A NaN source gives byte 0 (measured on RDNA2, #358): the translator selects +0 before FClamp,
+    which GLSL.std.450 leaves undefined for a NaN operand, so the interpreter now runs these cases."""
 
-    In spirv_mini_interp.py, FClamp on NaN raises UnsupportedConstruct because GLSL.std.450 leaves it undefined.
-    """
-
-    def test_nan_translation_and_interpreter_rejection(self):
+    def test_nan_gives_zero_byte(self):
         nan_cases = [
             ("qnan", F32_QNAN, "v1"),
             ("neg_qnan", F32_NEG_QNAN, "v1"),
@@ -692,8 +688,7 @@ class NaNHandlingTests(unittest.TestCase):
                 self.assertIn("glsl FClamp", spv)
                 self.assertIn("glsl RoundEven", spv)
                 self.assertIn("OpConvertFToU", spv)
-                with self.assertRaisesRegex(si.UnsupportedConstruct, r"FClamp.*undefined"):
-                    si.run_fragment(spv)
+                self.assertEqual(si.run_fragment(spv)["%out_mrt0"][0], ref_cvt_pk_u8_f32(xb, 0, OLD))
 
 
 # -----------------------------------------------------------------------------

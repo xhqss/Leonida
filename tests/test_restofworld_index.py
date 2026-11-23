@@ -327,6 +327,47 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("output must not overwrite the source archive", result.stderr)
 
+    def test_cli_rejects_output_aliasing_directory_payload_or_index(self):
+        folder = os.path.join(self.root, "carved_alias")
+        os.makedirs(folder)
+        payload = page()
+        with open(os.path.join(folder, f"{0x1000:012x}.bin"), "wb") as f:
+            f.write(payload)
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as f:
+            f.write("{}")
+        original = payload
+
+        # Directly overwriting the carved payload.
+        direct = subprocess.run(
+            [sys.executable, "-I", TOOL, folder, os.path.join(folder, f"{0x1000:012x}.bin")],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(direct.returncode, 2, direct.stderr)
+        self.assertIn("output must not overwrite the source archive", direct.stderr)
+
+        # A hard link at a JSON path naming the payload.
+        link = os.path.join(self.root, "payload.json")
+        os.link(os.path.join(folder, f"{0x1000:012x}.bin"), link)
+        linked = subprocess.run(
+            [sys.executable, "-I", TOOL, folder, link],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(linked.returncode, 2, linked.stderr)
+        self.assertIn("output must not overwrite the source archive", linked.stderr)
+
+        # Overwriting index.json, part of the carve.
+        idx = subprocess.run(
+            [sys.executable, "-I", TOOL, folder, os.path.join(folder, "index.json")],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(idx.returncode, 2, idx.stderr)
+        self.assertIn("output must not overwrite the source archive", idx.stderr)
+
+        # None of the inputs changed, and the bytes are preserved.
+        with open(os.path.join(folder, f"{0x1000:012x}.bin"), "rb") as f:
+            self.assertEqual(f.read(), original, "the carved payload was overwritten")
+        with open(os.path.join(folder, "index.json"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "{}", "the index was overwritten")
+        with open(link, "rb") as f:
+            self.assertEqual(f.read(), original, "the hard link target changed")
+
     def test_cli(self):
         out = os.path.join(self.root, "cli.json")
         proc = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
@@ -433,6 +474,132 @@ class ArchiveTest(unittest.TestCase):
                 if not m.closed:
                     m.close()
 
+
+class FolderModeStoredBytesTest(unittest.TestCase):
+    """A carve folder's stored (compressed) sizes and span come from rpf9_carve.py's index.json, as in archive mode;
+    without an index the length on disk is all there is."""
+
+    def make(self, tmp, with_index):
+        data = b"raw bytes " * 100                                   # 1,000 inflated bytes
+        with open(os.path.join(tmp, "000000001000.bin"), "wb") as f:
+            f.write(data)
+        if with_index:
+            index = {"summary": {"span": 2000, "zero_padding": 500, "unread_bytes": 1200},
+                     "files": [{"off": 0x1000, "stored": 300, "size": 1000}]}
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
+                json.dump(index, f)
+
+    def test_index_json_supplies_stored_bytes_and_span(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.make(tmp, with_index=True)
+            rows, summary = restofworld_index.scan_dir(tmp)
+        self.assertEqual(rows[0]["stored"], 300)
+        self.assertEqual((summary["compressed_bytes"], summary["inflated_bytes"]), (300, 1000))
+        self.assertAlmostEqual(summary["readable_fraction"], 300 / 2000, places=4)
+
+    def test_without_an_index_the_length_on_disk_is_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.make(tmp, with_index=False)
+            rows, summary = restofworld_index.scan_dir(tmp)
+        self.assertEqual((rows[0]["stored"], summary["compressed_bytes"]), (1000, 1000))
+
+
+def _synth_tex_descriptor(gpu_off, w, h, dxgi_fmt, flags_lo=5, mips=1, dtype=0x980, depth=1):
+    """Build one synthetic 8-qword RAGE9 texture descriptor (q[k-2]..q[k+5])."""
+    buf = bytearray(64)
+    struct.pack_into("<Q", buf, 0, 0)                                # q[k-2] packed
+    struct.pack_into("<Q", buf, 8, dtype)                            # q[k-1] dtype (0x980)
+    struct.pack_into("<Q", buf, 16, 0x60000000 + gpu_off)            # q[k]   GPU pointer
+    struct.pack_into("<HHHBB", buf, 48, w, h, depth, 1, dxgi_fmt)    # q[k+4] dims + DXGI fmt
+    struct.pack_into("<Q", buf, 56, flags_lo | (mips << 16))         # q[k+5] tiling + mips
+    return bytes(buf)
+
+
+def _synth_pg_tex_dict(descs):
+    """Build a synthetic zero-prefix pgDictionary<grcTexture> stream with len(descs) entries."""
+    header = bytearray(0x60)
+    struct.pack_into("<Q", header, 8, 0x50000040)
+    struct.pack_into("<Q", header, 16, 0)
+    struct.pack_into("<QHHxxxxQHH", header, 0x20,
+                     0x50000050, len(descs), len(descs),
+                     0x50000060, len(descs), len(descs))
+    return bytes(header) + b"".join(descs)
+
+
+class RageTextureDetectionTest(unittest.TestCase):
+    def test_pg_dictionary_of_bc_textures(self):
+        blob = _synth_pg_tex_dict([
+            _synth_tex_descriptor(0x0, 256, 256, 71, flags_lo=5, mips=7),     # BC1_UNORM
+            _synth_tex_descriptor(0x10000, 128, 128, 98, flags_lo=5, mips=6), # BC7_UNORM
+        ])
+        row = restofworld_index.classify(blob, 0x2000, 128)
+        self.assertEqual(row["signature"], "zero-prefix")
+        self.assertEqual(row["count"], 2)
+        self.assertIn("tex980=2;dict=1", row["detail"])
+        self.assertIn("BC1_UNORM:1", row["detail"])
+        self.assertIn("BC7_UNORM:1", row["detail"])
+
+    def test_dictionary_keeps_small_textures_and_counts_all_descriptors(self) -> None:
+        blob = _synth_pg_tex_dict([
+            _synth_tex_descriptor(0, 256, 256, 71, mips=7),
+            _synth_tex_descriptor(0x10000, 1, 2, 28, mips=2),
+        ])
+        row = restofworld_index.classify(blob, 0x2000, 128)
+        self.assertEqual(row["count"], 2)
+        self.assertIn("tex980=2;dict=1", row["detail"])
+        self.assertIn("R8G8B8A8_UNORM:1", row["detail"])
+        summary = restofworld_index.summarise([row], span=128, zero=0, unread=0)
+        self.assertEqual((summary["texture_dictionaries"], summary["texture_headers"]), (1, 2))
+
+    def test_small_texture_with_invalid_mip_count_is_excluded(self) -> None:
+        for mips in (0, 3):
+            with self.subTest(mips=mips):
+                descriptor = _synth_tex_descriptor(0, 1, 2, 28, mips=mips)
+                self.assertEqual(restofworld_index.find_rage_textures(descriptor), [])
+
+    def test_non_dict_resource_page_with_linear_f16_texture(self):
+        header = bytearray(0x60)
+        struct.pack_into("<QQ", header, 8, 0x50000040, 0x50000080)  # u10 != 0 -> not standalone pgDictionary
+        blob = bytes(header) + _synth_tex_descriptor(0x0, 16, 4, 10, flags_lo=0, mips=1)  # R16G16B16A16_FLOAT
+        row = restofworld_index.classify(blob, 0x3000, 96)
+        self.assertEqual(row["signature"], "zero-prefix")
+        self.assertEqual(row["count"], 1)
+        self.assertIn("tex980=1;dict=0", row["detail"])
+        self.assertIn("R16G16B16A16_FLOAT:1", row["detail"])
+
+    def test_negative_controls_reject_bad_dtype_unaligned_and_unknown_fmt(self):
+        bad_dtype = _synth_pg_tex_dict([_synth_tex_descriptor(0x0, 256, 256, 71, dtype=0x123)])
+        bad_align = _synth_pg_tex_dict([_synth_tex_descriptor(0x10, 256, 256, 71)])
+        bad_fmt = _synth_pg_tex_dict([_synth_tex_descriptor(0x0, 256, 256, 250)])
+        for blob in (bad_dtype, bad_align, bad_fmt):
+            row = restofworld_index.classify(blob, 0x4000, 64)
+            self.assertEqual(row["signature"], "zero-prefix")
+            self.assertIsNone(row["count"])
+            self.assertNotIn("tex980=", row["detail"])
+
+    def test_scan_rpf_reports_texture_summary_past_256_bytes(self):
+        # Put the 0x980 descriptor past byte 256 so scan_rpf must keep the zero-prefix body to find it.
+        header = bytearray(0x140)
+        struct.pack_into("<Q", header, 8, 0x50000040)
+        struct.pack_into("<QHHxxxxQHH", header, 0x20, 0x50000050, 1, 1, 0x50000060, 1, 1)
+        dict_blob = bytes(header) + _synth_tex_descriptor(0x0, 256, 256, 71, flags_lo=5, mips=7)
+        non_dict = bytes(8) + struct.pack("<QQ", 0x50000040, 0x50000080) + bytes(0x120) + _synth_tex_descriptor(
+            0x0, 16, 4, 10, flags_lo=0, mips=1)
+        with tempfile.TemporaryDirectory() as td:
+            rpf = os.path.join(td, "tex.rpf")
+            data_start = 0x100
+            body = bytearray(data_start)
+            body[:4] = b"9FPR"
+            struct.pack_into("<I", body, 4, data_start)
+            body += zlib.compress(dict_blob)
+            body += zlib.compress(non_dict)
+            with open(rpf, "wb") as f:
+                f.write(body)
+            rows, summary = restofworld_index.scan_rpf(rpf)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(summary["texture_streams"], 2)
+        self.assertEqual(summary["texture_dictionaries"], 1)
+        self.assertEqual(summary["texture_headers"], 2)
 
 if __name__ == "__main__":
     unittest.main()

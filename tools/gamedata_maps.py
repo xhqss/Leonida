@@ -56,12 +56,19 @@ Both formats scale a u8 value into the header's Z box:
 files). Only header fields, dimensions, row counts and value ranges are
 printed or written; the height bytes are not. Standard library only.
 """
+from __future__ import annotations
+
 import argparse
 import json
 import math
 import os
 import struct
 import sys
+import unicodedata
+
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 
 MAGIC = (b"MHIU", b"PAMH", b"SPS1Z")
 HEADER = 44
@@ -314,10 +321,15 @@ def _join(row: dict, data: bytes) -> dict:
     return out
 
 
-def read_payloads(directory: str) -> list[dict]:
+def _read_index_rows(directory: str) -> list[dict]:
     with open(os.path.join(directory, "index.json"), encoding="utf-8") as f:
         index = json.load(f)
-    rows = sorted(index["files"], key=lambda r: r["off"])
+    return sorted(index["files"], key=lambda r: r["off"])
+
+
+def read_payloads(directory: str, rows: list[dict] | None = None) -> list[dict]:
+    if rows is None:
+        rows = _read_index_rows(directory)
     out = []
     i = 0
     while i < len(rows):
@@ -331,7 +343,8 @@ def read_payloads(directory: str) -> list[dict]:
         size = len(data)
         parts = [data]
         j = i
-        while size < target_size and rows[j].get("size") == 65536 and j + 1 < len(rows):
+        # The header's size bounds the join, so any whole number of 64 KiB blocks may continue (as in gamedata_index).
+        while size < target_size and rows[j].get("size", 0) and rows[j]["size"] % 65536 == 0 and j + 1 < len(rows):
             nxt = _read_row(directory, rows[j + 1])
             if nxt[:4] in MAGIC or nxt.startswith((b"<?xml", b"\xef\xbb\xbf<")):
                 break
@@ -350,14 +363,153 @@ def _public(payload: dict) -> dict:
     return {k: v for k, v in payload.items() if not k.startswith("_")}
 
 
+_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
+
+
+def _resolve_report_path(path: str) -> str:
+    if os.name != "nt":
+        return os.path.realpath(path)
+    if not path.startswith("\\\\?\\"):
+        # GetFullPathName normalizes ordinary Windows paths the same way opening them does.
+        return os.path.realpath(os.path.abspath(path))
+    # realpath can trim literal trailing dots and spaces from missing verbatim components.
+    # Resolve the existing ancestor and append the missing components as written.
+    missing = []
+    while not os.path.lexists(path):
+        parent, name = os.path.split(path)
+        if not name:
+            break
+        missing.append(name)
+        path = parent
+    return os.path.join(os.path.realpath(path), *reversed(missing))
+
+
+def _case_insensitive_volume(path: str) -> bool:
+    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
+    os.path.normcase folds case only on Windows, so on macOS `INDEX.JSON` and `index.json` would otherwise
+    look like two different paths."""
+    if sys.platform != "darwin":
+        return False
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    try:
+        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
+    except (OSError, ValueError):
+        return True  # the macOS default; folding can only refuse a collision, never overwrite an input
+
+
+def _path_key(path: str) -> str:
+    path = os.path.normcase(_resolve_report_path(path))
+    if os.name != "nt":
+        if _case_insensitive_volume(path):
+            # APFS and HFS+ also treat composed and decomposed accents as one name.
+            path = unicodedata.normalize("NFD", path.casefold())
+        return path
+    # Drive and UNC paths can also be spelled using the extended-length prefix.
+    extended_prefix = "\\\\?\\"
+    unc_prefix = extended_prefix + "unc\\"
+    if path.startswith(unc_prefix):
+        return "\\\\" + path[len(unc_prefix):]
+    drive, _ = os.path.splitdrive(path)
+    if drive.startswith(extended_prefix) and len(drive) == len(extended_prefix) + 2 and drive.endswith(":"):
+        return path[len(extended_prefix):]
+    return path
+
+
+def _file_identity(path: str):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
+
+
+def _matches_candidate(out_key: str, out_id, out_in_carve: bool, out_name_folded: str,
+                       candidate: str, name: str, is_symlink: bool | None = None) -> bool:
+    if out_id is not None:
+        cand_id = _file_identity(candidate)
+        if cand_id is not None and cand_id == out_id:
+            return True
+    if is_symlink is None:
+        is_symlink = os.path.islink(candidate)
+    if is_symlink:
+        return _path_key(candidate) == out_key
+    if out_in_carve and unicodedata.normalize("NFD", name.casefold()) == out_name_folded:
+        return _path_key(candidate) == out_key
+    return False
+
+
+def check_report_path(out_path: str, carve_dir: str, rows: list[dict] | None = None) -> None:
+    """Refuse a --json path that points to an existing directory or collides with any carve input."""
+    if same_report_path(out_path, carve_dir):
+        raise ValueError(f"--json would overwrite the input {carve_dir}")
+    if os.path.isdir(out_path):
+        raise ValueError(f"--json is a directory: {out_path}")
+    index_path = os.path.join(carve_dir, "index.json")
+    if same_report_path(out_path, index_path):
+        raise ValueError(f"--json would overwrite the input {index_path}")
+
+    out_key = _path_key(out_path)
+    out_id = _file_identity(out_path)
+    carve_key = _path_key(carve_dir)
+    out_in_carve = os.path.dirname(out_key) == carve_key
+    out_name_folded = unicodedata.normalize("NFD", os.path.basename(out_key).casefold())
+
+    if rows is None:
+        if not os.path.isdir(carve_dir):
+            return
+        try:
+            entries = os.scandir(carve_dir)
+        except OSError:
+            return
+        with entries:
+            for entry in entries:
+                if not entry.name.lower().endswith(".bin"):
+                    continue
+                try:
+                    if entry.is_dir():
+                        continue
+                    is_link = entry.is_symlink()
+                except OSError:
+                    continue
+                if _matches_candidate(out_key, out_id, out_in_carve, out_name_folded,
+                                      entry.path, entry.name, is_link):
+                    raise ValueError(f"--json would overwrite the input {entry.path}")
+    else:
+        for row in rows:
+            name = f'{row["off"]:012x}.bin'
+            candidate = os.path.join(carve_dir, name)
+            if _matches_candidate(out_key, out_id, out_in_carve, out_name_folded,
+                                  candidate, name):
+                raise ValueError(f"--json would overwrite the input {candidate}")
+
+
+def _make_parent(path: str) -> None:
+    """Create the folder an output path lives in so a missing folder does not lose a finished scan."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("carve_dir", help="rpf9_carve.py output directory")
     ap.add_argument("--json", help="write the decoded header and grid summary to this JSON")
     a = ap.parse_args()
+    if not os.path.exists(a.carve_dir):
+        print(f"ERROR: {a.carve_dir}: does not exist", file=sys.stderr)
+        return 2
 
     try:
-        payloads = read_payloads(a.carve_dir)
+        if a.json:
+            check_report_path(a.json, a.carve_dir)
+        rows = _read_index_rows(a.carve_dir)
+        if a.json:
+            check_report_path(a.json, a.carve_dir, rows=rows)
+        payloads = read_payloads(a.carve_dir, rows=rows)
     except (OSError, ValueError, KeyError, TypeError, struct.error) as e:
         print("error:", e, file=sys.stderr)
         return 1
@@ -385,7 +537,8 @@ def main() -> int:
         if census:
             out["pamh_census"] = census
         try:
-            with open(a.json, "w", encoding="utf-8") as f:
+            _make_parent(a.json)
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(out, f, indent=1)
         except OSError as e:
             print(f"error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)

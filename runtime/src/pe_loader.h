@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -45,12 +47,13 @@ struct Module {
 
     // Static TLS (IMAGE_DIRECTORY_ENTRY_TLS). load() installs tls_block in the calling thread and writes tls_index to
     // the image's _tls_index. tls_index names TEB->ThreadLocalStoragePointer[tls_index], the array
-    // __declspec(thread) reads; it is not a TlsAlloc slot. The loader reserves the index by loading
-    // gta6rt_tls_host.dll, so only one manually mapped TLS module can be live at a time; a second one is rejected
-    // rather than sharing (and corrupting) the slot. Every thread started after load() gets its own copy through the
-    // helper's DLL_THREAD_ATTACH, and gives it back at DLL_THREAD_DETACH; install_tls_for_thread() is for threads
-    // that already existed.
+    // __declspec(thread) reads; it is not a TlsAlloc slot. The loader reserves distinct indices by loading
+    // gta6rt_tls_host.dll (and cloning it on demand for additional simultaneous TLS modules, up to 16 at a time).
+    // Every thread started after load() gets its own copy through the helper's DLL_THREAD_ATTACH, and gives it back
+    // at DLL_THREAD_DETACH; install_tls_for_thread() is for threads that already existed.
     uint32_t tls_index = kNoTlsIndex;
+    uint32_t tls_slot = kNoTlsIndex;   // index into the loader's reserved TLS-host slot pool
+    uint64_t tls_generation = 0;       // unique token per TLS initialisation, distinguishing reused slots/addresses
     void* tls_block = nullptr;         // calling thread's copy of the image's template
     void* tls_saved_block = nullptr;   // helper DLL block replaced in that thread, restored by ~Loader
     uint32_t tls_block_size = 0;       // raw template + zero fill
@@ -77,6 +80,11 @@ public:
 
     const std::vector<Module*>& modules() const { return order_; }
 
+    // The mapped module `address` lies in, with its RVA there. Safe from any thread at any time, also while another
+    // thread is in load(): it is what the shim registry asks for a caller's module (rt::shims::mapped_image_base on
+    // every C++ throw from a mapped image, and the trace and stop lines), and it reads its own table, not modules().
+    bool find_address(uint64_t address, std::string& module, uint32_t& rva) const;
+
     // The order initialise() runs modules in: each module after every module it imports (a cycle is broken at the
     // module that closed it). modules() is mapping order, which puts an importer before its imports.
     const std::vector<Module*>& initialisation_order() const { return init_order_; }
@@ -98,10 +106,17 @@ public:
     // Installs/removes this module's template copy in the calling thread's TEB slot. load() does this for its caller
     // and the thread events for threads started after it; both are no-ops on a thread that already has this module's
     // copy. Call install on a thread that existed before load(), before mapped code runs there, and uninstall before
-    // that thread exits. Only one TLS module can be installed in a thread. These do not run TLS callbacks (use
+    // that thread exits. Each module's copy sits in its own TEB slot, so one thread can hold copies of several
+    // modules. These do not run TLS callbacks (use
     // run_tls_callbacks with DLL_THREAD_ATTACH/DETACH for that).
     void install_tls_for_thread(Module& m);
     void uninstall_tls_for_thread(Module& m);
+
+    // Run-time module lookup/loading used by the library_loader shim for bundled package DLLs.
+    void* find_loaded_module(const std::string& dll_lower) const;
+    void* load_runtime_module(const std::string& dll_lower, uint32_t flags, bool& handled);
+    void* resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle);
+    bool owns_module_handle(void* module_handle) const;
 
 private:
     void initialise(Module& m);
@@ -115,11 +130,28 @@ private:
     void protect_sections(Module& m);
     void register_unwind(Module& m);
 
+    mutable std::recursive_mutex mutex_;
     std::filesystem::path game_dir_;
     std::map<std::string, Module*> by_name_;  // lower-case file name
     std::vector<Module*> order_;       // mapping order; owns the modules
     std::vector<Module*> init_order_;  // dependencies first, see initialisation_order()
+
+    // What find_address reads: one entry per mapped image, added once its memory exists. Under ranges_mutex_, a leaf
+    // lock: mutex_ is held while image code runs and the registry holds its own lock around the lookup, so the
+    // lookup must not wait for either.
+    struct MappedRange {
+        uint64_t base = 0;
+        uint32_t size = 0;
+        std::string name;
+    };
+    mutable std::shared_mutex ranges_mutex_;  // shared in find_address: lookups on different threads do not queue
+    std::vector<MappedRange> ranges_;
 };
+
+// Frees the TLS helper clones load() created and deletes their files (Module::tls_index background). load()
+// registers this with atexit; a caller that ends with ExitProcess must invoke it directly, because ExitProcess
+// skips the atexit table. Call it when no mapped code can run again: it unmaps the helper images.
+void cleanup_tls_clones();
 
 std::string lower(std::string s);
 

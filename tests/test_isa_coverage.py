@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS_DIR = os.path.join(ROOT, "tools")
@@ -46,6 +48,10 @@ FIXTURE_XML = (
     + _ins("IMAGE_LOAD", "ENC_MIMG", "MIMG_NSA1")
     + _ins("S_ENDPGM", "ENC_SOPP")
     + _ins("EXP", "ENC_EXP")
+    + _ins("S_AND_SAVEEXEC_B64", "ENC_SOP1")
+    + _ins("S_XOR_SAVEEXEC_B64", "ENC_SOP1")
+    + _ins("V_SHR_HI", "ENC_VOP1")
+    + _ins("V_SHR_LO", "ENC_VOP1")
     + "</Instructions></ISA></Spec>")
 
 FIXTURE_SRC = '''
@@ -58,6 +64,8 @@ def base_op(op):
 
 
 class Gen:
+    LOGIC = {"and": 1, "or": 2}
+
     def _insn(self, ins):
         op = base_op(ins["op"])
         if op in ("s_denorm_mode",):
@@ -73,6 +81,12 @@ class Gen:
                 raise Unsupported(op + " form")
         elif op == "exp":
             pass
+        elif op.endswith("_saveexec_b64") and op[2:].split("_saveexec")[0] in self.LOGIC:
+            pass
+        elif op.endswith("_hi") and flag:
+            pass
+        elif op.endswith("_lo"):
+            raise Unsupported(op)
         else:
             raise Unsupported(op)
 
@@ -86,6 +100,29 @@ def _fixture(text, suffix):
     f.write(text)
     f.close()
     return f.name
+
+
+class LlvmProbeTests(unittest.TestCase):
+    def test_backend_failure_is_not_instruction_support(self) -> None:
+        diagnostic = "llvm-mc: error: unable to get target for 'amdgcn'"
+        failure = subprocess.CompletedProcess(["llvm-mc"], 1, "", diagnostic)
+        with patch.object(ic.subprocess, "run", return_value=failure):
+            outcome = ic.probe_llvm_mc("llvm-mc", ["s_endpgm"])["s_endpgm"]
+        self.assertEqual(outcome, f"LLVM probe failed (exit 1): {diagnostic}")
+
+    def test_reports_success_and_known_instruction_diagnostics(self) -> None:
+        probes = (
+            ("s_endpgm", 0, "", "LLVM: valid on gfx1013"),
+            ("v_add_f32", 1, "<stdin>:1:1: error: too few operands for instruction", "LLVM: valid on gfx1013"),
+            ("v_bogus", 1, "<stdin>:1:1: error: invalid instruction", "unknown to LLVM"),
+            ("v_wmma_f32", 1, "<stdin>:1:1: error: instruction not supported on this GPU",
+             "LLVM: other GPU only (not gfx1013)"),
+        )
+        for name, code, diagnostic, expected in probes:
+            with self.subTest(name=name):
+                outcome = subprocess.CompletedProcess(["llvm-mc"], code, "", diagnostic)
+                with patch.object(ic.subprocess, "run", return_value=outcome):
+                    self.assertEqual(ic.probe_llvm_mc("llvm-mc", [name]), {name: expected})
 
 
 class FixtureTests(unittest.TestCase):
@@ -122,7 +159,16 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(c["v_fancy_f32"], "unknown")
         # op.startswith("global_") sits in a helper that is not the dispatch, so it must not count.
         self.assertEqual(c["global_load_dword"], "unknown")
-        self.assertEqual(self.rep["totals"], {"handled-exact": 6, "handled-family": 1, "refused": 1, "unknown": 3})
+        self.assertEqual(self.rep["totals"], {"handled-exact": 6, "handled-family": 2, "refused": 1, "unknown": 6})
+
+    def test_suffix_families(self):
+        c = self.rep["class"]
+        self.assertEqual(c["s_and_saveexec_b64"], "handled-family")
+        self.assertEqual(c["s_xor_saveexec_b64"], "unknown")
+        self.assertEqual(c["v_shr_hi"], "unknown")
+        self.assertEqual(c["v_shr_lo"], "unknown")
+        self.assertEqual(self.rep["suffixes"], {"_saveexec_b64": 1})
+        self.assertIn("Suffix families the dispatch tests with op.endswith", ic.markdown(self.rep))
 
     def test_partial_refusal_is_flagged_but_handled(self):
         self.assertEqual(self.rep["class"]["image_load"], "handled-exact")
@@ -140,6 +186,45 @@ class FixtureTests(unittest.TestCase):
         src = _fixture('def f(op):\n    if op != "s_setreg_imm32_b32":\n        raise Unsupported(op)\n', ".py")
         try:
             self.assertEqual(ic.scan_translator(src)["refused"], [])
+        finally:
+            os.unlink(src)
+
+    def test_accepted_names_keeps_tuple_comparators_when_refusal_uses_tuple(self):
+        # Python shares the ast.Load() singleton across every tuple/list comparator in the AST, so putting
+        # non-expr nodes into accepted_names()'s skip set used to drop every other `op in (...)` tuple in the file.
+        accepted = ic.accepted_names(self.src)
+        self.assertIn("image_load", accepted)
+        self.assertIn("v_add_u32_e64", accepted)
+        self.assertNotIn("s_denorm_mode", accepted)
+        src = _fixture(
+            'def f(op):\n'
+            '    if op in ("v_fancy_f32",):\n'
+            '        raise Unsupported(op)\n'
+            '    elif op in ("v_fancy_f32", "s_mov_b32"):\n'
+            '        return 1\n',
+            ".py",
+        )
+        try:
+            rep = ic.build_report(self.isa, ic.scan_translator(src), ic.accepted_names(src))
+            self.assertEqual(rep["class"]["v_fancy_f32"], "handled-exact")
+            self.assertNotIn("v_fancy_f32", rep["refused"])
+        finally:
+            os.unlink(src)
+
+    def test_negated_and_guarded_comparisons_are_not_refusals(self):
+        src = _fixture(
+            'def f(op, bad):\n'
+            '    if not (op == "s_setreg_imm32_b32"):\n'
+            '        raise Unsupported(op)\n'
+            '    if op in ("v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8") and bad:\n'
+            '        raise Unsupported(op)\n',
+            ".py",
+        )
+        try:
+            scan = ic.scan_translator(src)
+            self.assertEqual(scan["refused"], [])
+            self.assertEqual(scan["partial"], ["v_mqsad_pk_u16_u8", "v_qsad_pk_u16_u8"])
+            self.assertTrue({"v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8"} <= ic.accepted_names(src))
         finally:
             os.unlink(src)
 
@@ -163,7 +248,7 @@ class FixtureTests(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(ic.main(["--isa", self.xml, "--translator", self.src, "--json"]), 0)
-        self.assertEqual(json.loads(out.getvalue())["instructions"], 11)
+        self.assertEqual(json.loads(out.getvalue())["instructions"], 15)
 
 
 class TranslatorScanTests(unittest.TestCase):
@@ -183,6 +268,10 @@ class TranslatorScanTests(unittest.TestCase):
         # A scan that silently stops seeing the if/elif chain would report almost everything unknown.
         self.assertGreater(len(self.scan["exact"]), 300)
 
+    def test_accepted_names_matches_non_refused_exact(self):
+        accepted = ic.accepted_names(TRANSLATOR)
+        self.assertEqual(set(self.scan["exact"]) - accepted, set(self.scan["refused"]))
+
 
 @unittest.skipUnless(REAL_XML and os.path.isfile(REAL_XML), f"set {ic.ENV_XML} to amdgpu_isa_rdna2.xml")
 class RealIsaTests(unittest.TestCase):
@@ -201,6 +290,10 @@ class RealIsaTests(unittest.TestCase):
         "v_mac_legacy_f32": "gfx1013 per llvm-mc (VOP2 v_mac_legacy_f32_e32), missing from the XML",
         "v_add_u16": "internal: v_add_nc_u16 is re-dispatched under this GFX9 spelling",
         "v_sub_u16": "internal: v_sub_nc_u16 is re-dispatched under this GFX9 spelling",
+        "v_add_i16": "internal: v_add_nc_i16 is re-dispatched under this name",
+        "v_sub_i16": "internal: v_sub_nc_i16 is re-dispatched under this name",
+        "s_atc_probe": "gfx1013 per llvm-mc, missing from the XML (a no-op in NOOPS)",
+        "s_atc_probe_buffer": "gfx1013 per llvm-mc, missing from the XML (a no-op in NOOPS)",
         "v_subrev_u16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",
         "v_and_b16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",
         "v_or_b16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",
@@ -222,6 +315,12 @@ class RealIsaTests(unittest.TestCase):
 
     def test_every_prefix_matches_something(self):
         self.assertEqual(self.rep["prefixes_without_rdna2_match"], [])
+
+    def test_saveexec_family_is_handled(self):
+        stems = ("and", "andn1", "andn2", "nand", "nor", "or", "orn1", "orn2", "xnor", "xor")
+        for w in ("b32", "b64"):
+            for k in stems:
+                self.assertEqual(self.rep["class"][f"s_{k}_saveexec_{w}"], "handled-family", (k, w))
 
 
 if __name__ == "__main__":

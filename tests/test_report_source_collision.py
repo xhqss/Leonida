@@ -70,6 +70,23 @@ class ReportSourceCollisionTest(unittest.TestCase):
         self.assert_refused_without_touching(
             "bvh_index.py", ["{src}", "--csv", "{src}"], "x.rpf", make_rpf(make_bvh_payload()))
 
+    def test_anim_index_refuses_out_equal_to_source(self):
+        self.assert_refused_without_touching(
+            "anim_index.py", ["{src}", "{src}"], "x.rpf", make_rpf(b"\0" * 64, 0x40))
+
+    def test_anim_index_refuses_rigs_equal_to_source(self):
+        with tempfile.TemporaryDirectory() as folder:
+            src = os.path.join(folder, "x.rpf")
+            contents = make_rpf(b"\0" * 64, 0x40)
+            with open(src, "wb") as fh:
+                fh.write(contents)
+            out = os.path.join(folder, "out.csv")
+            result = self.run_tool("anim_index.py", [src, out, "--rigs", src])
+            with open(src, "rb") as fh:
+                self.assertEqual(fh.read(), contents)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must not overwrite the source", result.stderr)
+
     def test_rbf0_index_refuses_out_equal_to_source(self):
         self.assert_refused_without_touching(
             "rbf0_index.py", ["{src}", "{src}"], "x.rpf", make_rpf(b"RBF0" + bytes(128), 0x100))

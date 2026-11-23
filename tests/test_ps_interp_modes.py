@@ -6,6 +6,9 @@ layout is the one dxc writes (lib/DxilContainer/DxilPipelineStateValidation.cpp)
 interpolation-mode numbers are DXIL::InterpolationMode ("must match D3D_INTERPOLATION_MODE")
 and the class names come from the SPI_PS_INPUT_ENA fields (Mesa gfx103.json).
 """
+import contextlib
+import errno
+import io
 import json
 import os
 import struct
@@ -13,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -92,10 +96,23 @@ class Psv0InputsTest(unittest.TestCase):
 
     def test_truncated_chunks_are_refused(self):
         good = dxbc_container({b"PSV0": psv0([(0, 4, 0, 3, 2)])})
-        # shorten every prefix boundary: element size, semantic table, strings, resources
-        for cut in (4, 28, 36, 44, 52, 60):
+        # shorten every prefix boundary: runtime-info size word (<4 bytes), element size, semantic table, strings, resources
+        for cut in (2, 4, 28, 36, 44, 52, 60):
             with self.subTest(cut=cut):
                 self.assertRaises(ValueError, truncate_and_parse, good, cut)
+
+    def test_v0_runtime_info_without_r1_is_refused(self):
+        # runtime_info_size = 24 (PSVRuntimeInfo0 only, no PSVRuntimeInfo1): offset r1+4 (byte 32) lands inside the
+        # following resource/string tables and must not be read as SigInputElements.
+        heap = b"\0TEXCOORD\0\0\0"
+        elem = struct.pack("<II6B2B", 1, 0, 1, 0, 0x44, 0, 3, 2, 0, 0)
+        v0_only = (struct.pack("<I", 24) + (b"\0" * 24)
+                   + struct.pack("<I", 0)
+                   + struct.pack("<I", len(heap)) + heap
+                   + struct.pack("<I", 1) + struct.pack("<I", 0)
+                   + struct.pack("<I", 16) + elem)
+        c = dxbc_container({b"PSV0": v0_only})
+        self.assertRaises(ValueError, ps_interp_modes.psv0_inputs, c)
 
     def test_element_size_below_documented_16_is_refused(self):
         payload = bytearray(psv0([(0, 4, 0, 3, 2)]))
@@ -227,6 +244,55 @@ class ShaderRowTest(unittest.TestCase):
             with open(dx, "wb") as f: f.write(dxbc_container({b"PSV0": psv0([])[:20]}))
             self.assertIsNone(ps_interp_modes.shader_row(dx, None, None))
 
+    def test_component_packed_same_row_preserves_each_element_rw_and_name(self):
+        # Two inputs packed into register row 1: TEXCOORD0.xy (start_col=0, cols=2, mask=0x3, rw=0x3, read) and
+        # TEXCOORD1.zw (start_col=2, cols=2, mask=0xC, rw=0x0, unread), with noff=0 in PSV0 so names come from ISG1.
+        elems = [
+            struct.pack("<II6B2B", 0, 0, 1, 0, 0x40 | 4, 3, 3, 4, 0, 0),
+            struct.pack("<II6B2B", 0, 0, 1, 1, 0x40 | (0 << 4) | 2, 0, 3, 2, 0, 0),
+            struct.pack("<II6B2B", 0, 0, 1, 1, 0x40 | (2 << 4) | 2, 0, 3, 2, 0, 0),
+        ]
+        runtime = b"\0" * 24 + bytes([0, 0, 0, 0, 3, 0, 0, 0]) + b"\0" * 12
+        psv_payload = (struct.pack("<I", len(runtime)) + runtime
+                       + struct.pack("<I", 0) + struct.pack("<I", 4) + b"\0\0\0\0"
+                       + struct.pack("<I", 1) + struct.pack("<I", 0)
+                       + struct.pack("<I", 16) + b"".join(elems))
+        names = [b"SV_Position\0", b"TEXCOORD0\0", b"TEXCOORD1\0"]
+        first = 8 + 32 * 3
+        isg_payload = struct.pack("<II", 3, 8)
+        specs = [(0, 0xF, 0xF), (1, 0x3, 0x3), (1, 0xC, 0x0)]
+        for i, (reg, mask, rw) in enumerate(specs):
+            noff = first + sum(len(n) for n in names[:i])
+            isg_payload += struct.pack("<6I", 0, noff, i, 0, 3, reg) + bytes([mask, rw, 0, 0, 0, 0, 0, 0])
+        isg_payload += b"".join(names)
+        c = dxbc_container({b"PSV0": psv_payload, b"ISG1": isg_payload})
+        with tempfile.TemporaryDirectory() as tmp:
+            dx = os.path.join(tmp, "packed.dxbc")
+            ds = os.path.join(tmp, "packed.s")
+            with open(dx, "wb") as f: f.write(c)
+            with open(ds, "w") as f: f.write("v_interp_p1_f32_e32 v2, v0, attr1.x\n")
+            row = ps_interp_modes.shader_row(dx, None, ds)
+        self.assertEqual([i["rw"] for i in row["inputs"]], [15, 3, 0])
+        self.assertEqual([i["name"] for i in row["inputs"]], ["SV_Position", "TEXCOORD0", "TEXCOORD1"])
+        self.assertEqual(row["pair_class"], "persp_center")
+
+    def test_multi_row_element_aggregates_rw_across_spanned_registers(self):
+        # A 2-row input (rows=2, start row=0) read only in register 1 must still report its live rw mask.
+        elem = struct.pack("<II6B2B", 1, 0, 2, 0, 0x44, 6, 3, 2, 0, 0)
+        runtime = b"\0" * 24 + bytes([0, 0, 0, 0, 1, 0, 0, 0]) + b"\0" * 12
+        heap = b"\0SV_ClipDistance\0\0\0\0"
+        psv_payload = (struct.pack("<I", len(runtime)) + runtime
+                       + struct.pack("<I", 0) + struct.pack("<I", len(heap)) + heap
+                       + struct.pack("<I", 2) + struct.pack("<II", 0, 1)
+                       + struct.pack("<I", 16) + elem)
+        c = dxbc_container({b"PSV0": psv_payload,
+                            b"ISG1": isg1([(0, 0, "SV_ClipDistance"), (1, 0x3, "SV_ClipDistance")])})
+        with tempfile.TemporaryDirectory() as tmp:
+            dx = os.path.join(tmp, "multirow.dxbc")
+            with open(dx, "wb") as f: f.write(c)
+            row = ps_interp_modes.shader_row(dx, None, None)
+        self.assertEqual(row["inputs"][0]["rw"], 3)
+
 
 class TallyTest(unittest.TestCase):
     def test_census_counts_modes_and_pairs(self):
@@ -306,6 +372,32 @@ class CliTest(unittest.TestCase):
                                capture_output=True, text=True)
             self.assertEqual(p.returncode, 0, p.stderr)
             self.assertEqual(len(json.loads(p.stdout)["files"]), 2)
+
+    def test_scan_io_failures_do_not_emit_a_partial_census(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_two_shaders(tmp)
+            failing_path = os.path.join(tmp, "ps2.dxbc")
+            error = PermissionError(errno.EACCES, "permission denied", failing_path)
+            original = ps_interp_modes.shader_row
+
+            def fail_second(path, fssm_path, disasm_path):
+                if path == failing_path:
+                    raise error
+                return original(path, fssm_path, disasm_path)
+
+            for target, options, path, diagnostic in (
+                ("files_of", {"side_effect": OSError(errno.EIO, "I/O error", tmp)}, tmp, "cannot list"),
+                ("shader_row", {"side_effect": fail_second}, failing_path, "cannot read"),
+            ):
+                with self.subTest(target=target):
+                    out, err = io.StringIO(), io.StringIO()
+                    with mock.patch.object(ps_interp_modes, target, **options), contextlib.redirect_stdout(out), \
+                            contextlib.redirect_stderr(err):
+                        self.assertEqual(ps_interp_modes.main([tmp, "--json"]), 2)
+                    self.assertEqual(out.getvalue(), "")
+                    self.assertEqual(len(err.getvalue().splitlines()), 1)
+                    self.assertIn(diagnostic, err.getvalue())
+                    self.assertIn(path, err.getvalue())
 
     def test_missing_path_is_an_error(self):
         out = subprocess.run([sys.executable, "-I", TOOL, "Z:/nope"],

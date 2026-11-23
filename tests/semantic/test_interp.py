@@ -3,6 +3,7 @@ and GLSL.std.450 specifications (not from the translator)."""
 import unittest
 
 import spirv_mini_interp as si
+import spirv_wave_interp
 
 HEADER = """\
 OpCapability Shader
@@ -171,6 +172,46 @@ class InterpreterTests(unittest.TestCase):
                                    "%res = OpBitcast %uint %x\nOpStore %out %res\n" + FOOTER)
                     with self.assertRaises(si.UnsupportedConstruct):
                         si.run_fragment(body)
+
+    WIDE = HEADER.replace("%c0 = OpConstant %uint 0",
+                          "%ulong = OpTypeInt 64 0\n"
+                          "%cl_1 = OpConstant %ulong 1\n"
+                          "%cl_2p31 = OpConstant %ulong 2147483648\n"
+                          "%cl_2p32 = OpConstant %ulong 4294967296\n"
+                          "%cl_2p32_5 = OpConstant %ulong 4294967301\n"
+                          "%cl_hi = OpConstant %ulong 18446744069414584320\n"       # 0xFFFFFFFF00000000 = -2**32
+                          "%cl_m1 = OpConstant %ulong 18446744073709551615\n"
+                          "%c0 = OpConstant %uint 0")
+
+    def test_bit_count_counts_every_bit_of_a_64bit_operand(self):
+        # OpBitCount counts the set bits of its operand, whatever the width of the (32-bit) result.
+        for src, want in (("%cl_hi", 32), ("%cl_m1", 64), ("%cl_2p32_5", 3), ("%cl_1", 1)):
+            with self.subTest(src=src):
+                out = si.run_fragment(self.WIDE + f"%res = OpBitCount %uint {src}\nOpStore %out %res\n" + FOOTER)
+                self.assertEqual(out["%out"], (want,))
+        self.assertEqual(run_word("%res = OpBitCount %uint %cF0\n"), 28)
+
+    def test_signed_min_max_clamp_abs_use_the_width_of_a_64bit_type(self):
+        # GLSL.std.450 SMin/SMax/SClamp/SAbs read their operands as signed at the width of their type. 2**31 is
+        # positive in a 64-bit integer and 0xFFFFFFFF00000000 is -2**32; a 32-bit reading takes them as
+        # -2**31 and 0.
+        for inst, want in (("SMin %cl_2p31 %cl_1", "%cl_1"), ("SMax %cl_2p31 %cl_1", "%cl_2p31"),
+                           ("SMin %cl_hi %cl_1", "%cl_hi"), ("SMax %cl_hi %cl_m1", "%cl_m1"),
+                           ("SClamp %cl_2p31 %cl_1 %cl_2p32", "%cl_2p31"), ("SClamp %cl_hi %cl_m1 %cl_1", "%cl_m1"),
+                           ("SAbs %cl_hi", "%cl_2p32"), ("SAbs %cl_2p32_5", "%cl_2p32_5"), ("SAbs %cl_m1", "%cl_1")):
+            with self.subTest(inst=inst):
+                out = si.run_fragment(self.WIDE + f"%r = OpExtInst %ulong %glsl {inst}\n"
+                                      f"%eq = OpIEqual %bool %r {want}\n%res = OpSelect %uint %eq %c1 %c0\n"
+                                      "OpStore %out %res\n" + FOOTER)
+                self.assertEqual(out["%out"], (1,))
+
+    def test_find_bit_of_a_64bit_operand_is_rejected(self):
+        # GLSL.std.450 limits FindILsb, FindSMsb and FindUMsb to 32-bit components.
+        for name in ("FindILsb", "FindSMsb", "FindUMsb"):
+            with self.subTest(name=name):
+                with self.assertRaises(si.UnsupportedConstruct):
+                    si.run_fragment(self.WIDE + f"%r = OpExtInst %ulong %glsl {name} %cl_2p32\n"
+                                    "%res = OpUConvert %uint %r\nOpStore %out %res\n" + FOOTER)
 
     def test_round_even_clamp_max(self):
         # RoundEven sends halves to the even neighbour: 2.5 -> 2, 3.5 -> 4.
@@ -457,6 +498,26 @@ class InterpreterTests(unittest.TestCase):
                     "OpStore %out %res\n" + FOOTER)
             with self.subTest(cond=cond):
                 self.assertEqual(si.run_fragment(text)["%out"][0], want)
+
+    def test_phis_of_a_block_take_their_values_together(self):
+        # A loop header that swaps %a and %b on every back edge: each OpPhi reads the other's value from before
+        # the block. Three iterations from (1, 2) leave (2, 1); assigning %a first would give %b the new %a, (2, 2).
+        text = (HEADER.replace('"main" %out', '"main" %out %out2')
+                .replace("%main = OpFunction", "%out2 = OpVariable %_ptr_Output_uint Output\n"
+                         "%c3 = OpConstant %uint 3\n%main = OpFunction") +
+                "OpBranch %head\n"
+                "%head = OpLabel\n"
+                "%a = OpPhi %uint %c1 %entry %b %cont\n"
+                "%b = OpPhi %uint %c2 %entry %a %cont\n"
+                "%i = OpPhi %uint %c0 %entry %inext %cont\n"
+                "%more = OpULessThan %bool %i %c3\n"
+                "OpLoopMerge %done %cont None\nOpBranchConditional %more %cont %done\n"
+                "%cont = OpLabel\n%inext = OpIAdd %uint %i %c1\nOpBranch %head\n"
+                "%done = OpLabel\nOpStore %out %a\nOpStore %out2 %b\n" + FOOTER)
+        out = si.run_fragment(text)
+        self.assertEqual((out["%out"], out["%out2"]), ((2,), (1,)))
+        lane0 = spirv_wave_interp.run_wave(text, wave=32)["outputs"][0]     # the other interpreter agrees
+        self.assertEqual((lane0["%out"], lane0["%out2"]), ((2,), (1,)))
 
     def test_function_array_access(self):
         self.assertEqual(run_word("%arr_v = OpVariable %_ptr_Function_arr Function %null_arr\n"

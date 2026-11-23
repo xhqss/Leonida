@@ -8,7 +8,8 @@
 //   LEONIDA_BVH_FLAG=1                (optional: pass true as the constructor's bool argument)
 //   LEONIDA_BVH_WARP=1                (optional: use the WARP adapter; the default on an NVIDIA adapter, RT-54)
 //   LEONIDA_BVH_HARDWARE=1            (optional: keep an NVIDIA adapter instead of switching to WARP)
-//   LEONIDA_BVH_RECORD62=1            (optional: print each CreateComputePipelineState's container shape)
+//   LEONIDA_BVH_RECORD62=1            (optional: print each CreateComputePipelineState's container shape, its ILDN
+//                                     module name and digest)
 //   LEONIDA_BVH_DXIL=1                (optional, with RECORD62: dx.op counts and validator error kinds, needs
 //                                      dxcompiler.dll and dxil.dll on PATH)
 //   LEONIDA_BVH_DEVICE=vulkan         (optional: the Vulkan-backed ID3D12Device from #119 instead of a PC device)
@@ -154,6 +155,9 @@ int filter(EXCEPTION_POINTERS* e, Call* c) {
 using Ctor = void* (*)(void* self, void* device, bool flag);
 using Dtor = void (*)(void* self);
 
+// Each guard returns a copy of `c`, not `c` itself: with `return c;` the local becomes the named return value, and
+// clang-cl 19 and 20 crash (exit 139, in recoverAddrOfEscapedLocal) generating the __except filter that writes it,
+// which stops the Linux cross-build (runtime/cmake/clang-cl-xwin.cmake). MSVC is fine either way.
 Call guarded_ctor(Ctor fn, void* self, void* device, bool flag) {
     Call c;
     __try {
@@ -161,7 +165,7 @@ Call guarded_ctor(Ctor fn, void* self, void* device, bool flag) {
     } __except (filter(GetExceptionInformation(), &c)) {
         c.faulted = true;
     }
-    return c;
+    return Call(c);
 }
 
 Call guarded_dtor(Dtor fn, void* self) {
@@ -171,7 +175,7 @@ Call guarded_dtor(Dtor fn, void* self) {
     } __except (filter(GetExceptionInformation(), &c)) {
         c.faulted = true;
     }
-    return c;
+    return Call(c);
 }
 
 // main's loader (#95) maps, sets up TLS and runs DllMain, but doesn't register the image's x64 unwind tables yet
@@ -306,7 +310,8 @@ bool looks_like_iid(uint64_t p, const IID& iid) {
 uint64_t g_slot62_ok = 0, g_slot62_failed = 0;
 
 // The shape of a DXBC container, for the record: its parts (four-character code and size), the DXIL part's shader
-// model and DXIL version, the SFI0 feature flags, and whether the hash is zero (unsigned). Counts and flags only.
+// model and DXIL version, the SFI0 feature flags, whether the hash is zero (unsigned), the ILDN module name and the
+// first four bytes of the digest. Counts, flags and names only.
 std::string container_shape(const void* bytecode, size_t length) {
     const auto* b = static_cast<const uint8_t*>(bytecode);
     auto u32 = [&](size_t o) {
@@ -337,10 +342,58 @@ std::string container_shape(const void* bytecode, size_t length) {
             std::snprintf(item, sizeof(item), "(flags %#llx)",
                           static_cast<unsigned long long>(u32(data) | (uint64_t(u32(data + 4)) << 32)));
             out += item;
+        } else if (!std::strcmp(fourcc, "ILDN") && size >= 4) {
+            // ILDN: u16 flags, u16 name length, the debug name (NUL-padded): the module's PDB path, which names the
+            // container (docs/embedded_shaders.md section 3). Only the file name is printed.
+            const uint32_t name_length = u32(data) >> 16;
+            if (size_t(data) + 4 + name_length <= length && name_length > 0) {
+                std::string name(reinterpret_cast<const char*>(b + data + 4), name_length);
+                name.erase(name.find_last_not_of('\0') + 1);
+                name = name.substr(name.find_last_of("\\/") + 1);
+                out += "(" + name + ")";
+            }
         }
     }
-    return out;
+    // The first four bytes of the container digest (bytes 4..19 of the header), to tell two creations of the same
+    // container from two containers with the same module name.
+    char digest[24];
+    std::snprintf(digest, sizeof(digest), " digest %02x%02x%02x%02x", b[4], b[5], b[6], b[7]);
+    return out + digest;
 }
+
+// The module a container belongs to: the file name (without ".pdb") in its ILDN part, a DXIL debug-name record
+// (u16 flags, u16 name length, then the PDB path). Empty when there is no such part. The module names are the ones
+// listed in docs/embedded_shaders.md section 3.
+std::string container_module(const void* bytecode, size_t length) {
+    const auto* b = static_cast<const uint8_t*>(bytecode);
+    auto u32 = [&](size_t o) {
+        uint32_t v = 0;
+        if (o + 4 <= length) std::memcpy(&v, b + o, 4);
+        return v;
+    };
+    if (!b || length < 32 || std::memcmp(b, "DXBC", 4) != 0) return {};
+    const uint32_t parts = u32(28);
+    for (uint32_t i = 0; i < parts && 32 + 4 * size_t(i) + 4 <= length; ++i) {
+        const size_t off = u32(32 + 4 * size_t(i));
+        if (off + 8 > length || std::memcmp(b + off, "ILDN", 4) != 0) continue;
+        const size_t size = u32(off + 4), data = off + 8;
+        if (size < 5 || data + size > length) return {};
+        std::string path(reinterpret_cast<const char*>(b + data + 4), size - 4);
+        path.resize(std::strlen(path.c_str()));
+        const size_t slash = path.find_last_of("\\/");
+        std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
+        if (name.size() > 4 && name.compare(name.size() - 4, 4, ".pdb") == 0) name.resize(name.size() - 4);
+        return name;
+    }
+    return {};
+}
+
+// Every container the constructor has passed to slot 62 so far, to find one that is passed twice (RT-182). The bytes
+// are compared, not a hash, and nothing is printed from them.
+std::vector<std::vector<uint8_t>> g_seen_containers;
+std::vector<std::string> g_seen_modules;
+int g_repeat_first = 0, g_repeat_second = 0;  // creation numbers (1-based) of the first repeat found, 0 = none
+int g_repeats = 0;
 
 // LEONIDA_BVH_DXIL=1: what each shader uses, from dxcompiler.dll's disassembly in memory: the distinct dx.op names
 // with call counts, and a few type/feature markers. Also dxil.dll's validator verdict. Names and counts only; the
@@ -459,6 +512,27 @@ uint64_t WINAPI record_slot62(void* self, uint64_t a1, uint64_t a2, uint64_t a3,
     if (desc) {
         std::printf("  slot62 #%d container: %s\n", n + 1,
                     container_shape(desc->CS.pShaderBytecode, desc->CS.BytecodeLength).c_str());
+        const std::string module = container_module(desc->CS.pShaderBytecode, desc->CS.BytecodeLength);
+        std::printf("  slot62 #%d module: %s\n", n + 1, module.empty() ? "(no ILDN part)" : module.c_str());
+        const auto* bytes = static_cast<const uint8_t*>(desc->CS.pShaderBytecode);
+        std::vector<uint8_t> copy(bytes, bytes + desc->CS.BytecodeLength);
+        int same_as = 0;
+        for (size_t i = 0; i < g_seen_containers.size(); ++i)
+            if (g_seen_containers[i] == copy) {
+                same_as = static_cast<int>(i) + 1;
+                break;
+            }
+        if (same_as) {
+            std::printf("  slot62 #%d is byte-identical to #%d (module %s)\n", n + 1, same_as,
+                        g_seen_modules[same_as - 1].c_str());
+            if (!g_repeats) {
+                g_repeat_first = same_as;
+                g_repeat_second = n + 1;
+            }
+            ++g_repeats;
+        }
+        g_seen_containers.push_back(std::move(copy));
+        g_seen_modules.push_back(module);
         if (env("LEONIDA_BVH_DXIL") == "1")
             std::printf("  slot62 #%d uses: %s\n", n + 1, dxil_usage(desc->CS.pShaderBytecode, desc->CS.BytecodeLength).c_str());
     }
@@ -627,6 +701,16 @@ int main() {
         note("slot 62 (Xbox CreateComputePipelineState) calls: " + std::to_string(rt::d3d12_xs::device_slot_hits(62)) +
              (g_slot62_logged ? ", succeeded " + std::to_string(g_slot62_ok) + ", failed " + std::to_string(g_slot62_failed)
                               : std::string()));
+        if (g_slot62_logged) {
+            note("slot 62 creations: " + std::to_string(g_slot62_logged) + ", distinct containers: " +
+                 std::to_string(g_slot62_logged - g_repeats) + ", repeated creations: " + std::to_string(g_repeats));
+            if (g_repeats) {
+                note("first repeat: creation #" + std::to_string(g_repeat_second) + " passes the same container as #" +
+                     std::to_string(g_repeat_first) + ", module " + g_seen_modules[g_repeat_first - 1]);
+                check(g_seen_modules[g_repeat_first - 1] == g_seen_modules[g_repeat_second - 1],
+                      "the repeated container names the same module both times");
+            }
+        }
         note("OutputDebugString calls: " + std::to_string(g_debug_strings) + ", TerminateProcess calls: " +
              std::to_string(g_terminate_calls));
         check(!c.faulted || c.code == kTerminateCalled, "constructor returns or gives up through TerminateProcess, no fault");

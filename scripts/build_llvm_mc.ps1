@@ -56,9 +56,24 @@ if (-not (Test-Path (Join-Path $src "llvm\CMakeLists.txt"))) {
     # sparse checkout fails with "Filename too long" (Windows' 260-character limit). Set in the clone's config only.
     & git clone --quiet --depth 1 --branch "llvmorg-$Version" --filter=blob:none --sparse --config core.longpaths=true https://github.com/llvm/llvm-project $src
     if ($LASTEXITCODE -ne 0) { throw "git clone of llvmorg-$Version failed." }
-    & git -C $src sparse-checkout set llvm cmake third-party
+    # libc: LLVM 23 configures only with its shared headers (llvm/CMakeLists.txt, "LLVM libc is not found").
+    & git -C $src sparse-checkout set llvm cmake third-party libc
     if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout failed." }
 }
+# A source kept by a failed LLVM 23 build of an older version of this script has no libc yet.
+if ((Test-Path (Join-Path $src ".git\info\sparse-checkout")) -and -not (Test-Path (Join-Path $src "libc"))) {
+    & git -C $src sparse-checkout add libc
+    if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout add libc failed." }
+}
+
+# -Keep (or an interrupted build) can leave sources from another -Version.
+# Refuse that checkout rather than silently rebuilding the wrong release or resetting user files.
+$versionError = "Cannot reuse '$src' for LLVM $Version. Choose a fresh -Temp directory for this version; existing files were kept."
+if (-not (Test-Path -LiteralPath (Join-Path $src '.git'))) { throw $versionError }
+$wantedCommit = & git -C $src rev-parse --verify --quiet "refs/tags/llvmorg-$Version^{commit}"
+if ($LASTEXITCODE -ne 0 -or -not $wantedCommit) { throw $versionError }
+$sourceCommit = & git -C $src rev-parse --verify --quiet HEAD
+if ($LASTEXITCODE -ne 0 -or $sourceCommit -ne $wantedCommit) { throw $versionError }
 
 # DIA SDK off: its headers need ATL, which the C++ build tools don't always include, and llvm-mc doesn't use it.
 $body = @"
@@ -70,10 +85,28 @@ $body = @"
 "@
 New-Item -ItemType Directory -Force $out | Out-Null
 # A .cmd file avoids cmd.exe's quote stripping on paths with spaces.
+# Switch cmd.exe to UTF-8 before reading paths, then restore the shared console even if the build fails.
 $bat = Join-Path $Temp "_build.cmd"
-"@echo off`r`nset `"PATH=$installer;%PATH%`"`r`ncall `"$vcvars`" >nul || exit /b 1`r`n$body" | Set-Content -Encoding ascii $bat
+$batchText = @(
+    '@echo off'
+    'setlocal'
+    'set "_leonida_cp="'
+    'for /f "tokens=2 delims=:." %%c in (''chcp'') do set "_leonida_cp=%%c"'
+    'chcp 65001 >nul'
+    'call :build'
+    'set "_leonida_exit=%errorlevel%"'
+    'if defined _leonida_cp chcp %_leonida_cp% >nul'
+    'exit /b %_leonida_exit%'
+    ':build'
+    "set `"PATH=$installer;%PATH%`""
+    "call `"$vcvars`" >nul || exit /b 1"
+    $body
+    ''
+) -join "`r`n"
+[System.IO.File]::WriteAllText($bat, $batchText, [System.Text.UTF8Encoding]::new($false))
 
-$p = Start-Process cmd.exe -ArgumentList "/c", "`"$bat`"" -NoNewWindow -PassThru
+# /s with a second pair of quotes: cmd.exe strips only the outer pair, so a path holding & or ^ stays quoted.
+$p = Start-Process cmd.exe -ArgumentList "/s", "/c", "`"`"$bat`"`"" -NoNewWindow -PassThru
 $null = $p.Handle  # keeps the exit code readable after WaitForExit
 try { $p.PriorityClass = "BelowNormal" } catch {}
 $p.WaitForExit()
@@ -88,7 +121,8 @@ $probe = & $exe --disassemble -triple=amdgcn -mcpu=gfx1013 $probeFile
 if ($LASTEXITCODE -ne 0 -or -not ($probe -match "s_endpgm")) { throw "the built llvm-mc didn't disassemble an s_endpgm" }
 
 New-Item -ItemType Directory -Force $Dest | Out-Null
-$final = Join-Path $Dest "llvm-mc.exe"
+# LLVM_MC is saved for future terminals, whose working directory can differ from this one.
+$final = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath((Join-Path $Dest "llvm-mc.exe"))
 Copy-Item -Force $exe $final
 if (-not $Keep) {
     try {

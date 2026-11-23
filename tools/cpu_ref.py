@@ -90,10 +90,37 @@ SUPPORTED_OPS = {
     "v_min_u32", "v_max_u32", "v_min_i32", "v_max_i32",
     "v_bfe_u32", "v_bfe_i32", "v_bfi_b32", "v_alignbit_b32", "v_alignbyte_b32",
     "v_perm_b32", "v_med3_i32", "v_med3_u32",
+    "v_not_b32", "v_bfrev_b32", "v_ffbl_b32", "v_ffbh_u32", "v_ffbh_i32",
+    "v_xnor_b32", "v_bcnt_u32_b32",
+    "v_add3_u32", "v_lshl_add_u32", "v_add_lshl_u32", "v_lshl_or_b32", "v_and_or_b32", "v_or3_b32", "v_xad_u32",
     "v_add_f32", "v_sub_f32", "v_mul_f32", "v_fma_f32",
     "s_endpgm",
 }
 SPECIAL_WRITE = {"vcc", "vcc_lo", "vcc_hi", "exec", "exec_lo", "exec_hi", "scc", "null"}
+
+
+def _ffbh_i32(a):
+    if a in (0, MASK32):
+        return MASK32
+    return 32 - (~a & MASK32).bit_length() if a & SIGN32 else 32 - a.bit_length()
+
+
+_INT_VOP = {
+    "v_not_b32": (1, lambda a: ~a),
+    "v_bfrev_b32": (1, lambda a: int(f"{a:032b}"[::-1], 2)),
+    "v_ffbl_b32": (1, lambda a: MASK32 if a == 0 else (a & -a).bit_length() - 1),
+    "v_ffbh_u32": (1, lambda a: MASK32 if a == 0 else 32 - a.bit_length()),
+    "v_ffbh_i32": (1, _ffbh_i32),
+    "v_xnor_b32": (2, lambda a, b: ~(a ^ b)),
+    "v_bcnt_u32_b32": (2, lambda a, b: a.bit_count() + b),
+    "v_add3_u32": (3, lambda a, b, c: a + b + c),
+    "v_lshl_add_u32": (3, lambda a, b, c: (a << (b & 31)) + c),
+    "v_add_lshl_u32": (3, lambda a, b, c: ((a + b) & MASK32) << (c & 31)),
+    "v_lshl_or_b32": (3, lambda a, b, c: (a << (b & 31)) | c),
+    "v_and_or_b32": (3, lambda a, b, c: (a & b) | c),
+    "v_or3_b32": (3, lambda a, b, c: a | b | c),
+    "v_xad_u32": (3, lambda a, b, c: (a ^ b) + c),
+}
 
 
 class CpuRefError(Exception):
@@ -392,9 +419,9 @@ class Machine:
         else:
             raise Unsupported(arg.get("t", kind), self.pc, "operand kind is not modelled")
         if arg.get("abs"):
-            value = abs(value - (1 << 32)) if value & SIGN32 else value
+            value &= 0x7FFFFFFF
         if arg.get("neg"):
-            value = (-value) & MASK32
+            value ^= SIGN32
         return value & MASK32
 
     def _float_src(self, arg, lane):
@@ -661,6 +688,12 @@ class Machine:
                     vals = [v - (1 << 32) if v & SIGN32 else v for v in vals]
                 x, y, z = vals
                 self._write_vgpr(args[0], lane, max(min(x, y), min(max(x, y), z)) & MASK32)
+        elif base in _INT_VOP:
+            arity, fn = _INT_VOP[base]
+            self._expect(ins, 1 + arity)
+            for lane in self._active_lanes():
+                vals = [self._int_src(args[i], lane) for i in range(1, 1 + arity)]
+                self._write_vgpr(args[0], lane, fn(*vals) & MASK32)
         elif base == "s_mov_b32":
             self._expect(ins, 2)
             self._write_scalar_dst(args[0], self._int_src(args[1], 0, scalar=True))
@@ -775,6 +808,9 @@ def main(argv=None):
     ap.add_argument("--parse-only", action="store_true", help="report parsed and modelled instructions only")
     ap.add_argument("--json", action="store_true", help="print the result as JSON")
     args = ap.parse_args(argv)
+    if not os.path.exists(args.listing):
+        print(f"ERROR: {args.listing}: does not exist", file=sys.stderr)
+        return 2
 
     inputs = {"lanes": args.lanes, "vcc": args.vcc}
     if args.lanes == 1:

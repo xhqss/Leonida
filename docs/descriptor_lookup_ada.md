@@ -51,6 +51,8 @@ foreach ($memory in 'device', 'host', 'rebar') {
 }
 ```
 
+These commands predate `--warmup-ms` (TEST-277, default 300 ms of extra warm-up). With a current build add `--warmup-ms 0` to reproduce them as run.
+
 Device 0 was the RTX 4070 SUPER, the only Vulkan device. For the full 12-round series, let A, B and C denote 1k, 10k and 100k. The rounds used the same size orders and starting memory types as the M3 Max run. The first six size orders were ABC, CBA, BAC, CAB, ACB and BCA, starting with device, host, device, device, host and host respectively. The next six reversed the sequence of rounds and swapped the starting memory type in each. Each round ran the other of device and host second, and ReBAR third.
 
 ## System

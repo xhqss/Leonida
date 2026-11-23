@@ -6,9 +6,11 @@
 //   pass 1  two render targets (R8G8B8A8_UNORM and R32_FLOAT) and a D24_UNORM_S8_UINT depth/stencil buffer (the layer
 //           maps it to D32_SFLOAT_S8_UINT where the device has no 24-bit depth). Three rectangles from root constants:
 //           N (near, depth 0.25, depth LESS + write, stencil REPLACE with reference 1), then F (far, depth 0.75, the
-//           same state, stencil reference 2) inside BeginQuery/EndQuery(OCCLUSION), then G (no depth test, stencil
-//           EQUAL to reference 1, so it only reaches pixels N won). ResolveQueryData writes F's sample count to the
-//           readback buffer.
+//           same state, stencil reference 2), then G (no depth test, stencil
+//           EQUAL to reference 1, so it only reaches pixels N won). ResolveQueryData writes the probe's count to the
+//           readback buffer. Before F, a single-output probe of F uses the same depth/stencil tests without writing
+//           color, depth or stencil. Only that probe is inside BeginQuery/EndQuery(OCCLUSION): Vulkan permits MRT
+//           occlusion counts multiplied by the number of written color outputs even with PRECISE (D3D-209).
 //   barrier the first target goes RENDER_TARGET -> PIXEL_SHADER_RESOURCE | COPY_SOURCE, the second to COPY_SOURCE.
 //   pass 2  a descriptor-table SRV of the first target (the M2 path: heaps, T#, S#, hash table) sampled by a translated PS
 //           that swaps red and blue and writes a root constant to alpha, into a third target.
@@ -19,6 +21,7 @@
 // Compared with a CPU reference: every pixel of all three targets byte for byte (the float target bit for bit), and the
 // exact number of samples F made visible (rectangles are pixel-aligned, so the count is the area of F minus N).
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (0 errors required).
+// --first-pass-only isolates depth/stencil, MRT, queries and slot reuse from the descriptor-sampling second pass.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -83,7 +86,7 @@ struct Reference {
     std::vector<float> rt1;
     UINT64 samples = 0;
 };
-Reference reference_of(const Frame& fr) {
+Reference reference_of(const Frame& fr, bool first_pass_only) {
     Reference ref;
     ref.rt0.assign(image_bytes, 0);
     ref.rt2.assign(image_bytes, 0);
@@ -113,7 +116,7 @@ Reference reference_of(const Frame& fr) {
             const UINT i = UINT(y) * dim + UINT(x);
             if (inside(fr.g.rect, x, y) && stencil[i] == fr.g.stencil_ref) put(i, fr.g);
         }
-    for (UINT i = 0; i < dim * dim; ++i) {  // pass 2: (b, g, r, alpha)
+    for (UINT i = 0; !first_pass_only && i < dim * dim; ++i) {  // pass 2: (b, g, r, alpha)
         ref.rt2[i * 4 + 0] = ref.rt0[i * 4 + 2];
         ref.rt2[i * 4 + 1] = ref.rt0[i * 4 + 1];
         ref.rt2[i * 4 + 2] = ref.rt0[i * 4 + 0];
@@ -124,7 +127,12 @@ Reference reference_of(const Frame& fr) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool first_pass_only = argc == 2 && std::strcmp(argv[1], "--first-pass-only") == 0;
+    if (argc != 1 && !first_pass_only) {
+        std::fprintf(stderr, "usage: d3d12_m3_frame_test [--first-pass-only]\n");
+        return 1;
+    }
     vktest::Device d;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
@@ -139,11 +147,14 @@ int main() {
     EXPECT(library.load((root_dir / "spirv").string()));
     const auto program = [&](const char* name) { return read_file(root_dir / "fssm" / (std::string(name) + ".fssm")); };
     const auto vs1 = program("vs_m3"), ps1 = program("ps_m3"), vs2 = program("vs_m2"), ps2 = program("ps_m3_post");
+    const auto ps_query = program("ps_m3_query");
     EXPECT(vs1.size() >= 4 && ps1.size() >= 4 && vs2.size() >= 4 && ps2.size() >= 4);
     EXPECT(library.find("vs", leonida::sha256_hex(vs1)) && library.find("ps", leonida::sha256_hex(ps1)));
     EXPECT(library.find("vs", leonida::sha256_hex(vs2)) && library.find("ps", leonida::sha256_hex(ps2)));
+    EXPECT(ps_query.size() >= 4 && library.find("ps", leonida::sha256_hex(ps_query)));
     const auto vs1_container = shader_container(vs1), ps1_container = shader_container(ps1);
     const auto vs2_container = shader_container(vs2), ps2_container = shader_container(ps2);
+    const auto query_container = shader_container(ps_query);
 
     unsigned mismatches = 0, frames_checked = 0;
     UINT64 total_samples = 0;
@@ -199,7 +210,8 @@ int main() {
         EXPECT(!root_blob.empty());
         EXPECT(SUCCEEDED(device->CreateRootSignature(0, root_blob.data(), root_blob.size(), IID_PPV_ARGS(&root2.p))));
 
-        // Pipelines. A: depth LESS + write, stencil ALWAYS/REPLACE. C: no depth, stencil EQUAL. P: pass 2.
+        // A: depth LESS + write, stencil ALWAYS/REPLACE. Query: same tests, no writes, one color export.
+        // C: no depth, stencil EQUAL. P: pass 2.
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc{};
         pso_desc.pRootSignature = root1.p;
         pso_desc.VS = {vs1_container.data(), vs1_container.size()};
@@ -223,8 +235,17 @@ int main() {
         ds.StencilReadMask = ds.StencilWriteMask = 0xff;
         ds.FrontFace = ds.BackFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_REPLACE,
                                       D3D12_COMPARISON_FUNC_ALWAYS};
-        Ref<ID3D12PipelineState> pso_a, pso_c, pso_p;
+        Ref<ID3D12PipelineState> pso_a, pso_c, pso_p, pso_query;
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso_a.p))));
+        auto probe_desc = pso_desc;
+        probe_desc.PS = {query_container.data(), query_container.size()};
+        probe_desc.NumRenderTargets = 1;
+        probe_desc.RTVFormats[1] = DXGI_FORMAT_UNKNOWN;
+        probe_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0;
+        probe_desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        probe_desc.DepthStencilState.FrontFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+        probe_desc.DepthStencilState.BackFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+        EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&probe_desc, IID_PPV_ARGS(&pso_query.p))));
         ds.DepthEnable = FALSE;
         ds.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
         ds.FrontFace = ds.BackFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
@@ -237,7 +258,8 @@ int main() {
         pso_desc.NumRenderTargets = 1;
         pso_desc.RTVFormats[1] = DXGI_FORMAT_UNKNOWN;
         pso_desc.DSVFormat = DXGI_FORMAT_UNKNOWN;
-        EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso_p.p))));
+        if (!first_pass_only)
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso_p.p))));
 
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
@@ -422,9 +444,15 @@ int main() {
             list->RSSetScissorRects(1, &scissor);
             list->OMSetRenderTargets(2, rtvs[s], FALSE, &dsvs[s]);
             draw(list, fr.n, fr.n.stencil_ref);
+            // The probe must leave F's depth/stencil/color inputs intact for the real two-output draw below.
+            list->SetPipelineState(pso_query.p);
+            list->OMSetRenderTargets(1, rtvs[s], FALSE, &dsvs[s]);
             list->BeginQuery(query_heap.p, D3D12_QUERY_TYPE_OCCLUSION, s);
             draw(list, fr.f, fr.f.stencil_ref);
             list->EndQuery(query_heap.p, D3D12_QUERY_TYPE_OCCLUSION, s);
+            list->SetPipelineState(pso_a.p);
+            list->OMSetRenderTargets(2, rtvs[s], FALSE, &dsvs[s]);
+            draw(list, fr.f, fr.f.stencil_ref);
             list->SetPipelineState(pso_c.p);
             draw(list, fr.g, fr.g.stencil_ref);
             list->ResolveQueryData(query_heap.p, D3D12_QUERY_TYPE_OCCLUSION, s, 1, slot_.readback.p, 0);
@@ -434,15 +462,17 @@ int main() {
             list->ResourceBarrier(2, between);
 
             // Pass 2: the first target through an SRV in a descriptor table.
-            list->SetPipelineState(pso_p.p);
-            list->SetGraphicsRootSignature(root2.p);
-            list->SetDescriptorHeaps(2, heaps);
-            list->SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE{srv_gpu + std::uint64_t(s) * srv_step});
-            list->SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{sampler_gpu});
-            const float alpha = unorm(fr.alpha);
-            list->SetGraphicsRoot32BitConstants(2, 1, &alpha, 0);
-            list->OMSetRenderTargets(1, &rtvs[s][2], FALSE, nullptr);
-            list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+            if (!first_pass_only) {
+                list->SetPipelineState(pso_p.p);
+                list->SetGraphicsRootSignature(root2.p);
+                list->SetDescriptorHeaps(2, heaps);
+                list->SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE{srv_gpu + std::uint64_t(s) * srv_step});
+                list->SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{sampler_gpu});
+                const float alpha = unorm(fr.alpha);
+                list->SetGraphicsRoot32BitConstants(2, 1, &alpha, 0);
+                list->OMSetRenderTargets(1, &rtvs[s][2], FALSE, nullptr);
+                list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+            }
 
             D3D12_RESOURCE_BARRIER end = transition(slot_.rt2.p, D3D12_RESOURCE_STATE_RENDER_TARGET, copy_rest);
             list->ResourceBarrier(1, &end);
@@ -471,7 +501,7 @@ int main() {
             if (slot_.fence->GetCompletedValue() < slot_.fence_value) return false;
             const UINT n = UINT(slot_.frame);
             slot_.frame = -1;
-            const Reference want = reference_of(frame_of(n));
+            const Reference want = reference_of(frame_of(n), first_pass_only);
             void* mapped = nullptr;
             if (FAILED(slot_.readback->Map(0, nullptr, &mapped))) return false;
             const auto* base = static_cast<const std::uint8_t*>(mapped);
@@ -515,7 +545,7 @@ int main() {
             slot_.list.reset(); slot_.allocator.reset(); slot_.fence.reset();
         }
         index_buffer.reset();
-        pso_a.reset(); pso_c.reset(); pso_p.reset();
+        pso_a.reset(); pso_c.reset(); pso_p.reset(); pso_query.reset();
         root1.reset(); root2.reset();
         srv_heap.reset(); sampler_heap.reset(); rtv_heap.reset(); dsv_heap.reset();
         query_heap.reset();
@@ -530,9 +560,11 @@ int main() {
         return 1;
     }
     std::printf("M3: %u frames, %u in flight, two render targets + D24S8 depth/stencil, barriers, an occlusion query and "
-                "a second pass sampling the first through an SRV matched all %u pixels of three targets per frame "
+                "%s matched all %u pixels of three targets per frame "
                 "(error 0) and every sample count (%llu samples in all%s)\n",
-                frames, slots, dim * dim, static_cast<unsigned long long>(total_samples),
+                frames, slots, first_pass_only ? "first-pass isolation (third target stays clear)" :
+                    "a second pass sampling the first through an SRV", dim * dim,
+                static_cast<unsigned long long>(total_samples),
                 d.occlusion_query_precise ? ", exact" : ", imprecise device: non-zero only");
     return 0;
 }

@@ -197,9 +197,9 @@ class BaryFallbackGeometryShader(unittest.TestCase):
             missing = os.path.join(tmp, "missing")
             p = subprocess.run([sys.executable, "-I", bary_fallback_gs.__file__, missing],
                                capture_output=True, text=True)
-            self.assertEqual(p.returncode, 1)
+            self.assertEqual(p.returncode, 2)                              # a missing input exits 2 (BUILD-1046)
             self.assertEqual(p.stdout, "")
-            self.assertIn("not a directory", p.stderr)
+            self.assertIn("does not exist", p.stderr)
             self.assertEqual(os.listdir(tmp), [])                          # nothing written
 
     def test_collision_is_refused(self):

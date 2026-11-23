@@ -20,6 +20,8 @@
 #include "pe_loader.h"
 #endif
 
+#include "free_image_base.h"
+
 #if __has_include("../shims/shims.h")
 #include "../shims/shims.h"
 #elif __has_include("shims.h")
@@ -159,7 +161,7 @@ std::vector<uint8_t> make_base_image(uint32_t image_size = 0x2000, uint32_t file
     nt->FileHeader.NumberOfSections = 1;
     nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
     nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
-    nt->OptionalHeader.ImageBase = 0x140000000;
+    nt->OptionalHeader.ImageBase = leonida_test::free_image_base(0x140000000);
     nt->OptionalHeader.AddressOfEntryPoint = 0x1000;
     nt->OptionalHeader.SizeOfHeaders = 0x200;
     nt->OptionalHeader.SizeOfImage = image_size;
@@ -736,7 +738,7 @@ void test_forwarder_ordinal_range() {
     auto dll = make_base_image(0x2000, 0x400);
     std::fill(dll.begin() + 0x200, dll.end(), uint8_t{0});
     auto* dnt = nt_header_of(dll);
-    dnt->OptionalHeader.ImageBase = 0x150000000ull;
+    dnt->OptionalHeader.ImageBase = leonida_test::free_image_base(0x150000000ull);
     dnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT] = {0x1000, 0x100};
     auto* ed = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(dll.data() + 0x200);  // RVA 0x1000
     ed->Base = 1;

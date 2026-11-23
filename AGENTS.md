@@ -15,7 +15,7 @@ loader that maps the game's executable and resolves its imports to shims. Nothin
 - The notes under `docs/` record measured formats, indexed by [docs/README.md](docs/README.md); `docs/design.md` is the one quoted most.
 - `scripts/` holds the GPU/Wine test runners (`run_gpu_tests.py`, `run_wine_tests.py`) and PowerShell build helpers.
 - `viewer/` is the map viewer: `index.html` plus `serve.py`, a local-only server for the exported world.
-- `third_party/` holds the `rpf9-explorer` submodule (`tools/rpf9dump` needs `git submodule update --init`) and the vendored `xtaskqueue` the `xgameruntime` shim links.
+- `third_party/` holds the `rpf9-explorer` submodule (`tools/rpf9dump` needs `git submodule update --init`), the vendored `xtaskqueue` the `xgameruntime` shim links and the vendored `bcpack-rs` rANS decoder of the BCPack calibration tools.
 - `game/xbox-1.0.2.1.json` is the per-file size and SHA-256 manifest of the Xbox package — hashes only, no game content.
 - `tests/semantic/` is the translator regression suite; a new translator rule comes with a small hand-written `.asm` fixture there.
 
@@ -65,10 +65,19 @@ These need no game files and run in seconds:
 python -m compileall -q make_game.py tools tests
 python -I make_game.py --help
 python -m unittest discover -s tests/semantic -v   # translator regression suite; no LLVM, SPIR-V tools or GPU needed
-python -I tests/test_<name>.py                     # one unit test
+python -I tests/test_<name>.py                     # standalone standard-library unit test
 node --test tests/test_viewer_streaming.cjs        # viewer streaming; needs Node 22+
 dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
 cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo; cmake --build runtime/build
+```
+
+For pytest-based tests, use a virtual environment and install the pinned dependencies in
+[`tests/requirements.txt`](tests/requirements.txt). From the repository root, run `python -m pytest` with the
+test file you want to check.
+
+```powershell
+python -m pip install -r tests/requirements.txt
+python -m pytest tests/test_user_sgpr_census.py
 ```
 
 With a work folder already built, a translator change is checked on a slice before the full run, and the result is
@@ -85,8 +94,8 @@ Shard runs write `index.part*.json`; merge them into `index.json` with `--merge`
 ## Conventions
 
 - Python tools run with `python -I` and use only the standard library unless a file says otherwise; the exceptions
-  are the texture tools that import numpy or Pillow: `bc_feature.py`, `amd_swizzle.py`, `tile_probe.py`,
-  `swizzle_search.py`, `tex_export.py`, `tex_mode_probe.py`, `tex_headers.py` (which falls back to the standard
-  library when numpy is absent).
+  are the texture and model tools that import numpy or Pillow: `bc_feature.py`, `amd_swizzle.py`, `tile_probe.py`,
+  `swizzle_search.py`, `tex_export.py`, `tex_mode_probe.py`, `calibrated_texture.py`, `tex_headers.py` and
+  `skinned_glb.py` (which fall back to the standard library when numpy is absent).
 - Keep `make_game.py` working on Windows first: paths through `os.path`, no bash in the build.
 - In the pull request, say that it was AI-assisted, what you tested and on which GPU and driver.

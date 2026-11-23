@@ -117,6 +117,18 @@ class TextureAssets(unittest.TestCase):
             self.assertEqual(row["Mips"], 5)
             self.assertEqual((folder / row["File"]).read_bytes()[148:], b"".join(linear.values()))
 
+    def test_complete_pool_handles_unmapped_range_without_crashing(self):
+        # If pool.codecs() raises ValueError (e.g., an unmapped hole inside a texture's span),
+        # complete_pool must record BCPackLimitation on that row instead of aborting the pool.
+        build_bc1_bcpack_pool(self.pool)
+        self.legacy()
+        with mock.patch.object(ttpf_assets.ttpf.Pool, "codecs",
+                               side_effect=ValueError("texture range is not completely mapped")):
+            self.build()
+        row = self.row_after_export()
+        self.assertIsNone(row["File"])
+        self.assertEqual(row["BCPackLimitation"], "texture range is not completely mapped")
+
 
 if __name__ == "__main__":
     unittest.main()

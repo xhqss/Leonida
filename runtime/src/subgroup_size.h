@@ -81,6 +81,13 @@ struct SubgroupRequest {
 
 inline bool subgroup_is_power_of_two(std::uint32_t v) { return v && !(v & (v - 1)); }
 
+// Overflow-safe check of local_size[0] * local_size[1] * local_size[2] <= max_invocations.
+inline bool subgroup_workgroup_fits(const std::array<std::uint32_t, 3>& local_size, std::uint64_t max_invocations) {
+    const std::uint64_t xy = std::uint64_t(local_size[0]) * local_size[1];
+    if (local_size[2] == 0) return true;
+    return xy <= max_invocations / local_size[2];
+}
+
 // What to ask for one stage of a pipeline made from `entry`.
 //   - Emulated (`wave64_exchange` present): nothing.
 //   - Otherwise the wanted size is the entry's `subgroup_size`, or 64 for a wave64 entry without one and 32 for the
@@ -112,20 +119,19 @@ inline SubgroupRequest decide_subgroup_size(const ShaderEntry& entry, const Subg
     }
 
     const bool compute_like = r.stage == VK_SHADER_STAGE_COMPUTE_BIT || r.stage == VK_SHADER_STAGE_MESH_BIT_EXT;
-    const std::uint64_t invocations =
-        std::uint64_t(entry.local_size[0]) * entry.local_size[1] * entry.local_size[2];
+    const std::uint64_t max_invocations = std::uint64_t(r.wanted) * caps.max_compute_workgroup_subgroups;
     const bool fixed = caps.min_size && caps.min_size == caps.max_size && caps.min_size == r.wanted;
     const bool requirable =
         caps.subgroup_size_control && (caps.required_stages & r.stage) && subgroup_is_power_of_two(r.wanted) &&
         r.wanted >= caps.min_size && r.wanted <= caps.max_size &&
-        (!compute_like || invocations <= std::uint64_t(r.wanted) * caps.max_compute_workgroup_subgroups);
+        (!compute_like || subgroup_workgroup_fits(entry.local_size, max_invocations));
 
     if (fixed) {
         r.outcome = SubgroupOutcome::device_fixed;
     } else if (requirable) {
         r.outcome = SubgroupOutcome::required;
         r.size = r.wanted;
-        if (r.stage == VK_SHADER_STAGE_COMPUTE_BIT && caps.compute_full_subgroups &&
+        if (r.stage == VK_SHADER_STAGE_COMPUTE_BIT && caps.compute_full_subgroups && entry.local_size[0] != 0 &&
             entry.local_size[0] % r.wanted == 0)
             r.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
     } else if (caps.default_size == r.wanted) {

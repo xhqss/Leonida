@@ -41,6 +41,12 @@ by `v_interp_mov_f32` (4,295 read positions), every bit-1 position only by `v_in
 f16 forms (49,594), and no position is read both ways.  The FSSM stores no SPI_PS_INPUT_ENA/ADDR
 word.  Bit 3 (0x08) is set in 11,619 records.
 
+The header flags word at offset 0xD4 records the compiled wave size: bit 5 (0x20) is 1 for wave32
+and 0 for wave64 (`wave_size()`).  On the local 26,503-blob corpus every blob starts with `FSSM`
+and is at least 0xD8 bytes long: 2,662 are wave32 (1,535 CS, 1,127 PS) and 23,841 are wave64
+(1,154 CS, 195 GS, 9,282 MS, 10,974 PS, 2,236 VS), with zero contradictions against GFX10
+code-proven wave32/wave64 instructions across all five stages.
+
 The post-`code_end` tail carries a binding table.  After 16 bytes of `0xBF9F0000` filler and an
 8-byte header, 20-byte records run until a `0xFFFFFFFF` sentinel; then `u32 0`, `u16 0`, `u16`
 name length and the name.  `binding_table()` returns those records.  On the local 26,503-blob
@@ -60,6 +66,7 @@ import struct
 import sys
 from collections import Counter
 
+MAGIC = b"FSSM"
 TABLE_OFFSET = 0x138
 RECORD_SIZE = 8
 RECORD_KIND = 6
@@ -73,6 +80,8 @@ DIRECTORY_SIZE = 0x12C
 DIRECTORY_NEXT = 0x130
 CODE_OFFSET = 0xC0
 CODE_SIZE = 0xC8
+WAVE_FLAGS_OFFSET = 0xD4
+FLAG_WAVE32 = 0x20
 CODE_END = 0xE8
 CODE_END_UNSET = 0xDEADBEEFDEADBEEF
 TAIL_FILLER = 0xBF9F0000
@@ -143,6 +152,18 @@ def directory_ok(blob):
     return _u32(blob, DIRECTORY_OFFSET) + _u32(blob, DIRECTORY_SIZE) == _u32(blob, DIRECTORY_NEXT)
 
 
+def wave_size(blob):
+    """Return the compiled wave size (32 or 64) from u32[0xD4] bit 5, or None.
+
+    Bit 5 (0x20) is set for wave32 and clear for wave64.  Returns None when the blob is
+    shorter than 0xD8 bytes or does not begin with the FSSM magic (for example, synthetic
+    zero-prefixed compute headers).
+    """
+    if len(blob) < WAVE_FLAGS_OFFSET + 4 or blob[:4] != MAGIC:
+        return None
+    return 32 if (_u32(blob, WAVE_FLAGS_OFFSET) & FLAG_WAVE32) else 64
+
+
 def binding_table(blob):
     """Return the post-code binding table, or None when the tail does not match the layout.
 
@@ -202,17 +223,37 @@ def stage_index(path):
 
     The index is the one `make_game.py` writes next to the carved `.dxbc` files.  Both the `fssm`
     directory (parent holds index.json) and a directory that contains index.json are accepted.
-    Prefer the local index when it has rows.
+    Prefer the local index when it has stage rows.
     """
-    base = path if os.path.isdir(path) else os.path.dirname(path)
+    base = path if os.path.isdir(path) else (os.path.dirname(path) or ".")
     for candidate in (os.path.join(base, "index.json"), os.path.join(base, "..", "index.json")):
         if os.path.isfile(candidate):
             try:
                 with open(candidate, encoding="utf-8") as f:
                     rows = json.load(f)
-                stages = {os.path.splitext(row["file"])[0]: row.get("stage") for row in rows}
-            except (OSError, ValueError, KeyError, TypeError):
+            except (OSError, ValueError):
                 continue
+            if not isinstance(rows, list):
+                continue
+            stages = {}
+            ambiguous = set()
+            for row in rows:
+                if not (
+                    isinstance(row, dict)
+                    and isinstance(file := row.get("file"), str)
+                    and (stem := os.path.splitext(os.path.basename(file.replace("\\", "/")))[0])
+                    and isinstance(stage := row.get("stage"), str)
+                    and stage
+                ):
+                    continue
+                if stem in ambiguous:
+                    continue
+                prev = stages.get(stem)
+                if prev is not None and prev != stage:
+                    del stages[stem]
+                    ambiguous.add(stem)
+                else:
+                    stages[stem] = stage
             if stages:
                 return stages
     return {}
@@ -238,6 +279,7 @@ def summarize(path, stages, bindings=False):
         "name": os.path.basename(path),
         "stage": stages.get(stem),
         "directory_ok": directory_ok(blob),
+        "wave_size": wave_size(blob),
         "entries": count,
         "fp16_mask": fp16,
         "inputs": pixel_inputs(blob),
@@ -266,6 +308,7 @@ def tally(rows, stages_known):
         counts = Counter(row["entries"] for row in ps)
         scope = "all"
     methods = Counter(read_name(entry["flags"] & READ_MASK) for row in ps for entry in row["inputs"])
+    waves = Counter(f"wave{ws}" for row in rows if (ws := row.get("wave_size")) is not None)
     return {
         "files": len(rows),
         "directory_ok": sum(row["directory_ok"] for row in rows),
@@ -274,6 +317,7 @@ def tally(rows, stages_known):
         "entry_counts": dict(sorted(counts.items())),
         "entry_counts_scope": scope,
         "read_methods": dict(sorted(methods.items())),
+        "wave_sizes": dict(sorted(waves.items())),
         "stage_source": "index.json" if stages_known else "table-only",
     }
 
@@ -313,7 +357,8 @@ def main(argv=None):
     except OSError as e:
         print(f"ERROR: cannot read {e.filename or args.path}: {e.strerror or e}", file=sys.stderr)
         return 2
-    summary = tally(rows, bool(stages))
+    stages_known = any(row.get("stage") for row in rows) if rows else bool(stages)
+    summary = tally(rows, stages_known)
 
     if args.json:
         json.dump({"files": rows, "tally": summary}, sys.stdout, indent=1)
@@ -322,8 +367,9 @@ def main(argv=None):
 
     for row in rows:
         stage = row["stage"] or "?"
+        wave = row["wave_size"] if row["wave_size"] is not None else "?"
         print(f"{row['name']}: stage={stage} directory_ok={row['directory_ok']} "
-              f"entries={row['entries']} fp16=0x{row['fp16_mask']:x}")
+              f"entries={row['entries']} fp16=0x{row['fp16_mask']:x} wave={wave}")
         if args.bindings:
             table = row["bindings"]
             if table is None:
@@ -334,12 +380,15 @@ def main(argv=None):
     total = summary
     print(f"{total['files']} files, directory_ok {total['directory_ok']}, "
           f"PS with table {total['ps_with_table']}, entries {total['entries']}")
+    if total["wave_sizes"]:
+        print("wave sizes: " + ", ".join(f"{k}:{v}" for k, v in total["wave_sizes"].items()))
     if total["read_methods"]:
         print("read methods: " + ", ".join(f"{k}:{v}" for k, v in total["read_methods"].items()))
     label = "PS entry counts" if total["entry_counts_scope"] == "ps" else "entry counts"
     print(label + ": " + ", ".join(f"{k}:{v}" for k, v in total["entry_counts"].items()))
     if total["stage_source"] == "table-only":
-        print("(no index.json found: counted every blob with a non-empty table as a PS)")
+        why = "no inspected blob in index.json" if stages else "no index.json found"
+        print(f"({why}: counted every blob with a non-empty table as a PS)")
     if args.bindings:
         parsed = [row for row in rows if row["bindings"]]
         records = sum(row["bindings"]["records"] for row in parsed)

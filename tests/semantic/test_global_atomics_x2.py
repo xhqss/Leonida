@@ -1,8 +1,9 @@
 """Value tests for RDNA2 global_atomic_{and,or,xor,swap}_x2, run through spirv_mini_interp on the CPU.
 
 M = op(M, DATA) on the 64-bit element at the global_* address (two dwords, low first); with glc the old 64 bits land in
-vdst[0:1]. The translator does one 32-bit atomic per dword, which leaves the same memory for a bitwise op or an
-exchange. The carrying and comparing _x2 forms stay Unsupported. Standard library only; no GPU, no game files.
+vdst[0:1]. The translator does one 32-bit atomic per dword, which leaves the same memory for a bitwise op, and for an
+exchange by one lane at a time (two lanes swapping into one element at once can tear it). The carrying and comparing
+_x2 forms stay Unsupported. Standard library only; no GPU, no game files.
 """
 import os
 import random

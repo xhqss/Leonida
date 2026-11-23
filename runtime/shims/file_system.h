@@ -12,7 +12,8 @@
 // A GAME: path that climbs above the root with ".." or names another drive is refused with ERROR_INVALID_NAME.
 //
 // The shims that use this live in file_system.cpp: CreateFile*, FindFirstFile*/FindNextFile*/FindClose,
-// GetFileAttributes*/GetFileAttributesEx* and DeleteFile*.
+// GetFileAttributes*/GetFileAttributesEx*, DeleteFile*, CreateDirectory*/RemoveDirectory*, MoveFile*/MoveFileEx*,
+// CopyFile*/CopyFileEx*/CopyFile2 and SetFileAttributes* (the rules for each are in docs/runtime_imports.md).
 #pragma once
 
 #include <filesystem>

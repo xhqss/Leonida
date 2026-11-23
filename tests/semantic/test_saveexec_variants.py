@@ -9,6 +9,7 @@ f turns on (nand, nor, orn1, orn2, xnor, ...) become active, as on hardware. Sta
 import os
 import sys
 import unittest
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
@@ -47,6 +48,13 @@ def case(op_line, wave, exec_hi, s0_lo, s0_hi):
 
 
 class SaveexecVariants(unittest.TestCase):
+    def test_null_mask_source(self) -> None:
+        fixture = Path(HERE) / "fixtures" / "null_mask_source.asm"
+        lines = [line for line in fixture.read_text(encoding="utf-8").splitlines()
+                 if line and not line.startswith(";")]
+        outputs, _ = run_ps_wave(lines, wave=64)
+        self.assertEqual(outputs, [(1, 64, 0xFFFFFFFF, 7)] * 64)
+
     def check(self, kind, wave, exec_hi, s0_lo, s0_hi, wrexec=False):
         m = (1 << wave) - 1
         e, s = lanes(0, exec_hi, wave), lanes(s0_lo, s0_hi, wave)

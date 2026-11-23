@@ -168,6 +168,23 @@ class MalformedIndexTest(unittest.TestCase):
                 self.assertIn("expected a JSON object", p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
 
+    def test_invalid_graphics_locations_are_one_error_not_a_traceback(self):
+        cases = (
+            ("ps_bad", {"stage": "ps", "inputs": ["not-a-location"]}),
+            ("vs_bad", {"stage": "vs", "outputs": [None]}),
+            ("ms_bad", {"stage": "ms", "params": [-1]}),
+            ("gs_bad", {"stage": "gs", "gs_input_locations": [0x100000000]}),
+        )
+        for name, metadata in cases:
+            with self.subTest(shader=name):
+                p = self.run_tool(json.dumps({name: metadata}))
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("cannot generate stubs", p.stderr)
+                self.assertIn("index.json", p.stderr)
+                if name in ("ms_bad", "gs_bad"):
+                    self.assertIn("invalid Location", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

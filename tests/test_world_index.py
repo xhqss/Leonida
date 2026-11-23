@@ -165,6 +165,10 @@ class WorldIndexTest(unittest.TestCase):
     def test_split_resource_needs_continuation(self):
         self.assertFalse(WI._needs_continuation(make_resource()))
         self.assertTrue(WI._needs_continuation(make_resource()[:0x150]))
+        # CMapData starts at 0x500 with size 0x120: a split mid-block at 0x540 still needs continuation.
+        self.assertTrue(WI._needs_continuation(make_resource()[:0x540]))
+        # Non-map resource has a single block at 0x400..0x490: a split mid-block at 0x448 still needs continuation.
+        self.assertTrue(WI._needs_continuation(make_resource(map_file=False)[:0x448]))
 
     def test_rpf_scan_joins_a_split_stream(self):
         blob = make_resource()
@@ -176,6 +180,87 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(stats["streams"], 2)
         self.assertEqual(rows[0]["kind"], "map")
         self.assertEqual(rows[0]["entities"], 1)
+
+    def test_rpf_and_carve_join_block_split_across_streams(self):
+        # Splitting mid-CMapData (last block at 0x500..0x620) or mid-CEntityDef (moved after
+        # CMapData to 0x620..0x6B0 so no block starts past the cut) must join the continuation
+        # stream in both scan_rpf and carve-folder scan_path instead of reading zeroed fields.
+        blob_map = make_resource()
+        blob_ent = bytearray(make_resource())
+        blob_ent[0x620:0x6B0] = blob_ent[0x400:0x490]
+        struct.pack_into("<IIQ", blob_ent, 0x200, WI.ENTITY, 0x90, ptr(0x620))
+        cases = (
+            ("mid_mapdata", blob_map, 0x540),
+            ("mid_entity", bytes(blob_ent), 0x650),
+        )
+        for label, blob, cut in cases:
+            with self.subTest(case=label, cut=hex(cut)):
+                path = os.path.join(self.dir, f"{label}.rpf")
+                with open(path, "wb") as f:
+                    f.write(make_rpf_streams([blob[:cut], blob[cut:]]))
+                entities = []
+                rows, stats = WI.scan_rpf(path, collect=entities)
+                self.assertEqual(stats["streams"], 2)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["size"], len(blob))
+                self.assertEqual(rows[0]["parent"], 0xAABBCCDD)
+                self.assertEqual(rows[0]["extent_min"], [-10.0, -20.0, -30.0])
+                self.assertEqual(rows[0]["extent_max"], [10.0, 20.0, 30.0])
+                self.assertEqual(rows[0]["map_flags"], 2)
+                self.assertEqual(rows[0]["content_flags"], 65)
+                self.assertEqual(len(entities), 1)
+                self.assertTrue(entities[0]["complete"])
+                self.assertEqual(entities[0]["archetype"], 0xDEADBEEF)
+
+                carve_dir = os.path.join(self.dir, f"carve_{label}")
+                os.makedirs(carve_dir)
+                files, off = [], 0x1000
+                for part in (blob[:cut], blob[cut:]):
+                    stored = len(zlib.compress(part))
+                    with open(os.path.join(carve_dir, f"{off:012x}.bin"), "wb") as f:
+                        f.write(part)
+                    files.append({"off": off, "stored": stored, "size": len(part)})
+                    off = (off + stored + 15) & ~15
+                with open(os.path.join(carve_dir, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                    json.dump({"summary": {}, "files": files}, f)
+                c_entities = []
+                c_rows, _ = WI.scan_path(carve_dir, collect=c_entities)
+                self.assertEqual(len(c_rows), 1)
+                self.assertEqual(c_rows[0]["size"], len(blob))
+                self.assertEqual(c_rows[0]["parent"], 0xAABBCCDD)
+                self.assertTrue(c_entities[0]["complete"])
+
+    def test_truncated_resource_does_not_swallow_following_0drp_resource(self):
+        # A truncated 0x7a map followed immediately by another 0DRPz resource must not consume
+        # the second resource as a continuation stream (both RPF and carve folder).
+        blob = make_resource()
+        for cut, expect_count in ((0x150, 1), (0x540, 2)):
+            with self.subTest(cut=hex(cut)):
+                truncated = blob[:cut]
+                path = os.path.join(self.dir, f"trunc_{cut:x}_then_valid.rpf")
+                with open(path, "wb") as f:
+                    f.write(make_rpf_streams([truncated, blob]))
+                rows, stats = WI.scan_rpf(path)
+                self.assertEqual(stats["streams"], 2)
+                self.assertEqual(len(rows), expect_count)
+                self.assertEqual(rows[-1]["size"], len(blob))
+                self.assertEqual(rows[-1]["parent"], 0xAABBCCDD)
+
+                carve_dir = os.path.join(self.dir, f"carve_trunc_{cut:x}")
+                os.makedirs(carve_dir)
+                files, off = [], 0x1000
+                for part in (truncated, blob):
+                    stored = len(zlib.compress(part))
+                    with open(os.path.join(carve_dir, f"{off:012x}.bin"), "wb") as f:
+                        f.write(part)
+                    files.append({"off": off, "stored": stored, "size": len(part)})
+                    off = (off + stored + 15) & ~15
+                with open(os.path.join(carve_dir, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                    json.dump({"summary": {}, "files": files}, f)
+                c_rows, _ = WI.scan_path(carve_dir)
+                self.assertEqual(len(c_rows), expect_count)
+                self.assertEqual(c_rows[-1]["size"], len(blob))
+                self.assertEqual(c_rows[-1]["parent"], 0xAABBCCDD)
 
     def test_scan_window_options(self):
         blob = make_resource()
@@ -608,6 +693,22 @@ class WorldIndexTest(unittest.TestCase):
         blob = make_resource()
         rows, _ = WI.scan_path(self.carve([blob[:0x150], blob[0x150:]], gap=0x10))
         self.assertEqual(rows, [])
+
+    def test_carved_file_inflate_cap_matches_directory_scan(self):
+        resource = make_resource()
+        path = os.path.join(self.dir, "sample.bin")
+        with open(path, "wb") as f:
+            f.write(resource)
+
+        for source in (path, self.dir):
+            for cap, expected in ((len(resource) - 1, 0), (len(resource), 1)):
+                with self.subTest(source=source, cap=cap):
+                    entities = []
+                    rows, stats = WI.scan_path(source, max_inflate=cap, collect=entities)
+                    self.assertEqual(len(rows), expected)
+                    self.assertEqual(len(entities), expected)
+                    self.assertEqual(stats["files"], expected)
+                    self.assertEqual(stats["scanned_bytes"], expected * len(resource))
 
     def test_directory_inflate_cap_does_not_exclude_large_archives(self):
         resource = make_resource()

@@ -318,7 +318,7 @@ class PipelineStageIsolationTest(unittest.TestCase):
         os.makedirs(spirv_dir, exist_ok=True)
         index_path = os.path.join(spirv_dir, "index.json")
         with open(index_path, "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('{"shader_0": {}}')   # a finished translation is never empty
 
         dummy_exe = os.path.join(self.tmp.name, "vk_pipeline_check.exe")
         with open(dummy_exe, "w", encoding="utf-8") as f:
@@ -327,14 +327,21 @@ class PipelineStageIsolationTest(unittest.TestCase):
         expected_cache = os.path.join(self.out_dir, "pipeline_cache.bin")
         executed_cmds = []
 
-        def fake_run(args: list[str], **kwargs: object) -> None:
+        def fake_run(args: list[str], **kwargs: object) -> int:
             executed_cmds.append(args)
+            return 0
 
+        # The usage probe (checker_supports) really launches the checker, so it is stubbed too: CreateProcess on a
+        # text file named .exe makes native Windows show a modal "Unsupported 16-Bit Application" dialog that blocks
+        # the run. A checker without --inflight-file is what the old dummy answered.
         with mock.patch("make_game.pipeline_check_exe", return_value=dummy_exe), \
+                mock.patch("make_game.checker_supports", return_value=False) as supports, \
                 mock.patch("make_game.run", side_effect=fake_run), \
+                mock.patch.object(make_game.subprocess, "run", side_effect=AssertionError("launched the dummy")), \
                 mock.patch("make_game.log"):
             make_game.pipelines(self.work_dir, self.out_dir)
 
+        supports.assert_called_once()
         self.assertEqual(len(executed_cmds), 1)
         self.assertEqual(executed_cmds[0], [dummy_exe, spirv_dir, expected_cache])
 
@@ -363,7 +370,7 @@ class PipelineStageIsolationTest(unittest.TestCase):
             mock_assets.assert_not_called()
             mock_runtime.assert_not_called()
             mock_pipelines.assert_called_once_with(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir),
-                                                   mock.ANY)
+                                                   mock.ANY, runtime_build=None)
 
 
 class StageResumptionAndStepIsolationTest(unittest.TestCase):
@@ -386,9 +393,11 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         os.makedirs(spirv_dir, exist_ok=True)
 
         with open(os.path.join(dxbc_dir, "index.json"), "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('[{"file": "shader.dxbc"}]')
         with open(os.path.join(dxbc_dir, "fssm_index.json"), "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('[{"name": "shader"}]')
+        with open(os.path.join(dxbc_dir, "disasm", "shader.s"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("synthetic listing\n")
         with open(os.path.join(dxbc_dir, "disasm.done"), "w", encoding="utf-8") as f:
             f.write("test llvm-mc 21\n")
         with open(os.path.join(spirv_dir, "index.json"), "w", encoding="utf-8") as f:
@@ -425,10 +434,15 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             fake_py_calls.append(tool)
             if tool == "shader_carve.py":
                 with open(os.path.join(dxbc_dir, "index.json"), "w", encoding="utf-8") as f:
-                    f.write("{}")
+                    f.write('[{"file": "shader.dxbc"}]')
             elif tool == "fssm_unpack.py":
                 with open(os.path.join(dxbc_dir, "fssm_index.json"), "w", encoding="utf-8") as f:
-                    f.write("{}")
+                    f.write('[{"name": "shader"}]')
+            elif tool == "shader_disasm.py":
+                disasm = os.path.join(dxbc_dir, "disasm")
+                os.makedirs(disasm, exist_ok=True)
+                with open(os.path.join(disasm, "shader.s"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write("synthetic listing\n")
 
         with mock.patch("make_game.py", side_effect=fake_py), \
                 mock.patch("make_game.llvm_mc_signature", return_value="test llvm-mc 21"), \
@@ -452,6 +466,8 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
                 os.makedirs(dest, exist_ok=True)
                 with open(os.path.join(dest, "manifest.json"), "w", encoding="utf-8") as f:
                     f.write("{}")
+                with open(os.path.join(dest, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
+                    f.write(make_game.decoder_digest())
 
         with open(os.path.join(audio_dir, "audio_manifest.json"), "w", encoding="utf-8") as f:
             f.write("{}")

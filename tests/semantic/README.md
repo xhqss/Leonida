@@ -4,6 +4,12 @@ Standard library only; no GPU, no LLVM, no SPIRV-Tools, no game files.
 
     python -m unittest discover -s tests/semantic -v
 
+Every file here must call `tools/rdna2spirv.py` (directly, through `support.py`, or by running the tool) and assert
+on what it emitted. A test that reimplements the instruction in Python passes whatever the translator does, so it is
+not a regression test. `tests/test_semantic_translator_use.py` enforces this; the interpreter self-tests and the
+files whose subject is hand-written SPIR-V are listed there with a reason. The guard checks that a file reaches the
+translator, not that every assertion depends on it.
+
 What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 
 - `test_ps_semantics.py` translates `ps_sdwa`, `ps_ops`, `ps_ops2`, `ps_ops3`, `ps_ops4` and `ps_legacy_mul` and
@@ -24,6 +30,10 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   as compute too and asserts 16 dwords: 10:10:10:2 words read through formats 50 and 44 (from the V# and from
   tbuffer's own format) and stored in both. `ps_scc_minmax` asserts SCC after `s_min`/`s_max` `_i32`/`_u32`:
   0 on a tie, and 1 on a pair (-1 against 1) that only the right signedness orders that way.
+  `ps_vcmp_f32_nan` asserts 32 f32 VOPC results with a NaN input (ordered `ge`/`lg`/`o` false, the `n*`
+  forms true, `v_cmp` into VCC and an SGPR, and `v_cmpx`), `ps_vcmp_64` 32 64-bit integer compares (`u64`/`i64`,
+  equal high words compared on the unsigned low word), and `cs_w32_andn2_exec` (one 32-thread wave)
+  `s_andn2_saveexec_b32` / `s_andn2_wrexec_b32`: the EXEC they leave, the old / new EXEC in D and SCC.
   `RawBufferTailBounds` runs one-thread compute programs written in the test around one `buffer_load` and
   asserts the words and the exact addresses loaded for the raw-buffer rule measured on an RX 6800 (per-dword
   `num_records` check on the exact byte offset); `MeasuredBoundsShaders` runs the four GPU tests of the SMEM and
@@ -35,6 +45,10 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   RDNA2 ISA's swizzled buffer_offset and its OOB_SELECT 3 rule (docs/design.md Swizzled buffer addressing): the
   exact addresses loaded and stored for dword, multi-dword and typed accesses, each with a literal and a run-time
   V#, and the GPU fixture `cs_buf_swizzle` on 64 threads.
+- `test_tbuffer_store.py` runs the GPU test `cs_tbuffer_store` (13 `tbuffer_store_format_*` stores through V#s
+  whose format differs from the instruction's, or is 0) and asserts the 52 words `check.py` expects, measured natively on a
+  Radeon 680M; also the default `BUF_FMT_8_UNORM` byte, a format without an encoder staying `Unsupported`, and the
+  store's data VGPRs counting as reads.
 - `test_scalar_mem_smem.py` runs the code `Gen.scalar_load` emits with its own small evaluator (64-bit
   addresses, forward selection constructs) and asserts the SGPR values and the addresses read, including the
   measured SMEM truncation, `s_buffer_load` `NUM_RECORDS` bound and signed `s_load` immediate.
@@ -97,6 +111,11 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 - `test_alu_int_misc.py` translates one-instruction synthetic listings for `v_bfm_b32`, `v_and_or_b32`,
   `v_add_lshl_u32`, `v_lshl_or_b32`, `v_mad_i32_i24` and `v_mul_lo_u32` and checks the mrt0 word against
   hand-computed ISA values (masked shift counts, wrapping adds/products, 24-bit sign extension).
+- `test_lds_subdword_wide.py` translates the GPU tests `cs_w32_lds_subdword` (`ds_write_b8`/`_b16` and their
+  `_d16_hi` forms, `ds_read_u8`/`_i8`/`_u16`/`_i16`) and `cs_w32_lds_wide` (`ds_write`/`ds_read` `_b64`/`_b96`/`_b128`,
+  `ds_read2st64_b32`) and runs 32 lanes in lockstep; the 16 words come from a byte-level LDS model of the ISA rules
+  and match what an RTX 4070 SUPER (driver 610.88) wrote. Three SPIR-V sabotages (zero-extending `_i8`/`_i16`, no
+  high-half shift for `_d16_hi`, `st64` offset in dwords) must change the result.
 - `test_negative_controls.py` sabotages the translated SPIR-V text and requires the result to change.
 - `test_mutations.py` sabotages a temporary copy of `tools/` (13 regressions across SDWA, min3/max3, `v_bfe_i32`,
   `v_pk_fma_f16`, `v_fma_f16 op_sel`, `v_subrev_co_ci_u32`, `v_cmpx_eq_u64`, `v_mul_i32_i24`, `v_ffbh_i32`,
@@ -108,10 +127,14 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   `Fma`).
 - `test_fixtures.py` checks `tests/semantic/fixtures/disasm/*.s` equals what `regen_fixtures.py` makes from
   `runtime/test/shaders/*.asm` (`python tests/semantic/regen_fixtures.py` rewrites them).
+- `test_dpp_eager_subgroup.py` (SHADER-529) checks that no DPP ballot or shuffle is left where SPIRV-Cross
+  (MoltenVK) would inline it into a short-circuiting `&&`/`||` or a ternary's arm, for 11 DPP16/DPP8 forms with
+  and without a lane off in EXEC, using a model of SPIRV-Cross's single-use forwarding (its own tests cover the
+  model). It also runs the same programs in `spirv_wave_interp.py` against a plain-Python DPP reference.
 
 Limits: single lane (or lanes in lockstep, one instruction per lane per round, that exchange values only through
-`OpGroupNonUniformShuffle`, `Ballot`, `Any`, `All` and `BitwiseOr` Reduce), forward-only structured control flow (the fragment-exit discard test and the compute
-dynamic-bounds merge; no backward branches, loops, calls or switches), no texture access. PushConstant words,
+`OpGroupNonUniformShuffle`, `Ballot`, `Any`, `All` and `BitwiseOr` Reduce), control flow followed one branch at a time (the fragment-exit discard test, the compute
+dynamic-bounds merge, loops of up to 10000 backward branches and calls of the module's own functions; no switches), no texture access. PushConstant words,
 Input variables and a flat physical-address `{address: word}` map can be supplied per run. A shift by at least the bit width is an undefined value: arithmetic on it stays
 undefined and any other use (store, branch or select condition, shuffle, output) raises. Values that pass
 through a float op lose NaN payloads (Python floats), so expected output words avoid NaN bit patterns; a

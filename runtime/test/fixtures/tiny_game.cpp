@@ -1,11 +1,12 @@
 // A stand-in game executable for `gta6rt --run`: what a real title does in its first second, run through the
 // loader instead of the Windows one. Test code, not game content. Run as
-//   gta6rt --run tiny_game.exe -- hello 42 [tls] [eh] [exit-code]
+//   gta6rt --run tiny_game.exe -- hello 42 [tls] [eh] [game-file] [exit-code]
 // It checks its arguments, a static initializer, the heap, a file round trip, a second thread, and the
 // xgameruntime.dll imports (answered by the shim registry: the stub DLL it links against would fail them), then
 // calls exit() with 0 (42 with `exit-code`) when everything held. Two checks are opt-in, by argument (CTest's
 // run_tiny_game_tls and run_tiny_game_eh): `tls`, thread_local on the game's own threads, which needs the loader's
 // per-thread TLS (gta6rt starts main on a separate thread); and `eh`, a C++ exception caught inside the image.
+// A third, `game-file` (run_tiny_game_dir), reads GAME:\tiny_game_probe.txt after moving the current directory.
 // On MSVC, `eh` needs more than the unwind tables #176 registers: _CxxThrowException finds the throwing image
 // with RtlPcToFileHeader, which the loader redirects in the host MSVC runtime. Arguments, not environment variables,
 // so scripts/run_wine_tests.py (which passes a test's command line but not its ENVIRONMENT) runs them too. stdout is
@@ -105,6 +106,24 @@ int main(int argc, char** argv) {
         check(caught, "a C++ exception is thrown and caught inside the image");
     } else {
         std::printf("tiny_game: SKIP C++ exception (argument eh)\n");
+    }
+
+    if (has_arg(argc, argv, "game-file")) {
+        // The probe file sits in the game folder (check_game_dir.cmake writes it). Move the current directory away
+        // first, as a title may: GAME: must still name the game folder, whether gta6rt was given a bare image name
+        // or a relative --game-dir.
+        SetCurrentDirectoryA(tmp);
+        HANDLE file = CreateFileW(L"GAME:\\tiny_game_probe.txt", GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        char data[4] = {};
+        DWORD count = 0;
+        const bool read = file != INVALID_HANDLE_VALUE && ReadFile(file, data, sizeof(data), &count, nullptr) &&
+                          count == sizeof(data) && std::memcmp(data, "game", sizeof(data)) == 0;
+        if (file == INVALID_HANDLE_VALUE) std::printf("tiny_game: GAME: open error %lu\n", GetLastError());
+        else CloseHandle(file);
+        check(read, "GAME:\\tiny_game_probe.txt is read from the game folder after SetCurrentDirectory");
+    } else {
+        std::printf("tiny_game: SKIP GAME: file (argument game-file)\n");
     }
 
     std::printf("tiny_game: %s\n", g_failures ? "FAILED" : "OK");

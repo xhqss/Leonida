@@ -11,14 +11,28 @@
 //                                its address and passes the heap base, so a V# in VKH_SGPRS can point into it.
 //   VKH_HEAP_DUMP=<file>         after the draw, writes the 64 KiB heap (needs VKH_HEAP, which may be empty-valued as
 //                                "0=0"), so a test can read what the pixel shader stored or atomically added.
+//   VKH_DRAW_MESH=<file> + VKH_VERTEX_LAYOUT=0:3f,1:2f
+//                                draws an indexed mesh instead of the 3-vertex triangle. The file is u32
+//                                vertex_count, u32 index_count, vertex_count*stride bytes, index_count u32
+//                                indices; the layout lists location:float-components, one item per attribute.
+//   VKH_BINARY_OUT=<file>        writes the pipeline's VK_KHR_pipeline_binary data after building it
+//   VKH_BINARY_IN=<file>         builds the pipeline from such a file instead (tools/ps_oracle.py patches the pixel
+//                                shader in it); both exit 77 without VK_KHR_pipeline_binary
 //   VKH_SUBGROUP_SIZE=32|64      requires that subgroup size of the fragment shader (or of the compute or geometry
 //                                stage under test); stderr says "fragment subgroup size: N" when it took effect and
 //                                "... not available" when the device cannot require it (exit code stays 0).
+//   VKH_TEX_RGBA=<file>          binds a 2D RGBA8 texture (u32 width, u32 height, width*height*4 bytes) at bindless
+//                                set 0 image index 1 (with 1x1 magenta at index 0), writes a T# at VKH_TSHARP_VA
+//                                (default 0x100) in the 64 KiB heap, and registers VKH_SSHARP (4 comma-separated
+//                                dwords, default 0x92,0xc00000,0x14500000,0) at sampler index 1.
 //
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
+#include "vk_pc_tail.h"
+#include "../src/descriptor_table.h"
+#include "../src/gfx10_descriptors.h"
 
 #include <cctype>
 #include <cstddef>
@@ -26,6 +40,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <utility>
 #include <vector>
 
@@ -82,6 +97,42 @@ static bool parse_heap(const char* s, std::vector<std::pair<uint32_t, uint32_t>>
     return true;
 }
 
+// VKH_VERTEX_LAYOUT=0:3f,1:2f: one attribute per item, float components only. Location 0 is the first float3.
+struct VertexAttr {
+    uint32_t location, components, offset;
+    VkFormat format;
+};
+
+static bool parse_vertex_layout(const char* s, VertexAttr* attrs, uint32_t& count, uint32_t& stride) {
+    count = 0; stride = 0;
+    while (*s) {
+        uint32_t loc, comps;
+        if (count == 8 || !parse_u32(s, loc) || *s++ != ':' || !parse_u32(s, comps) ||
+            comps < 1 || comps > 4 || *s++ != 'f' || !next_item(s))
+            return false;
+        static const VkFormat formats[4] = {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32G32_SFLOAT,
+                                            VK_FORMAT_R32G32B32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT};
+        attrs[count++] = {loc, comps, stride, formats[comps - 1]};
+        stride += comps * 4;
+    }
+    return count > 0;
+}
+
+// VKH_DRAW_MESH file: u32 vertex_count, u32 index_count, vertex_count*stride bytes, index_count u32 indices.
+static bool read_mesh(const char* path, uint32_t stride, std::vector<uint8_t>& vertices,
+                      std::vector<uint32_t>& indices) {
+    std::ifstream f(path, std::ios::binary);
+    uint32_t vcount = 0, icount = 0;
+    f.read(reinterpret_cast<char*>(&vcount), 4);
+    f.read(reinterpret_cast<char*>(&icount), 4);
+    if (!f || vcount == 0 || icount == 0 || vcount > 10000000u || icount > 30000000u) return false;
+    vertices.resize(size_t(vcount) * stride);
+    indices.resize(icount);
+    f.read(reinterpret_cast<char*>(vertices.data()), std::streamsize(vertices.size()));
+    f.read(reinterpret_cast<char*>(indices.data()), std::streamsize(indices.size() * 4));
+    return bool(f);
+}
+
 int main(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr, "usage: vk_harness vs.spv fs.spv out.raw [w h [clip-test-s0 clip-test-s1]]\n"
@@ -113,6 +164,17 @@ int main(int argc, char** argv) {
     }
     // Push constants: s0..s31, heap base (32..33), code base (34..35), --mesh-compute output address (36..37).
     uint32_t pc[38] = {};
+    const char* draw_mesh_path = std::getenv("VKH_DRAW_MESH");
+    if (draw_mesh_path && !*draw_mesh_path) draw_mesh_path = nullptr;
+    VertexAttr vertex_attrs[8];
+    uint32_t vertex_attr_count = 0, vertex_stride = 0;
+    if (draw_mesh_path) {
+        const char* layout = std::getenv("VKH_VERTEX_LAYOUT");
+        if (!layout || !parse_vertex_layout(layout, vertex_attrs, vertex_attr_count, vertex_stride)) {
+            std::fprintf(stderr, "VKH_VERTEX_LAYOUT: expected locations like 0:3f,1:2f with VKH_DRAW_MESH\n");
+            return 2;
+        }
+    }
     const char* sgprs_env = std::getenv("VKH_SGPRS");
     if (sgprs_env && !parse_sgprs(sgprs_env, pc)) {
         std::fprintf(stderr, "VKH_SGPRS: expected up to 32 comma-separated words, got \"%s\"\n", sgprs_env);
@@ -127,6 +189,55 @@ int main(int argc, char** argv) {
                      heap_bytes, heap_env);
         return 2;
     }
+    const char* tex_rgba_path = std::getenv("VKH_TEX_RGBA");
+    if (tex_rgba_path && !*tex_rgba_path) tex_rgba_path = nullptr;
+    uint32_t tsharp_va = 0x100;
+    uint32_t ssharp[8] = {0x92, 0xc00000, 0x14500000, 0,
+                          0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+    uint32_t tex_w = 0, tex_h = 0;
+    std::vector<uint8_t> tex_pixels;
+    if (tex_rgba_path) {
+        if (const char* va_env = std::getenv("VKH_TSHARP_VA"); va_env && *va_env) {
+            const char* p = va_env;
+            if (!parse_u32(p, tsharp_va) || *p || (tsharp_va & 3u) || tsharp_va > heap_bytes - 32) {
+                std::fprintf(stderr, "VKH_TSHARP_VA: expected 4-byte aligned offset at most 0x%x, got \"%s\"\n",
+                             heap_bytes - 32, va_env);
+                return 2;
+            }
+        }
+        if (const char* ss_env = std::getenv("VKH_SSHARP"); ss_env && *ss_env) {
+            const char* p = ss_env;
+            for (int i = 0; i < 4; ++i) {
+                if (i && *p++ != ',') {
+                    std::fprintf(stderr, "VKH_SSHARP: expected 4 comma-separated dwords, got \"%s\"\n", ss_env);
+                    return 2;
+                }
+                if (!parse_u32(p, ssharp[i])) {
+                    std::fprintf(stderr, "VKH_SSHARP: expected 4 comma-separated dwords, got \"%s\"\n", ss_env);
+                    return 2;
+                }
+            }
+            if (*p) {
+                std::fprintf(stderr, "VKH_SSHARP: expected 4 comma-separated dwords, got \"%s\"\n", ss_env);
+                return 2;
+            }
+        }
+        std::ifstream tf(tex_rgba_path, std::ios::binary);
+        uint32_t hdr[2] = {};
+        if (!tf.read(reinterpret_cast<char*>(hdr), 8) || hdr[0] == 0 || hdr[1] == 0 ||
+            uint64_t(hdr[0]) * uint64_t(hdr[1]) > (1ull << 26)) {
+            std::fprintf(stderr, "VKH_TEX_RGBA: invalid header in %s\n", tex_rgba_path);
+            return 1;
+        }
+        tex_w = hdr[0];
+        tex_h = hdr[1];
+        tex_pixels.resize(size_t(tex_w) * size_t(tex_h) * 4);
+        if (!tf.read(reinterpret_cast<char*>(tex_pixels.data()), std::streamsize(tex_pixels.size()))) {
+            std::fprintf(stderr, "VKH_TEX_RGBA: truncated pixel data in %s\n", tex_rgba_path);
+            return 1;
+        }
+    }
+    const bool need_heap = heap_env != nullptr || tex_rgba_path != nullptr;
     gipa = load_vulkan();
     if (!gipa) return 1;
     VkInstance inst = VK_NULL_HANDLE;
@@ -240,6 +351,26 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    // Translated shaders declare a 144-byte push-constant block (user SGPRs, heap base, code base; see VKH_SGPRS /
+    // VKH_HEAP); --mesh-compute modules and their vertex shaders add the output address (152 bytes). A device with
+    // fewer bytes (128, the Vulkan minimum, as on some Intel Arc drivers and AMD's Windows driver for RDNA2 iGPUs)
+    // cannot take that range: declaring it anyway is invalid, and there a shader reading past the limit crashed or
+    // hung the device. 77, as vk_texture_test and vk_bindless_test: a device limit, not a wrong result (D3D-14).
+    // LEONIDA_PC_TAIL_UBO=1 (rdna2spirv.py --pc-tail-ubo): s0..s31 only, 128 bytes, which every device has; the
+    // tail is a uniform block at set 1 (vk_pc_tail.h). tools/mesh_compute_vs.py's vertex shader still reads the
+    // --mesh-compute output address from push constants, so that combination isn't run.
+    const bool pc_tail = leonida::vk_test::pc_tail_requested();
+    if (pc_tail && mesh_compute) {
+        std::fprintf(stderr, "unsupported: --mesh-compute's vertex shader reads the output address from push "
+                             "constants, not from the --pc-tail-ubo block\n");
+        return 77;
+    }
+    const uint32_t pc_bytes = pc_tail ? 128u : mesh_compute ? 152u : 144u;
+    if (props.limits.maxPushConstantsSize < pc_bytes) {
+        std::fprintf(stderr, "unsupported: need %u push constant bytes, device has %u\n", pc_bytes,
+                     props.limits.maxPushConstantsSize);
+        return 77;
+    }
     // VKH_MESH=1: the first shader is a mesh shader (VK_EXT_mesh_shader), drawn with vkCmdDrawMeshTasksEXT(1,1,1).
     const bool mesh = !mesh_compute && (group_readback || std::getenv("VKH_MESH") != nullptr);
     VkPhysicalDeviceMeshShaderFeaturesEXT meshf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
@@ -264,12 +395,22 @@ int main(int argc, char** argv) {
         m8.maintenance8 = VK_TRUE; m8.pNext = chain; chain = &m8;
     }
 #endif
+    VkPhysicalDeviceVulkan11Features f11q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     VkPhysicalDeviceVulkan12Features f12q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    f12q.pNext = &f11q;
     VkPhysicalDeviceVulkan13Features f13q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     f13q.pNext = &f12q;
     VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2q.pNext = &f13q;
     vkGetPhysicalDeviceFeatures2(pd, &f2q);
+    // Translated vertex shaders read BaseVertex / BaseInstance (DrawParameters) to give v0 / v3 the hardware's
+    // zero-based ids.
+    VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    if (f11q.shaderDrawParameters) {
+        f11.shaderDrawParameters = VK_TRUE;
+        f11.pNext = chain;
+        chain = &f11;
+    }
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     if (f13q.subgroupSizeControl) {
         f13.subgroupSizeControl = VK_TRUE;
@@ -277,15 +418,47 @@ int main(int argc, char** argv) {
         chain = &f13;
     }
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-    if (heap_env || mesh_compute) {
+    if (need_heap || mesh_compute) {
         // 77 is the "this device cannot run the test" code that check.py and run_gpu_tests.py report as SKIP.
         if (!f12q.bufferDeviceAddress) {
-            std::fprintf(stderr, "unsupported: %s needs bufferDeviceAddress\n", heap_env ? "VKH_HEAP" : "VKH_MESH_COMPUTE");
+            std::fprintf(stderr, "unsupported: %s needs bufferDeviceAddress\n",
+                         tex_rgba_path ? "VKH_TEX_RGBA" : heap_env ? "VKH_HEAP" : "VKH_MESH_COMPUTE");
             return 77;
         }
         f12.bufferDeviceAddress = VK_TRUE;
+        if (tex_rgba_path) {
+            if (!f12q.runtimeDescriptorArray || !f12q.descriptorIndexing) {
+                std::fprintf(stderr, "unsupported: VKH_TEX_RGBA needs runtimeDescriptorArray and descriptorIndexing\n");
+                return 77;
+            }
+            f12.runtimeDescriptorArray = VK_TRUE;
+            f12.descriptorIndexing = VK_TRUE;
+        }
         f12.pNext = chain;
         chain = &f12;
+    }
+    // VKH_BINARY_OUT=<file> / VKH_BINARY_IN=<file>: VK_KHR_pipeline_binary. OUT writes the pipeline's binaries after
+    // it is built; IN builds the pipeline from such a file instead of compiling the shaders (tools/ps_oracle.py
+    // patches the pixel shader's code in it). File: u32 count, then per binary u32 key size, 32 key bytes, u64 data
+    // size, the data.
+    const char* bin_out = std::getenv("VKH_BINARY_OUT");
+    const char* bin_in = std::getenv("VKH_BINARY_IN");
+    VkPhysicalDevicePipelineBinaryFeaturesKHR pbf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR};
+    VkPhysicalDeviceMaintenance5FeaturesKHR m5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+    if (bin_out || bin_in) {
+        VkPhysicalDeviceFeatures2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        VkPhysicalDevicePipelineBinaryFeaturesKHR pbq{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR};
+        q.pNext = &pbq;
+        vkGetPhysicalDeviceFeatures2(pd, &q);
+        if (!has(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME) || !has(VK_KHR_MAINTENANCE_5_EXTENSION_NAME) ||
+            !pbq.pipelineBinaries) {
+            std::fprintf(stderr, "unsupported: no VK_KHR_pipeline_binary\n");
+            return 77;
+        }
+        enable.push_back(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+        enable.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+        pbf.pipelineBinaries = VK_TRUE; pbf.pNext = chain; chain = &pbf;
+        m5.maintenance5 = VK_TRUE; m5.pNext = chain; chain = &m5;
     }
     for (auto e : enable) std::fprintf(stderr, "enabled %s\n", e);
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
@@ -314,9 +487,16 @@ int main(int argc, char** argv) {
         }
         feats.shaderFloat64 = VK_TRUE;
     }
-    if (heap_env || mesh_compute) {
+    if (need_heap || mesh_compute) {
         if (!f2q.features.shaderInt64) { std::fprintf(stderr, "unsupported: 64-bit addresses need shaderInt64\n"); return 77; }
         feats.shaderInt64 = VK_TRUE;   // heap and --mesh-compute output addresses are 64-bit
+    }
+    if (tex_rgba_path) {
+        if (!f2q.features.shaderSampledImageArrayDynamicIndexing) {
+            std::fprintf(stderr, "unsupported: VKH_TEX_RGBA needs shaderSampledImageArrayDynamicIndexing\n");
+            return 77;
+        }
+        feats.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
     }
     dci.pEnabledFeatures = &feats;
     VkDevice dev;
@@ -327,6 +507,8 @@ int main(int argc, char** argv) {
     LOADD(vkCreateShaderModule); LOADD(vkCreatePipelineLayout); LOADD(vkCreateGraphicsPipelines);
     LOADD(vkCreateCommandPool); LOADD(vkAllocateCommandBuffers); LOADD(vkBeginCommandBuffer);
     LOADD(vkCmdBeginRenderPass); LOADD(vkCmdBindPipeline); LOADD(vkCmdDraw); LOADD(vkCmdEndRenderPass);
+    LOADD(vkCmdBindVertexBuffers); LOADD(vkCmdBindIndexBuffer); LOADD(vkCmdDrawIndexed);
+    LOADD(vkCmdPipelineBarrier);
     LOADD(vkCmdCopyImageToBuffer); LOADD(vkEndCommandBuffer); LOADD(vkQueueSubmit); LOADD(vkQueueWaitIdle);
     LOADD(vkCreateBuffer); LOADD(vkGetBufferMemoryRequirements); LOADD(vkBindBufferMemory); LOADD(vkMapMemory);
     VkQueue q; vkGetDeviceQueue(dev, qi, 0, &q);
@@ -399,8 +581,11 @@ int main(int argc, char** argv) {
     VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     fbi.renderPass = rp; fbi.attachmentCount = rpi.attachmentCount; fbi.pAttachments = views; fbi.width = W; fbi.height = H; fbi.layers = 1;
     VkFramebuffer fb; CHECK(vkCreateFramebuffer(dev, &fbi, nullptr, &fb));
+    bool tail_block = false;   // some stage reads the --pc-tail-ubo block (declares set 1)
     auto module = [&](const char* p, VkShaderModule* m) {
         auto code = read_spv(p);
+        if (pc_tail && leonida::vk_test::spirv_declares_set(code.data(), code.size() * 4, leonida::vk_test::pc_tail_set))
+            tail_block = true;
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         smi.codeSize = code.size() * 4; smi.pCode = code.data();
         return vkCreateShaderModule(dev, &smi, nullptr, m);
@@ -437,11 +622,24 @@ int main(int argc, char** argv) {
             stages[2].pNext = &reqSg;
         else if (!mesh && !gs_tested && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_FRAGMENT_BIT))
             stages[1].pNext = &reqSg;
-        if (stages[1].pNext == &reqSg) std::fprintf(stderr, "fragment subgroup size: %u\n", req_sg);
+        // A device with one subgroup size runs every stage at it, required or not (AMD GCN: 64, with only COMPUTE
+        // in requiredSubgroupSizeStages), so the fragment stage of a plain draw already has the size asked for.
+        const bool fixed = !mesh && !gs_tested && sgProps.minSubgroupSize == sgProps.maxSubgroupSize;
+        if (stages[1].pNext == &reqSg || fixed) std::fprintf(stderr, "fragment subgroup size: %u\n", req_sg);
     } else if (req_sg > 0) {
         std::fprintf(stderr, "fragment subgroup size: %u not available\n", req_sg);
     }
     VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkVertexInputBindingDescription vbind{0, vertex_stride, VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription vattr[8]{};
+    if (draw_mesh_path) {
+        for (uint32_t i = 0; i < vertex_attr_count; ++i)
+            vattr[i] = {vertex_attrs[i].location, 0, vertex_attrs[i].format, vertex_attrs[i].offset};
+        vin.vertexBindingDescriptionCount = 1;
+        vin.pVertexBindingDescriptions = &vbind;
+        vin.vertexAttributeDescriptionCount = vertex_attr_count;
+        vin.pVertexAttributeDescriptions = vattr;
+    }
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkViewport vp{0, 0, float(W), float(H), 0, 1}; VkRect2D sc{{0, 0}, {W, H}};
@@ -454,14 +652,40 @@ int main(int argc, char** argv) {
     VkPipelineColorBlendAttachmentState cba{}; cba.colorWriteMask = 0xF;
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = 1; cb.pAttachments = &cba;
-    // Translated shaders declare a 144-byte push-constant block (user SGPRs, heap base, code base; see VKH_SGPRS /
-    // VKH_HEAP); --mesh-compute modules and their vertex shaders add the output address (152 bytes).
+    // The push-constant block (pc_bytes, checked against the device limit above).
     const VkShaderStageFlags pcs = (mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT) |
                                    VK_SHADER_STAGE_FRAGMENT_BIT | (gs_path ? VK_SHADER_STAGE_GEOMETRY_BIT : 0) |
                                    (mesh_compute ? VK_SHADER_STAGE_COMPUTE_BIT : 0);
-    VkPushConstantRange pcr{pcs, 0, mesh_compute ? 152u : 144u};
+    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    VkDescriptorSet ds = VK_NULL_HANDLE;
+    VkImage tex_fallback_img = VK_NULL_HANDLE, tex_img = VK_NULL_HANDLE;
+    VkBuffer tex_staging = VK_NULL_HANDLE;
+    if (tex_rgba_path) {
+        LOADD(vkCreateDescriptorSetLayout);
+        VkDescriptorSetLayoutBinding dslb[3]{};
+        dslb[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2, VK_SHADER_STAGE_ALL, nullptr};
+        dslb[1] = {1, VK_DESCRIPTOR_TYPE_SAMPLER, 2, VK_SHADER_STAGE_ALL, nullptr};
+        dslb[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr};
+        VkDescriptorSetLayoutCreateInfo dslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        dslci.bindingCount = 3;
+        dslci.pBindings = dslb;
+        CHECK(vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dsl));
+    }
+    VkPushConstantRange pcr{pcs, 0, pc_bytes};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    if (dsl) {
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts = &dsl;
+    }
     pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
+    // --pc-tail-ubo: the tail block at set 1 (set 0 stays empty here), one slot for the one draw.
+    leonida::vk_test::PcTail tail;
+    if (tail_block && !tail.create(vkGetDeviceProcAddr, dev, mp, props.limits.minUniformBufferOffsetAlignment, pcs, 1)) {
+        std::fprintf(stderr, "FAILED creating the --pc-tail-ubo block\n");
+        return 1;
+    }
+    const VkDescriptorSetLayout tail_layouts[] = {tail.empty_layout, tail.set_layout};
+    if (tail_block) { pli.setLayoutCount = 2; pli.pSetLayouts = tail_layouts; }
     VkPipelineLayout pl; CHECK(vkCreatePipelineLayout(dev, &pli, nullptr, &pl));
     VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     gpi.stageCount = nstages; gpi.pStages = stages;
@@ -479,7 +703,76 @@ int main(int argc, char** argv) {
         gpi.pDepthStencilState = &ds_state;
     }
     gpi.layout = pl; gpi.renderPass = rp;
+    VkPipelineCreateFlags2CreateInfoKHR capture{VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR};
+    std::vector<VkPipelineBinaryKHR> in_bins;
+    VkPipelineBinaryInfoKHR bin_info{VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR};
+    if (bin_out) {
+        capture.flags = VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR;
+        gpi.pNext = &capture;
+    }
+    if (bin_in) {
+        auto vkCreatePipelineBinariesKHR = reinterpret_cast<PFN_vkCreatePipelineBinariesKHR>(
+            vkGetDeviceProcAddr(dev, "vkCreatePipelineBinariesKHR"));
+        std::ifstream f(bin_in, std::ios::binary);
+        std::vector<char> all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        size_t at = 0;
+        auto take = [&](void* p, size_t n) {
+            if (at + n > all.size()) { std::fprintf(stderr, "%s: truncated\n", bin_in); std::exit(2); }
+            std::memcpy(p, all.data() + at, n); at += n;
+        };
+        uint32_t count = 0; take(&count, 4);
+        std::vector<VkPipelineBinaryKeyKHR> keys(count, {VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR});
+        std::vector<VkPipelineBinaryDataKHR> datas(count);
+        std::vector<std::vector<char>> blobs(count);
+        for (uint32_t i = 0; i < count; i++) {
+            take(&keys[i].keySize, 4); take(keys[i].key, VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR);
+            uint64_t n = 0; take(&n, 8);
+            blobs[i].resize(size_t(n)); take(blobs[i].data(), size_t(n));
+            datas[i].dataSize = size_t(n); datas[i].pData = blobs[i].data();
+        }
+        VkPipelineBinaryKeysAndDataKHR kd{count, keys.data(), datas.data()};
+        VkPipelineBinaryCreateInfoKHR bci{VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR};
+        bci.pKeysAndDataInfo = &kd;
+        in_bins.resize(count);
+        VkPipelineBinaryHandlesInfoKHR hi{VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
+        hi.pipelineBinaryCount = count; hi.pPipelineBinaries = in_bins.data();
+        CHECK(vkCreatePipelineBinariesKHR(dev, &bci, nullptr, &hi));
+        bin_info.binaryCount = count; bin_info.pPipelineBinaries = in_bins.data();
+        gpi.pNext = &bin_info;
+        std::fprintf(stderr, "pipeline from %u binaries in %s\n", count, bin_in);
+    }
     VkPipeline pipe; CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, nullptr, &pipe));
+    if (bin_out) {
+        auto vkCreatePipelineBinariesKHR = reinterpret_cast<PFN_vkCreatePipelineBinariesKHR>(
+            vkGetDeviceProcAddr(dev, "vkCreatePipelineBinariesKHR"));
+        auto vkGetPipelineBinaryDataKHR = reinterpret_cast<PFN_vkGetPipelineBinaryDataKHR>(
+            vkGetDeviceProcAddr(dev, "vkGetPipelineBinaryDataKHR"));
+        VkPipelineBinaryCreateInfoKHR bci{VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR};
+        bci.pipeline = pipe;
+        VkPipelineBinaryHandlesInfoKHR hi{VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
+        CHECK(vkCreatePipelineBinariesKHR(dev, &bci, nullptr, &hi));
+        std::vector<VkPipelineBinaryKHR> bins(hi.pipelineBinaryCount);
+        hi.pPipelineBinaries = bins.data();
+        CHECK(vkCreatePipelineBinariesKHR(dev, &bci, nullptr, &hi));
+        std::ofstream f(bin_out, std::ios::binary);
+        uint32_t count = uint32_t(bins.size());
+        f.write(reinterpret_cast<const char*>(&count), 4);
+        for (auto b : bins) {
+            VkPipelineBinaryDataInfoKHR di{VK_STRUCTURE_TYPE_PIPELINE_BINARY_DATA_INFO_KHR};
+            di.pipelineBinary = b;
+            VkPipelineBinaryKeyKHR key{VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
+            size_t n = 0;
+            CHECK(vkGetPipelineBinaryDataKHR(dev, &di, &key, &n, nullptr));
+            std::vector<char> data(n);
+            CHECK(vkGetPipelineBinaryDataKHR(dev, &di, &key, &n, data.data()));
+            uint64_t n64 = n;
+            f.write(reinterpret_cast<const char*>(&key.keySize), 4);
+            f.write(reinterpret_cast<const char*>(key.key), VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR);
+            f.write(reinterpret_cast<const char*>(&n64), 8);
+            f.write(data.data(), std::streamsize(n));
+        }
+        std::fprintf(stderr, "wrote %u pipeline binaries to %s\n", count, bin_out);
+    }
     VkPipeline cpipe = VK_NULL_HANDLE;
     if (mesh_compute) {
         VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -502,8 +795,43 @@ int main(int argc, char** argv) {
     bai.memoryTypeIndex = memtype(br.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VkDeviceMemory bmem; CHECK(vkAllocateMemory(dev, &bai, nullptr, &bmem));
     CHECK(vkBindBufferMemory(dev, buf, bmem, 0));
+    std::vector<uint8_t> mesh_vertices;
+    std::vector<uint32_t> mesh_indices;
+    VkBuffer vbo = VK_NULL_HANDLE, ibo = VK_NULL_HANDLE;
+    VkDeviceMemory vbo_mem = VK_NULL_HANDLE, ibo_mem = VK_NULL_HANDLE;
+    if (draw_mesh_path) {
+        if (!read_mesh(draw_mesh_path, vertex_stride, mesh_vertices, mesh_indices)) {
+            std::fprintf(stderr, "VKH_DRAW_MESH: cannot read %s\n", draw_mesh_path);
+            return 1;
+        }
+        auto host_buffer = [&](VkDeviceSize bytes, VkBufferUsageFlags usage, VkBuffer& b,
+                               VkDeviceMemory& m, void*& p) -> bool {
+            VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            ci.size = bytes; ci.usage = usage;
+            if (vkCreateBuffer(dev, &ci, nullptr, &b) != VK_SUCCESS) return false;
+            VkMemoryRequirements rq; vkGetBufferMemoryRequirements(dev, b, &rq);
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            ai.allocationSize = rq.size;
+            ai.memoryTypeIndex = memtype(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            return vkAllocateMemory(dev, &ai, nullptr, &m) == VK_SUCCESS &&
+                   vkBindBufferMemory(dev, b, m, 0) == VK_SUCCESS &&
+                   vkMapMemory(dev, m, 0, bytes, 0, &p) == VK_SUCCESS;
+        };
+        void* vmap = nullptr;
+        void* imap = nullptr;
+        if (!host_buffer(VkDeviceSize(mesh_vertices.size()), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vbo, vbo_mem, vmap) ||
+            !host_buffer(VkDeviceSize(mesh_indices.size() * 4), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, ibo, ibo_mem, imap)) {
+            std::fprintf(stderr, "VKH_DRAW_MESH: cannot create the vertex or index buffer\n");
+            return 1;
+        }
+        std::memcpy(vmap, mesh_vertices.data(), mesh_vertices.size());
+        std::memcpy(imap, mesh_indices.data(), mesh_indices.size() * 4);
+    }
     void* heap_map = nullptr;
-    if (heap_env) {
+    uint32_t tsharp[8] = {0x11111111, leonida::gfx10::format_from_vulkan(VK_FORMAT_R8G8B8A8_UNORM) << 20, 0x33333333,
+                          0x44444444, 0x55555555, 0x66666666, 0x77777777, 0x88888888};
+    if (need_heap) {
         LOADD(vkGetBufferDeviceAddress);
         VkBufferCreateInfo hbi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         hbi.size = heap_bytes;
@@ -520,11 +848,107 @@ int main(int argc, char** argv) {
         void* hp; CHECK(vkMapMemory(dev, hmem, 0, heap_bytes, 0, &hp));
         heap_map = hp;
         std::memset(hp, 0, heap_bytes);
+        if (tex_rgba_path) std::memcpy(static_cast<char*>(hp) + tsharp_va, tsharp, 32);
         for (auto [addr, word] : heap_words) std::memcpy(static_cast<char*>(hp) + addr, &word, 4);
         VkBufferDeviceAddressInfo hda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         hda.buffer = heap;
         const uint64_t base = vkGetBufferDeviceAddress(dev, &hda);
         pc[32] = uint32_t(base); pc[33] = uint32_t(base >> 32);
+    }
+    if (tex_rgba_path) {
+        LOADD(vkCreateSampler); LOADD(vkCreateDescriptorPool); LOADD(vkAllocateDescriptorSets);
+        LOADD(vkUpdateDescriptorSets);
+        leonida::DescriptorTable desc_table(16);
+        desc_table.insert(tsharp, 1);
+        desc_table.insert(ssharp, 1);
+        const auto table = desc_table.build_gpu_buffer(true);
+        VkBuffer tb = VK_NULL_HANDLE;
+        VkDeviceMemory tbm = VK_NULL_HANDLE;
+        void* tbp = nullptr;
+        {
+            VkBufferCreateInfo tbi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            tbi.size = table.size() * 4; tbi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            CHECK(vkCreateBuffer(dev, &tbi, nullptr, &tb));
+            VkMemoryRequirements tmr; vkGetBufferMemoryRequirements(dev, tb, &tmr);
+            VkMemoryAllocateInfo tai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            tai.allocationSize = tmr.size;
+            tai.memoryTypeIndex = memtype(tmr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            CHECK(vkAllocateMemory(dev, &tai, nullptr, &tbm));
+            CHECK(vkBindBufferMemory(dev, tb, tbm, 0));
+            CHECK(vkMapMemory(dev, tbm, 0, tbi.size, 0, &tbp));
+            std::memcpy(tbp, table.data(), table.size() * 4);
+        }
+        auto make_sampled_tex = [&](uint32_t tw, uint32_t th, VkImage& out_img, VkImageView& out_view) -> int {
+            VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R8G8B8A8_UNORM; ii.extent = {tw, th, 1};
+            ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT;
+            ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            CHECK(vkCreateImage(dev, &ii, nullptr, &out_img));
+            VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, out_img, &mr);
+            VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            mai.allocationSize = mr.size;
+            mai.memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            VkDeviceMemory mem; CHECK(vkAllocateMemory(dev, &mai, nullptr, &mem));
+            CHECK(vkBindImageMemory(dev, out_img, mem, 0));
+            VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vi.image = out_img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+            vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            CHECK(vkCreateImageView(dev, &vi, nullptr, &out_view));
+            return 0;
+        };
+        VkImageView tex_views[2]{};
+        if (make_sampled_tex(1, 1, tex_fallback_img, tex_views[0]) ||
+            make_sampled_tex(tex_w, tex_h, tex_img, tex_views[1])) return 1;
+        {
+            const VkDeviceSize stage_bytes = 4 + tex_pixels.size();
+            VkBufferCreateInfo sbi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            sbi.size = stage_bytes; sbi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            CHECK(vkCreateBuffer(dev, &sbi, nullptr, &tex_staging));
+            VkMemoryRequirements smr; vkGetBufferMemoryRequirements(dev, tex_staging, &smr);
+            VkMemoryAllocateInfo sai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            sai.allocationSize = smr.size;
+            sai.memoryTypeIndex = memtype(smr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            VkDeviceMemory smem; CHECK(vkAllocateMemory(dev, &sai, nullptr, &smem));
+            CHECK(vkBindBufferMemory(dev, tex_staging, smem, 0));
+            void* sp = nullptr; CHECK(vkMapMemory(dev, smem, 0, stage_bytes, 0, &sp));
+            const uint32_t magenta = 0xFFFF00FFu;
+            std::memcpy(sp, &magenta, 4);
+            std::memcpy(static_cast<char*>(sp) + 4, tex_pixels.data(), tex_pixels.size());
+        }
+        VkSampler samplers[2]{};
+        VkSamplerCreateInfo def_sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        def_sci.magFilter = VK_FILTER_NEAREST; def_sci.minFilter = VK_FILTER_NEAREST;
+        CHECK(vkCreateSampler(dev, &def_sci, nullptr, &samplers[0]));
+        const leonida::gfx10::SamplerWords sw{ssharp[0], ssharp[1], ssharp[2], ssharp[3]};
+        VkSamplerCreateInfo sci = leonida::gfx10::vulkan_sampler(leonida::gfx10::decode(sw));
+        sci.anisotropyEnable = VK_FALSE;
+        CHECK(vkCreateSampler(dev, &sci, nullptr, &samplers[1]));
+        VkDescriptorPoolSize dps[3] = {
+            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2},
+            {VK_DESCRIPTOR_TYPE_SAMPLER, 2},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
+        };
+        VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpci.maxSets = 1; dpci.poolSizeCount = 3; dpci.pPoolSizes = dps;
+        VkDescriptorPool dpool; CHECK(vkCreateDescriptorPool(dev, &dpci, nullptr, &dpool));
+        VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dsai.descriptorPool = dpool; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &dsl;
+        CHECK(vkAllocateDescriptorSets(dev, &dsai, &ds));
+        VkDescriptorImageInfo img_infos[2] = {
+            {VK_NULL_HANDLE, tex_views[0], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {VK_NULL_HANDLE, tex_views[1], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        };
+        VkDescriptorImageInfo smp_infos[2] = {
+            {samplers[0], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED},
+            {samplers[1], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED},
+        };
+        VkDescriptorBufferInfo tbl_info{tb, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet writes[3]{};
+        writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 0, 0, 2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, img_infos};
+        writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 1, 0, 2, VK_DESCRIPTOR_TYPE_SAMPLER, smp_infos};
+        writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &tbl_info};
+        vkUpdateDescriptorSets(dev, 3, writes, 0, nullptr);
     }
     const uint64_t mesh_groups = uint64_t(groups[0]) * groups[1] * groups[2];
     if (mesh_compute) {
@@ -564,10 +988,41 @@ int main(int argc, char** argv) {
         std::memcpy(pc, shifts, sizeof(shifts));
     }
     auto push = reinterpret_cast<PFN_vkCmdPushConstants>(vkGetDeviceProcAddr(dev, "vkCmdPushConstants"));
-    const uint32_t pc_bytes = mesh_compute ? 152u : 144u;
+    if (tex_rgba_path) {
+        LOADD(vkCmdPipelineBarrier); LOADD(vkCmdCopyBufferToImage);
+        VkImageMemoryBarrier to_dst[2]{};
+        for (int i = 0; i < 2; ++i) {
+            to_dst[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            to_dst[i].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            to_dst[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            to_dst[i].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            to_dst[i].image = i == 0 ? tex_fallback_img : tex_img;
+            to_dst[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        }
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                             0, nullptr, 0, nullptr, 2, to_dst);
+        VkBufferImageCopy c0{};
+        c0.bufferOffset = 0; c0.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; c0.imageExtent = {1, 1, 1};
+        vkCmdCopyBufferToImage(cmd, tex_staging, tex_fallback_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c0);
+        VkBufferImageCopy c1{};
+        c1.bufferOffset = 4; c1.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; c1.imageExtent = {tex_w, tex_h, 1};
+        vkCmdCopyBufferToImage(cmd, tex_staging, tex_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c1);
+        VkImageMemoryBarrier to_ro[2]{};
+        for (int i = 0; i < 2; ++i) {
+            to_ro[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            to_ro[i].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            to_ro[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            to_ro[i].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            to_ro[i].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            to_ro[i].image = i == 0 ? tex_fallback_img : tex_img;
+            to_ro[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        }
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                             0, nullptr, 0, nullptr, 2, to_ro);
+    }
     if (mesh_compute) {
         // The mesh shader as compute, then make its stores visible to the vertex shader's reads.
-        LOADD(vkCmdDispatch); LOADD(vkCmdPipelineBarrier);
+        LOADD(vkCmdDispatch);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cpipe);
         push(cmd, pl, pcs, 0, pc_bytes, pc);
         vkCmdDispatch(cmd, groups[0], groups[1], groups[2]);
@@ -590,16 +1045,47 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "mesh workgroups: %u x %u x %u\n", groups[0], groups[1], groups[2]);
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    if (ds) {
+        LOADD(vkCmdBindDescriptorSets);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &ds, 0, nullptr);
+    }
     push(cmd, pl, pcs, 0, pc_bytes, pc);
-    if (mesh_compute)
+    if (tail_block) {
+        LOADD(vkCmdBindDescriptorSets);
+        tail.write(0, pc, 4);           // heap base (VKH_HEAP) and code base, as pc[32..35] are without the flag
+        const uint32_t offset = tail.offset(0);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, leonida::vk_test::pc_tail_set, 1, &tail.set,
+                                1, &offset);
+    }
+    // VKH_VERTICES=<n>: draw n vertices instead of one triangle, so a vertex shader fills whole waves (TEST-251).
+    const char* vertices_env = std::getenv("VKH_VERTICES");
+    if (draw_mesh_path) {
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vbo, &offset);
+        vkCmdBindIndexBuffer(cmd, ibo, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, uint32_t(mesh_indices.size()), 1, 0, 0, 0);
+    } else if (const unsigned vertices = vertices_env ? unsigned(std::strtoul(vertices_env, nullptr, 10)) : 0;
+               vertices && !mesh)
+        vkCmdDraw(cmd, vertices, 1, 0, 0);
+    else if (mesh_compute)
         vkCmdDraw(cmd, uint32_t(mesh_groups * mesh_prims * 3), 1, 0, 0);
     else if (mesh)
         reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(vkGetDeviceProcAddr(dev, "vkCmdDrawMeshTasksEXT"))(cmd, groups[0], groups[1], groups[2]);
-    else
-        vkCmdDraw(cmd, 3, 1, 0, 0);
+    else {
+        // VKH_DRAW=<firstVertex>,<firstInstance>: draw the triangle with non-zero bases (vs_base_ids).
+        unsigned first_vertex = 0, first_instance = 0;
+        if (const char* d = std::getenv("VKH_DRAW")) std::sscanf(d, "%u,%u", &first_vertex, &first_instance);
+        vkCmdDraw(cmd, 3, 1, first_vertex, first_instance);
+    }
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy reg{}; reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; reg.imageExtent = {W, H, 1};
     vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
+    // Make the image copy and any shader writes to the heap visible to the host after the queue wait.
+    VkMemoryBarrier readback{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    readback.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    readback.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                         1, &readback, 0, nullptr, 0, nullptr);
     CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));

@@ -1,9 +1,10 @@
-// Query heaps and query calls on the Vulkan-backed device against Windows D3D12 (the default adapter and WARP):
+// Query heaps and query calls on the Vulkan-backed device against Windows D3D12 (the layer's own adapter and WARP):
 // CreateQueryHeap results by type, count and node mask, Close() results of lists that use queries on each list type,
 // and timestamps resolved on direct, compute and copy queues (pipeline statistics heaps are left out: the test
 // device does not enable pipelineStatisticsQuery). No game data or shaders. Run explicitly (needs Vulkan
 // hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
 #include "vk_test_device.h"
+#include "host_adapter.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
@@ -289,14 +290,15 @@ int main() {
         if (hostwine::host_is_wine()) break;
         Ref<IDXGIAdapter> adapter;
         Ref<ID3D12Device> host;
-        if (warp && FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p)))) continue;
+        std::string adapter_name;
+        if (!hostadapter::reference(factory.p, vk, warp, &adapter.p, adapter_name)) continue;
         if (FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) continue;
         const auto a = lines(mine), b = lines(all_cases(host.p));
         for (size_t i = 0; i < a.size() || i < b.size(); ++i) {
             const std::string x = i < a.size() ? a[i] : "", y = i < b.size() ? b[i] : "";
             if (x != y) {
                 ++differ;
-                std::printf("[%s] ours: %s | host: %s\n", warp ? "WARP" : "GPU", x.c_str(), y.c_str());
+                std::printf("[%s] ours: %s | host: %s\n", adapter_name.c_str(), x.c_str(), y.c_str());
             } else if (!warp) {
                 std::printf("same: %s\n", x.c_str());
             }

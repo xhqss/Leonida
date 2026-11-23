@@ -22,7 +22,12 @@ VKAPI_ATTR void VKAPI_CALL observe_barrier2(VkCommandBuffer cb, const VkDependen
 }
 int main() {
     vktest::Device d;
-    if (!d.create()) return 1;
+    const auto status = d.initialize();
+    if (status == vktest::DeviceStatus::unavailable) {
+        std::printf("vk_predicate_capture_test: no Vulkan device, skipped\n");
+        return 77;
+    }
+    if (status != vktest::DeviceStatus::ready) return 1;
     if (!d.conditional_rendering) { std::puts("predicate capture: skipped (no conditional rendering)"); return 0; }
     using namespace leonida;
     VkPhysicalDeviceMemoryProperties memory{};

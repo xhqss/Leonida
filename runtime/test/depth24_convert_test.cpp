@@ -253,6 +253,7 @@ int main() {
         VulkanContext context(gpu.device_proc, gpu.device, true);
         EXPECT(context.loaded());
         context.enable_depth24(gpu.device_proc, alloc_device_local);
+        context.set_occlusion_resolve_memory(mem_props);
 
         constexpr int kIters = 16;
         constexpr std::uint32_t tex_w = 64, tex_h = 16;
@@ -475,7 +476,23 @@ int main() {
             rgb96_b.rgb96 = true;
             context.add_resource(id_rgb96_img, rgb96_b, VK_IMAGE_LAYOUT_UNDEFINED);
 
+            // D3D-162: both conversion directions and formats must leave all 11 application counters zero.
+            VkQueryPool statistics = VK_NULL_HANDLE;
+            void* statistics_data = nullptr;
+            if (gpu.pipeline_statistics_query) {
+                VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+                info.queryCount = 1; info.pipelineStatistics = 0x7ff;
+                EXPECT(gpu.fn<PFN_vkCreateQueryPool>("vkCreateQueryPool")(gpu.device, &info, nullptr, &statistics) == VK_SUCCESS);
+                context.add_query_pool(100, {statistics, d3d12_query_heap::pipeline_statistics, 1, false, {false}, {}});
+                ResourceBinding counters{}; counters.size = 88; counters.host_readable = true;
+                counters.buffer = gpu.buffer(88, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &statistics_data);
+                EXPECT(counters.buffer && statistics_data);
+                std::memset(statistics_data, 0xcd, 88);
+                context.add_resource(100, counters);
+            }
             CommandList slice_list;
+            if (statistics) EXPECT(slice_list.begin_query({100, d3d12_query::pipeline_statistics, 0}));
             EXPECT(slice_list.copy_resource({id_copy, id_src}));
             const CopyLocation fp_src{id_src, true, 0, 0, w, h, 1, w * 4};
             const CopyLocation fp_rgba_rb{id_rgba_rb, true, 0, 0, w, h, 1, w * 4};
@@ -491,6 +508,10 @@ int main() {
             EXPECT(slice_list.copy_texture({fp_d24_rb, 0, 0, 0, loc_d24, false, {}}));
             EXPECT(slice_list.copy_texture({loc_rgb96, 0, 0, 0, fp_rgb96_src, false, {}}));
             EXPECT(slice_list.copy_texture({fp_rgb96_rb, 0, 0, 0, loc_rgb96, false, {}}));
+            if (statistics) {
+                EXPECT(slice_list.end_query({100, d3d12_query::pipeline_statistics, 0}));
+                EXPECT(slice_list.resolve_queries({100, d3d12_query::pipeline_statistics, 0, 1, 100, 0}));
+            }
             EXPECT(slice_list.close());
 
             const CommandList* ptr = &slice_list;
@@ -531,6 +552,14 @@ int main() {
             for (std::size_t i = 0; i < arena_bytes / 4; ++i)
                 if (!in_written(i)) EXPECT(arena_ptr[i] == guard_word);
 
+            if (statistics) {
+                for (unsigned word = 0; word < 11; ++word) {
+                    std::uint64_t value = UINT64_MAX;
+                    std::memcpy(&value, static_cast<const char*>(statistics_data) + 8 * word, 8);
+                    EXPECT(value == 0);
+                }
+                gpu.fn<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(gpu.device, statistics, nullptr);
+            }
             std::printf("depth24: shared-buffer offsets (CopyResource, RGBA8, depth24 and rgb96 CopyTexture) ok\n");
 
             // Host-readback barrier observation across logical queue kinds: compute-converted depth24 and rgb96

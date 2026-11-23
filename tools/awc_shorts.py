@@ -6,7 +6,8 @@ Uses `tools/awc_opus.py` for the AWC parse and packet collection. A streamed-mus
 when its decoded duration is inside the requested range. The descriptor's sample count is interleaved
 across the Opus packet channels, so the packet channel count is read from the TOC stereo bit and the
 per-channel frame count is `samples / packet_channels`. The output is
-`<out>/<bank>/<stream id>.ogg` plus `<out>/shorts.csv`. Directory scans preserve the input subdirectories.
+`<out>/<bank>/<stream id>.ogg` plus `<out>/shorts.csv`. Later selected channels with the same ID use
+`<stream id>~2.ogg`, `<stream id>~3.ogg`, and so on. Directory scans preserve the input subdirectories.
 
 This tool never re-encodes: the selected Opus packets are repacked into Ogg Opus exactly as stored.
 It does not transcribe or classify the clips; that is a separate analysis step.
@@ -23,6 +24,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import awc_opus as awc  # noqa: E402
 from file_mode import published_mode  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
 
 FIELDS = ("bank", "stream", "duration_s", "channels", "packets", "file")
 
@@ -56,20 +58,24 @@ def export_bank(path: str, out_dir: str, min_seconds: float, max_seconds: float,
     od = os.path.join(out_dir, bank)
     os.makedirs(od, exist_ok=True)
     _streams, music = awc.parse_awc(d)
+    selected = [
+        channel
+        for mus, data in music
+        for channel in short_channels(d, mus, data, min_seconds, max_seconds)
+    ]
+    stems = awc.export_stems(channel[0] for channel in selected)
     rows = []
-    for mus, data in music:
-        for cid, frames, rate, packets, channel_count, duration in short_channels(
-                d, mus, data, min_seconds, max_seconds):
-            op = os.path.join(od, f"{cid:08X}.ogg")
-            awc.write_ogg_opus(op, packets, channel_count, cid, frames * 48000 // rate)
-            rows.append({
-                "bank": bank,
-                "stream": f"{cid:08X}",
-                "duration_s": round(duration, 6),
-                "channels": channel_count,
-                "packets": len(packets),
-                "file": os.path.relpath(op, out_dir).replace(os.sep, "/"),
-            })
+    for (cid, frames, rate, packets, channel_count, duration), stem in zip(selected, stems):
+        op = os.path.join(od, stem + ".ogg")
+        awc.write_ogg_opus(op, packets, channel_count, cid, frames * 48000 // rate)
+        rows.append({
+            "bank": bank,
+            "stream": f"{cid:08X}",
+            "duration_s": round(duration, 6),
+            "channels": channel_count,
+            "packets": len(packets),
+            "file": os.path.relpath(op, out_dir).replace(os.sep, "/"),
+        })
     return rows
 
 
@@ -126,7 +132,7 @@ def main(argv=None) -> int:
             if i % 200 == 0:
                 print(f"  {i}/{len(banks)} banks, {len(rows)} clips", flush=True)
     else:
-        with ProcessPoolExecutor(max_workers=a.jobs) as ex:
+        with ProcessPoolExecutor(max_workers=process_workers(a.jobs)) as ex:
             futures = {ex.submit(export_bank, path, a.out, a.min_seconds, a.max_seconds, bank=bank): bank
                        for path, bank in banks}
             for i, fut in enumerate(as_completed(futures), 1):

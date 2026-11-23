@@ -13,8 +13,8 @@ For each texture:
   - writes <out>/<archive>/<cpu blob>_<q index>_<WxH>_<format>.dds and records the choice in export_log.json,
     with "heuristic": true whenever two distinct placements fitted (the pick is a score, not a verified layout)
   - with --png, also writes the same path with .png for every texture tools/dds_png.py can decode (BC1-BC5, BC7
-    and 8-bit RGBA/BGRA, stored values with no sRGB transfer; the blue channel of BC5 is a reconstructed normal Z).
-    The rest (BC6H and every other uncompressed format: R8, R8G8, 16-bit, R10G10B10A2, float, integer) keep their
+    and 8-bit RGBA/BGRA or R10G10B10A2_UNORM, with no sRGB transfer; BC5 blue is a reconstructed normal Z).
+    The rest (BC6H and other uncompressed formats: R8, R8G8, 16-bit, float, integer) keep their
     DDS only and are counted as "png unsupported". A PNG that fails to decode or write is counted as
     "png error:<Type>" and its DDS stays; neither changes the exit code
 
@@ -91,13 +91,17 @@ def dds_bytes(w, h, fmt, payload):
 
 def score_image(w, h, fmt, payload, bpe):
     a = None
-    if fmt in PILLOW_OK:
-        from PIL import Image
+    if fmt == 56:  # R16_UNORM
+        a = np.frombuffer(payload, "<u2").reshape(h, w).astype(np.float32)
+    elif fmt in PILLOW_OK:
         try:
+            from PIL import Image
+
             im = Image.open(io.BytesIO(dds_bytes(w, h, DECODE_AS.get(fmt, fmt), payload))).convert("RGB")
             a = np.asarray(im.reduce(4) if min(w, h) >= 64 else im, np.float32)
-        except NotImplementedError:
-            pass  # Pillow 13.0.0 can't decode DXGI 81 and 87 (91 as 87): score raw elements, not a tied 9e9 in export_one
+        except (ImportError, NotImplementedError, OSError):
+            # Some Pillow installations cannot decode these formats. Score the raw elements below.
+            a = None
     if a is None:
         block = FMT[fmt][1]
         we, he = (w + block - 1) // block, (h + block - 1) // block
@@ -113,11 +117,12 @@ def export_one(t, carve, out, blob_cache, png=False):
     bpe, blk = FMT[fmt]
     w, h = t["w"], t["h"]
     we, he = (w + blk - 1) // blk, (h + blk - 1) // blk
-    key = (t["archive"], t["gpu"])
+    chain_offs = tuple(off for off, _ in (t.get("gpu_chain") or ((t["gpu"], t["gpu_size"]),)))
+    key = (t["archive"], chain_offs)
     if key not in blob_cache:
         blob_cache.clear()
         parts = []
-        for off, _ in t.get("gpu_chain") or [[t["gpu"], t["gpu_size"]]]:
+        for off in chain_offs:
             with open(os.path.join(carve, t["archive"], f"{off:012x}.bin"), "rb") as f:
                 parts.append(f.read())
         blob_cache[key] = b"".join(parts)
@@ -215,21 +220,35 @@ def main():
         print(f"ERROR: cannot create {a.out}: {e.strerror or e}", file=sys.stderr)
         return 2
     res, cache, pngs = Counter(), {}, Counter()
+    io_failures = 0
+    first_io_error = None
     for i, t in enumerate(texs, 1):
         try:
             r = export_one(t, a.carve, a.out, cache, a.png)
         except Exception as e:  # noqa: BLE001
             r = "error:" + type(e).__name__
+            if isinstance(e, OSError):
+                io_failures += 1
+                if first_io_error is None:
+                    first_io_error = str(e)
         res[r] += 1
         if r.startswith("ok:") and "png" in t["export"]:  # an "export" read from the index may be stale
             pngs[t["export"]["png"]] += 1
         if i % 2000 == 0:
             print(f"[{i}/{len(texs)}] {dict(res)}", flush=True)
-    with open(os.path.join(a.out, "export_log.json"), "w", encoding="utf-8") as f:
-        json.dump(texs, f)
+    report = os.path.join(a.out, "export_log.json")
+    try:
+        with open(report, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(texs, f)
+    except OSError as e:
+        print(f"ERROR: cannot write {report}: {e.strerror or e}", file=sys.stderr)
+        return 1
     print(f"{len(texs)} textures: {dict(res)} -> {a.out}")
     if a.png:
         print(f"png: {dict(pngs)}")
+    if io_failures:
+        print(f"ERROR: {io_failures} texture(s) could not be read or written, first: {first_io_error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

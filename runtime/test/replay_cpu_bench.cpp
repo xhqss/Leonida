@@ -8,17 +8,15 @@
 // Two measurements:
 //   - per command type: a list of N commands of one kind (transitions come in pairs, queries as Begin+End),
 //     timed on its own, so one slow kind stands out;
-//   - a frame: L lists of P passes, each pass a mix of what a frame without draws records today (barriers,
-//     whole-view and rectangle clears, buffer and texture copies, a UAV clear, queries and predication).
-// prepare includes allocating the PreparedList and planning the query batch. emit includes committing query state
-// and freeing the preparation data, as VulkanQueue::execute does.
+//   - a frame: L lists of P passes, each pass a mix of what a frame records (barriers, whole-view and rectangle
+//     clears, buffer and texture copies, a UAV clear, queries, predication and indexed and non-indexed draws).
+// prepare includes refilling the PreparedList storage kept from the last execution (as VulkanQueue::execute keeps
+// prepared_) and planning the query batch. emit includes committing query state, as execute does.
 // Each figure is the median over --reps runs after --warmup runs. Heap allocations (global operator new) and
 // Vulkan calls are counted per command; both are deterministic, unlike the times.
 //
 // Usage:
 //   replay_cpu_bench [--lists L] [--passes P] [--count N] [--reps R] [--warmup W] [--csv] [--self-test]
-//
-// Draws join the frame once the draw path (#291) is on main.
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
 #endif
@@ -33,6 +31,7 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <new>
 #include <string>
 #include <tuple>
@@ -104,6 +103,14 @@ struct Scene {
              VkImageView>
         views;
     QueryPool occlusion, timestamps;
+    // One graphics pipeline: an RGBA8 target, D32 depth and two vertex input slots, as VulkanContext keeps them.
+    GraphicsPipeline pipeline;
+    static constexpr std::uintptr_t pipeline_id = 0x7000;
+    // A second one with no depth and one vertex slot, for the self-test's draw-storage check.
+    GraphicsPipeline bare;
+    static constexpr std::uintptr_t bare_id = 0x7001;
+    static constexpr std::uint64_t geometry_va = 0x100000000ull;  // a 16 MiB vertex and index arena
+    static constexpr std::uint64_t geometry_size = 16ull << 20;
     LayoutTracker tracker;
     ReplayFunctions vk;
 
@@ -184,6 +191,47 @@ struct Scene {
             if (id == timestamp_heap) return &timestamps;
             return nullptr;
         };
+
+        pipeline.pipeline = fake_handle<VkPipeline>(0x6000);
+        pipeline.layout = fake_handle<VkPipelineLayout>(0x6001);
+        pipeline.push_stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        pipeline.color_formats = {rgba8};
+        pipeline.depth_format = VK_FORMAT_D32_SFLOAT;
+        pipeline.depth_aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+        pipeline.vertex_slots = 0b11;
+        pipeline.variant = [](std::uint32_t) { return fake_handle<VkPipeline>(0x6002); };
+        bare.pipeline = fake_handle<VkPipeline>(0x6010);
+        bare.layout = pipeline.layout;
+        bare.push_stages = pipeline.push_stages;
+        bare.color_formats = {rgba8};
+        bare.vertex_slots = 0b1;
+        vk.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
+            if (id == pipeline_id) return &pipeline;
+            if (id == bare_id) return &bare;
+            return nullptr;
+        };
+        vk.buffer_at = [](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
+            if (va < geometry_va || va >= geometry_va + geometry_size) return false;
+            buffer = fake_handle<VkBuffer>(0x2100);
+            offset = va - geometry_va;
+            size = std::min<std::uint64_t>(size, geometry_va + geometry_size - va);
+            return true;
+        };
+        vk.zero_buffer = fake_handle<VkBuffer>(0x2101);
+        vk.zero_size = 65536;
+        vk.bind_pipeline = nop<PFN_vkCmdBindPipeline>();
+        vk.push_constants = nop<PFN_vkCmdPushConstants>();
+        vk.bind_descriptor_sets = nop<PFN_vkCmdBindDescriptorSets>();
+        vk.bind_vertex_buffers2 = nop<PFN_vkCmdBindVertexBuffers2>();
+        vk.bind_index_buffer = nop<PFN_vkCmdBindIndexBuffer>();
+        vk.set_viewport = nop<PFN_vkCmdSetViewport>();
+        vk.set_scissor = nop<PFN_vkCmdSetScissor>();
+        vk.set_primitive_topology = nop<PFN_vkCmdSetPrimitiveTopology>();
+        vk.set_primitive_restart_enable = nop<PFN_vkCmdSetPrimitiveRestartEnable>();
+        vk.set_stencil_reference = nop<PFN_vkCmdSetStencilReference>();
+        vk.set_blend_constants = nop<PFN_vkCmdSetBlendConstants>();
+        vk.draw = nop<PFN_vkCmdDraw>();
+        vk.draw_indexed = nop<PFN_vkCmdDrawIndexed>();
     }
 
     const ResourceBinding* resolve(ResourceId id) const {
@@ -222,6 +270,29 @@ bool texture_copy(CommandList& list, std::uint32_t index) {
 bool uav_clear(CommandList& list, std::uint32_t index) {
     const UavView view{Scene::uav, true, VK_FORMAT_R32_UINT, (index % 256) * 4096ull, 4096, 4, 0, 0, 1};
     return list.clear_unordered_access(view, false, {index, 0, 0, 0});
+}
+
+// A draw into the colour and depth targets, as a scene's mesh draws are: two vertex streams, and for `indexed`
+// a 16-bit index buffer; each draw reads its own part of the geometry arena.
+bool draw(CommandList& list, std::uint32_t index, bool indexed) {
+    Draw d{};
+    d.pipeline = Scene::pipeline_id;
+    auto views = std::make_shared<DrawViews>();  // out of line since D3D-391
+    views->render_targets = {color_view};
+    d.depth = depth_view;
+    const std::uint64_t base = Scene::geometry_va + (index % 256) * 65536ull;
+    views->vertex_buffers[0] = {base, 24576, 12};  // by input slot
+    views->vertex_buffers[1] = {base + 24576, 16384, 8};
+    d.views = std::move(views);
+    if (indexed) d.index = {base + 40960, 6144, 57};
+    d.topology = 4;  // D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+    d.viewport = {0, 0, 1920, 1080, 0, 1};
+    d.scissor = {0, 0, 1920, 1080};
+    d.blend_factor = {1, 1, 1, 1};
+    d.indexed = indexed;
+    d.count = indexed ? 3072 : 2048;
+    d.instances = 1;
+    return list.draw(d);
 }
 
 const Kind kinds[] = {
@@ -267,6 +338,8 @@ const Kind kinds[] = {
          return l.resolve_queries({Scene::occlusion_heap, q::binary_occlusion, first, 16, Scene::results, first * 8ull});
      },
      1},
+    {"draw", [](CommandList& l, std::uint32_t i) { return draw(l, i, false); }, 1},
+    {"draw indexed", [](CommandList& l, std::uint32_t i) { return draw(l, i, true); }, 1},
     {"predication on+off",
      [](CommandList& l, std::uint32_t) {
          return l.set_predication({Scene::predicate, 0, d3d12_predication::equal_zero}) &&
@@ -275,14 +348,20 @@ const Kind kinds[] = {
      2},
 };
 
-// One pass of the frame: what a render pass without draws records today.
+// Draws per pass; a frame's draws outnumber its other commands.
+constexpr std::uint32_t draws_per_pass = 16;
+
+// One pass of the frame.
 bool frame_pass(CommandList& l, std::uint32_t pass) {
     const std::uint32_t query = (pass * 2) % Scene::queries;
-    return l.end_query({Scene::timestamp_heap, q::timestamp, query}) &&
-           l.transition({Scene::color, all_subresources, s::pixel_shader_resource, s::render_target}) &&
-           l.clear_render_target(color_view, black) && l.clear_depth_stencil(depth_view, clear_depth, 1, 0) &&
-           l.begin_query({Scene::occlusion_heap, q::binary_occlusion, query}) &&
-           l.clear_render_target(color_view, black, two_rects) &&
+    bool ok = l.end_query({Scene::timestamp_heap, q::timestamp, query}) &&
+              l.transition({Scene::color, all_subresources, s::pixel_shader_resource, s::render_target}) &&
+              l.clear_render_target(color_view, black) && l.clear_depth_stencil(depth_view, clear_depth, 1, 0) &&
+              l.begin_query({Scene::occlusion_heap, q::binary_occlusion, query}) &&
+              l.clear_render_target(color_view, black, two_rects);
+    for (std::uint32_t i = 0; ok && i < draws_per_pass; ++i)
+        ok = draw(l, pass * draws_per_pass + i, i % 4 != 3);  // three of four indexed
+    return ok &&
            l.end_query({Scene::occlusion_heap, q::binary_occlusion, query}) &&
            l.transition({Scene::color, all_subresources, s::render_target, s::pixel_shader_resource}) &&
            l.copy_buffer({Scene::constants, (pass % 256) * 256ull, Scene::upload, (pass % 4096) * 256ull, 256}) &&
@@ -320,6 +399,7 @@ template<typename Build>
 Result run(Scene& scene, std::size_t lists, Build&& build, int reps, int warmup) {
     using clock = std::chrono::steady_clock;
     std::vector<CommandList> recorded(lists);
+    std::vector<PreparedList> prepared;
     const VkCommandBuffer command_buffer = fake_handle<VkCommandBuffer>(0x10);
     const auto resolve = [&scene](ResourceId id) { return scene.resolve(id); };
     std::vector<double> t_record, t_prepare, t_emit;
@@ -337,7 +417,8 @@ Result run(Scene& scene, std::size_t lists, Build&& build, int reps, int warmup)
         clock::time_point t2;
         std::size_t a2, v2;
         {
-            std::vector<PreparedList> prepared(lists);
+            // The PreparedList storage is kept between executions, as VulkanQueue::execute keeps prepared_.
+            prepared.resize(lists);
             QueryReplay queries;
             for (std::size_t i = 0; i < lists; ++i) {
                 if (const auto r = prepare(recorded[i], resolve, scene.vk, prepared[i]); r != ReplayResult::success) {
@@ -494,6 +575,34 @@ int main(int argc, char** argv) {
     const Result f = run(scene, lists, frame, reps, warmup);
     check("frame", f);
     if (self_test) {
+        // A PreparedList keeps its draws' storage from one execution to the next. A draw prepared in an entry an
+        // indexed draw with depth used before must not keep that draw's depth attachment or index buffer.
+        CommandList earlier, later;
+        Draw plain{};
+        plain.pipeline = Scene::bare_id;
+        auto plain_views = std::make_shared<DrawViews>();
+        plain_views->render_targets = {color_view};
+        plain.views = std::move(plain_views);
+        plain.topology = 4;
+        plain.viewport = {0, 0, 1920, 1080, 0, 1};
+        plain.scissor = {0, 0, 1920, 1080};
+        plain.count = 3;
+        plain.instances = 1;
+        PreparedList prepared;
+        const auto resolve = [&scene](ResourceId id) { return scene.resolve(id); };
+        const bool recorded = draw(earlier, 0, true) && draw(earlier, 1, true) && earlier.close() &&
+                              later.draw(plain) && later.close();
+        const bool replayed = recorded && prepare(earlier, resolve, scene.vk, prepared) == ReplayResult::success &&
+                              prepare(later, resolve, scene.vk, prepared) == ReplayResult::success;
+        const detail::PreparedDraw* d =
+            replayed && prepared.draw_count == 1 ? &prepared.draws[prepared.commands[0].draw] : nullptr;
+        if (!d || d->graphics != &scene.bare || d->pipeline != scene.bare.pipeline || d->depth.id ||
+            d->index_buffer || d->vertex_buffers.size() != 1 || d->vertex_buffers[0] != scene.vk.zero_buffer ||
+            d->colors.size() != 1 || d->colors[0].id != Scene::color) {
+            std::fprintf(stderr, "FAIL draw storage: a draw kept state from the draw prepared there before\n");
+            ++failures;
+        }
+
         // The counts don't depend on timing: a second run must make exactly the same allocations and calls.
         const Result again = run(scene, lists, frame, reps, warmup);
         if (again.emit.vk_calls != f.emit.vk_calls || again.prepare.allocations != f.prepare.allocations) {
@@ -508,26 +617,32 @@ int main(int argc, char** argv) {
     std::snprintf(name, sizeof name, "frame (%zu lists x %zu passes)", lists, passes);
     print_row(name, f, csv);
 
-    // The floor under prepare and emit: making and freeing one PreparedList entry per command, which execute does
-    // for every list before any command is looked at.
-    std::vector<double> floor_ns;
-    for (int rep = 0; rep < warmup + reps; ++rep) {
-        const auto t0 = std::chrono::steady_clock::now();
-        {
-            PreparedList list;
-            list.commands.assign(f.commands, {});
+    // The floor under prepare: one PreparedList entry per command, refilled in storage kept from the last
+    // execution (what execute does), and for comparison made in new storage and freed every time.
+    const auto entries_ns = [&](bool kept) {
+        std::vector<double> ns;
+        PreparedList storage;
+        for (int rep = 0; rep < warmup + reps; ++rep) {
+            const auto t0 = std::chrono::steady_clock::now();
+            if (kept) {
+                storage.commands.assign(f.commands, {});
+            } else {
+                PreparedList fresh;
+                fresh.commands.assign(f.commands, {});
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            if (rep >= warmup) ns.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count() / double(f.commands));
         }
-        const auto t1 = std::chrono::steady_clock::now();
-        if (rep >= warmup)
-            floor_ns.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count() / double(f.commands));
-    }
-    const double floor = median(floor_ns);
+        return median(ns);
+    };
+    const double kept = entries_ns(true), fresh = entries_ns(false);
     if (csv) {
-        std::printf("prepared_entries_only,%zu,0,%.1f,0,%.1f,0,0,0,0\n", f.commands, floor, floor);
+        std::printf("prepared_entries_kept,%zu,0,%.1f,0,%.1f,0,0,0,0\n", f.commands, kept, kept);
+        std::printf("prepared_entries_fresh,%zu,0,%.1f,0,%.1f,0,0,0,0\n", f.commands, fresh, fresh);
         return failures ? 1 : 0;
     }
-    std::printf("%-28s %8zu | %9s %9.1f %9s %9.1f |\n", "  PreparedList entries only", f.commands, "", floor, "",
-                floor);
+    std::printf("%-28s %8zu | %9s %9.1f %9s %9.1f |\n", "  entries, storage kept", f.commands, "", kept, "", kept);
+    std::printf("%-28s %8zu | %9s %9.1f %9s %9.1f |\n", "  entries, made fresh", f.commands, "", fresh, "", fresh);
     std::printf("\nframe: %.1f us per ExecuteCommandLists of %zu commands, layer only (no driver)\n",
                 (f.record.ns + f.prepare.ns + f.emit.ns) * double(f.commands) / 1000.0, f.commands);
     std::printf("one PreparedList entry (detail::Prepared): %zu bytes; one recorded Command: %zu bytes\n",

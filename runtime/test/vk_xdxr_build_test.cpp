@@ -6,10 +6,12 @@
 //
 // Cases: one triangle; five (two levels); 1000 random triangles; an indexed R16 grid with a 16-byte vertex stride;
 // R32 indices with R32G32 vertices; a geometry transform; two geometries with an inactive (NaN) triangle; no
-// triangles; 5000 triangles (three radix-sort tiles); and a TLAS of four instances (rotated and scaled, one with mask 0, one with no BLAS).
+// triangles; 5000 triangles (many radix-sort tiles); updates (refits) in place and into another buffer; clones and a
+// compaction (CopyRaytracingAccelerationStructure) with the postbuild size; a TLAS of four instances (rotated and scaled, one with mask 0, one with no BLAS).
 // Exit 77 when there is no Vulkan device with bufferDeviceAddress.
 // `vk_xdxr_build_test <out dir> <triangles>` instead times BLAS builds of that many random triangles (wall clock of
-// one submission each, after one warm-up; result and scratch in device-local memory) and writes nothing.
+// one submission each, after one warm-up; result and scratch in device-local memory), then in-place updates
+// (refits) of the same structure, and writes nothing.
 #include "vk_test_device.h"
 #include "../src/xdxr_build.h"
 
@@ -117,9 +119,12 @@ struct Built {
     std::vector<Tri> tris;
 };
 
+// With `moved` (the same geometries with new vertex positions) the BLAS is then updated: refitted in place, or with
+// `into_other` into a second buffer, in which case the untouched source is written too, as <name>_source.
 int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir, const std::string& name,
-               const std::vector<Geometry>& geometries, Built& built, unsigned rays = 0) {
-    std::vector<Buffer> keep;
+               const std::vector<Geometry>& geometries, Built& built, unsigned rays = 0,
+               const std::vector<Geometry>* moved = nullptr, bool into_other = false) {
+    std::vector<Buffer> keep, vertex_buffers;
     std::vector<XdxrTriangles> descs;
     std::uint32_t total = 0;
     for (std::size_t g = 0; g < geometries.size(); ++g) {
@@ -134,6 +139,7 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
         d.triangle_count = geo.triangle_count;
         d.flags = 1;
         keep.push_back(v);
+        vertex_buffers.push_back(v);
         if (!geo.indices.empty()) {
             Buffer ib = make(gpu, geo.indices.size() * 4);
             EXPECT(ib.buffer);
@@ -170,13 +176,41 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
         return recorded;
     }));
     built.address = base;
-    const auto* bytes = static_cast<const char*>(dst.map) + (base - dst.address);
-    EXPECT(write_file(dir + "/" + name + ".bin", bytes, layout.size));
-    const std::string json = "{\"kind\": \"blas\", \"address\": " + std::to_string(base) +
-                             (rays ? ", \"rays\": " + std::to_string(rays) : std::string()) +
-                             ", \"triangles\": " + tris_json(built.tris) + "}\n";
-    EXPECT(write_file(dir + "/" + name + ".json", json.data(), json.size()));
-    std::printf("%s: %u triangles, %u bytes, %u nodes\n", name.c_str(), total, layout.size, layout.nodes);
+    auto dump = [&](const std::string& case_name, const Buffer& buffer, std::uint64_t at, const std::vector<Tri>& tris) {
+        const auto* bytes = static_cast<const char*>(buffer.map) + (at - buffer.address);
+        const std::string json = "{\"kind\": \"blas\", \"address\": " + std::to_string(at) +
+                                 (rays ? ", \"rays\": " + std::to_string(rays) : std::string()) +
+                                 ", \"triangles\": " + tris_json(tris) + "}\n";
+        return write_file(dir + "/" + case_name + ".bin", bytes, layout.size) &&
+               write_file(dir + "/" + case_name + ".json", json.data(), json.size());
+    };
+    if (!moved) {
+        EXPECT(dump(name, dst, base, built.tris));
+        std::printf("%s: %u triangles, %u bytes, %u nodes\n", name.c_str(), total, layout.size, layout.nodes);
+        return 0;
+    }
+    // the update: new positions in the same vertex buffers, then a refit of the structure just built
+    EXPECT(moved->size() == geometries.size());
+    std::vector<Tri> moved_tris;
+    for (std::size_t g = 0; g < moved->size(); ++g) {
+        EXPECT((*moved)[g].vertex_data.size() == geometries[g].vertex_data.size());
+        std::memcpy(vertex_buffers[g].map, (*moved)[g].vertex_data.data(), (*moved)[g].vertex_data.size() * 4);
+        expand((*moved)[g], std::uint32_t(g), moved_tris);
+    }
+    Buffer other = into_other ? make(gpu, layout.size + 256) : Buffer{};
+    const std::uint64_t target = into_other ? (other.address + 255) & ~std::uint64_t(255) : base;
+    EXPECT(!into_other || other.buffer);
+    EXPECT(gpu.run([&](VkCommandBuffer cb) {
+        recorded = builder.record_blas(cb, layout, descs, target, scratch.address, base);
+        barrier_to_host(gpu, cb);
+        return recorded;
+    }));
+    if (into_other) EXPECT(dump(name + "_source", dst, base, built.tris));     // a refit must not touch its source
+    EXPECT(dump(name, into_other ? other : dst, target, moved_tris));
+    built.tris = moved_tris;
+    built.address = target;
+    std::printf("%s: %u triangles refitted %s, %u bytes\n", name.c_str(), total,
+                into_other ? "into another buffer" : "in place", layout.size);
     return 0;
 }
 
@@ -234,8 +268,17 @@ int main(int argc, char** argv) {
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             if (rep) best = std::min(best, ms);
         }
-        std::printf("%u triangles: %.2f ms (best of 3), result %u bytes, scratch %llu bytes, sort size %u\n", n, best,
-                    layout.size, static_cast<unsigned long long>(layout.scratch), layout.sort_size);
+        double refit = 1e30;                          // an update of the structure just built, in place
+        for (int rep = 0; rep < 4; ++rep) {
+            const auto t0 = std::chrono::steady_clock::now();
+            EXPECT(gpu.run([&](VkCommandBuffer cb) {
+                return builder.record_blas(cb, layout, {d}, dst.address, scratch.address, dst.address);
+            }));
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (rep) refit = std::min(refit, ms);
+        }
+        std::printf("%u triangles: %.2f ms (best of 3), refit %.2f ms, result %u bytes, scratch %llu bytes, sort size %u\n",
+                    n, best, refit, layout.size, static_cast<unsigned long long>(layout.scratch), layout.sort_size);
         return 0;
     }
 
@@ -287,9 +330,32 @@ int main(int argc, char** argv) {
     b.vertex_data[3 * 3 * 7] = std::nanf("");                    // triangle 7 of geometry 1: inactive
     if (build_blas(gpu, builder, dir, "blas_two_geometries", {a, b}, multi)) return 1;
     if (build_blas(gpu, builder, dir, "blas_empty", {}, empty)) return 1;
-    // three radix-sort tiles of 2048, the last one partial (fewer rays: the reference's brute force is slow)
+    // many radix-sort tiles (RADIX_TILE elements each), the last one partial (fewer rays: the brute force is slow)
     Built tiles;
     if (build_blas(gpu, builder, dir, "blas_three_sort_tiles", {soup(5000)}, tiles, 200)) return 1;
+
+    // Updates. Every triangle moves (its own offset, and a stretch), so each box changes; the tree is kept.
+    auto move = [&](Geometry g, float amount) {
+        std::uniform_real_distribution<float> d(-amount, amount);
+        const std::uint32_t floats = g.stride / 4;
+        for (std::size_t v = 0; v + 2 < g.vertex_data.size(); v += floats) {
+            const float dx = d(rng), dy = d(rng);
+            g.vertex_data[v] = g.vertex_data[v] * 1.25f + dx;
+            g.vertex_data[v + 1] = g.vertex_data[v + 1] * 0.8f + dy;
+            if (!g.xy) g.vertex_data[v + 2] += d(rng);
+        }
+        return g;
+    };
+    {
+        Built refitted;
+        const Geometry big = soup(3000);                    // the radix-sort path
+        const std::vector<Geometry> after = {move(big, 1.5f)};
+        if (build_blas(gpu, builder, dir, "blas_refit_in_place", {big}, refitted, 300, &after)) return 1;
+        Built copied;
+        const Geometry g = grid(12, 4, false);              // R32 indices, stride 16; the small-sort path
+        const std::vector<Geometry> after_grid = {move(g, 0.3f)};
+        if (build_blas(gpu, builder, dir, "blas_refit_into_other", {g}, copied, 0, &after_grid, true)) return 1;
+    }
 
     // TLAS: instances over blas_random and blas_grid_u16_stride16. An instance names its BLAS by a 40-bit address
     // (256-byte units in 32 bits), as on the console; device addresses can be wider (llvmpipe's are host pointers).
@@ -338,6 +404,95 @@ int main(int argc, char** argv) {
     }
     json += "]}\n";
     EXPECT(write_file(dir + "/tlas.json", json.data(), json.size()));
+
+    // The TLAS updated in place: every instance moves and turns; the masked and the BLAS-less ones stay so.
+    Inst moved_insts[sizeof insts / sizeof insts[0]];
+    std::memcpy(moved_insts, insts, sizeof insts);
+    const float c2 = std::cos(1.9f), s2 = std::sin(1.9f);
+    const float turned[12] = {c2, 0, s2, 4, 0, 1, 0, -3, -s2, 0, c2, 2};
+    std::memcpy(moved_insts[0].m, turned, sizeof turned);
+    moved_insts[1].m[3] -= 7;
+    moved_insts[1].m[7] += 5;
+    moved_insts[2].m[11] -= 4;
+    for (std::uint32_t i = 0; i < count; ++i) std::memcpy(static_cast<char*>(descs.map) + 64 * i, moved_insts[i].m, 48);
+    EXPECT(gpu.run([&](VkCommandBuffer cb) {
+        recorded = builder.record_tlas(cb, layout, descs.address, base, scratch.address, bias, base);
+        barrier_to_host(gpu, cb);
+        return recorded;
+    }));
+    EXPECT(write_file(dir + "/tlas_refit.bin", static_cast<const char*>(dst.map) + (base - dst.address), layout.size));
+    std::string json2 = "{\"kind\": \"tlas\", \"address\": " + std::to_string(base) + ", \"bias\": " +
+                        std::to_string(bias) + ", \"blas\": [\"blas_random\", \"blas_grid_u16_stride16\"], \"instances\": [";
+    for (std::uint32_t i = 0; i < count; ++i) {
+        json2 += i ? ", {" : "{";
+        json2 += "\"transform\": [";
+        for (int k = 0; k < 12; ++k) json2 += (k ? ", " : "") + num(moved_insts[i].m[k]);
+        json2 += "], \"mask\": " + std::to_string(moved_insts[i].id_mask >> 24) + ", \"blas\": " +
+                 std::to_string(moved_insts[i].which) + "}";
+    }
+    json2 += "]}\n";
+    EXPECT(write_file(dir + "/tlas_refit.json", json2.data(), json2.size()));
+
+    // CopyRaytracingAccelerationStructure: a clone of blas_random, its COMPACTED_SIZE (postbuild), a compaction into
+    // a buffer of exactly that size, and a clone of the refitted TLAS. The copies are position-independent.
+    {
+        XdxrLayout blas_layout;
+        EXPECT(blas_layout.compute(1000, false));
+        Buffer clone = make(gpu, blas_layout.size + 256), info = make(gpu, 16);
+        EXPECT(clone.buffer && info.buffer);
+        const std::uint64_t clone_at = (clone.address + 255) & ~std::uint64_t(255);
+        std::memset(info.map, 0xab, 16);
+        EXPECT(gpu.run([&](VkCommandBuffer cb) {
+            const bool ok = builder.record_copy(cb, random.address, clone_at, blas_layout.size) &&
+                            builder.record_postbuild(cb, random.address, info.address) &&
+                            builder.record_postbuild(cb, clone_at, info.address + 8);
+            barrier_to_host(gpu, cb);
+            return ok;
+        }));
+        std::uint64_t compacted = 0, clone_size = 0;
+        std::memcpy(&compacted, info.map, 8);
+        std::memcpy(&clone_size, static_cast<char*>(info.map) + 8, 8);
+        EXPECT(compacted == blas_layout.size);          // a build is exactly its layout's size
+        EXPECT(clone_size == compacted);
+        auto dump_blas = [&](const std::string& name, const Buffer& b, std::uint64_t at, std::size_t bytes) {
+            const std::string j = "{\"kind\": \"blas\", \"address\": " + std::to_string(at) +
+                                  ", \"triangles\": " + tris_json(random.tris) + "}\n";
+            return write_file(dir + "/" + name + ".bin", static_cast<const char*>(b.map) + (at - b.address), bytes) &&
+                   write_file(dir + "/" + name + ".json", j.data(), j.size());
+        };
+        EXPECT(dump_blas("blas_clone", clone, clone_at, blas_layout.size));
+        // COMPACT into exactly the compacted size; a guard word after it must survive
+        Buffer packed = make(gpu, std::size_t(compacted) + 256 + 4);
+        EXPECT(packed.buffer);
+        const std::uint64_t packed_at = (packed.address + 255) & ~std::uint64_t(255);
+        const std::uint32_t guard = 0x600dc0deu;
+        std::memcpy(static_cast<char*>(packed.map) + (packed_at - packed.address) + compacted, &guard, 4);
+        EXPECT(gpu.run([&](VkCommandBuffer cb) {
+            const bool ok = builder.record_copy(cb, clone_at, packed_at, compacted + 4);   // more room than needed
+            barrier_to_host(gpu, cb);
+            return ok;
+        }));
+        std::uint32_t after = 0;
+        std::memcpy(&after, static_cast<char*>(packed.map) + (packed_at - packed.address) + compacted, 4);
+        EXPECT(after == guard);                          // the copy stops at the source's own size
+        EXPECT(dump_blas("blas_compacted", packed, packed_at, std::size_t(compacted)));
+
+        Buffer tclone = make(gpu, layout.size + 256);
+        EXPECT(tclone.buffer);
+        const std::uint64_t tclone_at = (tclone.address + 255) & ~std::uint64_t(255);
+        EXPECT(gpu.run([&](VkCommandBuffer cb) {
+            const bool ok = builder.record_copy(cb, base, tclone_at, layout.size);
+            barrier_to_host(gpu, cb);
+            return ok;
+        }));
+        EXPECT(write_file(dir + "/tlas_refit_clone.bin", static_cast<const char*>(tclone.map) + (tclone_at - tclone.address),
+                          layout.size));
+        std::string json3 = json2;
+        json3.replace(json3.find(std::to_string(base)), std::to_string(base).size(), std::to_string(tclone_at));
+        EXPECT(write_file(dir + "/tlas_refit_clone.json", json3.data(), json3.size()));
+        std::printf("copies: blas_clone, blas_compacted (%llu bytes), tlas_refit_clone\n",
+                    static_cast<unsigned long long>(compacted));
+    }
     std::printf("tlas: %u instances, %u bytes\nvk_xdxr_build_test: built every case\n", count, layout.size);
     return 0;
 }

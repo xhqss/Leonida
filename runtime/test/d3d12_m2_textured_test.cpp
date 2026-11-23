@@ -14,12 +14,16 @@
 // the left half is drawn from the gradient, the right half (the second draw switches the SRV table to slot 1) from
 // the reflected texture. Compared byte for byte (error 0). The test also checks the hash table: the T# of each view and the S#
 // have distinct non-zero indices, and bytes that were never created have none (the fallback, 0).
+// The same quad is also drawn with LINEAR/CLAMP. Each RGBA8 channel is checked against the four clamped
+// texels at that pixel center, allowing one quantization level.
+//
 // Sampler control (suggested and measured by @Vonsek in #1489): with U in range, POINT/CLAMP, POINT/WRAP and the
 // fallback sampler all give the same pixels, so the draw above cannot tell which sampler it used. A second pass draws
 // with ps_m2_uoff.asm, which adds 1 to U just before image_sample, and two sampler-heap slots, [0] POINT/CLAMP and
 // [1] POINT/WRAP. The left half takes the WRAP sampler (U + 1 wraps back: the gradient again), the right half the
 // CLAMP one (U + 1 clamps to the last column: each row is that row's right-edge texel of the reflected texture). The
 // pixels are predicted on the CPU, error 0, and 1536 of them differ from the plain reflection.
+// The control also keeps one unbounded SRV table bound and selects its two entries by a root constant.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (0 errors required).
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
@@ -29,6 +33,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -65,6 +70,26 @@ Texel gradient(UINT x, UINT y) {
 // The second texture: the first one point-reflected, so no texel of it is in the same place.
 Texel reflected(UINT x, UINT y) { return gradient(texture_size - 1 - x, texture_size - 1 - y); }
 
+Texel linear_clamp(UINT col, UINT row) {
+    const float x = (col + 0.5f) * texture_size / target_size - 0.5f;
+    const float y = (row + 0.5f) * texture_size / target_size - 0.5f;
+    const int x0 = int(std::floor(x)), y0 = int(std::floor(y));
+    const float fx = x - x0, fy = y - y0;
+    const auto texel = col < target_size / 2 ? gradient : reflected;
+    auto tap = [&](int dx, int dy) {
+        return texel(std::clamp(x0 + dx, 0, int(texture_size) - 1),
+                     std::clamp(y0 + dy, 0, int(texture_size) - 1));
+    };
+    const Texel a = tap(0, 0), b = tap(1, 0), c = tap(0, 1), d = tap(1, 1);
+    Texel result{};
+    for (unsigned k = 0; k < result.size(); ++k) {
+        const float top = a[k] + fx * (b[k] - a[k]);
+        const float bottom = c[k] + fx * (d[k] - c[k]);
+        result[k] = std::uint8_t(std::lround(top + fy * (bottom - top)));
+    }
+    return result;
+}
+
 }  // namespace
 
 int main() {
@@ -91,8 +116,15 @@ int main() {
     const auto uoff_program = read_file(root_dir / "fssm" / "ps_m2_uoff.fssm");
     EXPECT(uoff_program.size() >= 4 && library.find("ps", leonida::sha256_hex(uoff_program)));
     const auto uoff_container = shader_container(uoff_program);
+    // ps_m2_literal builds its S# from immediates: the index lists it under literal_samplers.
+    const auto literal_program = read_file(root_dir / "fssm" / "ps_m2_literal.fssm");
+    const auto* literal_entry = library.find("ps", leonida::sha256_hex(literal_program));
+    EXPECT(literal_program.size() >= 4 && literal_entry);
+    const leonida::gfx10::SamplerWords literal_words{0x92u, 0xc00000u, 0x14500000u, 0u};
+    EXPECT(literal_entry->literal_samplers.size() == 1 && literal_entry->literal_samplers[0] == literal_words);
+    const auto literal_container = shader_container(literal_program);
 
-    std::vector<std::uint8_t> pixels(std::size_t(target_pitch) * target_size), control_pixels = pixels;
+    std::vector<std::uint8_t> pixels(std::size_t(target_pitch) * target_size), control_pixels = pixels, linear_pixels = pixels;
     unsigned image_hits = 0, sampler_hits = 0;
     {
         rt::d3d12::VulkanDeviceInfo info{};
@@ -148,8 +180,38 @@ int main() {
         pso_desc.SampleDesc.Count = 1;
         Ref<ID3D12PipelineState> pso, uoff_pso;
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
+        D3D12_DESCRIPTOR_RANGE indexed_range = srv_range;
+        indexed_range.NumDescriptors = UINT32_MAX;
+        D3D12_ROOT_PARAMETER indexed_params[3] = {params[0], params[1], {}};
+        indexed_params[0].DescriptorTable = {1, &indexed_range};
+        indexed_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        indexed_params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        indexed_params[2].Constants = {0, 0, 2};  // s4 = SRV index, s5 = SRV stride in bytes
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC indexed_desc = root_desc;
+        indexed_desc.Desc_1_0.NumParameters = 3;
+        indexed_desc.Desc_1_0.pParameters = indexed_params;
+        const auto indexed_blob = serialize_root_signature(indexed_desc);
+        EXPECT(!indexed_blob.empty());
+        Ref<ID3D12RootSignature> indexed_root;
+        EXPECT(SUCCEEDED(device->CreateRootSignature(0, indexed_blob.data(), indexed_blob.size(),
+                                                    IID_PPV_ARGS(&indexed_root.p))));
+        pso_desc.pRootSignature = indexed_root.p;
         pso_desc.PS = {uoff_container.data(), uoff_container.size()};
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&uoff_pso.p))));
+        {
+            // A pipeline with a literal-S# shader registers that S#: before it the hash table has no key for the
+            // words (a lookup gives the fallback, 0), after it a sampler index. Nothing else names this S#.
+            std::uint32_t key[8];
+            std::memcpy(key, literal_words.data(), 16);
+            std::fill(key + 4, key + 8, 0xffffffffu);
+            EXPECT(rt::d3d12::bindless_hash_lookup(device.p, key) == 0);
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC literal_desc = pso_desc;
+            literal_desc.pRootSignature = root.p;
+            literal_desc.PS = {literal_container.data(), literal_container.size()};
+            Ref<ID3D12PipelineState> literal_pso;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&literal_desc, IID_PPV_ARGS(&literal_pso.p))));
+            EXPECT(rt::d3d12::bindless_hash_lookup(device.p, key) != 0);
+        }
 
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
@@ -201,7 +263,7 @@ int main() {
         // The two heaps; their start handles come back in RAX (heap slots 9 and 10).
         const D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
                                                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-        const D3D12_DESCRIPTOR_HEAP_DESC sampler_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2,
+        const D3D12_DESCRIPTOR_HEAP_DESC sampler_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 3,
                                                            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Ref<ID3D12DescriptorHeap> srv_heap, sampler_heap;
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&srv_heap_desc, IID_PPV_ARGS(&srv_heap.p))));
@@ -235,6 +297,10 @@ int main() {
         EXPECT(sampler_step >= 16);
         sampler_desc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
         device->CreateSampler(&sampler_desc, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(sampler_cpu + sampler_step)});
+        sampler_desc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sampler_desc.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+        device->CreateSampler(&sampler_desc, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(sampler_cpu + 2 * sampler_step)});
+
 
         // The hash table, after the descriptors were created and before anything has run: a T# is 8 dwords of the
         // heap slot, an S# 4 dwords followed by 0xFFFFFFFF x4. Each of the three has an index, they differ, and
@@ -309,15 +375,18 @@ int main() {
         const D3D12_VIEWPORT viewport{0, 0, float(target_size), float(target_size), 0, 1};
         list->RSSetViewports(1, &viewport);
         list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-        list->SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{sampler_gpu});
-        for (UINT half = 0; half < 2; ++half) {
-            // The same quad over the whole target; the scissor rectangle keeps one half, and the SRV table names
-            // the texture of that half.
-            const D3D12_RECT scissor{LONG(half * target_size / 2), 0, LONG((half + 1) * target_size / 2), LONG(target_size)};
-            list->RSSetScissorRects(1, &scissor);
-            list->SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE{srv_gpu + std::uint64_t(half) * step});
-            list->DrawIndexedInstanced(6, 1, 0, 0, 0);
-        }
+        auto draw_halves = [&](std::uint64_t sampler) {
+            list->SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{sampler});
+            for (UINT half = 0; half < 2; ++half) {
+                // The same quad over the whole target; the scissor rectangle keeps one half, and the SRV table names
+                // the texture of that half.
+                const D3D12_RECT scissor{LONG(half * target_size / 2), 0, LONG((half + 1) * target_size / 2), LONG(target_size)};
+                list->RSSetScissorRects(1, &scissor);
+                list->SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE{srv_gpu + std::uint64_t(half) * step});
+                list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+            }
+        };
+        draw_halves(sampler_gpu);
 
         D3D12_RESOURCE_BARRIER to_copy = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
                                                     D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -330,6 +399,13 @@ int main() {
         src.pResource = target.p;
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        auto to_render = transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        list->ResourceBarrier(1, &to_render);
+        list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+        draw_halves(sampler_gpu + 2 * sampler_step);
+        list->ResourceBarrier(1, &to_copy);
+        dst.pResource = readback2.p;
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         EXPECT(list->Close() == S_OK);
         ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
@@ -339,6 +415,11 @@ int main() {
         void* mapped = nullptr;
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         std::memcpy(pixels.data(), mapped, pixels.size());
+
+        void* mapped_linear = nullptr;
+        EXPECT(SUCCEEDED(readback2->Map(0, nullptr, &mapped_linear)));
+        std::memcpy(linear_pixels.data(), mapped_linear, linear_pixels.size());
+        readback2->Unmap(0, nullptr);
 
         // The control pass: U + 1 in the PS, WRAP sampler (slot 1) on the left, CLAMP (slot 0) on the right.
         Ref<ID3D12CommandAllocator> allocator2;
@@ -350,8 +431,9 @@ int main() {
                                                  D3D12_RESOURCE_STATE_RENDER_TARGET);
         list2->ResourceBarrier(1, &back);
         list2->ClearRenderTargetView(rtv, clear, 0, nullptr);
-        list2->SetGraphicsRootSignature(root.p);
+        list2->SetGraphicsRootSignature(indexed_root.p);
         list2->SetDescriptorHeaps(2, heaps);
+        list2->SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE{srv_gpu});
         list2->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list2->IASetIndexBuffer(&ibv);
         list2->RSSetViewports(1, &viewport);
@@ -359,7 +441,8 @@ int main() {
         for (UINT half = 0; half < 2; ++half) {
             const D3D12_RECT scissor{LONG(half * target_size / 2), 0, LONG((half + 1) * target_size / 2), LONG(target_size)};
             list2->RSSetScissorRects(1, &scissor);
-            list2->SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE{srv_gpu + std::uint64_t(half) * step});
+            const UINT srv_args[] = {half, step};
+            list2->SetGraphicsRoot32BitConstants(2, 2, srv_args, 0);
             list2->SetGraphicsRootDescriptorTable(
                 1, D3D12_GPU_DESCRIPTOR_HANDLE{sampler_gpu + std::uint64_t(half == 0 ? sampler_step : 0)});
             list2->DrawIndexedInstanced(6, 1, 0, 0, 0);
@@ -387,6 +470,7 @@ int main() {
         uoff_pso.reset();
         list2.reset();
         allocator2.reset();
+        indexed_root.reset();
         root.reset();
         srv_heap.reset();
         sampler_heap.reset();
@@ -398,12 +482,22 @@ int main() {
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
 
-    unsigned mismatches = 0;
+    unsigned mismatches = 0, linear_mismatches = 0;
+    int max_linear_error = 0;
     for (UINT row = 0; row < target_size; ++row) {
         for (UINT col = 0; col < target_size; ++col) {
             const UINT tx = col / (target_size / texture_size), ty = row / (target_size / texture_size);
             const Texel want = col < target_size / 2 ? gradient(tx, ty) : reflected(tx, ty);
             const std::uint8_t* got = &pixels[std::size_t(row) * target_pitch + col * 4];
+            const Texel filtered = linear_clamp(col, row);
+            const auto* linear = &linear_pixels[std::size_t(row) * target_pitch + col * 4];
+            for (unsigned k = 0; k < filtered.size(); ++k) {
+                const int error = std::abs(int(linear[k]) - filtered[k]);
+                max_linear_error = std::max(max_linear_error, error);
+                if (error > 1 && linear_mismatches++ < 8)
+                    std::fprintf(stderr, "LINEAR (%u, %u) channel %u: got %u want %u\n",
+                                 col, row, k, unsigned(linear[k]), unsigned(filtered[k]));
+            }
             if (std::memcmp(got, want.data(), 4) == 0) continue;
             if (mismatches++ < 8)
                 std::fprintf(stderr, "pixel (%u, %u): got %u,%u,%u,%u want %u,%u,%u,%u\n", col, row, got[0], got[1],
@@ -411,6 +505,8 @@ int main() {
         }
     }
     EXPECT(!mismatches);
+    EXPECT(!linear_mismatches);
+    std::printf("M2 LINEAR: %u pixels, maximum RGBA8 channel error %d\n", target_size * target_size, max_linear_error);
 
     // The control pass: left half the gradient (WRAP: U + 1 wraps back), right half the reflected texture's last
     // column per row (CLAMP: U + 1 is past the edge). Pixels that differ from the plain pass tell the clamp was used.

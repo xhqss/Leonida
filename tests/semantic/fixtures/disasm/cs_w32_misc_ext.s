@@ -16,6 +16,7 @@
 	v_mad_u32_u16 v5, v1, v1, 1
 	v_mov_b32_e32 v1, 0x8000
 	v_mad_i32_i16 v6, v1, 2, 5
+	v_cmpx_eq_u32_e32 0, v0
 	v_mov_b32_e32 v10, 0x10
 	v_mov_b32_e32 v11, 5
 	v_mov_b32_e32 v12, 9
@@ -35,7 +36,6 @@
 	s_waitcnt lgkmcnt(0)
 	ds_read2_b64 v[20:23], v10 offset0:1 offset1:3
 	s_waitcnt lgkmcnt(0)
-	v_cmpx_eq_u32_e32 0, v0
 	v_mov_b32_e32 v24, s9
 	v_mov_b32_e32 v25, 0
 	buffer_store_dword v24, v25, s[0:3], 0 offen

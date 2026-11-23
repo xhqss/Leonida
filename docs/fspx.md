@@ -50,6 +50,11 @@ The pipeline function (RVA 0x4aa0, read from the DLL) accepts either a bare `FSP
 | +0x28, +0x30 | the copied kind 6, its size |
 | +0x38, +0x40 | kind 7 pointer, size |
 
+The size at `+0x30` is kind 6's own size, not the rounded allocation: the DLL rounds it into a separate register for
+`XMemAlloc` and stores the original, which is also the copy's length (read from the DLL's code with `objdump`, `0x5649` to
+`0x56d5`). So
+the bytes at `+0x28` with that size are exactly kind 6, and their SHA-256 is the key below.
+
 The DLL's own messages name that call `DeserializeComputePipelineStateX` and the path "ACO". When the call fails,
 the message says it falls back to "NewBE", and the DLL sets the environment variable `FFX_FSR4_XBOX_ACO_ACTIVE` to
 `0`. Its next pipeline call is slot 62 (measured in #864), so "NewBE" is inferred to be that path, the one a PC
@@ -88,8 +93,11 @@ compute shader.
   - `fspx_unpack.py --disasm` defaults to `gfx1030`.
 - **What llvm-mc still rejects.** With `gfx1030`, 21 of the 29 decode with no invalid word. The other 89 words, in 8
   programs, are all VOP3P opcode 0x16 with `op_sel` 2 and `op_sel_hi` 5. That is the opcode of the 1,458
-  `v_dot4_i32_i8` that `llvm-mc` does decode, all of which have `op_sel` 0. What the hardware does with that `op_sel`
-  was not checked.
+  `v_dot4_i32_i8` that `llvm-mc` does decode, all of which have `op_sel` 0.
+  - Measured on RDNA2 hardware (gfx1036, through `tools/hw_oracle`, the instruction given as two raw words): with
+    `op_sel` 2 and `op_sel_hi` 5 the result is the dot product with the two 16-bit halves of the second source
+    exchanged, in all 5 operand sets (4 of them give another word under the plain rule). So `op_sel` selects halves
+    here as it does for the packed 16-bit ops. The words are in `tests/semantic/test_alu_dot4_i8.py`.
 
 ## Kind 7: records
 
@@ -104,16 +112,65 @@ compute shader.
 - **Not read by the translator,** which does not read the game's FSSM binding table either. The programs load their
   descriptors with `s_load` and `s_buffer_load`, as the game's shaders do; that this is all they need is inferred.
 
+## Build and run-time lookup
+
+**Build.** `make_game.py`'s `shaders` stage, after the game's own shaders, runs `tools/fspx_unpack.py --disasm` on
+the package's `amd_fidelityfx_upscaler_xbox.dll` into `<work>/shaders/fspx/` and `tools/rdna2spirv.py` on that
+disassembly into `<work>/shaders/spirv/fspx/`, with the same `--wave64-emulate` and fallback flags. Each index entry
+of a program without an FSSM blob gets two keys (`tools/shader_meta.py`):
+
+- `fspx_code_sha256`, the SHA-256 of `fspx/<name>.code`: the whole kind-6 entry, prologue and padding included;
+- `fspx_state_sha256`, the SHA-256 of `fspx/<name>.state`: the kind-0 entry (dispatch state) as it is.
+
+The same kind-6 bytes can come with different kind-0 entries, for example two thread-group sizes, and then translate
+to different modules. Such a pair is allowed: the run time tells them apart by the state key. Two entries with the
+same code key and the same state key must have identical modules; when they do not, the step fails and names both
+programs, and leaves no `index.json` for the runtime to load. In the 1.0.2.1 DLL the 29 kind-6 programs are 29
+different byte strings, so every code key has one entry (measured).
+
+The step is redone as a whole when the DLL, the unpacking or translating tools, `llvm-mc`, the wave64 mode or the
+flags change (`fspx_build.json`, written last); it never makes the game's shaders translate again. A package without
+the DLL skips it.
+
+**Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json` and then, when it
+is there, `<dir>/fspx/index.json`, whose entries are named `fspx/<name>`. A missing or unreadable `fspx/index.json`
+leaves the main index loaded. Entries are found by `fssm_sha256` or by `fspx_code_sha256`, in two separate tables.
+`compute_program()` decides what a compute PSO's bytecode is looked up by:
+
+| Bytecode | Key | Who passes it |
+|---|---|---|
+| `FSSM` blob, bare or in a `DXIL` part | `fssm_sha256` of the blob | the game (unchanged) |
+| `DXBC` container whose `ACCC` part is an FSPX payload | `fspx_code_sha256` of its kind-6 bytes, then only the entries whose `fspx_state_sha256` is that of its kind-0 entry | the DLL, slot 62 |
+| bare FSPX payload | the same two keys | the DLL's pipeline function accepts one (none measured at a slot) |
+| bare kind-6 program: 4-byte multiple, at least 36 bytes, the prologue's words 0, 3 and 6 with bits 31..16 = `0xD580` | `fspx_code_sha256` of the bytes as they are; kind 0 is not passed | the slot-67 description at `+0x28`, size at `+0x30` |
+| anything else | none: `E_INVALIDARG`, as before | |
+
+With kind 0 (the first two rows), an input whose state key matches no entry for its code key has no program and gets
+`E_INVALIDARG`, like any untranslated shader. Without it (a bare kind-6 program), the entries for the code key are
+used when they all have the same module; when their modules differ, the program is ambiguous without its kind-0
+state, so the call is refused with `E_INVALIDARG` and a log line saying so, instead of taking one of them.
+
+The payload is parsed with the DLL reader's rules above (sizes and offsets checked in 64-bit arithmetic against the
+clamped total), so a malformed directory, or one without kind 0 or kind 6, gives no program and `E_INVALIDARG`. The
+pipeline's code base, which a translated shader reads its embedded constants through, is the kind-6 bytes: the
+translator's code offsets are into `fspx/<name>.code`.
+
+The proxy maps slot 67's description onto `CreateComputePipelineState` with `CS` = the kind-6 pointer and size
+(#1714), which is the bare-program row above. Not done here: the console-only pipeline slot 11 the DLL calls after
+either path ([d3d12_command_objects.md](d3d12_command_objects.md) §3.5a), and using
+kind 0 at run time beyond what the translated module already carries (its thread-group size and `RSRC2`).
+
 ## Translation status
 
 With `tools/fspx_unpack.py --disasm` and `tools/rdna2spirv.py` on the 29 programs:
 
-- **13 translate and pass `spirv-val`.** They are the 16 programs that use no dot4 instruction, minus 3 that stop at
-  `v_pk_add_u16`, `image_atomic_add` (2D) and `v_pk_fmac_f16`.
-- **The 13 programs that use dot4 do not translate yet.** The translator has neither dot4 form:
-  - 10 stop at `v_dot4_i32_i8`;
-  - 2 stop earlier, at a reachable word `llvm-mc` does not decode (the VOP3P words above);
-  - 1 stops earlier, at an `src_scc` operand.
+- **17 translate and pass `spirv-val`.** 13 of them are the 16 programs that use no dot4 instruction, minus 3 that
+  stop at `v_pk_add_u16`, `image_atomic_add` (2D) and `v_pk_fmac_f16`. The other 4 use dot4 (design.md, "Signed-byte
+  dot products").
+- **9 more programs that use dot4 do not translate yet.** The first thing each stops at:
+  - 6 at an `s_buffer_load_dwordx8` or `_dwordx16` whose destination range ends in `vcc_lo, vcc_hi`;
+  - 2 at a reachable word `llvm-mc` does not decode (the VOP3P words above);
+  - 1 at an `src_scc` operand.
 
 ## Unknown
 

@@ -50,6 +50,18 @@ class PathMappingTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIsNone(rwt.map_path(path, WINDOWS_ROOT, "/repo"))
 
+    def test_parent_segments_cannot_escape_windows_root(self):
+        self.assertIsNone(rwt.map_path("D:/win/root/../outside.exe", WINDOWS_ROOT, "/repo"))
+        self.assertEqual(rwt.map_path("D:/win/root/inside/../runner.exe", WINDOWS_ROOT, "/repo"),
+                         os.path.join("/repo", "runner.exe"))
+
+    def test_dot_and_repeated_separators_normalize_before_mapping(self):
+        self.assertEqual(rwt.map_path("D:/win/root/./runner.exe", WINDOWS_ROOT, "/repo"),
+                         os.path.join("/repo", "runner.exe"))
+        self.assertEqual(rwt.map_path("D:/win/root//sub//runner.exe", WINDOWS_ROOT, "/repo"),
+                         os.path.join("/repo", "sub", "runner.exe"))
+        self.assertIsNone(rwt.map_path("D:/win/root/../../outside.exe", WINDOWS_ROOT, "/repo"))
+
     def test_wine_path_uses_the_z_drive(self):
         self.assertEqual(rwt.wine_path("/tmp/x y"), "Z:" + os.path.abspath("/tmp/x y").replace("/", "\\"))
 
@@ -105,6 +117,22 @@ class RunTestTest(unittest.TestCase):
         self.assertEqual(status, "fail")
         self.assertIn("exit 3", detail)
 
+    def test_a_disabled_test_is_skipped_without_launching(self) -> None:
+        built = self.command_for(self.exiting(0))
+        missing = self.command_for(self.artifact / "missing.exe")
+        for command in (built, missing, None):
+            with self.subTest(command=command), \
+                    mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as launch:
+                status, detail = self.run_entry(ctest_entry("disabled", command, {"DISABLED": True}))
+                launch.assert_not_called()
+                self.assertEqual(status, "skip", detail)
+                self.assertIn("disabled by CTest", detail)
+
+    def test_a_false_disabled_property_still_runs_the_test(self) -> None:
+        command = self.command_for(self.exiting(0))
+        status, detail = self.run_entry(ctest_entry("enabled", command, {"DISABLED": "0"}))
+        self.assertEqual(status, "pass", detail)
+
     def test_a_test_without_a_command_fails(self):
         status, detail = self.run_entry(ctest_entry("unbuilt", None))
         self.assertEqual(status, "fail")
@@ -135,6 +163,35 @@ class RunTestTest(unittest.TestCase):
             ctest_entry("skipped", self.command_for(self.exiting(77)), {"SKIP_RETURN_CODE": "77"}))
         self.assertEqual(status, "skip")
         self.assertIn("exit 77", detail)
+
+    def test_ctest_environment_is_applied_only_to_its_child(self) -> None:
+        exe = self.program("show_environment.py",
+                           "import os\n"
+                           "for key in ('LEONIDA_HOST_ADAPTER', 'LEONIDA_WINE_TEST_INHERITED', "
+                           "'LEONIDA_WINE_TEST_VALUE', 'LEONIDA_WINE_TEST_EMPTY'):\n"
+                           "    print(repr(os.environ.get(key)))\n")
+        command = self.command_for(exe)
+        env = {"LEONIDA_HOST_ADAPTER": "inherited", "LEONIDA_WINE_TEST_INHERITED": "keep"}
+        props = {"ENVIRONMENT": ["LEONIDA_HOST_ADAPTER=warp", "LEONIDA_WINE_TEST_VALUE=path=a;b",
+                                 "LEONIDA_WINE_TEST_EMPTY="]}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("LEONIDA_WINE_TEST_VALUE", None)
+            os.environ.pop("LEONIDA_WINE_TEST_EMPTY", None)
+            status, detail = self.run_entry(ctest_entry("with_environment", command, props))
+            self.assertEqual(status, "pass", detail)
+            self.assertEqual(detail.splitlines()[1:], ["'warp'", "'keep'", "'path=a;b'", "''"])
+            status, detail = self.run_entry(ctest_entry("without_environment", command))
+            self.assertEqual(status, "pass", detail)
+            self.assertEqual(detail.splitlines()[1:], ["'inherited'", "'keep'", "None", "None"])
+
+    def test_malformed_ctest_environment_fails_before_launch(self) -> None:
+        command = self.command_for(self.exiting(0))
+        props = {"ENVIRONMENT": ["missing_equals"]}
+        with mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as launch:
+            status, detail = self.run_entry(ctest_entry("bad_environment", command, props))
+        launch.assert_not_called()
+        self.assertEqual(status, "fail", detail)
+        self.assertIn("invalid CTest ENVIRONMENT", detail)
 
     def test_ctest_output_expressions_determine_the_result(self):
         usage = {"PASS_REGULAR_EXPRESSION": ["alternative", "usage: gta6rt"]}
@@ -167,11 +224,26 @@ class RunTestTest(unittest.TestCase):
                 status, detail = self.run_entry(ctest_entry("regex", self.command_for(exe), props))
                 self.assertEqual(status, expected, detail)
 
+    def test_skip_output_overrides_a_normal_exit_status(self):
+        skip_pattern = "SKIP: missing adapter"
+        exe = self.program("skip.py", f"print({skip_pattern!r})\nraise SystemExit(3)\n")
+        for expression in (skip_pattern, ["different reason", skip_pattern]):
+            with self.subTest(expression=expression):
+                entry = ctest_entry("skip", self.command_for(exe), {"SKIP_REGULAR_EXPRESSION": expression})
+                status, detail = rwt.run_test(entry, self.args, [sys.executable, "-I"])
+                self.assertEqual(status, "skip", detail)
+                self.assertIn("SKIP_REGULAR_EXPRESSION", detail)
+
+        entry = ctest_entry("no_match", self.command_for(exe), {"SKIP_REGULAR_EXPRESSION": ["different reason"]})
+        status, detail = rwt.run_test(entry, self.args, [sys.executable, "-I"])
+        self.assertEqual(status, "fail", detail)
+
     def test_a_signal_termination_fails_even_with_success_overrides(self):
         # The mocked negative returncode keeps the test portable across Windows and POSIX.
         exe = self.exiting(0)
         fake = mock.Mock(returncode=-11, stdout=b"usage: gta6rt")
-        for props in ({"WILL_FAIL": True}, {"PASS_REGULAR_EXPRESSION": ["usage: gta6rt"]}):
+        for props in ({"WILL_FAIL": True}, {"PASS_REGULAR_EXPRESSION": ["usage: gta6rt"]},
+                      {"SKIP_REGULAR_EXPRESSION": ["usage: gta6rt"]}):
             with self.subTest(props=props), mock.patch.object(rwt.subprocess, "run", return_value=fake):
                 entry = ctest_entry("segv", self.command_for(exe), props | {"SKIP_RETURN_CODE": 77})
                 status, detail = self.run_entry(entry)
@@ -184,6 +256,24 @@ class RunTestTest(unittest.TestCase):
         status, detail = self.run_entry(ctest_entry("slow", self.command_for(slow)))
         self.assertEqual(status, "fail")
         self.assertIn("timed out after 0.2 s", detail)
+
+    def test_a_short_ctest_timeout_still_fails_a_will_fail_test(self):
+        slow = self.program("slow_failure.py", "import sys, time\ntime.sleep(1)\nsys.exit(1)\n")
+        entry = ctest_entry("slow_failure", self.command_for(slow), {"TIMEOUT": 0.2, "WILL_FAIL": True})
+        status, detail = self.run_entry(entry)
+        self.assertEqual(status, "fail", detail)
+        self.assertIn("timed out after 0.2 s", detail)
+
+    def test_ctest_timeout_cannot_remove_or_extend_the_runner_limit(self):
+        exe = self.exiting(0)
+        for timeout in (0, "20"):
+            with self.subTest(timeout=timeout):
+                entry = ctest_entry("bounded", self.command_for(exe), {"TIMEOUT": timeout})
+                result = rwt.subprocess.CompletedProcess([], 0, stdout=b"")
+                with mock.patch.object(rwt.subprocess, "run", return_value=result) as run:
+                    status, detail = self.run_entry(entry)
+                self.assertEqual(status, "pass", detail)
+                self.assertEqual(run.call_args.kwargs["timeout"], self.args.timeout)
 
     def test_an_unstartable_wine_fails_the_test_instead_of_aborting_the_run(self):
         status, detail = rwt.run_test(ctest_entry("ok", self.command_for(self.exiting(0))), self.args,
@@ -372,6 +462,48 @@ class MainTest(unittest.TestCase):
         code, _, err = self.run_main_json([{"name": "t"}])
         self.assertEqual(code, 2)
         self.assertIn("not the output of ctest", err)
+
+    def test_missing_tests_is_not_a_zero_test_run(self):
+        code, _, err = self.run_main_json({})
+        self.assertEqual(code, 2)
+        self.assertIn("not the output of ctest", err)
+
+    def test_scalar_tests_rows_are_rejected(self):
+        code, _, err = self.run_main_json({"tests": ["binary", 3, None]})
+        self.assertEqual(code, 2)
+        self.assertIn("not the output of ctest", err)
+
+    def test_malformed_command_and_property_rows_are_rejected_before_launch(self):
+        for fields in (
+            {"command": "D:/win/root/artifact/ok.py"},
+            {"command": [42]},
+            {"command": [self.command("ok.py")[0], "embedded\0null"]},
+            {"properties": {"TIMEOUT": 10}},
+            {"properties": [{"name": "TIMEOUT"}]},
+            {"properties": [{"name": ["TIMEOUT"], "value": 10}]},
+            {"name": []},
+        ):
+            with self.subTest(fields=fields):
+                good = ctest_entry("ok", self.command("ok.py"))
+                with mock.patch.object(rwt, "DriveMap") as drive, \
+                        mock.patch.object(rwt, "run_test", return_value=("pass", "")) as launch:
+                    code, _, err = self.run_main([good, good | fields])
+                self.assertEqual(code, 2)
+                self.assertIn("not the output of ctest", err)
+                drive.assert_not_called()
+                launch.assert_not_called()
+
+    def test_an_unbuilt_test_without_a_command_is_valid_inventory(self):
+        code, out, err = self.run_main([{"name": "unbuilt"}], "--require", "unbuilt")
+        self.assertEqual(code, 1)
+        self.assertIn("[FAIL] unbuilt", out)
+        self.assertIn("no command", out)
+        self.assertEqual(err, "")
+
+    def test_an_explicit_empty_tests_list_is_accepted(self):
+        code, out, _ = self.run_main_json({"tests": []})
+        self.assertEqual(code, 0)
+        self.assertIn("0 passed, 0 failed, 0 skipped under Wine (0 tests)", out)
 
     def run_main_json(self, document):
         listing = self.root / "wrong.json"

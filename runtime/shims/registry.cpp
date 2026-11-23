@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <map>
 #include <mutex>
 #include <set>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include "shims.h"
+#include "startup_trace.h"
 
 namespace rt::shims {
 namespace {
@@ -60,6 +62,9 @@ std::vector<Lookup> g_lookups;
 //                            D3D12XboxCreateDevice is matched by exact name: the console-only function has no public
 //                            reference page that could be reached; it is the factory this repo measured (it returns
 //                            an HRESULT with the device in an out parameter, docs/d3d12_vulkan.md), not a documented one.
+//                            D3D12XboxCreateSyntheticDevice is the other console-only factory the sibling export
+//                            inventories list (docs/d3d12_vulkan.md §7); same Create*Device HRESULT shape.
+//                            D3D12XboxSetProcessDebugFlags is left out: nothing measured its return.
 //  dxgi.dll                  CreateDXGIFactory, CreateDXGIFactory1, CreateDXGIFactory2, DXGIGetDebugInterface1 and
 //                            DXGIDeclareAdapterRemovalSupport return HRESULT (win32/api/dxgi/nf-dxgi-createdxgifactory,
 //                            dxgi1_3 and dxgi1_6 pages). Not the whole DXGI* prefix: only these names were verified.
@@ -69,6 +74,13 @@ std::vector<Lookup> g_lookups;
 //                            XGameRuntimeInitialize and XGameEventWrite: HRESULT.
 //                            Mixed families (XSystem*, XGameStreaming*, XThread*, XDisplay*, XGameRuntimeFeature*) are
 //                            left out on purpose.
+//  gameinput.dll             GameInputCreate: HRESULT (gaming/gdk/docs/reference/input/gameinput/functions/
+//                            gameinputcreate). The shim implements it (runtime/shims/gameinput.cpp); the class is
+//                            listed anyway for a build or import it misses.
+//  xaudio2_9.dll             XAudio2Create: HRESULT (learn.microsoft.com/windows/win32/api/xaudio2/
+//  xaudio2_9redist.dll       nf-xaudio2-xaudio2create). xaudio2_9.dll is the console name (docs/d3d12_vulkan.md §7).
+//  dstorage.dll              DStorageGetFactory: HRESULT (learn.microsoft.com/windows/win32/api/dstorage/
+//  dstorage_xs.dll           nf-dstorage-dstoragegetfactory). dstorage_xs.dll is the console name.
 const char* const kNotHResult[] = {
     "XAsyncCancel", "XAsyncComplete",
     "XTaskQueueCloseHandle", "XTaskQueueDispatch", "XTaskQueueGetCurrentProcessTaskQueue",
@@ -89,12 +101,18 @@ ReturnClass classify(const std::string& dll, const std::string& name) {
     if (dll == "d3d12.dll" || dll == "d3d12_xs.dll") {
         if (starts_with(name, "D3D12Create") || starts_with(name, "D3D12Serialize") ||
             name == "D3D12GetDebugInterface" || name == "D3D12EnableExperimentalFeatures" ||
-            name == "D3D12XboxCreateDevice")
+            name == "D3D12XboxCreateDevice" || name == "D3D12XboxCreateSyntheticDevice")
             return ReturnClass::HResult;
     } else if (dll == "dxgi.dll") {
         if (starts_with(name, "CreateDXGIFactory") || name == "DXGIGetDebugInterface1" ||
             name == "DXGIDeclareAdapterRemovalSupport")
             return ReturnClass::HResult;
+    } else if (dll == "xaudio2_9.dll" || dll == "xaudio2_9redist.dll") {
+        if (name == "XAudio2Create") return ReturnClass::HResult;
+    } else if (dll == "gameinput.dll") {
+        if (name == "GameInputCreate") return ReturnClass::HResult;
+    } else if (dll == "dstorage.dll" || dll == "dstorage_xs.dll") {
+        if (name == "DStorageGetFactory") return ReturnClass::HResult;
     } else if (dll == "xgameruntime.dll") {
         if (name == "XGameRuntimeInitialize" || name == "XGameEventWrite") return ReturnClass::HResult;
         for (const char* n : kNotHResult)
@@ -162,6 +180,9 @@ extern "C" uint64_t rt_unimplemented(const char* what, const CallInfo* info) {
         }
     }
     const uint64_t fail_value = cls == ReturnClass::HResult ? kENotImpl : 0;
+    if (first && startup_trace::enabled())
+        startup_trace::event("unimplemented_call", "\"import\":" + startup_trace::quote(what) +
+                                                       ",\"caller\":" + startup_trace::quote(module_offset(info->ret)));
 
     if (policy == UnimplementedPolicy::Stop) {
         std::fprintf(stderr,
@@ -314,6 +335,37 @@ bool mapped_image_base(uint64_t address, uint64_t& base) {
     return false;
 }
 
+std::string module_offset(uint64_t address) {
+    char b[48];
+    std::string module;
+    uint32_t rva = 0;
+    {
+        std::lock_guard lock(g_lookup_mutex);
+        for (auto& l : g_lookups)
+            if (l.fn(l.ctx, address, module, rva)) {
+                std::snprintf(b, sizeof b, "+0x%x", rva);
+                return module + b;
+            }
+    }
+    HMODULE host = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(address), &host) && host) {
+        // Wide, then UTF-8: the ANSI form would put code-page bytes into the trace's JSON lines.
+        wchar_t path[MAX_PATH] = {};
+        const DWORD len = GetModuleFileNameW(host, path, MAX_PATH);
+        const wchar_t* slash = std::wcsrchr(path, L'\\');
+        const wchar_t* file = slash ? slash + 1 : path;
+        const int wlen = len ? static_cast<int>(path + len - file) : 0;
+        const int bytes = wlen > 0 ? WideCharToMultiByte(CP_UTF8, 0, file, wlen, nullptr, 0, nullptr, nullptr) : 0;
+        std::string name(bytes > 0 ? bytes : 0, '\0');
+        if (bytes > 0) WideCharToMultiByte(CP_UTF8, 0, file, wlen, name.data(), bytes, nullptr, nullptr);
+        std::snprintf(b, sizeof b, "+0x%llx", static_cast<unsigned long long>(address - reinterpret_cast<uint64_t>(host)));
+        return "host:" + name + b;
+    }
+    std::snprintf(b, sizeof b, "0x%llx", static_cast<unsigned long long>(address));
+    return b;
+}
+
 void remove_module_lookup(void* ctx) {
     std::lock_guard lock(g_lookup_mutex);
     for (auto it = g_lookups.begin(); it != g_lookups.end(); ++it)
@@ -321,6 +373,85 @@ void remove_module_lookup(void* ctx) {
             g_lookups.erase(it);
             break;
         }
+}
+
+namespace {
+
+struct BundledLoaderEntry {
+    void* ctx;
+    const BundledModuleOps* ops;
+};
+
+// Immortal: late mapped-DLL detach or atexit handlers may call GetProcAddress/FreeLibrary during process teardown.
+std::mutex& bundled_loader_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
+std::vector<BundledLoaderEntry>& bundled_loaders() {
+    static auto* v = new std::vector<BundledLoaderEntry>;
+    return *v;
+}
+
+std::vector<BundledLoaderEntry> snapshot_bundled_loaders() {
+    std::lock_guard lock(bundled_loader_mutex());
+    return bundled_loaders();
+}
+
+}  // namespace
+
+void add_bundled_loader(void* ctx, const BundledModuleOps* ops) {
+    if (!ctx || !ops) return;
+    std::lock_guard lock(bundled_loader_mutex());
+    bundled_loaders().push_back({ctx, ops});
+}
+
+void remove_bundled_loader(void* ctx) {
+    std::lock_guard lock(bundled_loader_mutex());
+    auto& list = bundled_loaders();
+    for (auto it = list.begin(); it != list.end(); ++it)
+        if (it->ctx == ctx) {
+            list.erase(it);
+            break;
+        }
+}
+
+void* find_loaded_bundled_module(const std::string& dll_lower) {
+    for (const auto& entry : snapshot_bundled_loaders())
+        if (void* h = entry.ops->find_loaded(entry.ctx, dll_lower)) return h;
+    return nullptr;
+}
+
+void* load_bundled_module(const std::string& dll_lower, uint32_t flags, bool& handled) {
+    handled = false;
+    for (const auto& entry : snapshot_bundled_loaders()) {
+        bool loader_handled = false;
+        void* h = entry.ops->load_bundled(entry.ctx, dll_lower, flags, loader_handled);
+        if (loader_handled) {
+            handled = true;
+            return h;
+        }
+    }
+    return nullptr;
+}
+
+void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_handle) {
+    owns_handle = false;
+    for (const auto& entry : snapshot_bundled_loaders()) {
+        bool loader_owns = false;
+        void* fn = entry.ops->get_proc(entry.ctx, module, sym, loader_owns);
+        if (loader_owns) {
+            owns_handle = true;
+            return fn;
+        }
+    }
+    return nullptr;
+}
+
+bool owns_bundled_module_handle(void* module) {
+    for (const auto& entry : snapshot_bundled_loaders())
+        if (entry.ops->owns_handle(entry.ctx, module)) return true;
+    return false;
 }
 
 Table::Table(const Entry* entries, size_t count) {

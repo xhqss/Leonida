@@ -11,10 +11,14 @@ local GPU: llvm-mc assembles it, tools/rdna2spirv.py translates it (wave32 nativ
 VKC_DUMP, and every word every thread stores is compared. docs/shader_validation.md has the details.
 
     python -I tools/crosslane_fuzz.py --programs 200 --seed 1 [--wave 32|64|both] [--modes native,emulate]
+    python -I tools/crosslane_fuzz.py --ext --wave 64    # more wave64 ops (below); wave32 programs are unchanged
     python -I tools/crosslane_fuzz.py --self-test        # the model against hand-computed values, no GPU
     python -I tools/crosslane_fuzz.py --oracle hw        # model vs the AMD GPU natively (wave32 and wave64); exit 77
                                                          # when tools/hw_oracle's tools are missing. --oracle translator,hw
                                                          # does both. No llvm-mc, Vulkan or vk_compute_test for hw alone.
+    python -I tools/crosslane_fuzz.py --dpp-sweep --oracle hw   # one program per DPP case instead of random ones:
+                                                         # every DPP16 control x bound_ctrl x fi x EXEC pattern, all
+                                                         # row_mask / bank_mask pairs, DPP8 selects (7,206 per wave size)
 
 Exit code: 0 when every program that ran matches (or differs only in a program with a hypothesis op), 1 on a
 mismatch or an untranslated program, 2 when the only failures are harness errors: vk_compute_test timed out or
@@ -42,6 +46,23 @@ Reference semantics (AMD "RDNA 2" ISA reference guide; Mesa ACO and LLVM where t
     lane keeps its old vD. That was measured on RDNA2 and RDNA3.5 (docs/shader_validation.md, #374), but the
     translator models it only with #580, so programs that reach it are still reported apart.
   * VALU results are written only in active lanes; SALU is wave-uniform.
+
+--ext adds these to wave64 programs (the model of each was checked against an RDNA2 GPU, gfx1036, with --oracle hw):
+  * v_add_co / v_sub_co / v_subrev_co_u32 and the _ci forms, carries in SGPR pairs or VCC: the carry-out mask has
+    the lane's carry (borrow) for an active lane and 0 for an inactive one.
+  * ds_bpermute_b32: lane l reads vData of lane ((vAddr + offset) >> 2) & 31 of its own 32-lane half; a source
+    lane that is off in EXEC reads 0. ds_permute_b32: every active lane sends vData to that lane; a lane nobody
+    sends to gets 0, and with several senders the highest lane wins. ds_swizzle_b32 (QUAD_PERM, BITMASK_PERM, SWAP,
+    REVERSE, BROADCAST) works inside each group of 32 lanes; an EXEC-off source lane reads 0, which the
+    translator models only with #2780, so programs that reach it are reported apart like the permlane case.
+    On hardware the three need `s_waitcnt lgkmcnt(0)` before the result is used; the generator emits it.
+  * v_readlane / v_writelane with an SGPR lane select of 64 or more (S1[5:0]).
+  * s_bcnt0/1 and s_ff0/1 of a mask, s_and/or/xor/andn2_b64 of masks, the ten s_*_saveexec_b64 forms and
+    s_andn1/andn2_wrexec_b64, s_wqm_b64, s_cmp_eq/lg_u64 and s_bitcmp0/1_b64 of masks, each followed by an
+    s_cselect_b32 so its SCC reaches a stored SGPR; s_cselect_b64 between masks; s_mov_b64 exec, mask;
+    s_bfm_b64 (D = ((1 << S0[5:0]) - 1) << S1[5:0]) into a mask or EXEC.
+  * A loop in LLVM's SI_LOOP shape: per-lane trip counts, a break mask, s_andn2_b64 exec and s_cbranch_execnz
+    back to the head, so lanes of both halves leave on different iterations while the rest keep running.
 """
 import argparse
 import os
@@ -66,6 +87,10 @@ OUT_REGS = [("v", r) for r in DATA_V] + [("s", r) for r in DATA_S]
 SAVE = (22, 24, 26)                    # saveexec destinations (pairs in wave64)
 ENTRY = 30                             # entry EXEC (pair in wave64)
 SEL = 28                               # scratch SGPRs for lane selects / permlane selectors (28, 29)
+PERM_V = 23                            # --ext: scratch VGPR for ds_permute addresses
+LOOP_V = (24, 25)                      # --ext: a loop's per-lane trip limit and counter
+LOOP_S = (32, 34)                      # --ext: a loop's break mask and "done this iteration" mask (pairs)
+DS_WAIT = "\n\ts_waitcnt lgkmcnt(0)"   # after ds_bpermute / ds_permute / ds_swizzle: the result comes back late
 PERMLANE_FETCH_INACTIVE = False
 TRANSLATOR = [os.path.join(HERE, "rdna2spirv.py")]   # --translator        # --permlane-fetch-inactive: model FI = 1 (read inactive sources)
 
@@ -142,8 +167,170 @@ class Op:
         return hyp
 
 
+DPP16_CONTROLS = ("quad_perm", "row_shl", "row_shr", "row_ror", "row_mirror", "row_half_mirror", "row_share",
+                  "row_xmask")
+DPP_OPS = {"mov": "v_mov_b32", "not": "v_not_b32", "add": "v_add_nc_u32", "xor": "v_xor_b32"}
+
+
+def dpp16_select(control, arg=None):
+    """(modifier text, f) for one DPP16 control; f(x) gives (source lane in the 16-lane row, whether it is in the
+    row) for row lane x. arg: the four quad_perm selects, or the shift / rotate / share / xmask amount."""
+    if control == "quad_perm":
+        q = list(arg)
+        return f"quad_perm:[{','.join(map(str, q))}]", (lambda x: ((x & ~3) | q[x & 3], True))
+    if control == "row_shl":
+        return f"row_shl:{arg}", (lambda x: (x + arg, x + arg < 16))
+    if control == "row_shr":
+        return f"row_shr:{arg}", (lambda x: (x - arg, x >= arg))
+    if control == "row_ror":
+        return f"row_ror:{arg}", (lambda x: ((x - arg) & 15, True))
+    if control == "row_mirror":
+        return "row_mirror", (lambda x: (15 - x, True))
+    if control == "row_half_mirror":
+        return "row_half_mirror", (lambda x: ((x & 8) | (7 - (x & 7)), True))
+    if control == "row_share":
+        return f"row_share:{arg}", (lambda x: (arg, True))
+    if control == "row_xmask":
+        return f"row_xmask:{arg}", (lambda x: (x ^ arg, True))
+    raise ValueError(f"unknown DPP16 control {control!r}")
+
+
+def dpp_op(d, a, b, kind, control=None, dpp8=None, fi=False, bound=False, row_mask=0xF, bank_mask=0xF):
+    """A VOP1/VOP2 op with a DPP16 (control = (name, arg)) or DPP8 (dpp8 = the eight selects) src0, and its
+    effect on the model. From the RDNA 2 ISA guide's DPP section: DPP16 picks the source lane inside the 16-lane
+    row; a source out of the row, or one that is off in EXEC while fi = 0, is invalid: bound_ctrl 1 uses 0 as
+    src0, bound_ctrl 0 leaves the lane unwritten. Lanes in a row or bank that row_mask / bank_mask turn off are
+    not written. DPP8 picks a lane in the 8-lane group; an inactive source with fi = 0 reads 0 (as #238
+    implements it; reported apart as a hypothesis). Every source is read before vD is written, so d may be a."""
+    if dpp8 is not None:
+        sel = list(dpp8)
+        ctl = f"dpp8:[{','.join(map(str, sel))}]" + (" fi:1" if fi else "")
+        pick = lambda l: ((l & ~7) | sel[l & 7], True)
+    else:
+        ctl, f = dpp16_select(*control)
+
+        def pick(l, f=f):
+            s_, ok = f(l & 15)
+            return (l & ~15) | (s_ & 15), ok
+        ctl += f" row_mask:0x{row_mask:x} bank_mask:0x{bank_mask:x}" + (" bound_ctrl:1" if bound else "") + \
+            (" fi:1" if fi else "")
+    name = DPP_OPS[kind]
+    if kind in ("mov", "not"):
+        text = f"{name}_dpp v{d}, v{a} {ctl}"
+    else:
+        text = f"{name}_dpp v{d}, v{a}, v{b} {ctl}"
+    alu = {"mov": lambda x, y: x, "not": lambda x, y: ~x, "add": lambda x, y: x + y,
+           "xor": lambda x, y: x ^ y}[kind]
+
+    def fn(w):
+        src, other = w.vr(a), w.vr(b)
+        vals, hyp = list(w.vr(d)), False
+        for lane in range(w.size):
+            if not w.active(lane):
+                continue
+            sl, ok = pick(lane)
+            if dpp8 is not None:
+                if w.active(sl) or fi:
+                    x = src[sl]
+                else:
+                    x, hyp = 0, True
+            else:
+                if not (row_mask >> (lane >> 4) & 1 and bank_mask >> ((lane >> 2) & 3) & 1):
+                    continue
+                if ok and (w.active(sl) or fi):
+                    x = src[sl]
+                elif bound:
+                    x = 0
+                else:
+                    continue
+            vals[lane] = alu(x, other[lane]) & M32
+        w.vwrite(d, vals)
+        return hyp
+    return Op(text, fn, "dpp")
+
+
+def exec_op(wave, mask):
+    """EXEC = mask (a constant), as op_exec_const writes it."""
+    if wave == 32:
+        text = f"s_mov_b32 exec_lo, 0x{mask & M32:x}"
+    else:
+        text = f"s_mov_b32 exec_lo, 0x{mask & M32:x}\n\ts_mov_b32 exec_hi, 0x{mask >> 32:x}"
+
+    def fn(w):
+        w.exec = mask & ((1 << w.size) - 1)
+    return Op(text, fn, "exec")
+
+
+# --dpp-sweep: EXEC patterns. "all" has no inactive source; "odd" turns off every other lane, so every source a
+# lane reads one or three lanes away is off; "banks" turns off the first lane of each 4-lane bank and the whole
+# second row, so inactive sources sit next to active ones and one row (row 1) runs nothing.
+SWEEP_EXEC = {
+    32: (("all", M32), ("odd", 0x55555555), ("banks", 0x0000EEEE)),
+    64: (("all", M64), ("odd", 0x5555555555555555), ("banks", 0xEEEEEEEE0000EEEE)),
+}
+SWEEP_DPP8 = ((0, 1, 2, 3, 4, 5, 6, 7), (7, 6, 5, 4, 3, 2, 1, 0), (1, 0, 3, 2, 5, 4, 7, 6), (4, 5, 6, 7, 0, 1, 2, 3)) + \
+    tuple((k,) * 8 for k in range(8)) + tuple(tuple((i + k) & 7 for i in range(8)) for k in range(1, 8))
+SWEEP_MASK_CONTROLS = (("row_shr", 1), ("quad_perm", (1, 0, 3, 2)), ("row_share", 5))
+
+
+def dpp16_sweep_controls():
+    """Every DPP16 control the RDNA2 assembler takes: 256 quad_perms, row_shl/shr/ror 1-15, both mirrors,
+    row_share and row_xmask 0-15 (335)."""
+    out = [("quad_perm", tuple(q >> s & 3 for s in (0, 2, 4, 6))) for q in range(256)]
+    out += [(c, n) for c in ("row_shl", "row_shr", "row_ror") for n in range(1, 16)]
+    out += [("row_mirror", None), ("row_half_mirror", None)]
+    out += [(c, n) for c in ("row_share", "row_xmask") for n in range(16)]
+    return out
+
+
+def dpp_sweep_cases(wave):
+    """The --dpp-sweep cases for one wave size, as (family, exec name, exec mask, op kwargs). Three parts:
+    every DPP16 control x bound_ctrl x fi x EXEC pattern with both masks on; all 256 row_mask / bank_mask pairs
+    for three controls, with and without bound_ctrl, under the full and the odd EXEC; every DPP8 select set
+    x fi x EXEC pattern. The op (mov, not, add, xor) and whether vD is also src0 (in place, as a reduction
+    writes it) rotate through the cases, so each control meets all four ops and both register layouts."""
+    cases = []
+    execs = SWEEP_EXEC[wave]
+    for control in dpp16_sweep_controls():
+        for bound in (False, True):
+            for fi in (False, True):
+                for ename, emask in execs:
+                    cases.append((control[0], ename, emask,
+                                  dict(control=control, fi=fi, bound=bound)))
+    for control in SWEEP_MASK_CONTROLS:
+        for row_mask in range(16):
+            for bank_mask in range(16):
+                for bound in (False, True):
+                    for ename, emask in execs[:2]:
+                        cases.append(("masks", ename, emask, dict(control=control, bound=bound, row_mask=row_mask,
+                                                                   bank_mask=bank_mask)))
+    for sel in SWEEP_DPP8:
+        for fi in (False, True):
+            for ename, emask in execs:
+                cases.append(("dpp8", ename, emask, dict(dpp8=sel, fi=fi)))
+    return cases
+
+
+def dpp_sweep_programs(wave):
+    """One program per --dpp-sweep case: the usual prologue (data in v2-v7), EXEC set to the case's pattern, one
+    DPP op, and the usual epilogue (EXEC restored, every word stored). One full wave, so no source lane is missing."""
+    progs = []
+    kinds = tuple(DPP_OPS)
+    for i, (family, ename, emask, kw) in enumerate(dpp_sweep_cases(wave)):
+        rng = random.Random(wave * 1000003 + i)
+        pro, init = prologue(rng, wave)
+        kind = kinds[i % 4]
+        d, a, b = (2, 2, 4) if (i // 4) % 2 else (2, 3, 4)
+        op = dpp_op(d, a, b, kind, **kw)
+        p = Program(f"cs_dpp{wave}_{i}", wave, wave, pro, init, [exec_op(wave, emask), op])
+        p.label = f"{family}, EXEC {ename}: {op.text}"
+        p.family = family
+        progs.append(p)
+    return progs
+
+
 class Gen:
-    def __init__(self, rng, wave, group, allow_maskdata=True, wave32_hi_lanes=True, dpp=False):
+    def __init__(self, rng, wave, group, allow_maskdata=True, wave32_hi_lanes=True, dpp=False, ext=False):
         self.rng, self.W, self.L = rng, wave, group
         self.nwaves = (group + wave - 1) // wave
         last = group - (self.nwaves - 1) * wave
@@ -151,6 +338,7 @@ class Gen:
         self.full = last == wave
         self.allow_maskdata, self.hi_lanes = allow_maskdata, wave32_hi_lanes
         self.dpp = dpp
+        self.ext = ext and wave == 64               # --ext: the wave64 extension ops
         self.masks = []                             # mask registers written so far
         self.depth = 0
         self.in_branch, self.branch_id = False, 0
@@ -465,79 +653,24 @@ class Gen:
         d, a, b = self.r(DATA_V), self.vsrc(), self.vsrc()
         kind = self.r(("mov", "mov", "not", "add", "xor"))
         r = self.rng
+        # The draws stay in this order, so a seed gives the same programs as before dpp_op was split out.
         dpp8 = r.random() < 0.25
         fi = r.random() < 0.3
         bound = r.random() < 0.5
         row_mask = 0xF if r.random() < 0.6 else r.randrange(16)
         bank_mask = 0xF if r.random() < 0.6 else r.randrange(16)
         if dpp8:
-            sel = [r.randrange(8) for _ in range(8)]
-            ctl = f"dpp8:[{','.join(map(str, sel))}]" + (" fi:1" if fi else "")
-            pick = lambda l: ((l & ~7) | sel[l & 7], True)
+            return dpp_op(d, a, b, kind, fi=fi, dpp8=[r.randrange(8) for _ in range(8)])
+        c = r.choice(DPP16_CONTROLS)
+        if c == "quad_perm":
+            arg = [r.randrange(4) for _ in range(4)]
+        elif c in ("row_shl", "row_shr", "row_ror"):
+            arg = r.randrange(1, 16)
+        elif c in ("row_share", "row_xmask"):
+            arg = r.randrange(16)
         else:
-            c = r.choice(("quad_perm", "row_shl", "row_shr", "row_ror", "row_mirror", "row_half_mirror",
-                          "row_share", "row_xmask"))
-            if c == "quad_perm":
-                q = [r.randrange(4) for _ in range(4)]
-                ctl = f"quad_perm:[{','.join(map(str, q))}]"
-                f = lambda x: ((x & ~3) | q[x & 3], True)
-            elif c == "row_shl":
-                n = r.randrange(1, 16)
-                ctl, f = f"row_shl:{n}", (lambda x: (x + n, x + n < 16))
-            elif c == "row_shr":
-                n = r.randrange(1, 16)
-                ctl, f = f"row_shr:{n}", (lambda x: (x - n, x >= n))
-            elif c == "row_ror":
-                n = r.randrange(1, 16)
-                ctl, f = f"row_ror:{n}", (lambda x: ((x - n) & 15, True))
-            elif c == "row_mirror":
-                ctl, f = "row_mirror", (lambda x: (15 - x, True))
-            elif c == "row_half_mirror":
-                ctl, f = "row_half_mirror", (lambda x: ((x & 8) | (7 - (x & 7)), True))
-            elif c == "row_share":
-                n = r.randrange(16)
-                ctl, f = f"row_share:{n}", (lambda x: (n, True))
-            else:
-                n = r.randrange(16)
-                ctl, f = f"row_xmask:{n}", (lambda x: (x ^ n, True))
-
-            def pick(l, f=f):
-                s_, ok = f(l & 15)
-                return (l & ~15) | (s_ & 15), ok
-            ctl += f" row_mask:0x{row_mask:x} bank_mask:0x{bank_mask:x}" + (" bound_ctrl:1" if bound else "") +                 (" fi:1" if fi else "")
-        name = {"mov": "v_mov_b32", "not": "v_not_b32", "add": "v_add_nc_u32", "xor": "v_xor_b32"}[kind]
-        if kind in ("mov", "not"):
-            text = f"{name}_dpp v{d}, v{a} {ctl}"
-        else:
-            text = f"{name}_dpp v{d}, v{a}, v{b} {ctl}"
-        alu = {"mov": lambda x, y: x, "not": lambda x, y: ~x, "add": lambda x, y: x + y,
-               "xor": lambda x, y: x ^ y}[kind]
-
-        def fn(w):
-            src, other = w.vr(a), w.vr(b)
-            vals, hyp = list(w.vr(d)), False
-            for lane in range(w.size):
-                if not w.active(lane):
-                    continue
-                sl, ok = pick(lane)
-                if dpp8:
-                    if w.active(sl) or fi:
-                        x = src[sl]
-                    else:
-                        x, hyp = 0, True
-                else:
-                    if not (row_mask >> (lane >> 4) & 1 and bank_mask >> ((lane >> 2) & 3) & 1):
-                        continue
-                    if ok and (w.active(sl) or fi):
-                        x = src[sl]
-                    elif bound:
-                        x = 0
-                    else:
-                        continue
-                vals[lane] = alu(x, other[lane]) & M32
-            w.vwrite(d, vals)
-            return hyp
-        return Op(text, fn, "dpp")
+            arg = None
+        return dpp_op(d, a, b, kind, control=(c, arg), fi=fi, bound=bound, row_mask=row_mask, bank_mask=bank_mask)
 
     def op_valu(self):
         d, a, b = self.r(DATA_V), self.vsrc(), self.vsrc()
@@ -593,6 +726,387 @@ class Gen:
         op.tags = {"branch"} | {t for o in body for t in getattr(o, "tags", {o.tag})}
         return op
 
+    # ---- --ext: more wave64 ops (all return None in a wave32 program) -----------------------------------
+    def scc_probe(self):
+        """(text, fn) of an s_cselect_b32 right after an op, so the op's SCC reaches a stored SGPR."""
+        d, a, b = self.r(DATA_S), self.r(DATA_S), self.r(DATA_S)
+
+        def fn(w, scc):
+            w.s[d] = w.sr(a) if scc else w.sr(b)
+        return f"\n\ts_cselect_b32 s{d}, s{a}, s{b}", fn
+
+    def ext_mask(self):
+        """A mask that has been written, or EXEC."""
+        return self.r(self.masks + ["exec"])
+
+    def op_scan64(self):
+        """s_bcnt1 / s_bcnt0 / s_ff1 / s_ff0 of a 64-bit mask; the counts also show their SCC (result != 0)."""
+        if self.W != 64:
+            return None
+        m, d = self.ext_mask(), self.r(DATA_S)
+        kind = self.r(("bcnt1", "bcnt0", "ff1", "ff0"))
+        ptext, pfn = self.scc_probe()
+        probe = kind.startswith("bcnt")
+        text = f"s_{kind}_i32_b64 s{d}, {mreg(64, m)}" + (ptext if probe else "")
+
+        def fn(w):
+            x = w.mask(m)
+            if kind == "bcnt1":
+                r = popcount(x)
+            elif kind == "bcnt0":
+                r = 64 - popcount(x)
+            else:
+                y = x if kind == "ff1" else ~x & M64
+                r = ((y & -y).bit_length() - 1) & M32 if y else M32
+            w.s[d] = r
+            if probe:
+                pfn(w, r != 0)
+        return Op(text, fn, "scan64")
+
+    def op_mask_scc(self):
+        """s_and/or/xor/andn2_b64 of two masks into a mask or VCC, and its SCC (result != 0)."""
+        if self.W != 64 or not self.masks:
+            return None
+        a, b = self.r(self.masks), self.r(self.masks)
+        d = self.r([16, 18, 20, "vcc"])
+        kind = self.r(("and", "or", "xor", "andn2"))
+        ptext, pfn = self.scc_probe()
+        text = f"s_{kind}_b64 {mreg(64, d)}, {mreg(64, a)}, {mreg(64, b)}" + ptext
+        if d not in self.masks:
+            self.masks.append(d)
+
+        def fn(w):
+            x, y = w.mask(a), w.mask(b)
+            r = {"and": x & y, "or": x | y, "xor": x ^ y, "andn2": x & ~y}[kind] & M64
+            w.set_mask(d, r)
+            pfn(w, r != 0)
+        return Op(text, fn, "mask_scc")
+
+    def op_exec_logic(self):
+        """The saveexec / wrexec family (RDNA2 ISA SOP1): saveexec D = EXEC, EXEC = f(S0, EXEC); wrexec
+        EXEC = f(S0, EXEC), D = EXEC; SCC = (EXEC != 0). D is one of the mask registers, not the saveexec stack of
+        op_saveexec. The forms that complement a whole mask stay out of a partial wave: they would turn on lanes
+        that do not exist."""
+        if self.W != 64 or not self.masks:
+            return None
+        m, d = self.r(self.masks), self.r([16, 18, 20])
+        kinds = ["and", "or", "xor", "andn1", "andn2"]
+        if self.full:
+            kinds += ["orn1", "orn2", "nand", "nor", "xnor"]
+        kind = self.r(kinds)
+        wr = kind in ("andn1", "andn2") and self.rng.random() < 0.4
+        ptext, pfn = self.scc_probe()
+        text = f"s_{kind}_{'wrexec' if wr else 'saveexec'}_b64 {mreg(64, d)}, {mreg(64, m)}" + ptext
+        if d not in self.masks:
+            self.masks.append(d)
+
+        def fn(w):
+            s, e = w.mask(m), w.exec
+            r = {"and": s & e, "or": s | e, "xor": s ^ e, "andn1": ~s & e, "andn2": s & ~e, "orn1": ~s | e,
+                 "orn2": s | ~e, "nand": ~(s & e), "nor": ~(s | e), "xnor": ~(s ^ e)}[kind] & M64
+            w.exec = r
+            w.set_mask(d, r if wr else e)
+            pfn(w, r != 0)
+        return Op(text, fn, "exec")
+
+    def op_exec_mask(self):
+        """EXEC = a mask (s_mov_b64), not only the restore of a saved EXEC."""
+        if self.W != 64 or not self.masks:
+            return None
+        m = self.r(self.masks)
+
+        def fn(w):
+            w.exec = w.mask(m)
+        return Op(f"s_mov_b64 exec, {mreg(64, m)}", fn, "exec")
+
+    def op_cselect64(self):
+        """s_cselect_b64 between two masks on the SCC of a scalar compare."""
+        if self.W != 64 or not self.masks:
+            return None
+        a, b = self.ext_mask(), self.r(self.masks)
+        d = self.r([16, 18, 20, "vcc"])
+        sa, sb = self.r(DATA_S), self.r(DATA_S)
+        text = f"s_cmp_lt_u32 s{sa}, s{sb}\n\ts_cselect_b64 {mreg(64, d)}, {mreg(64, a)}, {mreg(64, b)}"
+        if d not in self.masks:
+            self.masks.append(d)
+
+        def fn(w):
+            w.set_mask(d, w.mask(a) if w.sr(sa) < w.sr(sb) else w.mask(b))
+        return Op(text, fn, "cselect64")
+
+    def op_mask_test(self):
+        """s_cmp_eq_u64 / s_cmp_lg_u64 of two masks, or s_bitcmp0/1_b64 of one lane's bit, seen through SCC."""
+        if self.W != 64 or not self.masks:
+            return None
+        ptext, pfn = self.scc_probe()
+        if self.rng.random() < 0.5:
+            a, b = self.ext_mask(), self.ext_mask()
+            kind = self.r(("eq", "lg"))
+            text = f"s_cmp_{kind}_u64 {mreg(64, a)}, {mreg(64, b)}" + ptext
+
+            def fn(w):
+                pfn(w, (w.mask(a) == w.mask(b)) == (kind == "eq"))
+        else:
+            m, one, lane = self.ext_mask(), self.rng.randrange(2), self.rng.randrange(64)
+            text = f"s_bitcmp{one}_b64 {mreg(64, m)}, {lane}" + ptext
+
+            def fn(w):
+                pfn(w, (w.mask(m) >> lane & 1) == one)
+        return Op(text, fn, "mask_test")
+
+    def op_bfm(self):
+        """s_bfm_b64 D, S0, S1: D = ((1 << S0[5:0]) - 1) << S1[5:0], into a mask, VCC or EXEC (full waves only)."""
+        if self.W != 64 or not self.full:
+            return None
+        d = self.r([16, 18, 20, "vcc", "exec"])
+        form = self.r(("cc", "sc", "cs", "ss"))
+        sa, sb = self.r(DATA_S), self.r(DATA_S)
+        ka, kb = self.rng.randrange(65), self.rng.randrange(65)
+        text = (f"s_bfm_b64 {mreg(64, d)}, " + (f"s{sa}" if form[0] == "s" else str(ka)) + ", " +
+                (f"s{sb}" if form[1] == "s" else str(kb)))
+        if d not in self.masks and d != "exec":
+            self.masks.append(d)
+
+        def fn(w):
+            size = (w.sr(sa) if form[0] == "s" else ka) & 63
+            off = (w.sr(sb) if form[1] == "s" else kb) & 63
+            w.set_mask(d, (((1 << size) - 1) << off) & M64)
+        return Op(text, fn, "exec" if d == "exec" else "bfm")
+
+    def op_wqm(self):
+        """s_wqm_b64: every group of four bits with a bit set becomes 1111; SCC = (D != 0). Full waves only."""
+        if self.W != 64 or not self.full or not self.masks:
+            return None
+        m, d = self.ext_mask(), self.r([16, 18, 20, "vcc"])
+        ptext, pfn = self.scc_probe()
+        text = f"s_wqm_b64 {mreg(64, d)}, {mreg(64, m)}" + ptext
+        if d not in self.masks:
+            self.masks.append(d)
+
+        def fn(w):
+            x, r = w.mask(m), 0
+            for q in range(16):
+                if x >> (4 * q) & 15:
+                    r |= 15 << (4 * q)
+            w.set_mask(d, r)
+            pfn(w, r != 0)
+        return Op(text, fn, "wqm")
+
+    def op_carry(self):
+        """v_add_co / v_sub_co / v_subrev_co (and the _ci forms) with the carry in and out in SGPR pairs or VCC.
+        Carry out: bit l for an active lane, 0 for an inactive one; the carry in is read before it is written."""
+        if self.W != 64:
+            return None
+        d, a, b = self.r(DATA_V), self.vsrc(), self.vsrc()
+        kind = self.r(("add_co", "sub_co", "subrev_co", "add_co_ci", "sub_co_ci", "subrev_co_ci"))
+        ci = kind.endswith("_ci")
+        if ci and not self.masks:
+            return None
+        mo = self.mask_name(write=True)
+        mi = self.r(self.masks) if ci else None
+        sfx = "e32" if mo == "vcc" and mi == "vcc" and self.rng.random() < 0.5 else "e64"   # VOP2 only has VCC
+        text = f"v_{kind}_u32_{sfx} v{d}, {mreg(64, mo)}, v{a}, v{b}" + (f", {mreg(64, mi)}" if ci else "")
+        if mo not in self.masks:
+            self.masks.append(mo)
+
+        def fn(w):
+            cin = w.mask(mi) if ci else 0
+            vals, m = [], 0
+            for l in range(w.size):
+                x, y, c = w.vr(a)[l], w.vr(b)[l], cin >> l & 1
+                if kind.startswith("add"):
+                    t = x + y + c
+                    co = t >> 32
+                else:
+                    t = (y - x - c) if kind.startswith("subrev") else (x - y - c)
+                    co = int(t < 0)
+                vals.append(t & M32)
+                if w.active(l) and co:
+                    m |= 1 << l
+            w.vwrite(d, vals)
+            w.set_mask(mo, m)
+        return Op(text, fn, "carry")
+
+    def op_bpermute(self):
+        """ds_bpermute_b32 vD, vAddr, vData: lane l reads vData of lane ((vAddr + offset) >> 2) & 31 of its own
+        32-lane half; a source lane that is off in EXEC (or missing from a partial wave) reads 0."""
+        if self.W != 64:
+            return None
+        d, ad, dat = self.r(DATA_V), self.vsrc(), self.vsrc()
+        off = self.r((0, 0, 4, 60, 128, 252, 65532))
+        text = f"ds_bpermute_b32 v{d}, v{ad}, v{dat}" + (f" offset:{off}" if off else "") + DS_WAIT
+
+        def fn(w):
+            vals = []
+            for l in range(w.size):
+                sl = (l & 32) | (((w.vr(ad)[l] + off) >> 2) & 31)
+                vals.append(w.vr(dat)[sl] if w.active(sl) else 0)
+            w.vwrite(d, vals)
+        return Op(text, fn, "bpermute")
+
+    def op_permute(self):
+        """ds_permute_b32 vD, vAddr, vData: every lane on in EXEC sends vData to lane ((vAddr + offset) >> 2) & 31
+        of its own half; a lane nobody sends to gets 0; several senders: the highest lane wins (measured). Half of
+        the time the addresses are a permutation (lane * odd + c), else any data VGPR."""
+        if self.W != 64:
+            return None
+        d, dat = self.r(DATA_V), self.vsrc()
+        if self.rng.random() < 0.5:
+            k, c = self.r((1, 3, 5, 7, 9, 11, 13, 15, 17, 31)), self.rng.randrange(64)
+            ad, off = PERM_V, self.r((0, 0, 4, 124))
+            pre = f"v_mad_u32_u24 v{ad}, v1, {k}, {c}\n\tv_lshlrev_b32_e32 v{ad}, 2, v{ad}\n\t"
+        else:
+            k = c = None
+            ad, off, pre = self.vsrc(), 0, ""
+        text = pre + f"ds_permute_b32 v{d}, v{ad}, v{dat}" + (f" offset:{off}" if off else "") + DS_WAIT
+
+        def fn(w):
+            if k is not None:
+                w.vwrite(ad, [((l * k + c) << 2) & M32 for l in range(w.size)])
+            vals = [0] * w.size
+            for l in range(w.size):
+                if w.active(l):
+                    vals[(l & 32) | (((w.vr(ad)[l] + off) >> 2) & 31)] = w.vr(dat)[l]
+            w.vwrite(d, vals)
+        return Op(text, fn, "permute")
+
+    def op_swizzle(self):
+        """ds_swizzle_b32 vD, vS offset:swizzle(...): QUAD_PERM inside each group of four lanes; the other modes
+        are source lane = ((lane & and) | or) ^ xor inside each group of 32. A source lane that is off in EXEC
+        reads 0 (measured; the translator does that with #2780, so a program that reaches it is reported apart)."""
+        if self.W != 64:
+            return None
+        d, v = self.r(DATA_V), self.vsrc()
+        mode = self.r(("quad", "bits", "bits", "swap", "reverse", "broadcast"))
+        and_m, or_m, xor_m = 31, 0, 0
+        if mode == "quad":
+            q = [self.rng.randrange(4) for _ in range(4)]
+            sw = f"swizzle(QUAD_PERM, {', '.join(map(str, q))})"
+        elif mode == "bits":
+            chars = [self.r("01pi") for _ in range(5)]
+            and_m = 0
+            for i, ch in enumerate(chars):          # bit 4 first: p = keep, i = invert, 0 / 1 = force
+                bit = 1 << (4 - i)
+                and_m |= bit if ch in "pi" else 0
+                xor_m |= bit if ch == "i" else 0
+                or_m |= bit if ch == "1" else 0
+            sw = f'swizzle(BITMASK_PERM, "{"".join(chars)}")'
+        elif mode == "swap":
+            xor_m = self.r((1, 2, 4, 8, 16))
+            sw = f"swizzle(SWAP,{xor_m})"
+        elif mode == "reverse":
+            n = self.r((2, 4, 8, 16, 32))
+            xor_m = n - 1
+            sw = f"swizzle(REVERSE,{n})"
+        else:
+            n = self.r((2, 4, 8, 16, 32))
+            or_m = self.rng.randrange(n)
+            and_m = ~(n - 1) & 31
+            sw = f"swizzle(BROADCAST,{n},{or_m})"
+        text = f"ds_swizzle_b32 v{d}, v{v} offset:{sw}" + DS_WAIT
+
+        def fn(w):
+            vals, hyp = [], False
+            for l in range(w.size):
+                sl = (l & ~3) | q[l & 3] if mode == "quad" else (l & ~31) | (((l & 31 & and_m) | or_m) ^ xor_m)
+                if w.active(sl):
+                    vals.append(w.vr(v)[sl])
+                else:
+                    vals.append(0)
+                    hyp |= bool(w.active(l))
+            w.vwrite(d, vals)
+            return hyp
+        return Op(text, fn, "swizzle")
+
+    def op_lane_wrap(self):
+        """v_readlane / v_writelane with an SGPR lane select of 64 or more: wave64 uses S1[5:0]."""
+        if self.W != 64:
+            return None
+        lane = self.lane()
+        enc = lane + 64 * self.rng.randrange(1, 1 << 20)
+        if self.rng.random() < 0.5:
+            d, v = self.r(DATA_S), self.vsrc()
+            text = f"s_mov_b32 s{SEL}, {enc}\n\tv_readlane_b32 s{d}, v{v}, s{SEL}"
+
+            def fn(w):
+                w.s[SEL] = enc
+                w.s[d] = w.vr(v)[lane]
+        else:
+            d, s = self.r(DATA_V), self.r(DATA_S)
+            text = f"s_mov_b32 s{SEL}, {enc}\n\tv_writelane_b32 v{d}, s{s}, s{SEL}"
+
+            def fn(w):
+                w.s[SEL] = enc
+                if w.exists >> lane & 1:
+                    w.vr(d)[lane] = w.sr(s)
+        return Op(text, fn, "lane_wrap")
+
+    LOOP_BODY = ("op_readfirstlane", "op_bcnt", "op_mbcnt", "op_valu", "op_valu", "op_readlane", "op_writelane",
+                 "op_cmp", "op_cndmask", "op_bpermute", "op_permute", "op_carry", "op_salu", "op_mask_salu",
+                 "op_scan64", "op_cselect64", "op_mask_test")
+
+    def op_loop(self):
+        """A loop in the shape LLVM's SI_LOOP gives: every lane has its own trip count (1 to 8), a lane that is
+        done joins the break mask, s_andn2_b64 takes it out of EXEC and s_cbranch_execnz closes the loop while a
+        lane is left; EXEC comes back from the break mask after it. The body is one to four ops that do not write
+        EXEC, then the count of the lanes still running added to a data VGPR, so every iteration shows."""
+        if self.W != 64 or self.in_branch:
+            return None
+        src, trips = self.vsrc(), self.r((1, 3, 3, 7))
+        self.in_branch = True                       # no branch and no second loop inside
+        body, n = [], self.rng.randrange(1, 5)
+        while len(body) < n:
+            o = getattr(self, self.r(self.LOOP_BODY))()
+            if o is not None:
+                body.append(o)
+        sd, vx = self.r(DATA_S), self.r(DATA_V)
+        self.in_branch = False
+        k = self.branch_id
+        self.branch_id += 1
+        lim, it = LOOP_V
+        brk, done = LOOP_S
+        lines = [f"v_and_b32_e32 v{lim}, {trips}, v{src}", f"v_mov_b32_e32 v{it}, 0",
+                 f"s_mov_b64 {mreg(64, brk)}, 0", f";@LOOP{k}"]
+        lines += [o.text for o in body]
+        lines += [f"s_bcnt1_i32_b64 s{sd}, exec", f"v_add_nc_u32_e32 v{vx}, s{sd}, v{vx}",
+                  f"v_cmp_ge_u32_e64 {mreg(64, done)}, v{it}, v{lim}", f"v_add_nc_u32_e32 v{it}, 1, v{it}",
+                  f"s_or_b64 {mreg(64, brk)}, {mreg(64, done)}, {mreg(64, brk)}",
+                  f"s_andn2_b64 exec, exec, {mreg(64, brk)}", f"s_cbranch_execnz @-{k}",
+                  f"s_or_b64 exec, exec, {mreg(64, brk)}"]
+
+        def fn(w):
+            hyp = False
+            w.vwrite(lim, [x & trips for x in w.vr(src)])
+            w.vwrite(it, [0] * w.size)
+            broke = 0
+            for _ in range(trips + 2):
+                for o in body:
+                    hyp |= bool(o.fn(w))
+                w.s[sd] = popcount(w.exec)
+                w.vwrite(vx, [w.sr(sd) + x for x in w.vr(vx)])
+                m = 0
+                for l in range(w.size):
+                    if w.active(l) and w.vr(it)[l] >= w.vr(lim)[l]:
+                        m |= 1 << l
+                w.vwrite(it, [x + 1 for x in w.vr(it)])
+                broke |= m
+                w.exec &= ~broke
+                if not w.exec:
+                    break
+            else:
+                raise AssertionError("loop model did not end")
+            w.set_mask(brk, broke)
+            w.set_mask(done, m)
+            w.exec |= broke
+            return hyp
+        op = Op("\n\t".join(lines), fn, "loop")
+        op.tags = {"loop"} | {t for o in body for t in getattr(o, "tags", {o.tag})}
+        return op
+
+    EXT_WEIGHTS = (("op_scan64", 3), ("op_mask_scc", 3), ("op_exec_logic", 3), ("op_exec_mask", 1),
+                   ("op_cselect64", 2), ("op_mask_test", 3), ("op_bfm", 2), ("op_wqm", 2), ("op_carry", 4),
+                   ("op_bpermute", 3), ("op_permute", 4), ("op_swizzle", 3), ("op_lane_wrap", 2), ("op_loop", 3))
+
     WEIGHTS = (("op_branch", 3), ("op_cmp", 5), ("op_cmpx", 2), ("op_exec_const", 2), ("op_saveexec", 2), ("op_restore", 2),
                ("op_readlane", 4), ("op_writelane", 3), ("op_readfirstlane", 3), ("op_bcnt", 3), ("op_mbcnt", 3),
                ("op_mbcnt_data", 1), ("op_cndmask", 2), ("op_maskdata", 1), ("op_mask_salu", 2),
@@ -600,6 +1114,8 @@ class Gen:
 
     def program(self, n):
         table = [kw for kw in self.WEIGHTS if kw[0] != "op_dpp" or self.dpp]   # seeds stay stable without --dpp
+        if self.ext:                                # and without --ext
+            table += self.EXT_WEIGHTS
         names = [k for k, _ in table]
         weights = [w for _, w in table]
         ops = []
@@ -662,6 +1178,9 @@ def epilogue(wave, hw=False):
 
 
 class Program:
+    label = None      # --dpp-sweep: what the case tests, printed with a failure
+    family = None     # --dpp-sweep: the control family, for the per-family summary
+
     def __init__(self, name, wave, group, pro, init, ops):
         self.name, self.wave, self.group, self.pro, self.init, self.ops = name, wave, group, pro, init, ops
 
@@ -682,11 +1201,12 @@ class Program:
         out = []
         for text in self.pro + [o.text for o in ops] + epilogue(self.wave, hw=True):
             for ln in (x.strip() for x in text.split("\n")):
-                m = re.fullmatch(r";@END(\d+)", ln)
+                m = re.fullmatch(r";@(END|LOOP)(\d+)", ln)
                 if m:
-                    out.append(f".L{self.name}_{m.group(1)}:")
+                    out.append(f".L{self.name}_{'B' if m.group(1) == 'LOOP' else ''}{m.group(2)}:")
                     continue
-                ln = re.sub(r"^(s_cbranch_\w+) @(\d+)$", lambda b: f"{b.group(1)} .L{self.name}_{b.group(2)}", ln)
+                ln = re.sub(r"^(s_cbranch_\w+) @(-?)(\d+)$",
+                            lambda b: f"{b.group(1)} .L{self.name}_{'B' if b.group(2) else ''}{b.group(3)}", ln)
                 out.append(ln)
                 if guard and ln != "s_endpgm":
                     out.append("s_nop 7")
@@ -739,36 +1259,49 @@ def assemble(mc, prog, src, disasm, fssm):
     if r.returncode or "error:" in r.stderr:
         raise RuntimeError(f"{prog.name} did not assemble:\n{r.stderr}\n{src}")
     code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
-    with open(os.path.join(disasm, prog.name + ".s"), "w", encoding="utf-8") as f:
+    with open(os.path.join(disasm, prog.name + ".s"), "w", encoding="utf-8", newline="\n") as f:
         f.write(f"; {prog.name}  crosslane_fuzz\n{code}")
     asm_path = os.path.join(fssm, prog.name + ".asm")
-    with open(asm_path, "w", encoding="utf-8") as f:
+    with open(asm_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(src)
     with open(os.path.join(fssm, prog.name + ".fssm"), "wb") as f:
         f.write(compute_fixture.compute_header(asm_path))
     os.remove(asm_path)
 
 
+def branch_offsets(lines, size_at):
+    """lines with every `s_cbranch_* @k` replaced by the dword offset to its `;@ENDk` line below it, and every
+    `@-k` (--ext loops) by the negative offset back to its `;@LOOPk` line above it. size_at: line index -> the
+    instruction's size in dwords. A branch offset counts from the instruction after the branch."""
+    out = list(lines)
+    for i, ln in enumerate(lines):
+        m = re.search(r"@(-?)(\d+)$", ln.strip())
+        if not m:
+            continue
+        if m.group(1):
+            head = next(j for j in range(i - 1, -1, -1) if lines[j].strip() == f";@LOOP{m.group(2)}")
+            off = -sum(size_at.get(j, 0) for j in range(head + 1, i + 1))
+        else:
+            end = next(j for j in range(i + 1, len(lines)) if lines[j].strip() == f";@END{m.group(2)}")
+            off = sum(size_at.get(j, 0) for j in range(i + 1, end))
+        out[i] = ln[:ln.rindex("@")] + str(off)
+    return out
+
+
 def resolve_branches(cmd, prog, src):
-    """Replace each `s_cbranch_* @k` with the dword offset to its `;@ENDk` line: assemble once with offset 0,
-    take each instruction's size from its encoding, and sum the sizes in between."""
+    """Replace each `s_cbranch_* @k` with the dword offset to its `;@ENDk` line (and `@-k` with the offset back
+    to `;@LOOPk`): assemble once with offset 0, take each instruction's size from its encoding, and sum the
+    sizes in between (branch_offsets)."""
     lines = src.splitlines()
     insns = [i for i, ln in enumerate(lines) if ln.strip() and not ln.strip().startswith(";")]
-    first = "\n".join(re.sub(r"@\d+$", "0", ln) for ln in lines) + "\n"
+    first = "\n".join(re.sub(r"@-?\d+$", "0", ln) for ln in lines) + "\n"
     r = mc_command.run(cmd, input=first, capture_output=True, text=True)
     if r.returncode or "error:" in r.stderr:
         raise RuntimeError(f"{prog.name} did not assemble:\n{r.stderr}\n{first}")
     sizes = [len(re.findall(r"0x[0-9a-f]{2}", m)) // 4 for m in re.findall(r"encoding: \[([^\]]*)\]", r.stdout)]
     if len(sizes) != len(insns):
         raise RuntimeError(f"{prog.name}: {len(sizes)} encodings for {len(insns)} instructions")
-    size_at = dict(zip(insns, sizes))
-    for i, ln in enumerate(lines):
-        m = re.search(r"@(\d+)$", ln.strip())
-        if not m:
-            continue
-        end = next(j for j in range(i + 1, len(lines)) if lines[j].strip() == f";@END{m.group(1)}")
-        lines[i] = ln.replace(f"@{m.group(1)}", str(sum(size_at.get(j, 0) for j in range(i + 1, end))))
-    return "\n".join(lines) + "\n"
+    return "\n".join(branch_offsets(lines, dict(zip(insns, sizes)))) + "\n"
 
 
 def translate(work, emulate):
@@ -931,6 +1464,14 @@ def main():
     ap.add_argument("--permlane-fetch-inactive", action="store_true",
                     help="model an inactive permlane source as read (FI = 1) instead of the hypothesis")
     ap.add_argument("--dpp", action="store_true", help="also generate DPP16 / DPP8 ops")
+    ap.add_argument("--ext", action="store_true",
+                    help="wave64 programs also get carries, ds_bpermute/ds_permute/ds_swizzle, lane selects of 64 "
+                         "and up, b64 mask SALU with SCC probes, the saveexec/wrexec family, s_bfm_b64, s_wqm_b64 "
+                         "and SI_LOOP-shaped loops (wave32 programs and seeds without the flag are unchanged)")
+    ap.add_argument("--dpp-sweep", action="store_true",
+                    help="instead of random programs, one program per DPP case: every DPP16 control x bound_ctrl x "
+                         "fi x EXEC pattern, all row_mask / bank_mask pairs, and a set of DPP8 selects "
+                         "(--programs, --seed, --ops and --dpp are ignored; --wave applies)")
     ap.add_argument("--oracle", default="translator",
                     help="comma-separated: translator (default; needs llvm-mc, the Vulkan SDK and vk_compute_test), hw "
                          "(natively on the AMD GPU, wave32 and native wave64; tools/hw_oracle/), or translator,hw")
@@ -979,10 +1520,14 @@ def main():
     waves = (32, 64) if args.wave == "both" else (int(args.wave),)
     modes = args.modes
     progs = []
-    for i in range(args.programs):
+    if args.dpp_sweep:
+        for wave in waves:
+            progs += dpp_sweep_programs(wave)
+        print(f"dpp sweep: {len(progs)} cases")
+    for i in range(0 if args.dpp_sweep else args.programs):
         wave = waves[i % len(waves)]
         progs.append(make_program(args.seed * 100003 + i, wave, args.ops, allow_maskdata=not args.no_maskdata,
-                                  wave32_hi_lanes=not args.no_w32_hi_lanes, dpp=args.dpp))
+                                  wave32_hi_lanes=not args.no_w32_hi_lanes, dpp=args.dpp, ext=args.ext))
     stats = {}
     fails = []
     try:
@@ -1004,11 +1549,13 @@ def main():
         for p, mode, what, bad in fails:
             tags = sorted({t for o in p.ops for t in getattr(o, 'tags', {o.tag})})
             print(f"{p.name} [{mode}] {what}; group {p.group}; ops: {', '.join(tags)}")
+            if p.label:
+                print(f"  case: {p.label}")
             if bad:
                 print(describe(p, bad))
             if args.keep:
                 os.makedirs(args.keep, exist_ok=True)
-                with open(os.path.join(args.keep, f"{p.name}_{mode}.asm"), "w", encoding="utf-8") as f:
+                with open(os.path.join(args.keep, f"{p.name}_{mode}.asm"), "w", encoding="utf-8", newline="\n") as f:
                     f.write(kept_source(p, mode, None, not args.no_hw_guard))
             if args.minimize and bad and what.startswith("mismatch"):
                 if mode == "hw":
@@ -1021,7 +1568,7 @@ def main():
                 print("  minimized:\n\t" + "\n\t".join(o.text + ("   ; hypothesis op" if i in hyp_ops else "")
                                                          for i, o in enumerate(ops)))
                 if args.keep:
-                    with open(os.path.join(args.keep, f"{p.name}_{mode}_min.asm"), "w", encoding="utf-8") as f:
+                    with open(os.path.join(args.keep, f"{p.name}_{mode}_min.asm"), "w", encoding="utf-8", newline="\n") as f:
                         f.write(kept_source(p, mode, ops, not args.no_hw_guard))
     finally:
         if oracle:
@@ -1029,6 +1576,17 @@ def main():
     print("summary:")
     for key, st in sorted(stats.items()):
         print(f"  {key}: " + ", ".join(f"{k} {v}" for k, v in st.items()))
+    if args.dpp_sweep:
+        print("dpp sweep by family (cases, failing per oracle mode):")
+        failing = {}
+        for p, mode, what, bad in fails:
+            failing.setdefault((p.wave, p.family, mode), set()).add(p.name)
+        for wave in waves:
+            for family in dict.fromkeys(p.family for p in progs if p.wave == wave):
+                n = sum(p.wave == wave and p.family == family for p in progs)
+                bad = ", ".join(f"{m} {len(s)}" for (w, f, m), s in sorted(failing.items())
+                                if w == wave and f == family) or "none"
+                print(f"  wave{wave} {family}: {n} cases; failing: {bad}")
     if any(st["mismatch"] or st["rejected"] for st in stats.values()):
         return 1
     if any(st.get("harness_errors") for st in stats.values()):
@@ -1080,7 +1638,7 @@ def run_hw(oracle, progs, stats, fails, guard=True):
             st["match"] += 1
             st["hyp_confirmed"] += bool(hyp)
             for kind in sorted({t for i in hyp for t in getattr(p.ops[i], "tags", {p.ops[i].tag})
-                                if t in ("permlane", "dpp")}):
+                                if t in ("permlane", "dpp", "swizzle")}):
                 st["hyp_" + kind] = st.get("hyp_" + kind, 0) + 1
         else:
             # On the hardware a failing hypothesis is a falsified claim, and it could hide a model bug elsewhere in

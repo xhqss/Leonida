@@ -32,7 +32,7 @@
 </div>
 <div id="help">
   <kbd>W A S D</kbd> move · <kbd>Q</kbd>/<kbd>E</kbd> down/up · <kbd>Shift</kbd> fast · <kbd>Ctrl</kbd> slow · wheel: speed<br>
-  <kbd>F</kbd> wireframe · <kbd>T</kbd> textures/clay · <kbd>G</kbd> chunk bounds · <kbd>R</kbd> back to spawn · <kbd>Esc</kbd> release mouse
+  <kbd>F</kbd> wireframe · <kbd>T</kbd> textures/clay · <kbd>G</kbd> chunk bounds · <kbd>R</kbd> back to spawn · <kbd>P</kbd> copy link to this view · <kbd>Esc</kbd> release mouse
 </div>
 <div id="start">Click to fly</div>
 
@@ -66,7 +66,7 @@ function manifestError(world) {
     if (!isPosition(b, 6) || b[0] > b[3] || b[1] > b[4] || b[2] > b[5])
       return `chunks[${i}].bounds must contain six finite, ordered coordinates`;
     if (chunk.lod !== undefined) {
-      const band = world.lod_bands?.[chunk.lod];
+      const band = isNonemptyString(chunk.lod) ? world.lod_bands?.[chunk.lod] : undefined;
       if (!isPosition(band, 2) || band[0] < 0 || band[0] > band[1])
         return `chunks[${i}].lod must name a lod_bands entry with two finite, ordered distances`;
       const c = chunk.cell;
@@ -76,6 +76,20 @@ function manifestError(world) {
     ids.add(chunk.id);
   }
   return null;
+}
+
+// Camera in the URL hash: #cam=x,y,z,yaw,pitch. Returns null for anything that is not five finite numbers,
+// so a hand-edited or stale link falls back to the spawn point instead of putting the camera at NaN.
+function parseCamHash(hash) {
+  const m = /^#?cam=([^&]*)/.exec(typeof hash === "string" ? hash : "");
+  if (!m) return null;
+  const parts = m[1].split(",");
+  if (parts.length !== 5 || parts.some(t => t.trim() === "")) return null;
+  const v = parts.map(Number);
+  return v.every(Number.isFinite) ? { pos: v.slice(0, 3), yaw: v[3], pitch: v[4] } : null;
+}
+function formatCamHash(pos, yaw, pitch) {
+  return "#cam=" + [...pos, yaw, pitch].map((n, i) => n.toFixed(i < 3 ? 1 : 3)).join(",");
 }
 
 async function loadWorld() {
@@ -133,6 +147,17 @@ function buildTestChunk([cx, cz, size]) {
   }
   geo.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
   geo.computeVertexNormals();
+  // Sample the shared height field on both sides of each border for matching edge normals.
+  const normal = geo.attributes.normal, stride = seg + 1, step = size / seg;
+  for (let i = 0; i < pos.count; i++) {
+    const row = Math.floor(i / stride), column = i % stride;
+    if (row > 0 && row < seg && column > 0 && column < seg) continue;
+    const x = pos.getX(i), z = pos.getZ(i);
+    const nx = height(x - step, z) - height(x + step, z);
+    const nz = height(x, z - step) - height(x, z + step);
+    const length = Math.hypot(nx, 2 * step, nz);
+    normal.setXYZ(i, nx / length, 2 * step / length, nz / length);
+  }
   g.add(new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95 })));
   const box = new THREE.BoxGeometry(1, 1, 1); box.translate(0, 0.5, 0);
   const count = 18, inst = new THREE.InstancedMesh(box, new THREE.MeshStandardMaterial({ color: 0x9aa4b1, roughness: 0.7 }), count);
@@ -148,7 +173,16 @@ function buildTestChunk([cx, cz, size]) {
 }
 
 // ---------- scene ----------
-const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+} catch (error) {
+  const start = document.getElementById("start");
+  start.setAttribute("role", "alert");
+  start.style.cursor = "default";
+  start.textContent = "Could not start WebGL. Check that WebGL is enabled, then reload.";
+  throw error;
+}
 renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
 renderer.setSize(innerWidth, innerHeight);
 document.body.prepend(renderer.domElement);
@@ -165,18 +199,27 @@ const keys = new Set(); let yaw = 0, pitch = -0.25, speed = 40, locked = false;
 // Pointer lock when the browser allows it; embedded views (iframes, preview panes) fall back to drag-to-look.
 const start = document.getElementById("start");
 let dragLook = false, dragging = false;
+function enableDragLook() {
+  if (locked || dragLook) return;
+  dragLook = true;
+  start.classList.add("hidden");
+  document.getElementById("help").insertAdjacentHTML("beforeend", "<br>mouse lock unavailable here: drag to look");
+}
 start.onclick = async () => {
   try { await renderer.domElement.requestPointerLock(); }
-  catch { dragLook = true; start.classList.add("hidden"); document.getElementById("help").insertAdjacentHTML("beforeend", "<br>mouse lock unavailable here: drag to look"); }
+  catch { enableDragLook(); }
 };
+document.addEventListener("pointerlockerror", enableDragLook);
 document.addEventListener("pointerlockchange", () => { locked = document.pointerLockElement === renderer.domElement; start.classList.toggle("hidden", locked || dragLook); });
-renderer.domElement.addEventListener("mousedown", () => { dragging = true; });
-addEventListener("mouseup", () => { dragging = false; });
+renderer.domElement.addEventListener("mousedown", e => { if (e.button === 0) dragging = true; });
+addEventListener("mouseup", e => { if (e.button === 0) dragging = false; });
 addEventListener("mousemove", e => {
+  if ((e.buttons & 1) === 0) dragging = false; // a release outside the window can skip mouseup
   if (!locked && !(dragLook && dragging)) return;
   yaw -= e.movementX * 0.0022; pitch = THREE.MathUtils.clamp(pitch - e.movementY * 0.0022, -1.55, 1.55);
 });
 addEventListener("wheel", e => { speed = THREE.MathUtils.clamp(speed * (e.deltaY < 0 ? 1.15 : 1 / 1.15), 1, 3000); }, { passive: true });
+addEventListener("blur", () => { keys.clear(); dragging = false; });
 const world = await loadWorld();
 addEventListener("keydown", e => {
   keys.add(e.code);
@@ -184,12 +227,16 @@ addEventListener("keydown", e => {
   if (e.code === "KeyT" && !e.repeat) clay = !clay, applyClay();
   if (e.code === "KeyG" && !e.repeat) toggleBounds();
   if (e.code === "KeyR") camera.position.fromArray(world.spawn);
+  if (e.code === "KeyP" && !e.repeat) {
+    history.replaceState(null, "", formatCamHash(camera.position.toArray(), yaw, pitch));
+    navigator.clipboard?.writeText(location.href).catch(() => {});
+  }
 });
 addEventListener("keyup", e => keys.delete(e.code));
-addEventListener("blur", () => keys.clear());
 
 // ---------- chunk streaming ----------
 const LOAD_R = 1400, UNLOAD_R = 2000, MAX_INFLIGHT = 4;
+const CHUNK_DOWNLOAD_TIMEOUT_MS = 30_000;
 // Three total attempts per chunk, with 1s/2s backoff. Failed chunks keep their budget
 // when leaving and returning; successfully loaded chunks start fresh after unloading.
 const MAX_LOAD_ATTEMPTS = 3, RETRY_DELAY_MS = 1000;
@@ -252,9 +299,8 @@ function dist(c, p) {
   const dx = Math.max(b[0] - p.x, 0, p.x - b[3]), dy = Math.max(b[1] - p.y, 0, p.y - b[4]), dz = Math.max(b[2] - p.z, 0, p.z - b[5]);
   return Math.hypot(dx, dy, dz);
 }
-// LOD sets: every grid cell has one chunk per detail tier, and a tier is shown only while the camera's
-// horizontal distance to the cell lies in that tier's band, so one tier per cell is drawn. LOD_SLACK
-// keeps a loaded tier a little past its band so crossing an edge does not reload it every frame.
+// Choose one loaded tier per cell. Prefer the tier whose band contains the camera's horizontal
+// distance, and use a cached tier within LOD_SLACK while the preferred tier is unavailable.
 const LOD_SLACK = 32;
 function cellDist(c, p) {
   const r = c.cell;
@@ -280,10 +326,17 @@ async function loadChunk(entry) {
   const { def, controller } = entry;
   inflight++;
   try {
-    const response = await fetch(def.url, { signal: controller.signal });
-    if (!response.ok) throw new Error(`Chunk request failed: ${response.status}`);
-    const bytes = await response.arrayBuffer();
-    if (controller.signal.aborted) return;
+    let response, bytes;
+    const timer = setTimeout(() => controller.abort(), CHUNK_DOWNLOAD_TIMEOUT_MS);
+    try {
+      response = await fetch(def.url, { signal: controller.signal });
+      if (!response.ok) throw new Error(`Chunk request failed: ${response.status}`);
+      bytes = await response.arrayBuffer();
+      controller.signal.throwIfAborted();
+    } finally {
+      // Bound both headers and body, but not the non-cancellable GLB parse.
+      clearTimeout(timer);
+    }
     const url = response.url || def.url;
     const resourcePath = THREE.LoaderUtils.extractUrlBase(url.split(/[?#]/, 1)[0]);
     const g = await loader.parseAsync(bytes, resourcePath);
@@ -303,11 +356,23 @@ async function loadChunk(entry) {
 }
 function stream(now = performance.now()) {
   const p = camera.position;
+  const visibleTiers = new Map();
   for (const [id, c] of live) {
     if (!c.obj && !c.loading) continue;
     const { load, keep } = range(c.def, p);
     if (keep) {
-      if (c.obj && c.def.lod !== undefined) c.obj.visible = load;
+      // Orphan HD has its own band and no replacement in the LOD chain.
+      if (c.obj && c.def.lod === "orphan_hd") {
+        c.obj.visible = load;
+      } else if (c.obj && c.def.lod !== undefined) {
+        const cell = c.def.cell.join(",");
+        const current = visibleTiers.get(cell);
+        c.obj.visible = !current || (load && !current.inBand);
+        if (c.obj.visible) {
+          if (current) current.obj.visible = false;
+          visibleTiers.set(cell, { obj: c.obj, inBand: load });
+        }
+      }
       continue;
     }
     drop(id);
@@ -338,6 +403,8 @@ function stream(now = performance.now()) {
 
 // ---------- main loop ----------
 camera.position.fromArray(world.spawn);
+const startCam = parseCamHash(location.hash);
+if (startCam) { camera.position.fromArray(startCam.pos); yaw = startCam.yaw; pitch = THREE.MathUtils.clamp(startCam.pitch, -1.55, 1.55); }
 if (world.test) {
   document.getElementById("world-status").textContent = world.reason;
   document.getElementById("banner").classList.remove("hidden");
@@ -349,7 +416,7 @@ renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
   camera.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, "YXZ"));
   camera.getWorldDirection(fwd); right.crossVectors(fwd, up).normalize();
-  const v = new THREE.Vector3(), s = speed * (keys.has("ShiftLeft") || keys.has("ShiftRight") ? 5 : 1) * (keys.has("ControlLeft") ? 0.2 : 1);
+  const v = new THREE.Vector3(), s = speed * (keys.has("ShiftLeft") || keys.has("ShiftRight") ? 5 : 1) * (keys.has("ControlLeft") || keys.has("ControlRight") ? 0.2 : 1);
   if (keys.has("KeyW")) v.add(fwd); if (keys.has("KeyS")) v.sub(fwd);
   if (keys.has("KeyD")) v.add(right); if (keys.has("KeyA")) v.sub(right);
   if (keys.has("KeyE")) v.y += 1; if (keys.has("KeyQ")) v.y -= 1;

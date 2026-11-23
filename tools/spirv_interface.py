@@ -3,6 +3,7 @@
 This reader is deliberately limited to declarations used for Vulkan stage linking. It does not
 validate shader instructions, device features, or resource bindings. IDs and debug names are local
 to each module; the result uses normalized types and Location/Component decorations instead.
+Literal specialization constants in array lengths use their declared defaults.
 """
 from __future__ import annotations
 
@@ -29,6 +30,7 @@ OP_TYPE_ARRAY = 28
 OP_TYPE_STRUCT = 30
 OP_TYPE_POINTER = 32
 OP_CONSTANT = 43
+OP_SPEC_CONSTANT = 50
 OP_VARIABLE = 59
 OP_DECORATE = 71
 OP_MEMBER_DECORATE = 72
@@ -38,9 +40,9 @@ OP_GROUP_MEMBER_DECORATE = 75
 
 TYPE_OPS = {OP_TYPE_INT, OP_TYPE_FLOAT, OP_TYPE_VECTOR, OP_TYPE_MATRIX,
             OP_TYPE_ARRAY, OP_TYPE_STRUCT, OP_TYPE_POINTER}
-DECLARATION_OPS = TYPE_OPS | {OP_ENTRY_POINT, OP_CONSTANT, OP_VARIABLE, OP_DECORATE,
-                             OP_MEMBER_DECORATE, OP_DECORATION_GROUP, OP_GROUP_DECORATE,
-                             OP_GROUP_MEMBER_DECORATE}
+DECLARATION_OPS = TYPE_OPS | {OP_ENTRY_POINT, OP_CONSTANT, OP_SPEC_CONSTANT, OP_VARIABLE,
+                             OP_DECORATE, OP_MEMBER_DECORATE, OP_DECORATION_GROUP,
+                             OP_GROUP_DECORATE, OP_GROUP_MEMBER_DECORATE}
 TYPE_OPERANDS = {OP_TYPE_INT: 3, OP_TYPE_FLOAT: 2, OP_TYPE_VECTOR: 3, OP_TYPE_MATRIX: 3,
                  OP_TYPE_ARRAY: 3, OP_TYPE_POINTER: 3}
 EXECUTION_STAGES = {0: "vs", 3: "gs", 4: "ps", 5365: "ms"}
@@ -83,7 +85,7 @@ class NumericType:
             raise InterfaceError("a 64-bit varying starts on an odd Component")
         if self.width != 64 and component + slots > 4:
             raise InterfaceError("a 16-bit or 32-bit varying extends beyond its Location")
-        if self.width == 64 and slots > 4 and component:
+        if self.width == 64 and component + slots > 4 and component:
             raise InterfaceError("a 64-bit vector spanning two locations needs Component 0")
         mask = ((1 << slots) - 1) << component
         if mask <= 0xf:
@@ -263,7 +265,7 @@ class Module:
             identifier, *args = operands
             self.define(identifier)
             self.types[identifier] = (opcode, tuple(args))
-        elif opcode == OP_CONSTANT:
+        elif opcode in (OP_CONSTANT, OP_SPEC_CONSTANT):
             self.require_operands(operands, at, 3)
             type_id, identifier, *literal = operands
             self.require_id(type_id)
@@ -345,7 +347,9 @@ class Module:
         try:
             type_id, literal = self.constants[identifier]
         except KeyError:
-            raise InterfaceError(f"varying array length %{identifier} is not a literal OpConstant") from None
+            raise InterfaceError(
+                f"varying array length %{identifier} is not a literal OpConstant or OpSpecConstant"
+            ) from None
         opcode, args = self.type_declaration(type_id)
         if opcode != OP_TYPE_INT or args[0] not in (16, 32, 64) or args[1] not in (0, 1):
             raise InterfaceError("varying array length must be an integer")

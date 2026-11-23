@@ -1,13 +1,16 @@
 """Semantic interpreter tests for RDNA2 v_cvt_flr_i32_f32 and v_cvt_rpi_i32_f32.
 
-RDNA ISA pseudocode: v_cvt_flr_i32_f32 is f32_to_i32(floor(S0)), v_cvt_rpi_i32_f32 is f32_to_i32(floor(S0 + 0.5)),
-with the + 0.5 rounded in binary32 like any f32 add. f32_to_i32 saturates as v_cvt_i32_f32 does (#300): at or past
-+-2^31, and +-inf, it gives INT_MAX / INT_MIN; NaN gives 0. Each case translates a synthetic pixel shader with
-tools/rdna2spirv.py, runs it in tests/semantic/spirv_mini_interp.py and compares the result with a plain-Python
-reference. Denormal inputs are left out (the float mode that would flush them is not modelled). The result leaves
-through exp as two 16-bit halves ORed into 0x40000000, so no export channel is a NaN or denormal pattern that a
-float round trip could change.
+Measured natively on RDNA2 (gfx1035 & gfx1036, wave32 & wave64): v_cvt_flr_i32_f32 is sat_i32(floor(S0)), and
+v_cvt_rpi_i32_f32 is sat_i32(floor(S0 + 0.5)) computed **exactly** (without binary32 rounding of S0 + 0.5, so
+0x3EFFFFFF = 0.49999997 gives 0, 0x4B000001 gives 0x00800001, and 0x4B7FFFFF gives 0x00FFFFFF). Values at or past
++-2^31, +-inf, and NaNs all saturate by the sign bit of the operand (+ -> 0x7FFFFFFF, - -> 0x80000000), unlike
+v_cvt_i32_f32 which returns 0 for NaN. Each case translates a synthetic pixel shader with tools/rdna2spirv.py, runs
+it in tests/semantic/spirv_mini_interp.py and compares the result with an exact plain-Python reference. Denormal
+inputs are left out (the float mode that would flush them is not modelled). The result leaves through exp as two
+16-bit halves ORed into 0x40000000, so no export channel is a NaN or denormal pattern that a float round trip could
+change.
 """
+from fractions import Fraction
 import math
 import os
 import random
@@ -32,38 +35,34 @@ M32 = 0xFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
 
-def u2f(u: int) -> float:
-    return struct.unpack("<f", struct.pack("<I", u & M32))[0]
-
-
-def f32(x: float) -> float:
-    try:
-        return struct.unpack("<f", struct.pack("<f", x))[0]
-    except OverflowError:
-        return math.copysign(math.inf, x)
-
-
-def f32_to_i32(x: float) -> int:
-    if math.isnan(x):
-        return 0
-    if x >= 2.0 ** 31:
-        return 0x7FFFFFFF
-    if x < -(2.0 ** 31):
-        return 0x80000000
-    return int(x) & M32
-
-
 def ref(op: str, u: int) -> int:
-    x = u2f(u)
+    u &= M32
+    sign = (u >> 31) & 1
+    exp = (u >> 23) & 0xFF
+    mant = u & 0x7FFFFF
+    if exp == 0xFF:
+        return 0x80000000 if sign else 0x7FFFFFFF
+    if exp == 0:
+        x = Fraction(mant, 1 << 149)
+    else:
+        x = Fraction((1 << 23) | mant) * (Fraction(2) ** (exp - 150))
+    if sign:
+        x = -x
     if op == "v_cvt_rpi_i32_f32":
-        x = f32(x + 0.5)                    # exact in double, then one rounding to binary32
-    return f32_to_i32(math.floor(x) if math.isfinite(x) else x)
+        x += Fraction(1, 2)
+    iv = math.floor(x)
+    if iv >= (1 << 31):
+        return 0x7FFFFFFF
+    if iv < -(1 << 31):
+        return 0x80000000
+    return iv & M32
 
 
 OPS = ("v_cvt_flr_i32_f32", "v_cvt_rpi_i32_f32")
-VALUES = [0x00000000, 0x80000000, 0x3F000000, 0xBF000000, 0x3EFFFFFF, 0xBEFFFFFF, 0x3FC00000, 0xBFC00000,
-          0x40200000, 0xC0200000, 0x3F7FFFFF, 0x4B000001, 0xCB000001, 0x4EFFFFFF, 0xCEFFFFFF, 0x4F000000,
-          0xCF000000, 0xCF000001, 0x7F7FFFFF, 0xFF7FFFFF, 0x7F800000, 0xFF800000, 0x7FC00000, 0xFFC00000, 0x7F800001]
+VALUES = [0x00000000, 0x80000000, 0x3F000000, 0xBF000000, 0x3EFFFFFF, 0xBEFFFFFF, 0xBF000001, 0x3FC00000, 0xBFC00000,
+          0x40200000, 0xC0200000, 0x3F7FFFFF, 0x4AFFFFFF, 0x4B000000, 0x4B000001, 0x4B7FFFFF, 0xCB000001, 0x4EFFFFFF,
+          0xCEFFFFFF, 0x4F000000, 0xCF000000, 0xCF000001, 0x7F7FFFFF, 0xFF7FFFFF, 0x7F800000, 0xFF800000, 0x7FC00000,
+          0xFFC00000, 0x7F800001, 0xFF800001]
 
 _TMP_DIR = None
 _SRC_PATH = None
@@ -112,9 +111,12 @@ class CvtFlrRpiTests(unittest.TestCase):
         self.assertEqual(ref("v_cvt_flr_i32_f32", 0xC0200000), (-3) & M32)       # floor(-2.5)
         self.assertEqual(ref("v_cvt_rpi_i32_f32", 0xC0200000), (-2) & M32)       # floor(-2.5 + 0.5)
         self.assertEqual(ref("v_cvt_rpi_i32_f32", 0x40200000), 3)                # 2.5 rounds up
-        self.assertEqual(ref("v_cvt_rpi_i32_f32", 0x3EFFFFFF), 1)                # 0.49999997 + 0.5 rounds to 1.0
+        self.assertEqual(ref("v_cvt_rpi_i32_f32", 0x3EFFFFFF), 0)                # 0.49999997 -> exact floor(x+0.5) = 0
+        self.assertEqual(ref("v_cvt_rpi_i32_f32", 0x4B000001), 0x00800001)       # 8388609.0 -> exact, not 8388610
+        self.assertEqual(ref("v_cvt_rpi_i32_f32", 0x4B7FFFFF), 0x00FFFFFF)       # 16777215.0 -> exact, not 16777216
         self.assertEqual(ref("v_cvt_flr_i32_f32", 0xCF000001), 0x80000000)       # below -2^31: saturated
-        self.assertEqual(ref("v_cvt_flr_i32_f32", 0x7FC00000), 0)                # NaN
+        self.assertEqual(ref("v_cvt_flr_i32_f32", 0x7FC00000), 0x7FFFFFFF)       # +NaN saturates to INT_MAX
+        self.assertEqual(ref("v_cvt_flr_i32_f32", 0xFFC00000), 0x80000000)       # -NaN saturates to INT_MIN
 
     def test_edge_values(self):
         for op in OPS:

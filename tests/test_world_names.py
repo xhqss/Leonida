@@ -258,6 +258,21 @@ class CliTest(unittest.TestCase):
             self.assertEqual(sorted(n for names in d.to_json()["names"].values() for n in names),
                              ["First", "Real", "Real.rpf", "RealName"])
 
+    def test_a_lone_surrogate_name_is_skipped_not_fatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = os.path.join(tmp, "m.json")
+            xml = os.path.join(tmp, "n.xml")
+            out = os.path.join(tmp, "out.json")
+            with open(manifest, "w", encoding="utf-8") as handle:
+                handle.write('{"Items": [{"Name": "bad\\ud800x"}, {"Name": "fine"}]}')
+            with open(xml, "w", encoding="utf-8") as handle:
+                handle.write("<root><name>one</name><name>bad&#xD800;x</name><name>two</name></root>")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(WN.main(["build", "--manifest", manifest, "--xml", xml, "--out", out]), 0)
+            with open(out, encoding="utf-8") as handle:
+                names = json.load(handle)["names"]
+            self.assertEqual(sorted(n for group in names.values() for n in group), ["fine", "one", "two"])
+
     def test_xml_unescape_is_strict(self):
         self.assertEqual(WN._xml_unescape("A&amp;B&#x26;C&#38;D&lt;"), "A&B&C&D<")
         for text in ("Tom&notes", "R&reg_x", "A&nbsp;B", "A&B"):
@@ -310,6 +325,35 @@ class CliTest(unittest.TestCase):
             self.assertIn(maps, err.getvalue())
             self.assertFalse(os.path.exists(out))
 
+    def test_resolve_requires_a_recognized_archetype_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dictionary = os.path.join(tmp, "names.json")
+            archetypes = os.path.join(tmp, "archetypes.json")
+            out = os.path.join(tmp, "report.json")
+            with open(dictionary, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(WN.NameDictionary().to_json(), f)
+
+            args = ["resolve", "--dict", dictionary, "--archetypes", archetypes, "--out", out]
+            for wrong in ([], {"summary": {}}, {"archetypes": []}):
+                with self.subTest(report=wrong):
+                    with open(archetypes, "w", encoding="utf-8", newline="\n") as f:
+                        json.dump(wrong, f)
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        self.assertEqual(WN.main(args), 1)
+                    self.assertIn(archetypes, stderr.getvalue())
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertFalse(os.path.exists(out))
+
+            for field in ("archetypes", "hashes"):
+                with self.subTest(field=field):
+                    with open(archetypes, "w", encoding="utf-8", newline="\n") as f:
+                        json.dump({field: {}}, f)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(WN.main(args), 0)
+                    with open(out, encoding="utf-8") as f:
+                        self.assertEqual(json.load(f)["archetypes"]["entities"], 0)
+
     def test_resolve_out_refuses_to_overwrite_an_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             dictionary = os.path.join(tmp, "names.json")
@@ -337,7 +381,7 @@ class CliTest(unittest.TestCase):
                     err = io.StringIO()
                     with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
                         self.assertNotEqual(WN.main(["resolve", *prefix, "--out", source]), 0)
-                    self.assertIn(repr(source), err.getvalue())
+                    self.assertIn(f"would overwrite input {source}", err.getvalue())
                     with open(source, "rb") as handle:
                         self.assertEqual(handle.read(), original)
 
@@ -352,6 +396,36 @@ class CliTest(unittest.TestCase):
                 self.assertNotEqual(WN.main(["resolve", "--dict", dictionary, "--out", hardlink]), 0)
             with open(dictionary, "rb") as handle:
                 self.assertEqual(handle.read(), dict_bytes)
+
+    def test_parent_link_counts_only_map_rows(self) -> None:
+        dictionary = WN.NameDictionary()
+        dictionary.add("synthetic_parent")
+        dictionary.add("synthetic_metadata")
+        parent_hash = WN.joaat("synthetic_parent")
+        meta_hash = WN.joaat("synthetic_metadata")
+        rows = [
+            {"kind": "map", "map_name": WN.joaat("synthetic_child"), "parent": parent_hash},
+            {"kind": "map", "map_name": WN.joaat("synthetic_orphan"), "parent": meta_hash},
+            {"kind": "map", "map_name": parent_hash, "parent": 0},
+            {"kind": "meta", "name": meta_hash},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            names = os.path.join(tmp, "names.json")
+            maps = os.path.join(tmp, "maps.json")
+            out = os.path.join(tmp, "report.json")
+            with open(names, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(dictionary.to_json(), f)
+            with open(maps, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"resources": rows}, f)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(WN.main(["resolve", "--dict", names, "--maps", maps, "--out", out]), 0)
+            with open(out, encoding="utf-8") as f:
+                report = json.load(f)["maps"]
+
+        self.assertEqual(report["rows"], 3)
+        self.assertEqual(report["parent_resolved"], 2)
+        self.assertEqual(report["parent_links"], 1)
+        self.assertEqual(report["parent_links_resolved"], 1)
 
     def test_build_and_resolve(self):
         with tempfile.TemporaryDirectory() as tmp:

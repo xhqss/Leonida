@@ -27,7 +27,8 @@ class InstallDestinationTest(unittest.TestCase):
                         cmd.append("-Keep")
                     # An accepted path reaches the prerequisite check. Stop there.
                     result = subprocess.run(cmd, cwd=cwd, env={**os.environ, "PATH": ""},
-                                            capture_output=True, text=True)
+                                            capture_output=True, text=True,
+                                            encoding="utf-8", errors="replace")  # localized PowerShell output is not UTF-8
                     self.assertNotEqual(result.returncode, 0)
                     expected = "Cleanup would delete" if rejected else "git wasn't found"
                     self.assertIn(expected, result.stderr)

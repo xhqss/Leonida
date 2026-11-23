@@ -40,6 +40,7 @@ class SchemaGap(unittest.TestCase):
     def test_scan_keeps_going(self):
         V, P = without_prop_struct()
         blob = bytearray(16)
+        blob[:4] = b"RPF9"
         struct.pack_into("<I", blob, 4, 16)                       # data start
         blob += zlib.compress(V)
         blob += b"\0" * (-len(blob) % 16) + zlib.compress(P)

@@ -123,6 +123,20 @@ class FormatDecode(unittest.TestCase):
                  "tbuffer_load_format_xyzw v[8:11], off, s[0:3], 0 format:[BUF_FMT_32_UINT]"])
         self.assertEqual([ref.v[i] for i in range(8, 12)], [42, 0, 0, 0])
 
+    def test_mtbuf_default_format_matches_explicit_8_unorm(self) -> None:
+        descriptor = md.OOB_RAW | md.XYZW | (20 << 12)
+        setup = ["s_mov_b32 s0, 0x7000", "s_mov_b32 s1, 0", "s_mov_b32 s2, 0x1000",
+                 f"s_mov_b32 s3, {descriptor:#x}"]
+        for modifier in (" format:[BUF_FMT_8_UNORM]", ""):
+            with self.subTest(modifier=modifier):
+                load = "tbuffer_load_format_xyzw v[8:11], off, s[0:3], 0" + modifier
+                probe = program(setup + [load, "s_waitcnt vmcnt(0)"], {0x7000: 0xFF})
+                ref = md.RefMachine(dict(probe.memory))
+                ref.run(probe.lines)
+                self.assertEqual([ref.v[reg] for reg in md.EXPORT], [0x3F800000, 0, 0, 0])
+                status, detail = md.run_one("ps_mem_default_mtbuf", probe)
+                self.assertEqual(status, "match", detail)
+
     def test_shader86_closed_open_questions(self):
         """Missing W repeats X; UNORM raw 3 matches correctly rounded 0x3c40c0c1 (no 1-ULP split)."""
         base = ["s_mov_b32 s0, 0x7000", "s_mov_b32 s1, 0", "s_mov_b32 s2, 0x100"]

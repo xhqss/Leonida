@@ -2,8 +2,10 @@
 
 D[15:0] = norm16(S0), D[31:16] = norm16(S1): the f32 is clamped to [-1, 1] (i16) or [0, 1] (u16), scaled by 32767 or
 65535 and rounded to nearest even. Mesa ACO emits these opcodes for NIR pack_snorm_2x16 / pack_unorm_2x16, defined in
-nir_opcodes.py as fround_even(fclamp(x) * 32767.0 / 65535.0). NaN gives 0 (as v_cvt_i32_f32; not measured on
-hardware). The whole dword is written. Each case translates a synthetic pixel shader with tools/rdna2spirv.py, runs it in
+nir_opcodes.py as fround_even(fclamp(x) * 32767.0 / 65535.0). NaN gives 0 (as v_cvt_i32_f32), and the exact product
+is rounded once, not the f32 product: both measured on an RDNA2 iGPU (gfx1036, SHADER-339; the rounding is
+SHADER-363). NEAR_TIES are inputs whose f32 product lands exactly on k + 0.5 while the exact one does not; rounding the
+f32 product would be one off there. The whole dword is written. Each case translates a synthetic pixel shader with tools/rdna2spirv.py, runs it in
 tests/semantic/spirv_mini_interp.py and compares the result with a plain-Python reference. D leaves through exp as two
 16-bit halves ORed into 0x40000000, so no export channel is a NaN or denormal pattern that a float round trip could
 change.
@@ -15,6 +17,7 @@ import sys
 import tempfile
 import unittest
 import warnings
+from fractions import Fraction
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -45,15 +48,31 @@ def norm16(b: int, snorm: bool) -> int:
         return 0
     lo = -1.0 if snorm else 0.0
     x = min(max(x, lo), 1.0)
-    # The product is rounded to f32 first, as the shader's OpFMul is.
-    p = f32(bits(x * (32767.0 if snorm else 65535.0)))
-    return round(p) & 0xFFFF                     # Python's round() is round-half-even
+    # The exact product is rounded once to nearest even, as RDNA2 does (gfx1036, SHADER-339/363), not the f32
+    # product. Fraction keeps it exact; round() on a Fraction is round-half-even.
+    return round(Fraction(x) * (32767 if snorm else 65535)) & 0xFFFF
 
 
 OPS = {"v_cvt_pknorm_i16_f32": True, "v_cvt_pknorm_u16_f32": False}
 VALUES = [bits(v) for v in (0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 1e-30, 0.25, 0.75, 0.999, -0.999,
                              1 / 32767, 0.5 / 32767, 1.5 / 32767, 2.5 / 32767, 0.5 / 65535, 1.5 / 65535, 2.5 / 65535,
                              float("inf"), float("-inf"))] + [0x7FC00000, 0xFFC00000, 0x00000001, 0x80000001]
+# (op, S0, S1, the dword an RDNA2 iGPU (gfx1036) gave, tools/pknorm_probe.py --oracle hw). S0 or S1 is a near tie:
+# below k + 0.5 exactly (1.5 - 1.4e-9 gives 1, 3.5 - ... gives 3) or above it (256.5 + 1.5e-5 gives 257).
+MEASURED = [
+    ("v_cvt_pknorm_i16_f32", 0x38400180, 0x00000000, 0x00000001),
+    ("v_cvt_pknorm_i16_f32", 0x38E001C0, 0x80000000, 0x00000003),
+    ("v_cvt_pknorm_i16_f32", 0x39300160, 0x3F800000, 0x7FFF0005),
+    ("v_cvt_pknorm_i16_f32", 0x3C004101, 0xBF800000, 0x80010101),
+    ("v_cvt_pknorm_i16_f32", 0x3F000000, 0x3C014103, 0x01034000),
+    ("v_cvt_pknorm_i16_f32", 0xBF000000, 0x3C024105, 0x0105C000),
+    ("v_cvt_pknorm_u16_f32", 0x37C000C0, 0x40000000, 0xFFFF0001),
+    ("v_cvt_pknorm_u16_f32", 0x386000E0, 0x80000000, 0x00000003),
+    ("v_cvt_pknorm_u16_f32", 0x38B000B0, 0x3F800000, 0xFFFF0005),
+    ("v_cvt_pknorm_u16_f32", 0x3B008081, 0xBF800000, 0x00000081),
+    ("v_cvt_pknorm_u16_f32", 0x3F000000, 0x3B028083, 0x00838000),
+    ("v_cvt_pknorm_u16_f32", 0xBF000000, 0x3B048085, 0x00850000),
+]
 
 _TMP_DIR = None
 _SRC_PATH = None
@@ -107,6 +126,12 @@ class CvtPknormTests(unittest.TestCase):
         self.assertEqual(norm16(bits(0.5), True), 16384)             # 16383.5 rounds to even
         self.assertEqual(norm16(0x7FC00000, True), 0)
 
+    def test_near_ties_round_once_as_measured_on_rdna2(self):
+        for op, s0, s1, want in MEASURED:
+            with self.subTest(op=op, s0=hex(s0), s1=hex(s1)):
+                self.assertEqual(norm16(s0, OPS[op]) | norm16(s1, OPS[op]) << 16, want)
+                self.assertEqual(run_op(op, s0, s1), want)
+
     def test_values(self):
         for op, snorm in OPS.items():
             for x in VALUES:
@@ -122,14 +147,23 @@ class CvtPknormTests(unittest.TestCase):
             with self.subTest(op=op, x=hex(x), y=hex(y)):
                 self.assertEqual(run_op(op, x, y), norm16(x, OPS[op]) | norm16(y, OPS[op]) << 16)
 
-    def test_source_modifiers_and_rejected_clamp(self):
+    def test_source_and_output_modifiers(self):
         half = bits(0.5)
         self.assertEqual(run_op("v_cvt_pknorm_i16_f32", half, half, "-"), (-16384 & 0xFFFF) | 16384 << 16)
         got = run_lines([f"v_mov_b32 v1, {bits(-0.5):#x}", f"v_mov_b32 v2, {half:#x}",
                          "v_cvt_pknorm_u16_f32 v0, |v1|, -v2"])
         self.assertEqual(got, 32768)                                  # |-0.5| -> 32768, -0.5 -> 0
+        for op, snorm in OPS.items():
+            for x, y in ((bits(-2.0), bits(2.0)), (bits(0.5), bits(-0.5)), (0x7FC00000, bits(1.0))):
+                with self.subTest(op=op, x=hex(x), y=hex(y)):
+                    got_clamp = run_lines([
+                        f"v_mov_b32 v1, {x:#x}",
+                        f"v_mov_b32 v2, {y:#x}",
+                        f"{op} v0, v1, v2 clamp",
+                    ])
+                    self.assertEqual(got_clamp, norm16(x, snorm) | (norm16(y, snorm) << 16))
         with self.assertRaises(rdna2spirv.Unsupported):
-            run_lines(["v_cvt_pknorm_i16_f32 v0, v1, v2 clamp"])
+            run_lines(["v_cvt_pknorm_i16_f32 v0, v1, v2 mul:2"])
 
 
 if __name__ == "__main__":

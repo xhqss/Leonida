@@ -364,6 +364,90 @@ class TestRdna2SpirvBitcmpEmission(unittest.TestCase):
         self.assertIn("FindILsb", emitted)
         self.assertIn("OpIAdd %uint", emitted)
 
+    def test_s_ff0_s_ff1_b64_negative_inline_and_literal_immediates(self):
+        """s_ff0_i32_b64 / s_ff1_i32_b64 sign-extend negative inline constants (-1..-16) and zero-extend literals."""
+        import shutil
+        import struct
+        import subprocess
+        import tempfile
+        import warnings
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        import spirv_mini_interp as si
+
+        stub_dxbc = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
+        vsharp = [0, 0, 0xFFFFFFFF, 0x31016FAC]
+        cases = [
+            # (instruction, expected u32 result)
+            ("s_ff0_i32_b64 s10, -1", 0xFFFFFFFF),           # 0xFFFFFFFF_FFFFFFFF -> no 0 bit
+            ("s_ff0_i32_b64 s10, -2", 0),                    # 0xFFFFFFFF_FFFFFFFE -> bit 0 is 0
+            ("s_ff0_i32_b64 s10, -16", 0),                   # 0xFFFFFFFF_FFFFFFF0 -> bit 0 is 0
+            ("s_ff0_i32_b64 s10, 0xffffffff", 32),           # 0x00000000_FFFFFFFF -> bit 32 is first 0
+            ("s_ff0_i32_b64 s10, 0", 0),                     # 0x00000000_00000000 -> bit 0 is 0
+            ("s_ff0_i32_b64 s10, 0x5", 1),                   # 0b101 -> bit 1 is 0
+            ("s_ff1_i32_b64 s10, -1", 0),                    # 0xFFFFFFFF_FFFFFFFF -> bit 0 is 1
+            ("s_ff1_i32_b64 s10, -16", 4),                   # 0xFFFFFFFF_FFFFFFF0 -> bit 4 is 1
+            ("s_ff1_i32_b64 s10, 0", 0xFFFFFFFF),            # no 1 bit
+            ("s_ff1_i32_b64 s10, 0x80000000", 31),           # literal bit 31
+            ("s_ff0_i32_b64 s10, null", 0),                  # null -> 0
+            ("s_ff1_i32_b64 s10, null", 0xFFFFFFFF),         # null -> 0
+        ]
+        asm_lines = []
+        for idx, (insn, _) in enumerate(cases):
+            asm_lines += [
+                insn,
+                "v_mov_b32_e32 v1, s10",
+                f"v_mov_b32_e32 v2, {idx * 4}",
+                "buffer_store_dword v1, v2, s[0:3], 0 offen",
+            ]
+        asm_lines.append("s_endpgm")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkdir(os.path.join(tmp, "disasm"))
+            os.mkdir(os.path.join(tmp, "fssm"))
+            src = os.path.join(tmp, "disasm", "cs_ff_b64_imm.s")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write("; cs_ff_b64_imm\n" + "".join(f"\t{ln}\n" for ln in asm_lines))
+            with open(os.path.join(tmp, "cs_ff_b64_imm.dxbc"), "wb") as f:
+                f.write(stub_dxbc)
+            with open(os.path.join(tmp, "fssm", "cs_ff_b64_imm.fssm"), "wb") as f:
+                f.write(bytes(0x138) + struct.pack("<4I", 0x8090, 64, 1, 1))
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                spv = rdna2spirv.translate(src)
+            spirv_as = shutil.which("spirv-as")
+            spirv_val = shutil.which("spirv-val")
+            if spirv_as and spirv_val:
+                spvasm = os.path.join(tmp, "m.spvasm")
+                spvbin = os.path.join(tmp, "m.spv")
+                with open(spvasm, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(spv)
+                r1 = subprocess.run([spirv_as, "--target-env", "vulkan1.2", spvasm, "-o", spvbin],
+                                    capture_output=True, text=True)
+                self.assertEqual(r1.returncode, 0, r1.stderr)
+                r2 = subprocess.run([spirv_val, "--target-env", "vulkan1.2", spvbin],
+                                    capture_output=True, text=True)
+                self.assertEqual(r2.returncode, 0, r2.stderr)
+        mem = si.run_workgroup(
+            spv, 64, 64,
+            inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+            push_constants=vsharp + [0] * 28, memory={},
+        )
+        for idx, (insn, want) in enumerate(cases):
+            with self.subTest(insn=insn):
+                self.assertEqual(mem[idx * 4], want)
+
+    def test_s_ff1_i32_b64_high_word_immediate(self):
+        """Synthetic 64-bit immediate with only high-word bits set uses hi via src64_data."""
+        g = rdna2spirv.Gen("ps")
+        g.insn({
+            "op": "s_ff1_i32_b64",
+            "args": [{"k": "sgpr", "r": 0}, {"k": "imm", "v": 0x0000000100000000}],
+            "mods": [],
+        })
+        emitted = "\n".join(g.body)
+        self.assertIn("OpBitcast %int %c0", emitted)
+        self.assertIn("OpBitcast %int %c1", emitted)
+
 
 if __name__ == "__main__":
     unittest.main()

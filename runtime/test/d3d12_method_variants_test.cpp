@@ -1,5 +1,6 @@
 // The 1/2/3 method variants of the Vulkan-backed ID3D12Device (D3D-28), each compared with the method it wraps:
-// CreateCommittedResource1/2/3 with CreateCommittedResource, CreateCommandQueue1 with CreateCommandQueue and
+// CreateCommittedResource1/2/3 with CreateCommittedResource, CreatePlacedResource2 with CreatePlacedResource,
+// CreateReservedResource1/2 with CreateReservedResource, CreateCommandQueue1 with CreateCommandQueue and
 // GetCopyableFootprints1 with GetCopyableFootprints. The device is called directly, not through the Xbox-ABI proxy,
 // because the proxy's slot 76 is the Xbox texture method, not CreateCommittedResource3 (docs/d3d12_vulkan.md
 // section 7). The newer arguments' edge cases are checked against the PC runtime's answers, live when the host has
@@ -215,22 +216,65 @@ struct Edge {
 // The edge cases of the newer arguments, run on any ID3D12Device10: ours, or the host's PC runtime to compare
 // with. A GetCopyableFootprints1 answer is S_FALSE when every output is all ones (the failure answer), S_OK when
 // the footprint is the ordinary one, E_FAIL otherwise.
-std::vector<Edge> edge_answers(ID3D12Device10* device) {
-    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT}, upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_device,
+                               ID3D12Device* size_host = nullptr) {
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT}, upload_heap{D3D12_HEAP_TYPE_UPLOAD},
+        readback_heap{D3D12_HEAP_TYPE_READBACK}, bad_heap{D3D12_HEAP_TYPE(99)};
     D3D12_RESOURCE_DESC1 texture = desc1(texture_desc(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE));
+    D3D12_RESOURCE_DESC1 rt_tex =
+        desc1(texture_desc(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET));
+    D3D12_RESOURCE_DESC1 ds_tex =
+        desc1(texture_desc(8, 8, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+    D3D12_RESOURCE_DESC1 ds_deny_tex = desc1(texture_desc(
+        8, 8, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE));
+    D3D12_RESOURCE_DESC1 uav_tex =
+        desc1(texture_desc(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+    D3D12_RESOURCE_DESC1 rt_ds_tex = desc1(texture_desc(
+        8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+    D3D12_RESOURCE_DESC1 ds_uav_tex = desc1(texture_desc(
+        8, 8, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+    D3D12_RESOURCE_DESC1 deny_only_tex =
+        desc1(texture_desc(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE));
+    D3D12_RESOURCE_DESC1 zero_width_tex = desc1(texture_desc(0, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE));
+    D3D12_RESOURCE_DESC1 big_tex =
+        desc1(texture_desc(1024, 1024, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE));
+    D3D12_RESOURCE_DESC1 tex_256x256 =
+        desc1(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE));
+    D3D12_RESOURCE_DESC base_1000x600_10m =
+        texture_desc(1000, 600, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 10);
+    D3D12_RESOURCE_DESC base_300x200_f16 =
+        texture_desc(300, 200, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+    D3D12_RESOURCE_DESC base_1x1024 =
+        texture_desc(1, 1024, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+
     D3D12_RESOURCE_DESC1 buffer = desc1(buffer_desc(300));
+    D3D12_RESOURCE_DESC1 uav_buffer = desc1(buffer_desc(256));
+    uav_buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_RESOURCE_DESC1 tall_buffer = desc1(buffer_desc(256));
+    tall_buffer.Height = 2;
+
     D3D12_RESOURCE_DESC1 texture_region = texture, buffer_region = buffer;
     texture_region.SamplerFeedbackMipRegion = buffer_region.SamplerFeedbackMipRegion = {4, 4, 1};
+
+    D3D12_CLEAR_VALUE cv_rt{DXGI_FORMAT_R8G8B8A8_UNORM, {0.f, 0.f, 0.f, 1.f}};
+    D3D12_CLEAR_VALUE cv_ds{DXGI_FORMAT_D32_FLOAT, {1.f, 0}};
+    D3D12_CLEAR_VALUE cv_bad{DXGI_FORMAT_R32_FLOAT, {0.f, 0.f, 0.f, 1.f}};
+
+    const DXGI_FORMAT srgb_cast[] = {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB};
+    const DXGI_FORMAT unknown_cast[] = {DXGI_FORMAT_UNKNOWN};
+    const DXGI_FORMAT wide_cast[] = {DXGI_FORMAT_R16G16B16A16_FLOAT};
+
     const auto v2 = [&](const D3D12_HEAP_PROPERTIES& heap, const D3D12_RESOURCE_DESC1& desc) {
         Ref<ID3D12Resource> r;
         return device->CreateCommittedResource2(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
                                                 nullptr, nullptr, IID_PPV_ARGS(&r.p));
     };
     const auto v3 = [&](const D3D12_HEAP_PROPERTIES& heap, const D3D12_RESOURCE_DESC1& desc, D3D12_BARRIER_LAYOUT layout,
-                        UINT32 castable_count = 0, bool output = true) {
+                        UINT32 castable_count = 0, bool output = true, D3D12_HEAP_FLAGS heap_flags = D3D12_HEAP_FLAG_NONE,
+                        const D3D12_CLEAR_VALUE* clear = nullptr, const DXGI_FORMAT* castable = nullptr) {
         Ref<ID3D12Resource> r;
-        return device->CreateCommittedResource3(&heap, D3D12_HEAP_FLAG_NONE, &desc, layout, nullptr, nullptr,
-                                                castable_count, nullptr, __uuidof(ID3D12Resource),
+        return device->CreateCommittedResource3(&heap, heap_flags, &desc, layout, clear, nullptr, castable_count,
+                                                castable, __uuidof(ID3D12Resource),
                                                 output ? reinterpret_cast<void**>(&r.p) : nullptr);
     };
     const auto footprint = [&](const D3D12_RESOURCE_DESC1& desc) {
@@ -245,6 +289,53 @@ std::vector<Edge> edge_answers(ID3D12Device10* device) {
     void* queue = nullptr;
     const HRESULT null_queue = device->CreateCommandQueue1(nullptr, creator, __uuidof(ID3D12CommandQueue), &queue);
     if (queue) static_cast<IUnknown*>(queue)->Release();
+
+    // Placed v2 setup.
+    D3D12_HEAP_DESC placed_heap_desc{256 * 1024, default_heap, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+                                     D3D12_HEAP_FLAG_NONE};
+    D3D12_HEAP_DESC upload_heap_desc{256 * 1024, upload_heap, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+                                     D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS};
+    Ref<ID3D12Heap> placed_heap, upload_placed_heap;
+    placed_device->CreateHeap(&placed_heap_desc, IID_PPV_ARGS(&placed_heap.p));
+    placed_device->CreateHeap(&upload_heap_desc, IID_PPV_ARGS(&upload_placed_heap.p));
+    const auto p2 = [&](ID3D12Heap* heap, UINT64 offset, const D3D12_RESOURCE_DESC1& desc, D3D12_BARRIER_LAYOUT layout,
+                        const D3D12_CLEAR_VALUE* clear = nullptr, UINT32 cast_count = 0,
+                        const DXGI_FORMAT* cast = nullptr) {
+        Ref<ID3D12Resource> r;
+        return placed_device->CreatePlacedResource2(heap, offset, &desc, layout, clear, cast_count, cast,
+                                                    IID_PPV_ARGS(&r.p));
+    };
+    const auto p2_host_sized = [&](const D3D12_RESOURCE_DESC& base, UINT64 fallback_bytes) {
+        const UINT64 bytes = size_host ? size_host->GetResourceAllocationInfo(0, 1, &base).SizeInBytes
+                                       : fallback_bytes;
+        D3D12_HEAP_DESC hd{bytes, default_heap, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, D3D12_HEAP_FLAG_NONE};
+        Ref<ID3D12Heap> h;
+        if (FAILED(placed_device->CreateHeap(&hd, IID_PPV_ARGS(&h.p)))) return E_FAIL;
+        return p2(h.p, 0, desc1(base), D3D12_BARRIER_LAYOUT_COMMON);
+    };
+
+    // Reserved v1/v2 setup.
+    D3D12_RESOURCE_DESC res_tex = texture_desc(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+    res_tex.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+    D3D12_RESOURCE_DESC res_rt = res_tex;
+    res_rt.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_RESOURCE_DESC res_uav = res_tex;
+    res_uav.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_RESOURCE_DESC res_ds_deny = texture_desc(
+        64, 64, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+    res_ds_deny.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+    D3D12_RESOURCE_DESC res_buf = buffer_desc(65536);
+    const auto r1 = [&](const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear) {
+        Ref<ID3D12Resource> r;
+        return device->CreateReservedResource1(&desc, state, clear, nullptr, IID_PPV_ARGS(&r.p));
+    };
+    const auto r2 = [&](const D3D12_RESOURCE_DESC& desc, D3D12_BARRIER_LAYOUT layout,
+                        const D3D12_CLEAR_VALUE* clear = nullptr, UINT32 cast_count = 0,
+                        const DXGI_FORMAT* cast = nullptr) {
+        Ref<ID3D12Resource> r;
+        return device->CreateReservedResource2(&desc, layout, clear, nullptr, cast_count, cast, IID_PPV_ARGS(&r.p));
+    };
+
     return {
         {"CreateCommittedResource2, texture with a mip region", v2(default_heap, texture_region), E_INVALIDARG},
         {"CreateCommittedResource2, buffer with a mip region", v2(upload_heap, buffer_region), S_OK},
@@ -254,12 +345,138 @@ std::vector<Edge> edge_answers(ID3D12Device10* device) {
          v3(upload_heap, buffer_region, D3D12_BARRIER_LAYOUT_UNDEFINED), S_OK},
         {"CreateCommittedResource3, buffer in layout COMMON", v3(upload_heap, buffer, D3D12_BARRIER_LAYOUT_COMMON),
          E_INVALIDARG},
+        {"CreateCommittedResource3, upload buffer in UNDEFINED",
+         v3(upload_heap, buffer, D3D12_BARRIER_LAYOUT_UNDEFINED), S_OK},
+        {"CreateCommittedResource3, readback buffer in COMMON",
+         v3(readback_heap, buffer, D3D12_BARRIER_LAYOUT_COMMON), E_INVALIDARG},
+        {"CreateCommittedResource3, readback buffer in UNDEFINED",
+         v3(readback_heap, buffer, D3D12_BARRIER_LAYOUT_UNDEFINED), S_OK},
+        {"CreateCommittedResource3, upload buffer with ALLOW_UAV",
+         v3(upload_heap, uav_buffer, D3D12_BARRIER_LAYOUT_UNDEFINED), E_INVALIDARG},
+        {"CreateCommittedResource3, buffer with Height=2",
+         v3(default_heap, tall_buffer, D3D12_BARRIER_LAYOUT_UNDEFINED), E_INVALIDARG},
         {"CreateCommittedResource3, texture in layout UNDEFINED",
          v3(default_heap, texture, D3D12_BARRIER_LAYOUT_UNDEFINED), S_OK},
         {"CreateCommittedResource3, castable count with a null list",
          v3(default_heap, texture, D3D12_BARRIER_LAYOUT_COMMON, 2), S_OK},
         {"CreateCommittedResource3, null output",
          v3(default_heap, texture, D3D12_BARRIER_LAYOUT_COMMON, 0, false), S_FALSE},
+        {"CreateCommittedResource3, bad heap type",
+         v3(bad_heap, texture, D3D12_BARRIER_LAYOUT_COMMON), E_INVALIDARG},
+        {"CreateCommittedResource3, DENY_BUFFERS heap flag",
+         v3(default_heap, texture, D3D12_BARRIER_LAYOUT_COMMON, 0, true, D3D12_HEAP_FLAG_DENY_BUFFERS), E_INVALIDARG},
+        {"CreateCommittedResource3, ALLOW_DISPLAY on buffer",
+         v3(default_heap, buffer, D3D12_BARRIER_LAYOUT_UNDEFINED, 0, true, D3D12_HEAP_FLAG_ALLOW_DISPLAY),
+         E_INVALIDARG},
+        {"CreateCommittedResource3, clear value on buffer",
+         v3(upload_heap, buffer, D3D12_BARRIER_LAYOUT_UNDEFINED, 0, true, D3D12_HEAP_FLAG_NONE, &cv_rt), E_INVALIDARG},
+        {"CreateCommittedResource3, clear value on plain texture",
+         v3(default_heap, texture, D3D12_BARRIER_LAYOUT_COMMON, 0, true, D3D12_HEAP_FLAG_NONE, &cv_rt), E_INVALIDARG},
+        {"CreateCommittedResource3, mismatched clear value on RT",
+         v3(default_heap, rt_tex, D3D12_BARRIER_LAYOUT_COMMON, 0, true, D3D12_HEAP_FLAG_NONE, &cv_bad), E_INVALIDARG},
+        {"CreateCommittedResource3, valid clear value on RT",
+         v3(default_heap, rt_tex, D3D12_BARRIER_LAYOUT_RENDER_TARGET, 0, true, D3D12_HEAP_FLAG_NONE, &cv_rt), S_OK},
+        {"CreateCommittedResource3, valid clear value on DS",
+         v3(default_heap, ds_tex, D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE, 0, true, D3D12_HEAP_FLAG_NONE, &cv_ds),
+         S_OK},
+        {"CreateCommittedResource3, RT | DS flags",
+         v3(default_heap, rt_ds_tex, D3D12_BARRIER_LAYOUT_COMMON), E_INVALIDARG},
+        {"CreateCommittedResource3, DS | UAV flags",
+         v3(default_heap, ds_uav_tex, D3D12_BARRIER_LAYOUT_COMMON), E_INVALIDARG},
+        {"CreateCommittedResource3, DENY_SHADER_RESOURCE without DS",
+         v3(default_heap, deny_only_tex, D3D12_BARRIER_LAYOUT_COMMON), E_INVALIDARG},
+        {"CreateCommittedResource3, texture Width=0",
+         v3(default_heap, zero_width_tex, D3D12_BARRIER_LAYOUT_COMMON), E_INVALIDARG},
+        {"CreateCommittedResource3, non-RT texture in RENDER_TARGET",
+         v3(default_heap, texture, D3D12_BARRIER_LAYOUT_RENDER_TARGET), E_INVALIDARG},
+        {"CreateCommittedResource3, non-UAV texture in UNORDERED_ACCESS",
+         v3(default_heap, texture, D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS), E_INVALIDARG},
+        {"CreateCommittedResource3, non-UAV texture in DIRECT_QUEUE_UAV",
+         v3(default_heap, texture, D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS), E_INVALIDARG},
+        {"CreateCommittedResource3, non-UAV texture in COMPUTE_QUEUE_UAV",
+         v3(default_heap, texture, D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS), E_INVALIDARG},
+        {"CreateCommittedResource3, UAV texture in DIRECT_QUEUE_UAV",
+         v3(default_heap, uav_tex, D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS), S_OK},
+        {"CreateCommittedResource3, non-DS texture in DEPTH_STENCIL_WRITE",
+         v3(default_heap, texture, D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE), E_INVALIDARG},
+        {"CreateCommittedResource3, non-DS texture in DEPTH_STENCIL_READ",
+         v3(default_heap, texture, D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ), E_INVALIDARG},
+        {"CreateCommittedResource3, DS texture in DEPTH_STENCIL_READ",
+         v3(default_heap, ds_tex, D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ), S_OK},
+        {"CreateCommittedResource3, DS+DENY_SR in SHADER_RESOURCE",
+         v3(default_heap, ds_deny_tex, D3D12_BARRIER_LAYOUT_SHADER_RESOURCE), E_INVALIDARG},
+        {"CreateCommittedResource3, DS+DENY_SR in DIRECT_QUEUE_SHADER_RESOURCE",
+         v3(default_heap, ds_deny_tex, D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE), E_INVALIDARG},
+        {"CreateCommittedResource3, DS+DENY_SR in COMPUTE_QUEUE_SHADER_RESOURCE",
+         v3(default_heap, ds_deny_tex, D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_SHADER_RESOURCE), E_INVALIDARG},
+        {"CreateCommittedResource3, DS+DENY_SR in GENERIC_READ",
+         v3(default_heap, ds_deny_tex, D3D12_BARRIER_LAYOUT_GENERIC_READ), S_OK},
+        {"CreatePlacedResource2, buffer in COMMON",
+         p2(upload_placed_heap.p, 0, buffer, D3D12_BARRIER_LAYOUT_COMMON), E_INVALIDARG},
+        {"CreatePlacedResource2, buffer with Height=2",
+         p2(placed_heap.p, 0, tall_buffer, D3D12_BARRIER_LAYOUT_UNDEFINED), E_INVALIDARG},
+        {"CreatePlacedResource2, upload buffer with ALLOW_UAV",
+         p2(upload_placed_heap.p, 0, uav_buffer, D3D12_BARRIER_LAYOUT_UNDEFINED), E_INVALIDARG},
+        {"CreatePlacedResource2, clear value on buffer",
+         p2(placed_heap.p, 0, buffer, D3D12_BARRIER_LAYOUT_UNDEFINED, &cv_rt), E_INVALIDARG},
+        {"CreatePlacedResource2, clear value on plain texture",
+         p2(placed_heap.p, 0, texture, D3D12_BARRIER_LAYOUT_COMMON, &cv_rt), E_INVALIDARG},
+        {"CreatePlacedResource2, valid clear value on RT",
+         p2(placed_heap.p, 0, rt_tex, D3D12_BARRIER_LAYOUT_RENDER_TARGET, &cv_rt), S_OK},
+        {"CreatePlacedResource2, oversized 1024x1024 texture in 256 KiB heap",
+         p2(placed_heap.p, 0, big_tex, D3D12_BARRIER_LAYOUT_COMMON), E_INVALIDARG},
+        {"CreatePlacedResource2, 256x256 at 64 KiB in 256 KiB heap",
+         p2(placed_heap.p, 65536, tex_256x256, D3D12_BARRIER_LAYOUT_COMMON), E_INVALIDARG},
+        {"CreatePlacedResource2, 1000x600 RGBA8 10 mips in host-sized heap",
+         p2_host_sized(base_1000x600_10m, 3538944), S_OK},
+        {"CreatePlacedResource2, 300x200 RGBA16F in host-sized heap",
+         p2_host_sized(base_300x200_f16, 589824), S_OK},
+        {"CreatePlacedResource2, 1x1024 RGBA8 in 64 KiB heap",
+         p2_host_sized(base_1x1024, 65536), S_OK},
+        {"CreatePlacedResource2, 8x8 texture at 192 KiB in 256 KiB heap",
+         p2(placed_heap.p, 3 * 65536, texture, D3D12_BARRIER_LAYOUT_COMMON), S_OK},
+        {"CreatePlacedResource2, non-RT texture in RENDER_TARGET",
+         p2(placed_heap.p, 0, texture, D3D12_BARRIER_LAYOUT_RENDER_TARGET), E_INVALIDARG},
+        {"CreatePlacedResource2, non-UAV texture in UNORDERED_ACCESS",
+         p2(placed_heap.p, 0, texture, D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS), E_INVALIDARG},
+        {"CreatePlacedResource2, non-DS texture in DEPTH_STENCIL_WRITE",
+         p2(placed_heap.p, 0, texture, D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE), E_INVALIDARG},
+        {"CreatePlacedResource2, DS+DENY_SR in DIRECT_QUEUE_SHADER_RESOURCE",
+         p2(placed_heap.p, 0, ds_deny_tex, D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE), E_INVALIDARG},
+        {"CreateReservedResource1, clear value on plain texture",
+         r1(res_tex, D3D12_RESOURCE_STATE_COMMON, &cv_rt), E_INVALIDARG},
+        {"CreateReservedResource2, buffer in COMMON",
+         r2(res_buf, D3D12_BARRIER_LAYOUT_COMMON), E_INVALIDARG},
+        {"CreateReservedResource2, buffer in UNDEFINED",
+         r2(res_buf, D3D12_BARRIER_LAYOUT_UNDEFINED), S_OK},
+        {"CreateReservedResource2, clear value on buffer",
+         r2(res_buf, D3D12_BARRIER_LAYOUT_UNDEFINED, &cv_rt), E_INVALIDARG},
+        {"CreateReservedResource2, clear value on plain texture",
+         r2(res_tex, D3D12_BARRIER_LAYOUT_COMMON, &cv_rt), E_INVALIDARG},
+        {"CreateReservedResource2, mismatched clear value on RT",
+         r2(res_rt, D3D12_BARRIER_LAYOUT_COMMON, &cv_bad), E_INVALIDARG},
+        {"CreateReservedResource2, valid clear value on RT",
+         r2(res_rt, D3D12_BARRIER_LAYOUT_RENDER_TARGET, &cv_rt), S_OK},
+        {"CreateReservedResource2, non-RT texture in RENDER_TARGET",
+         r2(res_tex, D3D12_BARRIER_LAYOUT_RENDER_TARGET), E_INVALIDARG},
+        {"CreateReservedResource2, non-UAV texture in UNORDERED_ACCESS",
+         r2(res_tex, D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS), E_INVALIDARG},
+        {"CreateReservedResource2, UAV texture in COMPUTE_QUEUE_UAV",
+         r2(res_uav, D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS), S_OK},
+        {"CreateReservedResource2, non-DS texture in DEPTH_STENCIL_WRITE",
+         r2(res_tex, D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE), E_INVALIDARG},
+        {"CreateReservedResource2, DS+DENY_SR in SHADER_RESOURCE",
+         r2(res_ds_deny, D3D12_BARRIER_LAYOUT_SHADER_RESOURCE), E_INVALIDARG},
+        {"CreateReservedResource2, castable format on buffer",
+         r2(res_buf, D3D12_BARRIER_LAYOUT_UNDEFINED, nullptr, 1, srgb_cast), E_INVALIDARG},
+        {"CreateReservedResource2, unknown castable format on texture",
+         r2(res_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 1, unknown_cast), E_INVALIDARG},
+        {"CreateReservedResource2, mismatched texel-size castable format",
+         r2(res_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 1, wide_cast), E_INVALIDARG},
+        {"CreateReservedResource2, valid castable format on texture",
+         r2(res_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 1, srgb_cast), S_OK},
+        {"CreateReservedResource2, castable count with null list",
+         r2(res_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 2, nullptr), S_OK},
         {"CreateCommandQueue1, null description", null_queue, E_INVALIDARG},
         {"GetCopyableFootprints1, texture with a mip region", footprint(texture_region), S_FALSE},
         {"GetCopyableFootprints1, buffer with a mip region", footprint(buffer_region), S_OK},
@@ -297,32 +514,47 @@ int main() {
             EXPECT(create(device.p, via, upload_heap, buffer_desc(256), &out, fake_session()) == E_INVALIDARG);
             EXPECT(out == nullptr);
         }
+        {
+            D3D12_RESOURCE_DESC tiled_buf = buffer_desc(65536);
+            void* out = reinterpret_cast<void*>(1);
+            EXPECT(device->CreateReservedResource1(&tiled_buf, D3D12_RESOURCE_STATE_COMMON, nullptr, fake_session(),
+                                                   __uuidof(ID3D12Resource), &out) == E_INVALIDARG);
+            EXPECT(out == nullptr);
+            out = reinterpret_cast<void*>(1);
+            EXPECT(device->CreateReservedResource2(&tiled_buf, D3D12_BARRIER_LAYOUT_UNDEFINED, nullptr, fake_session(),
+                                                   0, nullptr, __uuidof(ID3D12Resource), &out) == E_INVALIDARG);
+            EXPECT(out == nullptr);
+        }
 
         // The newer arguments' edge cases, each with the answer the PC runtime gives (and, when the host has a
-        // D3D12 device, compared with it live).
-        const std::vector<Edge> ours = edge_answers(device.p);
+        // D3D12 device, compared with it live). Placed cases use standalone_device so the heap arena is present.
+        const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        const auto create_host = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
+                                             reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
+                                       : nullptr;
+        Ref<ID3D12Device10> host;
+        const bool have_host =
+            create_host && SUCCEEDED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)));
+        Ref<ID3D12Device> standalone_base;
+        Ref<ID3D12Device10> standalone_device;
+        EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&standalone_base.p))));
+        EXPECT(SUCCEEDED(standalone_base->QueryInterface(IID_PPV_ARGS(&standalone_device.p))));
+        const std::vector<Edge> ours = edge_answers(device.p, standalone_device.p, host.p);
         for (const Edge& e : ours) {
             if (e.got == e.want) continue;
             std::fprintf(stderr, "%s: got %08lx, want %08lx\n", e.name, e.got, e.want);
             return 1;
         }
-        {
-            const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-            const auto create_host = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
-                                                 reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
-                                           : nullptr;
-            Ref<ID3D12Device10> host;
-            if (create_host && SUCCEEDED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
-                const std::vector<Edge> theirs = edge_answers(host.p);
-                for (std::size_t i = 0; i < ours.size(); ++i) {
-                    if (ours[i].got == theirs[i].got) continue;
-                    std::fprintf(stderr, "%s: ours %08lx, host runtime %08lx\n", ours[i].name, ours[i].got,
-                                 theirs[i].got);
-                    return 1;
-                }
-            } else {
-                std::printf("no host D3D12 device: edge cases checked against their recorded answers only\n");
+        if (have_host) {
+            const std::vector<Edge> theirs = edge_answers(host.p, host.p, host.p);
+            for (std::size_t i = 0; i < ours.size(); ++i) {
+                if (ours[i].got == theirs[i].got) continue;
+                std::fprintf(stderr, "%s: ours %08lx, host runtime %08lx\n", ours[i].name, ours[i].got,
+                             theirs[i].got);
+                return 1;
             }
+        } else {
+            std::printf("no host D3D12 device: edge cases checked against their recorded answers only\n");
         }
 
         // Castable formats: the layer reports relaxed format casting and passes a real list to
@@ -359,7 +591,7 @@ int main() {
             Ref<ID3D12DescriptorHeap> heap;
             D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
             heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-            heap_desc.NumDescriptors = 3;
+            heap_desc.NumDescriptors = 4;
             heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
             EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
             D3D12_CPU_DESCRIPTOR_HANDLE slot = heap->GetCPUDescriptorHandleForHeapStart();
@@ -413,6 +645,30 @@ int main() {
             nonzero = false;
             for (std::uint32_t word : words) nonzero = nonzero || word != 0;
             EXPECT(nonzero);
+
+            // CreateReservedResource2 forwards its castable list to the backing Vulkan image too.
+            const auto slot_is_zero = [](D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+                std::uint32_t descriptor_words[8]{};
+                std::memcpy(descriptor_words, reinterpret_cast<void*>(handle.ptr), sizeof(descriptor_words));
+                for (std::uint32_t word : descriptor_words)
+                    if (word != 0) return false;
+                return true;
+            };
+            D3D12_RESOURCE_DESC res_tex = texture_desc(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+            res_tex.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+            Ref<ID3D12Resource> reserved_srgb;
+            EXPECT(SUCCEEDED(device->CreateReservedResource2(&res_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 1,
+                                                             srgb_only, IID_PPV_ARGS(&reserved_srgb.p))));
+            slot.ptr += stride;
+            srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            device->CreateShaderResourceView(reserved_srgb.p, &srv, slot);
+            EXPECT(!slot_is_zero(slot));
+            srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+            device->CreateShaderResourceView(reserved_srgb.p, &srv, slot);
+            EXPECT(!slot_is_zero(slot));
+            srv.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+            device->CreateShaderResourceView(reserved_srgb.p, &srv, slot);
+            EXPECT(slot_is_zero(slot));
         }
 
         // A texture from CreateCommittedResource3 (a castable count with a null list, which is no list) is
@@ -523,7 +779,8 @@ int main() {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    std::printf("D3D12 method variants: CreateCommittedResource1/2/3, CreateCommandQueue1 and GetCopyableFootprints1 "
-                "matched their base methods and the PC runtime's edge-case answers; a texture round-tripped\n");
+    std::printf("D3D12 method variants: CreateCommittedResource1/2/3, CreatePlacedResource2, "
+                "CreateReservedResource1/2, CreateCommandQueue1 and GetCopyableFootprints1 matched their base methods "
+                "and the PC runtime's edge-case answers; a texture round-tripped\n");
     return 0;
 }

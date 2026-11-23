@@ -62,6 +62,10 @@ VOP2_MODELLED_OPS = tuple(op for op in ALL_OPS if op != "v_sub_nc_u16")
 
 # 8-byte VOP3 encoding comment (LLVM 21 disassembles VOP3 16-bit integer ops without _e64, with 8-byte encoding).
 VOP3_ENC8 = "; encoding: [0x00,0x00,0x00,0xd5,0x01,0x05,0x02,0x00]"
+# 12-byte GFX10 VOP3 encoding with a 32-bit literal constant (byte 3 bits [31:26] = 0b110101 = 0x35 -> 0xd4..0xd7).
+VOP3_ENC12 = "; encoding: [0x00,0x00,0x03,0xd7,0xff,0x02,0x02,0x00,0x34,0x12,0x00,0x00]"
+# 8-byte VOP2 encoding with a 32-bit literal constant (byte 3 bit 31 = 0 -> not VOP3).
+VOP2_ENC8_LIT = "; encoding: [0xff,0x02,0x00,0x64,0x34,0x12,0x00,0x00]"
 
 BOUNDARY_HALVES = (0x0000, 0x0001, 0x7FFF, 0x8000, 0x8001, 0xFFFE, 0xFFFF)
 
@@ -334,7 +338,7 @@ class ValuInt16OpSelAndEncodingTests(unittest.TestCase):
             with self.subTest(op=op, mode="e32"):
                 self.assertEqual(run_one(f"{op}_e32 v0, v1, v2", OPSEL_A, OPSEL_B),
                                  ref_word(op, OPSEL_A, OPSEL_B, OLD, (0, 0, 0), preserve_high=False))
-            for sel in ("op_sel:[1,0,0]", "op_sel:[0,1,0]"):
+            for sel in ("op_sel:[1,0,0]", "op_sel:[0,1,0]", "op_sel:[0,0,1]"):
                 with self.subTest(op=op, mode=sel):
                     with self.assertRaises(rdna2spirv.Unsupported):
                         translate_lines([
@@ -344,6 +348,47 @@ class ValuInt16OpSelAndEncodingTests(unittest.TestCase):
                             f"{op}_e32 v0, v1, v2 {sel}",
                             "exp mrt0 v0, v0, v0, v0 done vm",
                         ])
+
+    def test_12byte_vop3_literal_encoding_preserves_other_half_and_honours_op_sel(self):
+        # GFX10 VOP3 instructions with a 32-bit literal constant have a 12-byte (24-hex-char) encoding
+        # with byte 3 bits [31:26] == 0x35; they must still be recognized as VOP3 (e64=True).
+        lit = 0x56781234
+        for op in ALL_OPS:
+            with self.subTest(op=op, mode="lo"):
+                got = run_one(f"{op} v0, {lit:#x}, v2 {VOP3_ENC12}", OPSEL_A, OPSEL_B)
+                self.assertEqual(got, ref_word(op, lit, OPSEL_B, OLD, (0, 0, 0), preserve_high=True))
+            with self.subTest(op=op, mode="dst_hi"):
+                got = run_one(f"{op} v0, {lit:#x}, v2 op_sel:[0,0,1] {VOP3_ENC12}", OPSEL_A, OPSEL_B)
+                self.assertEqual(got, ref_word(op, lit, OPSEL_B, OLD, (0, 0, 1), preserve_high=True))
+            with self.subTest(op=op, mode="src1_hi"):
+                got = run_one(f"{op} v0, {lit:#x}, v2 op_sel:[0,1,0] {VOP3_ENC12}", OPSEL_A, OPSEL_B)
+                self.assertEqual(got, ref_word(op, lit, OPSEL_B, OLD, (0, 1, 0), preserve_high=True))
+        # Also verify VOP3-only v_add_nc_u16 with a 12-byte literal encoding.
+        self.assertEqual(
+            run_one(f"v_add_nc_u16 v0, {lit:#x}, v2 {VOP3_ENC12}", OPSEL_A, OPSEL_B),
+            merge16(OLD, (u16(lit) + u16(OPSEL_B)) & MASK16, dst_hi=0, preserve_high=True),
+        )
+        self.assertEqual(
+            run_one(f"v_add_nc_u16 v0, {lit:#x}, v2 op_sel:[0,1,1] {VOP3_ENC12}", OPSEL_A, OPSEL_B),
+            merge16(OLD, (u16(lit) + half16(OPSEL_B, 1)) & MASK16, dst_hi=1, preserve_high=True),
+        )
+
+    def test_8byte_vop2_literal_encoding_stays_vop2(self):
+        # An 8-byte VOP2 encoding with a 32-bit literal has byte 3 bit 31 == 0 (not VOP3 0x35),
+        # so it must stay VOP2 (zeroing dst[31:16] and rejecting op_sel).
+        lit = 0x00001234
+        for op in VOP2_MODELLED_OPS:
+            with self.subTest(op=op, mode="e32_lit"):
+                got = run_one(f"{op}_e32 v0, {lit:#x}, v2 {VOP2_ENC8_LIT}", OPSEL_A, OPSEL_B)
+                self.assertEqual(got, ref_word(op, lit, OPSEL_B, OLD, (0, 0, 0), preserve_high=False))
+            with self.subTest(op=op, mode="e32_lit_opsel"):
+                with self.assertRaises(rdna2spirv.Unsupported):
+                    translate_lines([
+                        f"v_mov_b32 v0, {OLD:#x}",
+                        f"v_mov_b32 v2, {OPSEL_B:#x}",
+                        f"{op}_e32 v0, {lit:#x}, v2 op_sel:[0,1,0] {VOP2_ENC8_LIT}",
+                        "exp mrt0 v0, v0, v0, v0 done vm",
+                    ])
 
 
 class ValuInt16OperandsAndExecTests(unittest.TestCase):

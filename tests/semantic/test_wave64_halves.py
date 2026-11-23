@@ -59,6 +59,7 @@ def meta_of(name, lines):
 
 
 PRO = ["s_mov_b64 s[10:11], exec"]           # the program is wave64 (a 64-bit op on EXEC)
+LANE_ID = ["v_mbcnt_lo_u32_b32 v10, -1, 0", "v_mbcnt_hi_u32_b32 v10, -1, v10"]   # the lane id, 0..63 in the wave
 EPI_VS = ["v_mov_b32_e32 v5, 0", "exp pos0 v5, v5, v5, v5 done", "exp param0 v6, v7, v5, v5", "s_endpgm"]
 EPI_PS = ["exp mrt0 v6, v7, v5, v5 done vm", "s_endpgm"]
 
@@ -79,7 +80,8 @@ def run_cut(asm, wave, push=None):
     for half in range(64 // wave):
         res = wi.run_wave(asm, wave=wave, push_constants=push,
                           builtins={"VertexIndex": lambda lane, base=half * wave: base + lane,
-                                     "InstanceIndex": lambda lane: 0})
+                                     "InstanceIndex": lambda lane: 0, "BaseVertex": lambda lane: 0,
+                                     "BaseInstance": lambda lane: 0})
         words += [o and tuple(sorted(o.items())) for o in res["outputs"]]
     return words
 
@@ -91,6 +93,22 @@ def out_param(words, k=0):
         d = dict(w) if w else {}
         result.append(next((v for name, v in d.items() if name.endswith(f"param{k}")), None))
     return result
+
+
+# ---- the early exit of a pixel kill ------------------------------------------------------------------------------
+KILL = ["s_mov_b64 s[20:21], exec", "v_cmp_gt_u32_e32 vcc, 40, v0", "s_andn2_b64 s[20:21], s[20:21], vcc"]
+RUN_WQM = ["s_wqm_b64 s[22:23], s[20:21]", "s_and_b64 exec, exec, s[22:23]"]
+EXIT_PS = ["s_mov_b64 exec, s[20:21]", "exp null off, off, off, off done vm", "s_endpgm"]
+EXIT_VS = ["s_mov_b64 exec, s[20:21]", "exp pos0 v5, v5, v5, v5 done", "s_endpgm"]
+
+
+def kill(head, run, exit_, stage="ps", vote="s_cbranch_scc0"):
+    """head, a branch to the exit when the live mask is empty, the run side and the epilogue, then the exit."""
+    epi = EPI_PS if stage == "ps" else EPI_VS
+    tail = run + epi
+    hop = sum(size(t) for t in tail) // 4
+    return PRO + ["v_mov_b32_e32 v6, 0", "v_mov_b32_e32 v7, 0", "v_mov_b32_e32 v5, 0"] + head + \
+        [f"{vote} {hop}"] + tail + exit_
 
 
 class Classification(unittest.TestCase):
@@ -126,6 +144,18 @@ class Classification(unittest.TestCase):
     def test_a_bpermute_swizzle_in_half(self):
         self.tier("ps_a_bperm", ps(["v_lshlrev_b32_e32 v4, 2, v0", "ds_bpermute_b32 v6, v4, v0"]), "A", [], [])
 
+    def test_a_bpermute_lane_id_address(self):
+        # the lane id is 0..63 in the wave and 0..31 in a half: equal modulo 32 lanes, which is all a wave64
+        # ds_bpermute uses (address bits 2..6, per half), so xor/and/or/add on it and a shift by 2 stay exact
+        self.tier("ps_a_bperm_id", ps([*LANE_ID, "v_xor_b32_e32 v11, 1, v10", "v_lshlrev_b32_e32 v11, 2, v11",
+                                       "ds_bpermute_b32 v6, v11, v0", "v_and_b32_e32 v12, -4, v10",
+                                       "v_or_b32_e32 v12, 2, v12", "v_lshl_add_u32 v12, v12, 2, 0",
+                                       "ds_bpermute_b32 v7, v12, v0", "s_waitcnt lgkmcnt(0)"]), "A", [], [])
+
+    def test_a_permute_lane_id_address(self):
+        self.tier("ps_a_perm_id", ps([*LANE_ID, "v_add_nc_u32_e32 v11, 5, v10", "v_lshlrev_b32_e32 v11, 2, v11",
+                                      "ds_permute_b32 v6, v11, v0", "s_waitcnt lgkmcnt(0)"]), "A", [], [])
+
     # -- tier B
     def test_b_waterfall(self):
         self.tier("ps_b_wf", ps([
@@ -156,6 +186,99 @@ class Classification(unittest.TestCase):
         self.tier("ps_b_spill", ps(["v_writelane_b32 v20, s4, 3", "v_readlane_b32 s21, v20, 3",
                                     "v_add_nc_u32_e32 v6, s21, v0"]), "B", [], ["lane-spill"])
 
+    def test_b_spill_and_reload_upper_half_lane_40(self):
+        # Pure scalar spill into lanes 32..63 (v20 is never read as a vector operand): lowered to a parked scalar
+        # slot so SGPR spills past lane 31 are exact on 32-wide subgroups (tier B).
+        self.tier("ps_b_spill_hi", ps([
+            "v_writelane_b32 v20, s4, 40", "v_writelane_b32 v20, s5, 63",
+            "v_readlane_b32 s21, v20, 40", "v_readlane_b32 s22, v20, 63",
+            "s_add_u32 s23, s21, s22", "v_add_nc_u32_e32 v6, s23, v0"]), "B", [], ["lane-spill"])
+
+    def test_c_spill_in_divergent_vote_branch_is_stale_scalar(self):
+        # Spilling to lane 40 behind a wave-wide vote and reading outside must stay tier C (stale-scalar).
+        # v_writelane_b32 is an 8-byte VOP3 instruction (2 dwords).
+        self.tier("ps_c_spill_stale", ps([
+            "v_writelane_b32 v20, s4, 40", "v_cmp_eq_u32_e32 vcc, 0, v0", "s_cbranch_vccz 2",
+            "v_writelane_b32 v20, s5, 40", "v_readlane_b32 s21, v20, 40",
+            "v_mov_b32_e32 v6, s21"]), "C", contains=["stale-scalar"])
+
+    def test_c_spill_of_tainted_count_stays_tier_c(self):
+        # Spilling a tainted scalar (lane-count) into lane 40 and reloading must still report lane-count.
+        self.tier("ps_c_spill_cnt", ps([
+            "v_cmp_eq_u32_e32 vcc, 1, v0", "s_bcnt1_i32_b64 s6, vcc",
+            "v_writelane_b32 v20, s6, 40", "v_readlane_b32 s21, v20, 40",
+            "v_mov_b32_e32 v6, s21"]), "C", ["lane-count"])
+
+    def test_b_readfirstlane_uniform_inside_narrowed_exec(self):
+        # v5 written from a scalar inside a narrowed EXEC block is uniform across all active lanes,
+        # so v_readfirstlane_b32 inside that block is exact (tier B).
+        self.tier("ps_b_rfl_narrow", ps([
+            "v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4",
+            "s_and_saveexec_b64 s[12:13], vcc", "v_mov_b32_e32 v5, s4",
+            "v_readfirstlane_b32 s20, v5", "v_add_nc_u32_e32 v6, s20, v0",
+            "s_or_b64 exec, exec, s[12:13]"]), "B", [], ["readfirstlane-uniform"])
+
+    def test_c_readfirstlane_after_exec_restore_not_uniform(self):
+        # Writing v5 from a scalar under narrowed EXEC and reading after EXEC restore is NOT uniform (tier C).
+        self.tier("ps_c_rfl_after_restore", ps([
+            "v_mov_b32_e32 v5, v0", "v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4",
+            "s_and_saveexec_b64 s[12:13], vcc", "v_mov_b32_e32 v5, s4",
+            "s_or_b64 exec, exec, s[12:13]", "v_readfirstlane_b32 s20, v5",
+            "v_mov_b32_e32 v6, s20"]), "C")
+
+    def test_c_readfirstlane_active_uniform_scalar_escapes_after_restore(self):
+        # Reading v5 inside narrowed EXEC produces lane-0's old value in a half where EXEC == 0;
+        # using that scalar after EXEC restore escapes the mask and must stay tier C (PR #2469 review).
+        self.tier("ps_c_rfl_escape", ps([
+            "v_mov_b32_e32 v5, 7", "v_cmp_eq_u32_e32 vcc, 33, v0",
+            "s_and_saveexec_b64 s[12:13], vcc", "v_mov_b32_e32 v5, 50",
+            "v_readfirstlane_b32 s20, v5", "s_mov_b64 exec, s[10:11]",
+            "v_mov_b32_e32 v6, s20"]), "C", contains=["cross-lane"])
+
+    def test_c_nonlinear_count_scaling_refused(self):
+        # Count as shift distance (1 << count) and 24-bit truncating multiply (v_mul_u32_u24) are nonlinear
+        # and must NOT qualify for wave-aggregated atomics (PR #2469 review).
+        self.tier("ps_c_atomic_shift_dist", ps([
+            "v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4", "s_and_saveexec_b64 s[12:13], vcc",
+            "s_bcnt1_i32_b64 s6, exec", "s_lshl_b32 s6, 1, s6",
+            "v_mbcnt_lo_u32_b32 v10, exec_lo, 0", "v_mbcnt_hi_u32_b32 v10, exec_hi, v10",
+            "v_cmp_eq_u32_e32 vcc, 0, v10", "s_and_saveexec_b64 s[14:15], vcc", "v_mov_b32_e32 v11, s6",
+            "v_mov_b32_e32 v12, 0", "buffer_atomic_add v11, v12, s[0:3], 0 offen glc", "s_or_b64 exec, exec, s[14:15]",
+            "v_readfirstlane_b32 s7, v11", "v_add_nc_u32_e32 v13, s7, v10", "v_lshlrev_b32_e32 v13, 2, v13",
+            "buffer_store_dword v0, v13, s[0:3], 0 offen offset:256", "s_mov_b64 exec, s[10:11]"]), "C",
+            contains=["lane-count"])
+        self.tier("ps_c_atomic_mul_u24", ps([
+            "v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4", "s_and_saveexec_b64 s[12:13], vcc",
+            "s_bcnt1_i32_b64 s6, exec", "s_mul_i32 s6, s6, 0x100000",
+            "v_mbcnt_lo_u32_b32 v10, exec_lo, 0", "v_mbcnt_hi_u32_b32 v10, exec_hi, v10",
+            "v_cmp_eq_u32_e32 vcc, 0, v10", "s_and_saveexec_b64 s[14:15], vcc", "v_mov_b32_e32 v15, s6",
+            "v_mul_u32_u24_e32 v11, 1, v15",
+            "v_mov_b32_e32 v12, 0", "buffer_atomic_add v11, v12, s[0:3], 0 offen glc", "s_or_b64 exec, exec, s[14:15]",
+            "v_readfirstlane_b32 s7, v11", "v_add_nc_u32_e32 v13, s7, v10", "v_lshlrev_b32_e32 v13, 2, v13",
+            "buffer_store_dword v0, v13, s[0:3], 0 offen offset:256", "s_mov_b64 exec, s[10:11]"]), "C",
+            contains=["lane-count"])
+
+    def test_b_scaled_aggregated_atomic_and_global_atomic_add(self):
+        # Stride-scaled s_bcnt1 (s_lshl_b32 by 2 = 4 bytes/lane) in buffer_atomic_add and global_atomic_add.
+        self.tier("ps_b_atomic_scaled", ps([
+            "v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4", "s_and_saveexec_b64 s[12:13], vcc",
+            "s_bcnt1_i32_b64 s6, exec", "s_lshl_b32 s6, s6, 2",
+            "v_mbcnt_lo_u32_b32 v10, exec_lo, 0", "v_mbcnt_hi_u32_b32 v10, exec_hi, v10",
+            "v_cmp_eq_u32_e32 vcc, 0, v10", "s_and_saveexec_b64 s[14:15], vcc", "v_mov_b32_e32 v11, s6",
+            "v_mov_b32_e32 v12, 0", "buffer_atomic_add v11, v12, s[0:3], 0 offen glc", "s_or_b64 exec, exec, s[14:15]",
+            "v_readfirstlane_b32 s7, v11", "v_lshlrev_b32_e32 v13, 2, v10", "v_add_nc_u32_e32 v13, s7, v13",
+            "buffer_store_dword v0, v13, s[0:3], 0 offen offset:256", "s_mov_b64 exec, s[10:11]"]), "B", [],
+            ["aggregated-atomic", "elected-lane"])
+        # global_atomic_add with glc has operand order (vdst, vaddr, vdata, saddr).
+        self.tier("ps_b_global_atomic", ps([
+            "v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4", "s_and_saveexec_b64 s[12:13], vcc",
+            "s_bcnt1_i32_b64 s6, exec", "v_mbcnt_lo_u32_b32 v10, exec_lo, 0", "v_mbcnt_hi_u32_b32 v10, exec_hi, v10",
+            "v_cmp_eq_u32_e32 vcc, 0, v10", "s_and_saveexec_b64 s[14:15], vcc", "v_mov_b32_e32 v11, s6",
+            "v_mov_b32_e32 v12, 0", "global_atomic_add v14, v12, v11, s[4:5] glc", "s_or_b64 exec, exec, s[14:15]",
+            "v_readfirstlane_b32 s7, v14", "v_add_nc_u32_e32 v13, s7, v10", "v_lshlrev_b32_e32 v13, 2, v13",
+            "global_store_dword v13, v0, s[4:5]", "s_mov_b64 exec, s[10:11]"]), "B", [],
+            ["aggregated-atomic", "elected-lane"])
+
     # -- tier C: each near miss of the idioms above
     def test_c_lane_count_exported(self):
         self.tier("ps_c_cnt", ps(["v_cmp_eq_u32_e32 vcc, 1, v0", "s_bcnt1_i32_b64 s6, vcc", "v_mov_b32_e32 v6, s6"]),
@@ -167,6 +290,31 @@ class Classification(unittest.TestCase):
 
     def test_c_lane_id_exported(self):
         self.tier("ps_c_id", ps(["v_mbcnt_lo_u32_b32 v6, -1, 0", "v_mbcnt_hi_u32_b32 v6, -1, v6"]), "C", ["lane-id"])
+
+    def test_c_bpermute_lane_id_address_near_misses(self):
+        # a shift by 1: address bit 7 is not reached, lane bit 5 lands in bit 6, which the permute uses
+        self.tier("ps_c_bperm_shl1", ps([*LANE_ID, "v_lshlrev_b32_e32 v11, 1, v10", "ds_bpermute_b32 v6, v11, v0",
+                                         "s_waitcnt lgkmcnt(0)"]), "C", ["lane-id"])
+        # the low count alone is 32 for every upper-half lane of the wave
+        self.tier("ps_c_bperm_lo", ps(["v_mbcnt_lo_u32_b32 v10, -1, 0", "v_lshlrev_b32_e32 v11, 2, v10",
+                                       "ds_bpermute_b32 v6, v11, v0", "s_waitcnt lgkmcnt(0)"]), "C", ["lane-id"])
+        # a right shift moves lane bit 5 down into the bits the permute uses
+        self.tier("ps_c_bperm_shr", ps([*LANE_ID, "v_lshrrev_b32_e32 v11, 1, v10", "v_lshlrev_b32_e32 v11, 3, v11",
+                                        "ds_bpermute_b32 v6, v11, v0", "s_waitcnt lgkmcnt(0)"]), "C", ["lane-id"])
+        # combined with a lane mask: the mask is not the same in the wave and in a half
+        self.tier("ps_c_bperm_mask", ps([*LANE_ID, "v_and_b32_e32 v11, s10, v10", "v_lshlrev_b32_e32 v11, 2, v11",
+                                         "ds_bpermute_b32 v6, v11, v0", "s_waitcnt lgkmcnt(0)"]), "C")
+        # SDWA selects and integer clamp change the value: a byte of id << 7, a saturating id - 32
+        self.tier("ps_c_bperm_sdwa", ps([*LANE_ID, "v_lshlrev_b32_e32 v11, 7, v10",
+                                         "v_mov_b32_sdwa v12, v11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1",
+                                         "v_lshlrev_b32_e32 v12, 2, v12", "ds_bpermute_b32 v6, v12, v0",
+                                         "s_waitcnt lgkmcnt(0)"]), "C", ["lane-id"])
+        self.tier("ps_c_bperm_clamp", ps([*LANE_ID, "v_add_nc_u32_e64 v11, v10, -32 clamp",
+                                          "v_lshlrev_b32_e32 v11, 2, v11", "ds_bpermute_b32 v6, v11, v0",
+                                          "s_waitcnt lgkmcnt(0)"]), "C", ["lane-id"])
+        # the lane id still taints the data it permutes, and the lane id itself
+        self.tier("ps_c_bperm_data", ps([*LANE_ID, "v_lshlrev_b32_e32 v11, 2, v10", "ds_bpermute_b32 v6, v11, v10",
+                                         "s_waitcnt lgkmcnt(0)"]), "C", ["lane-id"])
 
     def test_c_first_lane_index(self):
         self.tier("ps_c_ff1", ps(["v_cmp_eq_u32_e32 vcc, 1, v0", "s_ff1_i32_b64 s6, vcc", "v_mov_b32_e32 v6, s6"]),
@@ -275,6 +423,36 @@ class Execution(unittest.TestCase):
         self.assertEqual(whole, halves)
         self.assertEqual([w[0] for w in whole], [17 * (k & 7) + k for k in range(64)])
 
+    def test_a_bpermute_lane_id_address_invariant(self):
+        tier, whole, halves = self.run_both("vs_a_bperm_id", vs([
+            *LANE_ID, "v_xor_b32_e32 v11, 1, v10", "v_lshlrev_b32_e32 v11, 2, v11", "ds_bpermute_b32 v6, v11, v0",
+            "s_waitcnt lgkmcnt(0)"]))
+        self.assertEqual(tier, "A")
+        self.assertEqual(whole, halves)
+        self.assertEqual([w[0] for w in whole], [k ^ 1 for k in range(64)])
+
+    def test_a_permlane_swizzle_invariant(self):
+        # vertex k is lane k of the wave (and lane k % 32 of its half): every read stays in the lane's half
+        tier, whole, halves = self.run_both("vs_a_perm", vs([
+            "s_mov_b32 s20, 0x67452301", "s_mov_b32 s21, 0xefcdab89", "v_permlane16_b32 v6, v0, s20, s21",
+            "s_mov_b32 s22, 0x76543210", "s_mov_b32 s23, 0xfedcba98", "v_permlanex16_b32 v7, v0, s22, s23"]))
+        self.assertEqual(tier, "A")
+        self.assertEqual(whole, halves)
+        self.assertEqual([w[:2] for w in whole], [(k ^ 1, k ^ 16) for k in range(64)])
+        tier, whole, halves = self.run_both("vs_a_swz", vs([
+            "ds_swizzle_b32 v6, v0 offset:swizzle(QUAD_PERM,3,2,1,0)", "ds_swizzle_b32 v7, v0 offset:swizzle(SWAP,16)",
+            "s_waitcnt lgkmcnt(0)"]))
+        self.assertEqual(tier, "A")
+        self.assertEqual(whole, halves)
+        self.assertEqual([w[:2] for w in whole], [(k ^ 3, k ^ 16) for k in range(64)])
+
+    def test_c_bpermute_shift_by_one_differs(self):
+        # the negative control of the rule: lane bit 5 reaches an address bit the permute uses
+        tier, whole, halves = self.run_both("vs_c_bperm_shl1", vs([
+            *LANE_ID, "v_lshlrev_b32_e32 v11, 1, v10", "ds_bpermute_b32 v6, v11, v0", "s_waitcnt lgkmcnt(0)"]))
+        self.assertEqual(tier, "C")
+        self.assertNotEqual([w[0] for w in whole], [w[0] for w in halves])
+
     def test_b_readlane_of_uniform_value_at_lane_40(self):
         # lane 40 does not exist in a 32-lane wave: without the rewrite the shuffle reads a lane that is not running
         tier, whole, halves = self.run_both("vs_b_rl", vs([
@@ -291,6 +469,43 @@ class Execution(unittest.TestCase):
         self.assertEqual(tier, "B")
         self.assertEqual(whole, halves)
         self.assertEqual([w[0] for w in whole], [9 + k for k in range(64)])
+
+    def test_b_spill_upper_half_lane_40_and_63_invariant(self):
+        # Lanes 40 and 63 do not exist on a 32-lane subgroup: parked scalar slots keep 64-lane and 2x32-lane exact.
+        tier, whole, halves = self.run_both("vs_b_spill_hi", vs([
+            "v_writelane_b32 v20, s4, 40", "v_writelane_b32 v20, s5, 63",
+            "v_readlane_b32 s21, v20, 40", "v_readlane_b32 s22, v20, 63",
+            "s_add_u32 s23, s21, s22", "v_add_nc_u32_e32 v6, s23, v0"]),
+            push=[0, 0, 0, 0, 100, 23])
+        self.assertEqual(tier, "B")
+        self.assertEqual(whole, halves)
+        self.assertEqual([w[0] for w in whole], [123 + k for k in range(64)])
+
+    def test_b_readfirstlane_uniform_under_narrowed_exec_invariant(self):
+        # Also test with only lane 33 active (lower half has empty EXEC): using s20 ONLY inside the
+        # narrowed block keeps 64-lane and 2x32-lane outputs identical.
+        tier, whole, halves = self.run_both("vs_b_rfl_narrow", vs([
+            "v_mov_b32_e32 v5, 7", "v_cmp_eq_u32_e32 vcc, 33, v0",
+            "s_and_saveexec_b64 s[12:13], vcc", "v_mov_b32_e32 v5, s4",
+            "v_readfirstlane_b32 s20, v5", "v_add_nc_u32_e32 v6, s20, v0",
+            "s_mov_b64 exec, s[10:11]"]),
+            push=[0, 0, 0, 0, 50])
+        self.assertEqual(tier, "B")
+        self.assertEqual(whole, halves)
+        self.assertEqual([w[0] for w in whole], [83 if k == 33 else 0 for k in range(64)])
+
+    def test_c_readfirstlane_escape_after_restore_differs(self):
+        # Same narrowed-EXEC readfirstlane, but s20 escapes past EXEC restore: lower half gets lane-0
+        # fallback (7) while upper half gets 50, so it MUST classify C.
+        tier, whole, halves = self.run_both("vs_c_rfl_escape", vs([
+            "v_mov_b32_e32 v5, 7", "v_cmp_eq_u32_e32 vcc, 33, v0",
+            "s_and_saveexec_b64 s[12:13], vcc", "v_mov_b32_e32 v5, 50",
+            "v_readfirstlane_b32 s20, v5", "s_mov_b64 exec, s[10:11]",
+            "v_mov_b32_e32 v6, s20"]))
+        self.assertEqual(tier, "C")
+        self.assertNotEqual(whole, halves)
+        self.assertEqual([w[0] for w in whole], [50] * 64)
+        self.assertEqual([w[0] for w in halves], [7] * 32 + [50] * 32)
 
     def test_c_lane_count_differs(self):
         tier, whole, halves = self.run_both("vs_c_cnt", vs([
@@ -516,6 +731,201 @@ class ReviewExecution(unittest.TestCase):
         self.assertEqual(whole, [4, 7])                                  # only vertex 33, in the second half
 
 
+class SccVotePolarity(unittest.TestCase):
+    """`s_cmp_eq_u64 m, 0` sets SCC when the mask is empty, `s_cmp_lg_u64 m, 0` (and the 64-bit logic ops, s_bcnt1)
+    when it is not: the side a vote runs when some lane votes yes is the not-taken side of `s_cbranch_scc1` after
+    cmp_eq and the taken one after cmp_lg."""
+    tier = Classification.tier
+    run_both = Execution.run_both
+    HEAD = ["v_cmp_gt_u32_e32 vcc, 20, v0", "s_and_b64 s[20:21], exec, vcc"]
+
+    def test_cmp_eq_jump_to_narrowing_is_c(self):
+        # scc1 (mask empty) jumps to the narrowing, the "yes" side skips it: a half with no lane < 20 empties EXEC,
+        # the wave never does
+        tier, whole, halves = self.run_both("vs_cmp_eq_wrong", vs(self.HEAD + [
+            "s_cmp_eq_u64 s[20:21], 0", "s_cbranch_scc1 1", "s_branch 1", "s_and_b64 exec, exec, s[20:21]",
+            "v_add_nc_u32_e32 v6, 3, v0"]))
+        self.assertEqual([w[0] for w in whole], [3 + k for k in range(64)])
+        self.assertEqual([w[0] for w in halves], [3 + k for k in range(32)] + [0] * 32)
+        self.assertEqual(tier, "C")
+
+    def test_cmp_eq_skip_when_empty_is_a(self):
+        # scc1 (mask empty) skips the narrowed region: the yes side narrows EXEC to the mask, the no side is the join
+        for name, cmp_, br in (("vs_cmp_eq_skip", "s_cmp_eq_u64 s[20:21], 0", "s_cbranch_scc1 2"),
+                               ("vs_cmp_eq_skip0", "s_cmp_eq_u64 0, s[20:21]", "s_cbranch_scc1 2"),
+                               ("vs_cmp_lg_skip", "s_cmp_lg_u64 s[20:21], 0", "s_cbranch_scc0 2")):
+            tier, whole, halves = self.run_both(name, vs(self.HEAD + [
+                cmp_, br, "s_and_b64 exec, exec, s[20:21]", "v_add_nc_u32_e32 v6, 3, v0",
+                "s_mov_b64 exec, s[10:11]"]))
+            self.assertEqual(tier, "A", name)
+            self.assertEqual(whole, halves, name)
+            self.assertEqual([w[0] for w in whole], [3 + k if k < 20 else 0 for k in range(64)], name)
+
+    def test_exec_restore_by_mov_is_not_an_exec_vote(self):
+        # s_mov_b64 writes no SCC: the branch after restoring EXEC reads the cmp_lg vote on the mask, not EXEC's
+        tier, whole, halves = self.run_both("vs_mov_exec_scc", vs(self.HEAD + [
+            "s_cmp_lg_u64 s[20:21], 0", "s_mov_b64 exec, s[10:11]", "s_cbranch_scc0 1",
+            "v_add_nc_u32_e32 v6, 3, v0"]))
+        self.assertEqual([w[0] for w in whole], [3 + k for k in range(64)])
+        self.assertEqual([w[0] for w in halves], [3 + k for k in range(32)] + [0] * 32)
+        self.assertEqual(tier, "C")
+
+    def test_mov_of_the_mask_keeps_the_cmp_eq_vote(self):
+        # s_mov_b64 writes no SCC: scc0 after cmp_eq is "mask not empty", the wrong side to skip the narrowing. Tagged
+        # as a vote on the copy (non-empty polarity) the same skip looked like the exact one: a false tier A
+        tier, whole, halves = self.run_both("vs_mov_keeps_vote", vs(self.HEAD + [
+            "s_cmp_eq_u64 s[20:21], 0", "s_mov_b64 s[22:23], vcc", "s_cbranch_scc0 2",
+            "s_and_b64 exec, exec, s[22:23]", "v_add_nc_u32_e32 v6, 3, v0", "s_mov_b64 exec, s[10:11]"]))
+        self.assertEqual(tier, "C")
+        self.assertEqual(whole, halves)       # equal on this input; the tier is about the branch sense
+
+    def test_cselect_result_is_no_vote_execution(self):
+        # s_cselect_b64 reads SCC and writes none: scc1 after cmp_eq skips when the mask is empty; the narrowing by the
+        # cselect result is the wrong thing to skip and the halves differ from the wave
+        tier, whole, halves = self.run_both("vs_cselect_keeps_vote", vs(self.HEAD + [
+            "s_cmp_eq_u64 s[20:21], 0", "s_cselect_b64 s[22:23], s[20:21], exec", "s_cbranch_scc1 2",
+            "s_and_b64 exec, exec, s[22:23]", "v_add_nc_u32_e32 v6, 3, v0", "s_mov_b64 exec, s[10:11]"]))
+        self.assertEqual(tier, "C")
+        self.assertNotEqual(whole, halves)
+
+    def test_cselect_and_mov_keep_the_scc_vote(self):
+        # neither s_cselect_b64 nor s_mov_b64 of a mask writes SCC: the vote stays on the compared mask
+        for name, mid in (("vs_keep_cselect", "s_cselect_b64 s[22:23], s[20:21], exec"),
+                          ("vs_keep_mov_vcc", "s_mov_b64 s[22:23], vcc")):
+            self.tier(name, vs(self.HEAD + [
+                "s_cmp_eq_u64 s[20:21], 0", mid, "s_cbranch_scc1 1", "s_branch 1", "s_and_b64 exec, exec, s[20:21]",
+                "v_add_nc_u32_e32 v6, 3, v0"]), "C", contains=["unsafe-vote-branch"])
+            self.tier(name + "_a", vs(self.HEAD + [
+                "s_cmp_eq_u64 s[20:21], 0", mid, "s_cbranch_scc1 2", "s_and_b64 exec, exec, s[20:21]",
+                "v_add_nc_u32_e32 v6, 3, v0", "s_mov_b64 exec, s[10:11]"]), "A")
+
+    def test_cmp_eq_wrong_polarity_classification(self):
+        # the same skip with the branch sense flipped: scc0 after cmp_eq jumps over the narrowing when lanes vote yes
+        self.tier("vs_cmp_eq_scc0", vs(self.HEAD + [
+            "s_cmp_eq_u64 s[20:21], 0", "s_cbranch_scc0 2", "s_and_b64 exec, exec, s[20:21]",
+            "v_add_nc_u32_e32 v6, 3, v0", "s_mov_b64 exec, s[10:11]"]), "C", contains=["unsafe-vote-branch"])
+
+
+class KillExit(unittest.TestCase):
+    """The early exit of a pixel kill (`s_andn2_b64 live, live, exec/vcc`, `s_cbranch_scc0` to a block that only
+    empties EXEC from that mask, exports and ends): a half whose live mask is empty writes nothing there, and in the
+    wave its lanes stay off on the run side to the end. Tier A only when the exit is inert, the run side narrows EXEC
+    into the mask's quads before anything else and never widens it, and the vote is the mask's own."""
+    tier = Classification.tier
+    run_both = Execution.run_both
+
+    # -- tier A
+    def test_a_kill_wqm_and_exec(self):
+        self.tier("ps_kill_wqm", kill(KILL, RUN_WQM + ["v_add_nc_u32_e32 v6, 3, v0"], EXIT_PS), "A", [], [])
+
+    def test_a_kill_cmpx_wqm_mov_exec(self):
+        self.tier("ps_kill_cmpx", kill(
+            ["s_mov_b64 s[20:21], exec", "v_cmpx_gt_u32_e32 40, v0", "s_andn2_b64 s[20:21], s[20:21], exec"],
+            ["s_wqm_b64 s[22:23], s[20:21]", "s_mov_b64 exec, s[22:23]", "v_add_nc_u32_e32 v6, 3, v0"],
+            EXIT_PS), "A", [], [])
+
+    def test_a_kill_direct_narrowing(self):
+        for name, run in (("ps_kill_and", ["s_and_b64 exec, exec, s[20:21]"]),
+                          ("ps_kill_mov", ["s_mov_b64 exec, s[20:21]"]),
+                          ("ps_kill_wqm_exec", ["s_wqm_b64 exec, s[20:21]"])):
+            self.tier(name, kill(KILL, run + ["v_add_nc_u32_e32 v6, 3, v0"], EXIT_PS), "A", [], [])
+        self.tier("ps_kill_exit0", kill(KILL, RUN_WQM, ["s_mov_b64 exec, 0"] + EXIT_PS[1:]), "A", [], [])
+
+    def test_a_kill_then_if_endif(self):
+        # a saveexec / restore pair after the narrowing restores a mask taken inside it: EXEC stays in the quads
+        self.tier("ps_kill_if", kill(KILL, RUN_WQM + [
+            "v_cmp_eq_u32_e32 vcc, 1, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_cbranch_execz 1",
+            "v_mov_b32_e32 v6, 7", "s_or_b64 exec, exec, s[12:13]"], EXIT_PS), "A", [], [])
+
+    def test_a_kill_saveexec_first(self):
+        # the run side's first narrowing is a SAVEEXEC: EXEC = wqm mask & EXEC (inside), s[30:31] = the old EXEC
+        self.tier("ps_kill_saveexec", kill(KILL, ["s_wqm_b64 s[22:23], s[20:21]", "s_and_saveexec_b64 s[30:31], "
+                                                  "s[22:23]", "v_add_nc_u32_e32 v6, 3, v0"], EXIT_PS), "A", [], [])
+
+    # -- near misses: tier C unsafe-vote-branch
+    def test_c_exit_with_code_of_its_own(self):
+        for name, exit_ in (
+                ("ps_kill_exit_vmov", ["v_mov_b32_e32 v6, 1"] + EXIT_PS),
+                ("ps_kill_exit_exp_first", ["exp mrt0 v6, v7, v5, v5 done vm", "s_mov_b64 exec, s[20:21]",
+                                            "s_endpgm"]),
+                ("ps_kill_exit_store", EXIT_PS[:1] + ["buffer_store_dword v6, v5, s[0:3], 0 offen"] + EXIT_PS[1:]),
+                ("ps_kill_exit_sgpr", EXIT_PS[:1] + ["s_mov_b32 s5, 1"] + EXIT_PS[1:]),
+                ("ps_kill_exit_other_mask", ["s_mov_b64 exec, s[10:11]"] + EXIT_PS[1:]),
+                ("ps_kill_exit_jumps_back", EXIT_PS[:2] + ["s_branch -8"])):      # into the run side's s_and
+            self.tier(name, kill(KILL, RUN_WQM, exit_), "C", contains=["unsafe-vote-branch"])
+
+    def test_c_run_side_does_not_narrow(self):
+        self.tier("ps_kill_run_code", kill(KILL, ["v_mov_b32_e32 v6, 5"] + RUN_WQM, EXIT_PS),
+                  "C", contains=["unsafe-vote-branch"])
+        self.tier("ps_kill_run_other", kill(KILL, ["s_and_b64 exec, exec, s[10:11]"], EXIT_PS),
+                  "C", contains=["unsafe-vote-branch"])
+
+    def test_c_saveexec_that_does_not_narrow(self):
+        # s_or_saveexec: EXEC = mask | EXEC, not inside; restoring the saved (old) EXEC widens again
+        self.tier("ps_kill_or_saveexec", kill(KILL, ["s_wqm_b64 s[22:23], s[20:21]", "s_or_saveexec_b64 s[30:31], "
+                                                     "s[22:23]", "v_add_nc_u32_e32 v6, 3, v0"], EXIT_PS),
+                  "C", contains=["unsafe-vote-branch"])
+        self.tier("ps_kill_saveexec_restore", kill(KILL, ["s_wqm_b64 s[22:23], s[20:21]", "s_and_saveexec_b64 "
+                                                          "s[30:31], s[22:23]", "s_mov_b64 exec, s[30:31]",
+                                                          "v_add_nc_u32_e32 v6, 3, v0"], EXIT_PS),
+                  "C", contains=["unsafe-vote-branch"])
+
+    def test_c_run_side_widens_again(self):
+        self.tier("ps_kill_widen", kill(KILL, RUN_WQM + ["s_mov_b64 exec, s[10:11]", "v_mov_b32_e32 v6, 9"],
+                                        EXIT_PS), "C", contains=["unsafe-vote-branch"])
+        self.tier("ps_kill_or", kill(KILL, RUN_WQM + ["s_or_b64 exec, exec, s[10:11]"], EXIT_PS),
+                  "C", contains=["unsafe-vote-branch"])
+
+    def test_c_mask_redefined_or_not_the_vote(self):
+        # the mask is rewritten after the vote (s_mov leaves SCC alone): the exit reads another value
+        self.tier("ps_kill_redef", kill(KILL + ["s_mov_b64 s[20:21], exec"], RUN_WQM, EXIT_PS),
+                  "C", contains=["unsafe-vote-branch"])
+        # SCC = (mask == 0): the branch to the "exit" is taken when the mask is not empty
+        self.tier("ps_kill_cmp_eq", kill(KILL + ["s_cmp_eq_u64 s[20:21], 0"], RUN_WQM, EXIT_PS),
+                  "C", contains=["unsafe-vote-branch"])
+
+    def test_c_vm_export_before_the_vote(self):
+        self.tier("ps_kill_vm_first", kill(["exp mrt1 v6, v7, v5, v5 vm"] + KILL, RUN_WQM, EXIT_PS),
+                  "C", contains=["unsafe-vote-branch"])
+
+    def test_shared_exit_of_two_kills_stays_c(self):
+        # conservative: the exit sets EXEC from a live mask the second kill redefined behind the first vote (stale)
+        second = ["v_cmp_gt_u32_e32 vcc, 50, v0", "s_andn2_b64 s[20:21], s[20:21], vcc"]
+        run = RUN_WQM + second + ["s_cbranch_scc0 5"] + RUN_WQM
+        self.tier("ps_kill_shared", kill(KILL, run, EXIT_PS), "C", contains=["tainted-exec"])
+
+    def test_mov_of_a_mask_is_not_a_vote(self):
+        # s_mov_b64 writes no SCC: the branch reads the lane-count compare before it, not a vote on the copy
+        self.tier("ps_mov_scc", ps([
+            "v_cmp_eq_u32_e32 vcc, 1, v0", "s_bcnt1_i32_b64 s6, vcc", "s_cmp_eq_u32 s6, 5",
+            "s_mov_b64 s[24:25], vcc", "s_cbranch_scc0 3", "s_and_saveexec_b64 s[16:17], s[24:25]",
+            "v_mov_b32_e32 v6, 7", "s_or_b64 exec, exec, s[16:17]"]), "C", contains=["lane-count"])
+
+    # -- execution: vertex shaders, 64 lanes against two halves of 32 (vertices < 40 killed: all of the first half)
+    def test_kill_exit_invariant(self):
+        tier, whole, halves = self.run_both("vs_kill", kill(KILL, RUN_WQM + [
+            "v_mul_u32_u24_e32 v6, 3, v0", "v_mov_b32_e32 v7, 1"], EXIT_VS, "vs"))
+        self.assertEqual(tier, "A")
+        self.assertEqual(whole, halves)
+        # a vertex that is off writes nothing: the interpreter's outputs start at zero
+        self.assertEqual([w[:2] for w in whole], [(0, 0)] * 40 + [(3 * k, 1) for k in range(40, 64)])
+
+    def test_kill_exit_saveexec_invariant(self):
+        tier, whole, halves = self.run_both("vs_kill_saveexec", kill(KILL, [
+            "s_wqm_b64 s[22:23], s[20:21]", "s_and_saveexec_b64 s[30:31], s[22:23]",
+            "v_mul_u32_u24_e32 v6, 3, v0", "v_mov_b32_e32 v7, 1"], EXIT_VS, "vs"))
+        self.assertEqual(tier, "A")
+        self.assertEqual(whole, halves)
+        self.assertEqual([w[:2] for w in whole], [(0, 0)] * 40 + [(3 * k, 1) for k in range(40, 64)])
+
+    def test_kill_exit_that_widens_differs_and_is_c(self):
+        tier, whole, halves = self.run_both("vs_kill_widen", kill(KILL, RUN_WQM + [
+            "s_mov_b64 exec, s[10:11]", "v_mul_u32_u24_e32 v6, 3, v0", "v_mov_b32_e32 v7, 1"], EXIT_VS, "vs"))
+        self.assertEqual(tier, "C")
+        self.assertEqual([w[:2] for w in whole], [(3 * k, 1) for k in range(64)])
+        self.assertEqual([w[:2] for w in halves[:32]], [(0, 0)] * 32)      # the first half took the exit
+
+
 class Refusal(unittest.TestCase):
     def test_error_mode_refuses_tier_c(self):
         old = rdna2spirv.WAVE64_GRAPHICS
@@ -538,6 +948,133 @@ class Refusal(unittest.TestCase):
             self.assertIsNone(rdna2spirv.translate.last_gen.w64g)
         finally:
             rdna2spirv.WAVE64_GRAPHICS = old
+
+
+class GeometryRing(unittest.TestCase):
+    """TEST-251: a legacy GS's LDS write is an output slot from its offset alone (rdna2spirv.gs_ds drops the VGPR
+    address, the lane's GSVS area), so a lane id that only forms that address is no partition dependence; the data
+    written, and a lane id in a memory store's address, still are. GPU twins: gs_w64_a_ring, gs_w64_c_lane_id."""
+    PRO = ["s_bfe_i32 s0, s3, 0x80008", "s_bfm_b64 exec, s0, 0", "s_cmp_eq_u32 s0, 64", "s_cselect_b64 exec, -1, exec",
+           "v_mbcnt_lo_u32_b32 v13, -1, 0", "v_mbcnt_hi_u32_b32 v13, -1, v13"]
+    EPI = ["s_sendmsg sendmsg(MSG_GS, GS_OP_EMIT, 0)", "s_sendmsg sendmsg(MSG_GS, GS_OP_CUT, 0)",
+           "s_sendmsg sendmsg(MSG_GS_DONE, GS_OP_NOP)", "s_endpgm"]
+
+    def tier(self, body):
+        sys.path.insert(0, os.path.join(HERE, "..", "..", "runtime", "test", "shaders"))
+        import build                                       # gs_container: gs_tri's ISG1/OSG1
+        name = "gs_w64_ring_test"
+        translate_listing(name, listing(name, self.PRO + body + self.EPI), build.gs_container())
+        w = rdna2spirv.translate.last_gen.w64g
+        return w["tier"], w["reasons"]
+
+    def test_lane_id_in_the_ring_address_is_tier_a(self):
+        self.assertEqual(self.tier(["v_mul_u32_u24_e32 v12, 0x60, v13", "v_mov_b32_e32 v14, 0",
+                                    "ds_write2_b32 v12, v14, v14 offset0:0 offset1:1"]), ("A", []))
+
+    def test_lane_id_written_to_the_ring_is_tier_c(self):
+        self.assertEqual(self.tier(["v_mov_b32_e32 v12, 0", "ds_write2_b32 v12, v13, v13 offset0:0 offset1:1"]),
+                         ("C", ["lane-id"]))
+
+    def test_lane_id_in_a_memory_store_address_is_tier_c(self):
+        self.assertEqual(self.tier(["v_mov_b32_e32 v14, 0", "v_lshlrev_b32_e32 v12, 2, v13",
+                                    "buffer_store_dword v14, v12, s[4:7], 0 offen",
+                                    "ds_write2_b32 v14, v14, v14 offset0:0 offset1:1"]), ("C", ["lane-id"]))
+
+
+
+
+def _ps_xy(lane):
+    """8x8 2x2-quad pixel coordinates per lane: lane 4k+{0,1,2,3} is TL, TR, BL, BR."""
+    q, c = divmod(lane, 4)
+    return 2 * (q % 4) + (c & 1), 2 * (q // 4) + (c >> 1)
+
+
+_SWIZZLE_OFFSETS = {
+    "offset:0x801b": "offset:swizzle(QUAD_PERM,3,2,1,0)",
+    "offset:0x41f": "offset:swizzle(SWAP,1)",
+    "offset:0x401f": "offset:swizzle(SWAP,16)",
+    "offset:0x1c": "offset:swizzle(BROADCAST,4,0)",
+}
+
+
+def _load_ps_w64_lines(name):
+    asm_path = os.path.join(os.path.dirname(HERE), "..", "runtime", "test", "shaders", f"{name}.asm")
+    out = []
+    with open(asm_path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith(";"):
+                continue
+            for hex_off, sym_off in _SWIZZLE_OFFSETS.items():
+                line = line.replace(hex_off, sym_off)
+            out.append(line)
+    return out
+
+
+def _run_ps_cut(asm, wave, push=None, memory=None):
+    words = []
+    for half in range(64 // wave):
+        base = half * wave
+        res = wi.run_wave(
+            asm,
+            wave=wave,
+            push_constants=push,
+            inputs={0: lambda lane, b=base: ((_ps_xy(b + lane)[0] + 0.5) / 64.0,
+                                             (_ps_xy(b + lane)[1] + 0.5) / 64.0, 0.0, 0.0)},
+            memory=memory,
+        )
+        for o in res["outputs"]:
+            if o is None:                 # a killed lane exports nothing; the attachment keeps its clear value
+                words.append(None)
+                continue
+            mrt = o["%out_mrt0"]
+            words.append(tuple(v.bits if isinstance(v, wi.F) else v for v in mrt))
+    return words
+
+
+class PixelShaders(unittest.TestCase):
+    """TEST-722: run every runtime/test/shaders/ps_w64_*.asm fixture on spirv_wave_interp (wave 64 vs 2x32)."""
+
+    def test_ps_w64_fixtures(self):
+        sys.path.insert(0, os.path.join(HERE, "..", "..", "runtime", "test", "shaders"))
+        import w64_graphics as wg
+
+        ps_names = sorted(n for n in wg.FIXTURES if n.startswith("ps_w64_"))
+        self.assertGreaterEqual(len(ps_names), 17)   # 17 when TEST-722 landed; new fixtures run here too
+        for name in ps_names:
+            with self.subTest(fixture=name):
+                ref_tier, ref_fn, env = wg.FIXTURES[name]
+                (tier, _, _), asm = meta_of(name, _load_ps_w64_lines(name))
+                self.assertEqual(tier, ref_tier)
+                push = [int(x, 0) for x in env["VKH_SGPRS"].split(",")] if "VKH_SGPRS" in env else None
+                mem64 = {0: 0} if "VKH_HEAP" in env else None
+                mem32 = {0: 0} if "VKH_HEAP" in env else None
+                w64 = _run_ps_cut(asm, 64, push=push, memory=mem64)
+                for lane in range(64):
+                    x, y = _ps_xy(lane)
+                    exp = ref_fn(y * 64 + x)
+                    if w64[lane] is None:
+                        self.assertEqual(exp, (wg.CLEAR,) * 4, f"{name} wave64 lane {lane} was killed")
+                        continue
+                    for c in range(4):
+                        if exp[c] is not None:
+                            self.assertEqual(w64[lane][c], exp[c], f"{name} wave64 lane {lane} c{c}")
+                if name == "ps_w64_c_readlane":
+                    with self.assertRaises(wi.UnsupportedConstruct):
+                        _run_ps_cut(asm, 32, push=push)
+                    continue
+                w32 = _run_ps_cut(asm, 32, push=push, memory=mem32)
+                if tier in ("A", "B"):
+                    self.assertEqual(w32, w64)
+                else:
+                    self.assertNotEqual(w32, w64)
+                if "VKH_HEAP" in env:
+                    self.assertEqual(mem64[0], 16)
+                    self.assertEqual(mem32[0], 16)
+                    slots64 = {mem64[0x100 + 4 * k] for k in range(16)}
+                    slots32 = {mem32[0x100 + 4 * k] for k in range(16)}
+                    self.assertEqual(len(slots64), 16)
+                    self.assertEqual(slots64, slots32)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ import sys
 import tempfile
 import unittest
 import warnings
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -188,6 +189,24 @@ class F16AndMixConstModifierTests(unittest.TestCase):
         self.assertEqual(got[:3], [0x40003C00, 0x0000BC00, 0xBC00BC00])
 
 class F64ConstModifierStructureTests(unittest.TestCase):
+    def test_f64_literal_and_inline_source_words(self) -> None:
+        fixture = Path(HERE) / "fixtures" / "f64_literals.asm"
+        instructions = [line for line in fixture.read_text(encoding="utf-8").splitlines()
+                        if line and not line.startswith(";")]
+        spv = translate(instructions)
+        words = {name: int(value) for name, value in
+                 re.findall(r"(%\w+) = OpConstant %uint (\d+)", spv)}
+        pairs = {name: (words[high] << 32) | words[low] for name, low, high in
+                 re.findall(r"(%\w+) = OpCompositeConstruct %v2uint_d (%\w+) (%\w+)", spv)}
+        doubles = {name: pairs[pair] for name, pair in
+                   re.findall(r"(%\w+) = OpBitcast %double (%\w+)", spv)}
+        conversions = re.findall(r"OpFConvert %float (%\w+)", spv)
+        additions = re.findall(r"OpFAdd %double (%\w+) (%\w+)", spv)
+        self.assertEqual([doubles[source] for source in conversions],
+                         [0x3FF8000000000000, 0xFFF0000000000000, 64, 0xFFFFFFFFFFFFFFFF])
+        self.assertEqual([(doubles[left], doubles[right]) for left, right in additions],
+                         [(0x0000000100000000, 1), (0x3FF0000000000000, 0xBFF8000000000000)])
+
     def test_f64_emits_fabs_then_fnegate_for_neg_abs_const(self):
         spv = translate([
             "v_cvt_f32_f64 v0, -|1.0|",

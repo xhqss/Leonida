@@ -14,6 +14,7 @@ import gc
 import math
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -145,7 +146,7 @@ def run_ps_bit(x_word: int, y_word: int, cmp_line: str, mask: str = "s4") -> int
     return w & 1
 
 
-def run_cs(name: str, body_lines, wave_size: int):
+def run_cs(name: str, body_lines, wave_size: int, user_sgprs=None):
     """Translate a synthetic compute shader and run all lanes in spirv_mini_interp.run_workgroup."""
     with tempfile.TemporaryDirectory() as tmp:
         os.mkdir(os.path.join(tmp, "disasm"))
@@ -158,15 +159,16 @@ def run_cs(name: str, body_lines, wave_size: int):
             f.write("\ts_endpgm\n")
         with open(os.path.join(tmp, name + ".dxbc"), "wb") as f:
             f.write(STUB_DXBC)
-        # COMPUTE_PGM_RSRC2: 0x8088 -> 4 user SGPRs (s[0:3] = output V#), TGID_X.
+        rsrc2 = 0x8090 if user_sgprs else 0x8088
         with open(os.path.join(tmp, "fssm", name + ".fssm"), "wb") as f:
-            f.write(bytes(0x138) + struct.pack("<4I", 0x8088, wave_size, 1, 1))
+            f.write(bytes(0x138) + struct.pack("<4I", rsrc2, wave_size, 1, 1))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", ResourceWarning)
             spv = rdna2spirv.translate(s_path)
             gc.collect()
         assert rdna2spirv.translate.last_gen.wave64 == (wave_size == 64)
-    pc = VSHARP + [0] * 28
+    sgprs = list(user_sgprs) if user_sgprs else []
+    pc = VSHARP + sgprs + [0] * (28 - len(sgprs))
     return si.run_workgroup(
         spv, wave_size, wave_size,
         inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
@@ -382,6 +384,175 @@ class CmpxWaveExecOpSelTests(unittest.TestCase):
                             self.assertEqual(outputs[lane]["%out_mrt0"][0], 0x40000000 | lane)
                         else:
                             self.assertIsNone(outputs[lane], f"lane {lane} should be killed by v_cmpx")
+
+
+class VcmpInactiveLanesSdstTests(unittest.TestCase):
+    def test_vcmp_inactive_lanes_wave32(self):
+        body = [
+            "v_mov_b32 v1, 0x1234",
+            "v_mov_b32 v2, 0x1234",
+            "s_mov_b32 exec_lo, 0x55555555",
+            "v_cmp_eq_u16_e64 s4, v1, v2 op_sel:[0,0]",
+            "s_mov_b32 exec_lo, -1",
+            "v_lshrrev_b32_e32 v3, v0, s4",
+            "v_and_b32_e32 v3, 1, v3",
+            "v_lshlrev_b32_e32 v6, 2, v0",
+            "buffer_store_dword v3, v6, s[0:3], 0 offen",
+        ]
+        mem = run_cs("cs_vcmp_inactive_w32", body, 32)
+        for lane in range(32):
+            self.assertEqual(mem.get(lane * 4), 1 if (lane % 2 == 0) else 0)
+
+    def test_vcmp_inactive_lanes_wave64(self):
+        body = [
+            "v_mov_b32 v1, 0x1234",
+            "v_mov_b32 v2, 0x1234",
+            "s_mov_b64 exec, 0x5555555555555555",
+            "v_cmp_eq_u16_e64 s[4:5], v1, v2 op_sel:[0,0]",
+            "s_mov_b64 exec, -1",
+            "v_cmp_ge_u32_e64 s6, v0, 32",
+            "v_cndmask_b32_e64 v4, s4, s5, s6",
+            "v_and_b32_e32 v5, 31, v0",
+            "v_lshrrev_b32_e32 v3, v5, v4",
+            "v_and_b32_e32 v3, 1, v3",
+            "v_lshlrev_b32_e32 v6, 2, v0",
+            "buffer_store_dword v3, v6, s[0:3], 0 offen",
+        ]
+        mem = run_cs("cs_vcmp_inactive_w64", body, 64)
+        for lane in range(64):
+            self.assertEqual(mem.get(lane * 4), 1 if (lane % 2 == 0) else 0)
+
+
+class ConstantsAndLiteralsOpSelTests(unittest.TestCase):
+    def test_inline_float_constants_opsel(self):
+        # 1.0 has 0x3C00 in low half, +0.0 in high half
+        v1 = pack16(H_ONE, H_TWO)
+        self.assertEqual(run_ps_bit(v1, 0, "v_cmp_eq_f16_e64 s4, v1, 1.0 op_sel:[0,0]", mask="s4"), 1)
+        self.assertEqual(run_ps_bit(v1, 0, "v_cmp_eq_f16_e64 s4, v1, 1.0 op_sel:[1,0]", mask="s4"), 0)
+        self.assertEqual(run_ps_bit(pack16(H_ZERO, H_TWO), 0, "v_cmp_eq_f16_e64 s4, v1, 1.0 op_sel:[0,1]", mask="s4"), 1)
+        self.assertEqual(run_ps_bit(v1, 0, "v_cmp_eq_f16_e64 s4, v1, 1.0 op_sel:[0,1]", mask="s4"), 0)
+        self.assertEqual(run_ps_bit(pack16(H_MTWO, H_ONE), 0, "v_cmp_eq_f16_e64 s4, v1, -2.0 op_sel:[0,0]", mask="s4"), 1)
+        self.assertEqual(run_ps_bit(pack16(H_ZERO, H_ONE), 0, "v_cmp_eq_f16_e64 s4, v1, -2.0 op_sel:[0,1]", mask="s4"), 1)
+
+    def test_inline_integer_constants_opsel(self):
+        # Inline integer constant 1: opsel=0 -> 1; opsel=1 -> 0
+        self.assertEqual(run_ps_bit(pack16(1, 2), 0, "v_cmp_eq_u16_e64 s4, v1, 1 op_sel:[0,0]", mask="s4"), 1)
+        self.assertEqual(run_ps_bit(pack16(0, 2), 0, "v_cmp_eq_u16_e64 s4, v1, 1 op_sel:[0,1]", mask="s4"), 1)
+        # Inline integer constant -1: opsel=0 -> 0xFFFF; opsel=1 -> 0xFFFF
+        self.assertEqual(run_ps_bit(pack16(0xFFFF, 0), 0, "v_cmp_eq_u16_e64 s4, v1, -1 op_sel:[0,0]", mask="s4"), 1)
+        self.assertEqual(run_ps_bit(pack16(0xFFFF, 0), 0, "v_cmp_eq_u16_e64 s4, v1, -1 op_sel:[0,1]", mask="s4"), 1)
+        self.assertEqual(run_ps_bit(pack16(0xFFFF, 0), 0, "v_cmp_eq_i16_e64 s4, v1, -1 op_sel:[0,0]", mask="s4"), 1)
+        self.assertEqual(run_ps_bit(pack16(0xFFFF, 0), 0, "v_cmp_eq_i16_e64 s4, v1, -1 op_sel:[0,1]", mask="s4"), 1)
+
+    def test_32bit_literals_opsel(self):
+        # Literal 0x80007FFF: lo=0x7FFF (+32767), hi=0x8000 (-32768 in i16, 32768 in u16)
+        self.assertEqual(run_ps_bit(pack16(0x7FFF, 0), 0, "v_cmp_eq_u16_e64 s4, v1, 0x80007FFF op_sel:[0,0]", mask="s4"), 1)
+        self.assertEqual(run_ps_bit(pack16(0x8000, 0), 0, "v_cmp_eq_u16_e64 s4, v1, 0x80007FFF op_sel:[0,1]", mask="s4"), 1)
+        self.assertEqual(run_ps_bit(pack16(0x7FFF, 0), 0, "v_cmp_eq_i16_e64 s4, v1, 0x80007FFF op_sel:[0,0]", mask="s4"), 1)
+        self.assertEqual(run_ps_bit(pack16(0, 0x8000), 0, "v_cmp_eq_i16_e64 s4, v1, 0x80007FFF op_sel:[1,1]", mask="s4"), 1)
+        self.assertEqual(run_ps_bit(pack16(0, 0), 0, "v_cmp_lt_i16_e64 s4, v1, 0x80007FFF op_sel:[0,1]", mask="s4"), 0)
+
+        # f16 literal 0x40003C00 (lo = 1.0, hi = 2.0)
+        self.assertEqual(run_ps_bit(pack16(H_ONE, H_FOUR), 0, "v_cmp_eq_f16_e64 s4, v1, 0x40003C00 op_sel:[0,0]", mask="s4"), 1)
+        self.assertEqual(run_ps_bit(pack16(H_FOUR, H_TWO), 0, "v_cmp_eq_f16_e64 s4, v1, 0x40003C00 op_sel:[1,1]", mask="s4"), 1)
+
+    def test_spirv_val_compliance(self):
+        cases = [
+            ("f16_opsel_const", ["v_cmp_eq_f16_e64 s4, v1, 1.0 op_sel:[0,1]", "v_cndmask_b32_e64 v0, 0, 1, s4", "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"]),
+            ("u16_opsel_lit", ["v_cmp_gt_u16_e64 s4, v1, 0x80007FFF op_sel:[1,0]", "v_cndmask_b32_e64 v0, 0, 1, s4", "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"]),
+            ("i16_opsel_const", ["v_cmp_lt_i16_e64 s4, v1, -1 op_sel:[0,1]", "v_cndmask_b32_e64 v0, 0, 1, s4", "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"]),
+            ("cmpx_f16_wave64", ["v_cmpx_lt_f16_e64 v1, v2 op_sel:[1,0]", "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"]),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for tag, lines in cases:
+                spv_text = translate_ps(lines)
+                spv_path = os.path.join(tmp, f"ps_{tag}.spv")
+                sa_path = os.path.join(tmp, f"ps_{tag}.spvasm")
+                with open(sa_path, "w", encoding="utf-8") as f:
+                    f.write(spv_text)
+                rdna2spirv.assemble_spirv(sa_path, spv_path)
+                res = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", spv_path], capture_output=True, text=True)
+                self.assertEqual(res.returncode, 0, f"spirv-val failed for {tag}: {res.stderr}")
+
+
+class SgprHighHalvesOpSelTests(unittest.TestCase):
+    def test_sgpr_high_halves_f16(self):
+        user_s4 = pack16(H_ONE, H_FOUR)
+        # s4 as src1: opsel:[0, 0] reads lo(s4)=1.0
+        lines = [
+            f"v_mov_b32 v1, {pack16(H_ONE, 0):#x}",
+            "v_cmp_eq_f16_e64 s5, v1, s4 op_sel:[0,0]",
+            "v_and_b32_e32 v2, 1, s5",
+            "v_lshlrev_b32_e32 v3, 2, v0",
+            "buffer_store_dword v2, v3, s[0:3], 0 offen",
+        ]
+        mem = run_cs("cs_sgpr_f16_0", lines, 32, user_sgprs=[user_s4])
+        self.assertEqual(mem.get(0), 1)
+
+        # opsel:[0, 1] reads hi(s4)=4.0
+        lines = [
+            f"v_mov_b32 v1, {pack16(H_FOUR, 0):#x}",
+            "v_cmp_eq_f16_e64 s5, v1, s4 op_sel:[0,1]",
+            "v_and_b32_e32 v2, 1, s5",
+            "v_lshlrev_b32_e32 v3, 2, v0",
+            "buffer_store_dword v2, v3, s[0:3], 0 offen",
+        ]
+        mem = run_cs("cs_sgpr_f16_1", lines, 32, user_sgprs=[user_s4])
+        self.assertEqual(mem.get(0), 1)
+
+        # s4 as src0:
+        lines = [
+            f"v_mov_b32 v1, {pack16(H_FOUR, 0):#x}",
+            "v_cmp_eq_f16_e64 s5, s4, v1 op_sel:[1,0]",
+            "v_and_b32_e32 v2, 1, s5",
+            "v_lshlrev_b32_e32 v3, 2, v0",
+            "buffer_store_dword v2, v3, s[0:3], 0 offen",
+        ]
+        mem = run_cs("cs_sgpr_f16_src0", lines, 32, user_sgprs=[user_s4])
+        self.assertEqual(mem.get(0), 1)
+
+        # s4 with neg / abs on high half:
+        lines = [
+            f"v_mov_b32 v1, {pack16(H_MFOUR, 0):#x}",
+            "v_cmp_eq_f16_e64 s5, v1, -s4 op_sel:[0,1]",
+            "v_and_b32_e32 v2, 1, s5",
+            "v_lshlrev_b32_e32 v3, 2, v0",
+            "buffer_store_dword v2, v3, s[0:3], 0 offen",
+        ]
+        mem = run_cs("cs_sgpr_f16_neg", lines, 32, user_sgprs=[user_s4])
+        self.assertEqual(mem.get(0), 1)
+
+    def test_sgpr_high_halves_int16(self):
+        user_s4 = pack16(0x7FFF, 0xFFFF)
+        lines = [
+            f"v_mov_b32 v1, {pack16(0xFFFF, 0):#x}",
+            "v_cmp_eq_u16_e64 s5, v1, s4 op_sel:[0,1]",
+            "v_and_b32_e32 v2, 1, s5",
+            "v_lshlrev_b32_e32 v3, 2, v0",
+            "buffer_store_dword v2, v3, s[0:3], 0 offen",
+        ]
+        mem = run_cs("cs_sgpr_u16_1", lines, 32, user_sgprs=[user_s4])
+        self.assertEqual(mem.get(0), 1)
+
+        lines = [
+            "v_mov_b32 v1, 0",
+            "v_cmp_lt_i16_e64 s5, s4, v1 op_sel:[1,0]",
+            "v_and_b32_e32 v2, 1, s5",
+            "v_lshlrev_b32_e32 v3, 2, v0",
+            "buffer_store_dword v2, v3, s[0:3], 0 offen",
+        ]
+        mem = run_cs("cs_sgpr_i16_lt", lines, 32, user_sgprs=[user_s4])
+        self.assertEqual(mem.get(0), 1)
+
+        lines = [
+            "v_mov_b32 v1, 0",
+            "v_cmp_lt_u16_e64 s5, s4, v1 op_sel:[1,0]",
+            "v_and_b32_e32 v2, 1, s5",
+            "v_lshlrev_b32_e32 v3, 2, v0",
+            "buffer_store_dword v2, v3, s[0:3], 0 offen",
+        ]
+        mem = run_cs("cs_sgpr_u16_lt", lines, 32, user_sgprs=[user_s4])
+        self.assertEqual(mem.get(0), 0)
 
 
 if __name__ == "__main__":

@@ -94,6 +94,20 @@ def tri_prim():
 
 
 class InstancedGlbTest(unittest.TestCase):
+    def test_gpu_instance_bounds_follow_the_stored_translation_and_scale(self) -> None:
+        meshes = [{
+            "primitives": [tri_prim()],
+            "instances": [((16_777_219, 0, 0), (0, 0, 0, 1), (1, 1.00000003, 1))],
+        }]
+        data, stats = glb_writer.build_instanced_glb(meshes)
+        gltf, binary = twb.parse_and_validate_glb(data)
+        attrs = gltf["nodes"][0]["extensions"][EXT]["attributes"]
+        (translation,) = twb.read_accessor_floats(gltf, binary, attrs["TRANSLATION"])
+        (scale,) = twb.read_accessor_floats(gltf, binary, attrs["SCALE"])
+        self.assertEqual(translation, (16_777_220, 0, 0))
+        self.assertEqual(scale, (1, 1, 1))
+        self.assertEqual(stats["bounds"], [16_777_220, 0, 0, 16_777_221, 1, 0])
+
     def test_gpu_mode(self):
         meshes = [{"name": "a", "primitives": [tri_prim()],
                    "instances": [((0, 0, 0), (0, 0, 0, 1), (1, 1, 1)), ((5, 0, 0), (0, 0, 0, 1), (2, 2, 2))]},
@@ -127,6 +141,25 @@ class InstancedGlbTest(unittest.TestCase):
         self.assertTrue(twp.close(gltf["nodes"][1]["rotation"], [0, 0, h, h], 1e-12))
         self.assertEqual(len(gltf["meshes"]), 1)
         self.assertEqual(st["instances"], 2)
+
+    def test_indexed_material_is_preserved_in_both_instancing_modes(self) -> None:
+        primitive = {
+            "positions": [(0, 0, 0), (1, 0, 0), (0, 1, 0)],
+            "indices": [0, 1, 2],
+            "material_index": 2,
+        }
+        materials = {2: {"name": "paint", "base_color_factor": [0.25, 0.5, 0.75, 1.0]}}
+        meshes = [{"primitives": [glb_writer.pack_primitive(primitive)],
+                   "instances": [((0, 0, 0), (0, 0, 0, 1), (1, 1, 1))]}]
+        for mode in ("gpu", "nodes"):
+            with self.subTest(mode=mode):
+                data, _ = glb_writer.build_instanced_glb(meshes, materials, mode=mode)
+                gltf, _ = twb.parse_and_validate_glb(data)
+                material_index = gltf["meshes"][0]["primitives"][0]["material"]
+                material = gltf["materials"][material_index]
+                self.assertEqual(material["name"], "paint")
+                self.assertEqual(material["pbrMetallicRoughness"]["baseColorFactor"],
+                                 [0.25, 0.5, 0.75, 1.0])
 
     def test_rejects_mirroring_scale_and_bad_input(self):
         bad = [{"primitives": [tri_prim()], "instances": [((0, 0, 0), (0, 0, 0, 1), (1, -1, 1))]}]
@@ -301,6 +334,41 @@ class InstancedBuildTest(unittest.TestCase):
         gltf, _ = read_chunk(out, doc["chunks"][0]["id"])
         self.assertEqual((len(gltf["images"]), len(gltf["meshes"])), (1, 1))
 
+    def test_texture_cache_respects_each_build_size(self) -> None:
+        assets = os.path.join(self.tmp, "tex_assets")
+        twb._write_param_fixture(assets, twb.PARAM_CASES["albedo-first"])
+        ents = os.path.join(self.tmp, "tex.jsonl")
+        twp.write_entities(ents, [twp.entity("tri", (10, 10, 0))])
+
+        for limit, expected in ((1, 1), (0, 4), (2, 2)):
+            with self.subTest(limit=limit):
+                out = os.path.join(self.tmp, f"world_{limit}")
+                doc = world_build.build_world(assets, out, placements=ents, jobs=1, max_tex_size=limit)
+                gltf, bin_data = read_chunk(out, doc["chunks"][0]["id"])
+                (image,) = gltf["images"]
+                view = gltf["bufferViews"][image["bufferView"]]
+                start = view.get("byteOffset", 0)
+                width, height, rgba = twb.parse_and_validate_png(bin_data[start:start + view["byteLength"]])
+                self.assertEqual((width, height), (expected, expected))
+                self.assertEqual(tuple(rgba[:4]), tuple(twb.ALBEDO_RGBA))
+
+    def test_rebuild_embeds_changed_texture_at_the_same_path(self) -> None:
+        assets = os.path.join(self.tmp, "tex_assets")
+        twb._write_param_fixture(assets, twb.PARAM_CASES["albedo-first"])
+        ents = os.path.join(self.tmp, "tex.jsonl")
+        twp.write_entities(ents, [twp.entity("tri", (10, 10, 0))])
+        out = os.path.join(self.tmp, "tex_world")
+        dds = os.path.join(assets, "models", "tri_tex", "001_albedo.dds")
+
+        for color in (tuple(twb.ALBEDO_RGBA), (25, 90, 175, 255)):
+            with self.subTest(color=color):
+                with open(dds, "wb") as texture:
+                    texture.write(twb._uniform_bgra_dds(color))
+                doc = world_build.build_world(assets, out, placements=ents, jobs=1)
+                glb = os.path.join(out, "chunks", doc["chunks"][0]["id"] + ".glb")
+                _, rgba = twb._glb_first_base_color_pixel(glb)
+                self.assertEqual(rgba, color)
+
     def test_cli_instancing_option(self):
         ents = os.path.join(self.tmp, "cli.jsonl")
         twp.write_entities(ents, [twp.entity("test_box", (10, 10, 0))])
@@ -363,6 +431,17 @@ class LodSetsTest(unittest.TestCase):
         with open(os.path.join(out, "world.json"), encoding="utf-8") as f:
             self.assertEqual(json.load(f)["lod_bands"]["lod"], [130.0, 450.0])
 
+    def test_export_uses_finer_lod_distance_when_child_distance_is_missing(self) -> None:
+        rows = [self.lod_row((10, 10, 0), 0, own=120.0),
+                self.lod_row((10, 10, 0), 1, own=450.0)]
+        _, out = self.build(rows, lod_sets=True, lod_levels=(0, 1))
+        with open(os.path.join(out, "world.json"), encoding="utf-8") as handle:
+            world = json.load(handle)
+        self.assertEqual(sorted(chunk["lod"] for chunk in world["chunks"]), ["hd", "lod"])
+        for chunk in world["chunks"]:
+            self.assertTrue(os.path.isfile(os.path.join(out, "chunks", f'{chunk["id"]}.glb')))
+        self.assertEqual(world["lod_bands"], {"hd": [0.0, 120.0], "lod": [120.0, 450.0]})
+
     def test_option_rules(self):
         with self.assertRaisesRegex(ValueError, "lod-sets needs --instancing"):
             self.build([self.lod_row((0, 0, 0), 0)], lod_sets=True, instancing="bake")
@@ -370,6 +449,28 @@ class LodSetsTest(unittest.TestCase):
             assets = twp.write_assets(tmp)
             with self.assertRaisesRegex(ValueError, "lod-sets needs --placements"):
                 world_build.build_world(assets, os.path.join(tmp, "w"), lod_sets=True)
+
+    def test_cli_rejects_unnamed_lod_levels_with_lod_sets(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = twp.write_assets(tmp)
+            ents = os.path.join(tmp, "e.jsonl")
+            twp.write_entities(ents, [self.lod_row((10, 10, 0), level) for level in (7, 255)])
+            out = os.path.join(tmp, "w")
+            for level in (7, 255):
+                with self.subTest(level=level), contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    result = world_build.main([assets, "--out", out, "--no-textures", "--placements", ents,
+                                               "--lod-sets", "--lod-levels", f"0,{level}"])
+                    self.assertEqual(result, 1)
+                    self.assertIn(f"--lod-sets does not recognize lodLevel {level}", stderr.getvalue())
+                    self.assertFalse(os.path.exists(out))
+
+    def test_unnamed_lod_levels_work_without_lod_sets(self):
+        rows = [self.lod_row((10, 10, 0), level) for level in (7, 255)]
+        doc, _ = self.build(rows, lod_levels=(7, 255))
+        self.assertEqual(doc["stats"]["placements"]["placed"], 2)
+        self.assertNotIn("lod_bands", doc)
 
     def test_cli_places_every_level_with_lod_sets(self):
         import contextlib
@@ -388,6 +489,43 @@ class LodSetsTest(unittest.TestCase):
                                                    "--lod-sets", "--lod-levels", "0"]), 0)
                 with open(os.path.join(out, "world.json"), encoding="utf-8") as f:
                     self.assertEqual(sorted(json.load(f)["lod_bands"]), ["hd"])
+
+    def test_prune_stale_chunks_removes_obsolete_lod_set_chunks(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            chunks_dir = os.path.join(tmp, "direct_chunks")
+            os.makedirs(chunks_dir)
+            for name in ("c_hd_0_-1.glb", "c_lod_0_-1.glb", "c_slod2_0_-1.glb",
+                         "c_orphan_hd_1_-1.glb", "c_hd_0_-1.glb.tmp", "c_0_-1.glb", "unrelated.glb"):
+                with open(os.path.join(chunks_dir, name), "wb") as f:
+                    f.write(b"x")
+            world_build._prune_stale_chunks(chunks_dir, {"c_hd_0_-1.glb"})
+            self.assertEqual(sorted(os.listdir(chunks_dir)), ["c_hd_0_-1.glb", "unrelated.glb"])
+
+            assets = twp.write_assets(tmp)
+            ents = os.path.join(tmp, "e.jsonl")
+            twp.write_entities(ents, [self.lod_row((10, 10, 0), 0), self.lod_row((10, 10, 0), 3, child=1000.0)])
+            out = os.path.join(tmp, "w")
+            out_chunks = os.path.join(out, "chunks")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(world_build.main([assets, "--out", out, "--no-textures", "--placements", ents,
+                                                   "--lod-sets"]), 0)
+                self.assertEqual(sorted(os.listdir(out_chunks)), ["c_hd_0_-1.glb", "c_slod2_0_-1.glb"])
+                # Narrowing --lod-levels must prune the obsolete slod2 chunk.
+                self.assertEqual(world_build.main([assets, "--out", out, "--no-textures", "--placements", ents,
+                                                   "--lod-sets", "--lod-levels", "0"]), 0)
+                self.assertEqual(sorted(os.listdir(out_chunks)), ["c_hd_0_-1.glb"])
+                # Switching to a non-LOD build must prune the obsolete c_hd_* chunk.
+                self.assertEqual(world_build.main([assets, "--out", out, "--no-textures", "--placements", ents,
+                                                   "--lod-levels", "0"]), 0)
+                self.assertEqual(sorted(os.listdir(out_chunks)), ["c_0_-1.glb"])
+                # Rebuilding with --lod-sets and then --limit 0 must clear all LOD chunks.
+                self.assertEqual(world_build.main([assets, "--out", out, "--no-textures", "--placements", ents,
+                                                   "--lod-sets"]), 0)
+                self.assertEqual(world_build.main([assets, "--out", out, "--no-textures", "--placements", ents,
+                                                   "--lod-sets", "--limit", "0"]), 0)
+                self.assertEqual(os.listdir(out_chunks), [])
 
 
 class IterPlacementsTest(unittest.TestCase):

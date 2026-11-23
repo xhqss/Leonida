@@ -209,6 +209,55 @@ int main() {
     CHECK(vulkan_view_format(VK_FORMAT_R8G8B8A8_UINT, 20, true) == VK_FORMAT_R32_UINT);
     CHECK(vulkan_view_format(VK_FORMAT_UNDEFINED, 56) == VK_FORMAT_UNDEFINED);
 
+    // Depth/stencil images are only compatible with their own format, even with allow_channel_cast = true,
+    // and colour images never resolve to a depth/stencil view format.
+    for (const VkFormat ds : {VK_FORMAT_D16_UNORM, VK_FORMAT_X8_D24_UNORM_PACK32, VK_FORMAT_D32_SFLOAT,
+                              VK_FORMAT_S8_UINT, VK_FORMAT_D16_UNORM_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT,
+                              VK_FORMAT_D32_SFLOAT_S8_UINT})
+        CHECK(is_depth_stencil_format(ds));
+    for (const VkFormat colour : {VK_FORMAT_R16_UNORM, VK_FORMAT_R16_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_UINT,
+                                  VK_FORMAT_R8_UINT, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_UNDEFINED})
+        CHECK(!is_depth_stencil_format(colour));
+    for (const bool cast : {false, true}) {
+        CHECK(vulkan_view_format(VK_FORMAT_D16_UNORM, 7, cast) == VK_FORMAT_D16_UNORM);
+        for (const std::uint32_t bad_d16 : {8u, 11u, 12u, 13u, 1u, 20u, 22u, 56u, 141u, 146u})
+            CHECK(vulkan_view_format(VK_FORMAT_D16_UNORM, bad_d16, cast) == VK_FORMAT_UNDEFINED);
+        CHECK(vulkan_view_format(VK_FORMAT_D32_SFLOAT, 22, cast) == VK_FORMAT_D32_SFLOAT);
+        for (const std::uint32_t bad_d32 : {20u, 21u, 7u, 13u, 56u, 141u, 146u})
+            CHECK(vulkan_view_format(VK_FORMAT_D32_SFLOAT, bad_d32, cast) == VK_FORMAT_UNDEFINED);
+        CHECK(vulkan_view_format(VK_FORMAT_D24_UNORM_S8_UINT, 141, cast) == VK_FORMAT_D24_UNORM_S8_UINT);
+        CHECK(vulkan_view_format(VK_FORMAT_X8_D24_UNORM_PACK32, 141, cast) == VK_FORMAT_X8_D24_UNORM_PACK32);
+        CHECK(vulkan_view_format(VK_FORMAT_D32_SFLOAT_S8_UINT, 146, cast) == VK_FORMAT_D32_SFLOAT_S8_UINT);
+        CHECK(vulkan_view_format(VK_FORMAT_S8_UINT, 5, cast) == VK_FORMAT_S8_UINT);
+        for (const std::uint32_t bad_ds : {1u, 5u, 7u, 13u, 20u, 21u, 22u, 56u}) {
+            CHECK(vulkan_view_format(VK_FORMAT_D24_UNORM_S8_UINT, bad_ds, cast) == VK_FORMAT_UNDEFINED);
+            CHECK(vulkan_view_format(VK_FORMAT_D32_SFLOAT_S8_UINT, bad_ds, cast) == VK_FORMAT_UNDEFINED);
+        }
+        CHECK(vulkan_view_format(VK_FORMAT_D24_UNORM_S8_UINT, 146, cast) == VK_FORMAT_UNDEFINED);
+        CHECK(vulkan_view_format(VK_FORMAT_D32_SFLOAT_S8_UINT, 141, cast) == VK_FORMAT_UNDEFINED);
+        // Colour images never resolve to a depth/stencil view format, while normal colour casts remain intact.
+        CHECK(vulkan_view_format(VK_FORMAT_R32_SFLOAT, 141, cast) == VK_FORMAT_UNDEFINED);
+        CHECK(vulkan_view_format(VK_FORMAT_R32_SFLOAT, 146, cast) == VK_FORMAT_UNDEFINED);
+        CHECK(vulkan_view_format(VK_FORMAT_R8G8B8A8_UNORM, 141, cast) == VK_FORMAT_UNDEFINED);
+        CHECK(vulkan_view_format(VK_FORMAT_R8G8B8A8_UNORM, 146, cast) == VK_FORMAT_UNDEFINED);
+        CHECK(vulkan_view_format(VK_FORMAT_R16_UNORM, 13, cast) == VK_FORMAT_R16_SFLOAT);
+        CHECK(vulkan_view_format(VK_FORMAT_R32_SFLOAT, 20, cast) == VK_FORMAT_R32_UINT);
+    }
+    // Exhaustive invariant across the whole format table: depth/stencil images only accept their own code,
+    // and colour images never produce a depth/stencil view format.
+    for (const FormatRow& img : format_table) {
+        for (const FormatRow& view : format_table) {
+            for (const bool cast : {false, true}) {
+                const VkFormat resolved = vulkan_view_format(img.vulkan, view.gfx10, cast);
+                if (is_depth_stencil_format(img.vulkan)) {
+                    CHECK(resolved == (img.gfx10 == view.gfx10 ? img.vulkan : VK_FORMAT_UNDEFINED));
+                } else {
+                    CHECK(!is_depth_stencil_format(resolved));
+                }
+            }
+        }
+    }
+
     // DST_SEL as a component mapping.
     const auto same = [](const VkComponentMapping& m, VkComponentSwizzle r, VkComponentSwizzle g, VkComponentSwizzle b,
                          VkComponentSwizzle a) { return m.r == r && m.g == g && m.b == b && m.a == a; };
@@ -313,6 +362,15 @@ int main() {
                            .compare = CompareFunction::greater, .max_lod = 9.0f, .unnormalized = true});
     CHECK(info.unnormalizedCoordinates == VK_TRUE && info.mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST);
     CHECK(info.maxLod == 0.0f && info.anisotropyEnable == VK_FALSE && info.compareEnable == VK_FALSE);
+    // Unnormalised: U and V clamp (wrap, the default S# mode, would be invalid: VUID ...-01075), border stays border,
+    // W is free; min and mag filter agree (VUID ...-01072).
+    CHECK(info.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE &&
+          info.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE &&
+          info.addressModeW == VK_SAMPLER_ADDRESS_MODE_REPEAT && info.minFilter == info.magFilter);
+    info = vulkan_sampler({.address_u = AddressMode::clamp_border, .address_v = AddressMode::mirror,
+                           .min_filter = Filter::bilinear, .unnormalized = true});
+    CHECK(info.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER &&
+          info.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && info.minFilter == VK_FILTER_NEAREST);
     CHECK(vulkan_address_mode(AddressMode::mirror) == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT);
     CHECK(vulkan_address_mode(AddressMode::mirror_once_last_texel) == VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE);
     CHECK(vulkan_address_mode(AddressMode::clamp_half_border) == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);

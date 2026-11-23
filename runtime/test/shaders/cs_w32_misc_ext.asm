@@ -8,6 +8,8 @@
 ;   out[5] = v_mad_i32_i16(0x8000, 2, 5)                  = 0xFFFF0005  (-32768 * 2 + 5)
 ;   out[6] = (ds_cmpst_rtn_b32 old << 8) | LDS after      = 0x509       (LDS 5, compare 5, store 9)
 ;   out[7] = high dword of the second ds_read2_b64 element = 0xCAFEF00D (written by ds_write2_b64 offset1:3)
+; EXEC is cut to lane 0 before the LDS ops: 32 lanes on one LDS address would race (which lane's
+; ds_cmpst / ds_wrxchg2 runs first is up to the hardware), as #1850 showed for ds_xor_b64.
 ; group: 32,1,1
 ; Run: vk_compute_test cs_w32_misc_ext.spv 1 dump -> out[0..7] = 268374015 3804538504 524287 2147450880 4294836226 4294901765 1289 3405705229
 ; mattr: +wavefrontsize32,-wavefrontsize64
@@ -28,6 +30,7 @@ v_mov_b32_e32 v1, 0xffff
 v_mad_u32_u16 v5, v1, v1, 1
 v_mov_b32_e32 v1, 0x8000
 v_mad_i32_i16 v6, v1, 2, 5
+v_cmpx_eq_u32_e32 0, v0
 v_mov_b32_e32 v10, 0x10
 v_mov_b32_e32 v11, 5
 v_mov_b32_e32 v12, 9
@@ -47,7 +50,6 @@ ds_write2_b64 v10, v[16:17], v[18:19] offset0:1 offset1:3
 s_waitcnt lgkmcnt(0)
 ds_read2_b64 v[20:23], v10 offset0:1 offset1:3
 s_waitcnt lgkmcnt(0)
-v_cmpx_eq_u32_e32 0, v0
 v_mov_b32_e32 v24, s9
 v_mov_b32_e32 v25, 0
 buffer_store_dword v24, v25, s[0:3], 0 offen

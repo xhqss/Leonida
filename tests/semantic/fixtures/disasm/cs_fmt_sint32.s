@@ -45,7 +45,7 @@
 	tbuffer_load_format_x v9, v5, s[4:7], 0 format:[BUF_FMT_32_SINT] offen offset:8
 	v_mov_b32_e32 v6, 0x70
 	buffer_store_dwordx2 v[8:9], v6, s[0:3], 0 offen
-	s_mov_b32 s7, 0x3103ffac
+	s_mov_b32 s7, 0x3103f22c
 	v_mov_b32_e32 v6, 0x90
 	buffer_store_format_xy v[1:2], v6, s[4:7], 0 offen
 	s_mov_b32 s7, 0x31049fac
@@ -54,7 +54,7 @@
 	s_mov_b32 s7, 0x3104cfac
 	v_mov_b32_e32 v6, 0xb0
 	buffer_store_format_xyzw v[1:4], v6, s[4:7], 0 offen
-	s_mov_b32 s7, 0x3103ffac
+	s_mov_b32 s7, 0x3103f22c
 	v_mov_b32_e32 v6, 0xc0
 	v_mov_b32_e32 v7, 0x8000fffd
 	buffer_store_format_d16_xy v7, v6, s[4:7], 0 offen

@@ -7,8 +7,11 @@ It never decrypts, never writes game data, and does not decode resources.
 The story-specific signature is `PSIN`: a section chain whose records are a four-byte tag
 (`LSCH`, `LENM`, `LSNS`, `LGID`, `LRSC`, `CHKS`) followed by a big-endian u32 length that includes
 the eight-byte record header. `0DRP` pages (magic at +16, version at +0x14, page count at +0x20)
-and `RSC8` resource headers (version at +4) are reported with their measured fields. Anything else
-is reported as `raw:<hex>` instead of being guessed.
+and `RSC8` resource headers (version at +4) are reported with their measured fields. The tagged
+auxiliary table that starts a `0DRP` second system page keeps its historical label `clip-stream`
+and is reported with its entry count, tags and payload end, only when anim_index.aux_table finds
+its directory and every payload inside the stream. Anything else is reported as `raw:<hex>`
+instead of being guessed.
 
 Usage:
     python -I story_index.py <archive.rpf> <out.csv|out.json> [--start N] [--limit BYTES] [--quiet]
@@ -29,9 +32,11 @@ import tempfile
 import time
 import zlib
 
-# -I keeps the script directory off sys.path; add it back so file_mode's helpers are importable.
+# -I keeps the script directory off sys.path; add it back so the sibling helpers are importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from anim_index import aux_table  # noqa: E402
 from file_mode import published_mode  # noqa: E402
+from zero_span import gap_split  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
@@ -97,7 +102,7 @@ def _printable(data):
     if not data:
         return False
     sample = data[:512]
-    good = sum(1 for b in sample if 9 <= b < 127 or b in (10, 13))
+    good = sum(1 for b in sample if 32 <= b < 127 or b in (9, 10, 13))
     return len(sample) >= 64 and good / len(sample) > 0.9
 
 
@@ -136,8 +141,13 @@ def classify(data, offset, stored):
           and 0 < (_u32(data, 8) or 0) <= 4096):
         record.update(signature="typehash", version=8, count=_u32(data, 8),
                       detail=f"type=0x{_u32(data, 0):08x}")
-    elif len(data) >= 8 and _u32(data, 0) in (2, 3) and data[4:8] == b"\x01\x01\x00\x00":
-        record.update(signature="clip-stream", version=_u32(data, 0), detail="24-byte header")
+    elif (table := aux_table(data)) is not None:
+        # Same validated check and record shape as anim_index (#2496): historical label kept so consumers
+        # group these pages as before; the count is the measured entry count, not a version.
+        entries, payload_end = table
+        record.update(signature="clip-stream", count=len(entries),
+                      detail=f"aux-table tags={','.join(f'0x{tag:x}' for tag, _ in entries)} "
+                             f"payload_end={payload_end}")
     elif data[:3] == b"KB2" and len(data) >= 0x20:
         record.update(signature="bink2", version=chr(data[3]), count=_u32(data, 8),
                       detail=f"{_u32(data, 0x14)}x{_u32(data, 0x18)}")
@@ -149,9 +159,6 @@ def classify(data, offset, stored):
         record.update(signature="raw:" + data[:4].hex())
     return record
 
-
-def _gap(gap):
-    return (len(gap), 0) if gap.count(0) == len(gap) else (0, len(gap))
 
 
 def scan_rpf(path, start=None, limit=None, progress=None):
@@ -183,7 +190,7 @@ def scan_rpf(path, start=None, limit=None, progress=None):
                 if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                     pos = s + 1
                     continue
-                z, u = _gap(m[last:s])
+                z, u = gap_split(m, last, s)
                 zero += z
                 unread += u
                 record = classify(head, s, blen)
@@ -208,14 +215,14 @@ def scan_rpf(path, start=None, limit=None, progress=None):
                 pos = s + 1
                 continue
             used = p - s - len(d.unused_data)
-            z, u = _gap(m[last:s])
+            z, u = gap_split(m, last, s)
             zero += z
             unread += u
             rows.append(classify(out, s, used))
             last = pos = s + used
             if progress and len(rows) % 2000 == 0:
                 progress(len(rows), pos, end)
-        z, u = _gap(m[last:end])
+        z, u = gap_split(m, last, end)
         zero += z
         unread += u
         if size:
@@ -299,7 +306,7 @@ def write_output(path, rows, summary):
     with tempfile.TemporaryDirectory(dir=parent) as staging:
         staged = os.path.join(staging, "story_index" + ext)
         if ext == ".json":
-            with open(staged, "w", encoding="utf-8") as f:
+            with open(staged, "w", encoding="utf-8", newline="\n") as f:
                 json.dump({"summary": summary, "files": rows}, f, indent=1)
         else:
             with open(staged, "w", encoding="utf-8", newline="") as f:

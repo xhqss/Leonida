@@ -7,7 +7,10 @@ import unittest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "meta_to_xml.ps1"
-POWERSHELL = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"]
+POWERSHELL_EXE = Path(os.environ.get("SystemRoot", r"C:\Windows")).joinpath(
+    "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+)
+POWERSHELL = [str(POWERSHELL_EXE), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"]
 BUILD_STUB = """
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition 'public class SharpDXPlaceholder {}' -OutputAssembly SharpDX.dll
@@ -30,7 +33,7 @@ namespace CodeWalker.GameFiles {
 
 @unittest.skipUnless(os.name == "nt", "Windows PowerShell 5.1 script")
 class MetaToXmlPathsTest(unittest.TestCase):
-    def test_plain_and_bracketed_paths(self):
+    def test_plain_bracketed_and_unicode_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             deps = root / "deps"
@@ -47,6 +50,7 @@ class MetaToXmlPathsTest(unittest.TestCase):
                 ("carve [1]", "archive", "out"),
                 ("carve", "archive [2]", "out"),
                 ("carve", "archive", "out [3]"),
+                ("carve", "archive 東京🧪", "out"),
             )
             for i, (carve_name, archive_name, out_name) in enumerate(cases):
                 with self.subTest(carve=carve_name, archive=archive_name, out=out_name):
@@ -55,6 +59,7 @@ class MetaToXmlPathsTest(unittest.TestCase):
                     archive = carve / archive_name
                     archive.mkdir(parents=True)
                     (archive / "index.json").write_text(json.dumps({"files": [
+                        {"head": "5053494e", "off": 8},  # Indexed blob is missing.
                         {"head": "5053494e00", "off": 0},
                         {"head": "5053494e", "off": 16},
                     ]}), encoding="utf-8")
@@ -67,11 +72,13 @@ class MetaToXmlPathsTest(unittest.TestCase):
                         capture_output=True, text=True, timeout=30,
                     )
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertIn("pso ok 1 failed 1; rbf ok 0 failed 0", result.stdout)
+                    self.assertIn("pso ok 1 failed 2; rbf ok 0 failed 0", result.stdout)
                     self.assertEqual((out / archive_name / "000000000000.pso.xml").read_text(),
                                      "<synthetic />")
-                    self.assertEqual((out / "failures.txt").read_text().splitlines(),
-                                     ["", f"{archive_name}\\000000000010 pso : synthetic parser failure"])
+                    failures = (out / "failures.txt").read_text(encoding="utf-8-sig").splitlines()
+                    self.assertEqual(len(failures), 3)
+                    self.assertTrue(failures[1].startswith(f"{archive_name}\\000000000008 pso : "), failures[1])
+                    self.assertEqual(failures[2], f"{archive_name}\\000000000010 pso : synthetic parser failure")
 
 
 if __name__ == "__main__":

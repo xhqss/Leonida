@@ -1,10 +1,13 @@
-// Shared setup for the GPU tests of the D3D12 layer: a Vulkan 1.3 device with dynamicRendering, synchronization2,
-// timelineSemaphore and separateDepthStencilLayouts, images, buffers and one-shot submissions.
+// Shared setup for the GPU tests of the D3D12 layer: a Vulkan 1.3 device (or 1.2 with VK_KHR_dynamic_rendering and
+// VK_KHR_synchronization2) with dynamicRendering, synchronization2, timelineSemaphore and
+// separateDepthStencilLayouts, images, buffers and one-shot submissions.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; Device::validation_errors() counts errors.
 #pragma once
 
 #include "vulkan_loader.h"
+#include "../src/queue_families.h"
 #include "../src/vulkan_device_filter.h"
+#include "../src/vulkan13_features.h"
 #include "vk_device_pick.h"
 #include "../src/subgroup_size.h"
 
@@ -82,13 +85,24 @@ public:
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     std::uint32_t family = 0;
+    // Set before initialize(): how many queues of `family` to create (fewer if the family has fewer). `queues` holds the
+    // handles; queues[0] == queue. A test that wants distinct VkQueues for its D3D12 queues passes them on as
+    // VulkanDeviceInfo::command_queues when there is more than one.
+    std::uint32_t queue_count_wanted = 1;
+    std::uint32_t family_queue_count = 1;  // the family's queueCount, known after the device is chosen
+    std::vector<VkQueue> queues;
     bool validation = false;
     bool bc = false;  // textureCompressionBC enabled
+    bool all_queue_types = false;
+    VkQueue compute_queue = VK_NULL_HANDLE, copy_queue = VK_NULL_HANDLE;
+    std::uint32_t compute_family = 0, copy_family = 0;
+    std::vector<VkQueueFamilyProperties> families;
     VkPhysicalDeviceFeatures enabled{};  // the core features enabled on `device`
     bool bindless = false;         // the features the bindless set 0 needs are enabled
     bool partially_bound = false;  // and its slots can stay empty
     bool image_view_min_lod = false;
     bool sampler_filter_minmax = false;
+    bool vertex_attribute_divisor = false;
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
@@ -101,9 +115,12 @@ public:
     bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
     bool request_buffer_device_address = false;  // set before create(): enable bufferDeviceAddress where supported
     bool buffer_device_address = false;  // enabled: buffer() memory and buffers can be addressed (device_address())
+    bool conservative_rasterization = false; // VK_EXT_conservative_rasterization enabled where available
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
     // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
     leonida::SubgroupSizeCaps subgroup;
+    bool custom_border_color = false;  // VK_EXT_custom_border_color and customBorderColors enabled
+    bool custom_border_color_without_format = false;
 
     Device() = default;
     Device(const Device&) = delete;
@@ -134,9 +151,10 @@ public:
             reinterpret_cast<PFN_vkDestroyInstance>(instance_proc(instance, "vkDestroyInstance"))(instance, nullptr);
     }
 
+    // A Vulkan 1.3 function falls back to its KHR name on a 1.2 device.
     template<typename F>
     F fn(const char* name) const {
-        return reinterpret_cast<F>(device_proc(device, name));
+        return reinterpret_cast<F>(leonida::device_proc_or_khr(device_proc, device, name));
     }
 
     template<typename F>
@@ -200,6 +218,9 @@ public:
             std::vector<VkExtensionProperties> available(count);
             enumerate_instance(nullptr, &count, available.data());
             bool caps2 = false;
+            for (const auto& e : available)  // lists the HDR10 (ST.2084) surface formats, when the display has them
+                if (std::strcmp(e.extensionName, "VK_EXT_swapchain_colorspace") == 0)
+                    instance_extensions.push_back("VK_EXT_swapchain_colorspace");
             for (const auto& e : available) {
                 caps2 = caps2 || std::strcmp(e.extensionName, "VK_KHR_get_surface_capabilities2") == 0;
                 surface_m1_khr = surface_m1_khr || std::strcmp(e.extensionName, "VK_KHR_surface_maintenance1") == 0;
@@ -263,22 +284,30 @@ public:
         if (result != VK_SUCCESS) return failure("vkEnumeratePhysicalDevices", result);
         VkPhysicalDeviceProperties chosen{};
         int best_rank = -1;
+        const auto features2_of = instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2");
+        const auto device_extensions_of =
+            instance_fn<PFN_vkEnumerateDeviceExtensionProperties>("vkEnumerateDeviceExtensionProperties");
+        leonida::Vulkan13Features candidate13;
         for (auto candidate : devices) {
             VkPhysicalDeviceProperties props{};
             properties_of(candidate, &props);
-            if (props.apiVersion < VK_API_VERSION_1_3 || !leonida::vulkan_device_wanted(props.deviceName)) continue;
+            if (!leonida::vulkan_device_wanted(props.deviceName)) continue;
+            candidate13.query(candidate, props.apiVersion, features2_of, device_extensions_of);
+            if (!candidate13.usable()) continue;
             std::uint32_t family_count = 0;
             families_of(candidate, &family_count, nullptr);
-            std::vector<VkQueueFamilyProperties> families(family_count);
-            families_of(candidate, &family_count, families.data());
+            std::vector<VkQueueFamilyProperties> candidate_families(family_count);
+            families_of(candidate, &family_count, candidate_families.data());
             for (std::uint32_t i = 0; i < family_count; ++i) {
-                if (!(families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
+                if (!(candidate_families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
                 if (const int rank = leonida::vk_test::device_rank(props.deviceType, props.vendorID);
                     rank > best_rank) {
                     physical = candidate;
                     family = i;
+                    family_queue_count = candidate_families[i].queueCount;
                     chosen = props;
                     best_rank = rank;
+                    v13_.choose(candidate13);
                 }
                 break;
             }
@@ -286,22 +315,25 @@ public:
         if (!physical) {
             if (const std::string filter = leonida::vulkan_device_filter(); !filter.empty()) {
                 // A filter that matches nothing fails the test instead of skipping it.
-                std::fprintf(stderr, "LEONIDA_VK_DEVICE=%s: no Vulkan 1.3 device with a graphics queue matches\n",
+                std::fprintf(stderr,
+                             "LEONIDA_VK_DEVICE=%s: no Vulkan 1.3 device (or 1.2 with VK_KHR_dynamic_rendering and "
+                             "VK_KHR_synchronization2) with a graphics queue matches\n",
                              filter.c_str());
                 return DeviceStatus::failed;
             }
-            std::fprintf(stderr, "no Vulkan 1.3 device with a graphics queue\n");
+            std::fprintf(stderr, "no Vulkan 1.3 device (or 1.2 with VK_KHR_dynamic_rendering and "
+                                 "VK_KHR_synchronization2) with a graphics queue\n");
             return DeviceStatus::unavailable;
         }
-        std::printf("device: %s%s\n", chosen.deviceName, validation ? " (validation on)" : "");
+        std::printf("device: %s%s%s\n", chosen.deviceName, v13_.core ? "" : " (Vulkan 1.2 + KHR extensions)",
+                    validation ? " (validation on)" : "");
 
-        VkPhysicalDeviceVulkan13Features features13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-        VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &features13};
+        VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
         VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &features11};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features12};
-        instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &features);
-        if (!features13.dynamicRendering || !features13.synchronization2 || !features12.timelineSemaphore ||
-            !features12.separateDepthStencilLayouts || !features12.bufferDeviceAddress) {
+        features2_of(physical, &features);
+        if (!features12.timelineSemaphore || !features12.separateDepthStencilLayouts ||
+            !features12.bufferDeviceAddress) {
             std::fprintf(stderr, "the device lacks dynamicRendering, synchronization2, timelineSemaphore or "
                                  "separateDepthStencilLayouts\n");
             return DeviceStatus::unavailable;
@@ -327,14 +359,8 @@ public:
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
         enable_conditional.conditionalRendering = VK_TRUE;
 
-        VkPhysicalDeviceVulkan13Features enable13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-                                                  conditional_rendering ? &enable_conditional : nullptr};
-        enable13.dynamicRendering = VK_TRUE;
-        enable13.synchronization2 = VK_TRUE;
-        enable13.subgroupSizeControl = features13.subgroupSizeControl;
-        enable13.computeFullSubgroups = features13.computeFullSubgroups;
         leonida::query_subgroup_size_caps(instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2"),
-                                          physical, features13.subgroupSizeControl, features13.computeFullSubgroups,
+                                          physical, v13_.subgroup_size_control, v13_.compute_full_subgroups,
                                           subgroup);
         std::printf("subgroup sizes: %u..%u (default %u), requirable in stages 0x%x, subgroupSizeControl %s, "
                     "computeFullSubgroups %s\n",
@@ -342,7 +368,8 @@ public:
                     subgroup.subgroup_size_control ? "on" : "off", subgroup.compute_full_subgroups ? "on" : "off");
         // shaderDrawParameters, where available: translated vertex shaders will read BaseVertex and BaseInstance once PR 436
         // (zero-based VS ids) is in; harmless before.
-        VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &enable13};
+        VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+                                                  v13_.enable(conditional_rendering ? &enable_conditional : nullptr)};
         enable11.shaderDrawParameters = features11.shaderDrawParameters;
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
         enable12.timelineSemaphore = VK_TRUE;
@@ -369,11 +396,32 @@ public:
         enable12.samplerFilterMinmax = sampler_filter_minmax;
         enable12.bufferDeviceAddress = VK_TRUE;
 
-        const float priority = 1.0f;
-        VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-        queue_info.queueFamilyIndex = family;
-        queue_info.queueCount = 1;
-        queue_info.pQueuePriorities = &priority;
+        const std::uint32_t graphics_count = std::max(1u, std::min(queue_count_wanted, family_queue_count));
+        const std::vector<float> priority(graphics_count, 1.0f);
+        {
+            std::uint32_t family_count = 0;
+            families_of(physical, &family_count, nullptr);
+            families.resize(family_count);
+            families_of(physical, &family_count, families.data());
+        }
+        compute_family = copy_family = family;
+        if (all_queue_types) {
+            const auto picked = leonida::pick_queue_families(families, family);
+            compute_family = picked.compute;
+            copy_family = picked.copy;
+        }
+        std::vector<VkDeviceQueueCreateInfo> queue_infos;
+        for (std::uint32_t f : {family, compute_family, copy_family}) {
+            bool seen = false;
+            for (const auto& q : queue_infos) seen = seen || q.queueFamilyIndex == f;
+            if (seen) continue;
+            VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+            q.queueFamilyIndex = f;
+            q.queueCount = f == family ? graphics_count : 1;
+            q.pQueuePriorities = priority.data();
+            queue_infos.push_back(q);
+            sharing_.push_back(f);
+        }
         VkPhysicalDeviceFeatures enable{};
         enable.textureCompressionBC = features.features.textureCompressionBC;  // BC uploads, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 (index features)
@@ -381,6 +429,7 @@ public:
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
         enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
+        enable.geometryShader = features.features.geometryShader;  // d3d12_geometry_test, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 for their addresses
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
@@ -399,8 +448,38 @@ public:
             instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
             image_view_min_lod = min_lod.minLod == VK_TRUE;
             if (image_view_min_lod) {
-                min_lod.pNext = enable13.pNext;
-                enable13.pNext = &min_lod;
+                min_lod.pNext = *v13_.next();
+                *v13_.next() = &min_lod;
+            }
+        }
+        const char* divisor_extension = nullptr;
+        for (const char* name :
+             {VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME}) {
+            if (std::any_of(extensions.begin(), extensions.end(),
+                            [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; })) {
+                divisor_extension = name;
+                break;
+            }
+        }
+        VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divisor_khr{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
+        VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT divisor_ext{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
+        if (divisor_extension) {
+            const bool is_khr = std::strcmp(divisor_extension, VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) == 0;
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                            is_khr ? static_cast<void*>(&divisor_khr) : static_cast<void*>(&divisor_ext)};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            vertex_attribute_divisor = (is_khr ? divisor_khr.vertexAttributeInstanceRateDivisor
+                                               : divisor_ext.vertexAttributeInstanceRateDivisor) == VK_TRUE;
+            if (vertex_attribute_divisor) {
+                if (is_khr) {
+                    divisor_khr.pNext = *v13_.next();
+                    *v13_.next() = &divisor_khr;
+                } else {
+                    divisor_ext.pNext = *v13_.next();
+                    *v13_.next() = &divisor_ext;
+                }
             }
         }
         VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{
@@ -413,8 +492,8 @@ public:
         }
         const char* host_image_copy_name = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
         if (host_image_copy) {
-            host_copy.pNext = enable13.pNext;  // after the conditional rendering features, if any
-            enable13.pNext = &host_copy;
+            host_copy.pNext = *v13_.next();  // after the conditional rendering features, if any
+            *v13_.next() = &host_copy;
         }
 
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
@@ -427,8 +506,8 @@ public:
             instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
             shader_fma = fma_features.shaderFmaFloat32 == VK_TRUE;
             if (shader_fma) {
-                fma_features.pNext = enable13.pNext;
-                enable13.pNext = &fma_features;
+                fma_features.pNext = *v13_.next();
+                *v13_.next() = &fma_features;
             }
         }
 #endif
@@ -436,13 +515,36 @@ public:
         enable.pipelineStatisticsQuery = features.features.pipelineStatisticsQuery;
         occlusion_query_precise = features.features.occlusionQueryPrecise == VK_TRUE;
         pipeline_statistics_query = features.features.pipelineStatisticsQuery == VK_TRUE;
+
+        // VK_EXT_custom_border_color where the device has it.
+        VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+        for (const auto& extension : extensions) {
+            if (std::strcmp(extension.extensionName, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME) != 0) continue;
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &custom_border};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            custom_border_color = custom_border.customBorderColors == VK_TRUE;
+            custom_border_color_without_format = custom_border.customBorderColorWithoutFormat == VK_TRUE;
+        }
+        const char* custom_border_color_name = VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
+        if (custom_border_color) {
+            custom_border.pNext = *v13_.next();   // where later feature structs go since #1706
+            *v13_.next() = &custom_border;
+        }
+
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
-        device_info.queueCreateInfoCount = 1;
-        device_info.pQueueCreateInfos = &queue_info;
+        device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
+        device_info.pQueueCreateInfos = queue_infos.data();
         device_info.pEnabledFeatures = &enable;
         enabled = enable;
         std::vector<const char*> device_extensions;
+        v13_.add_extensions(device_extensions);
+        conservative_rasterization = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0;
+        });
+        if (conservative_rasterization) device_extensions.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
         if (image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+        if (vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
         const char* swapchain = "VK_KHR_swapchain";
@@ -462,8 +564,8 @@ public:
                 VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &swapchain_m1};
                 instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
                 if (swapchain_m1.swapchainMaintenance1 == VK_TRUE) {
-                    swapchain_m1.pNext = enable13.pNext;
-                    enable13.pNext = &swapchain_m1;
+                    swapchain_m1.pNext = *v13_.next();
+                    *v13_.next() = &swapchain_m1;
                     device_extensions.push_back(name);
                     swapchain_maintenance1 = true;
                 }
@@ -473,12 +575,18 @@ public:
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
         if (shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
+        if (custom_border_color) device_extensions.push_back(custom_border_color_name);
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);
         if (result != VK_SUCCESS) return failure("vkCreateDevice", result);
         device_proc = instance_fn<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");
-        fn<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(device, family, 0, &queue);
+        queues.resize(graphics_count);
+        for (std::uint32_t i = 0; i < graphics_count; ++i)
+            fn<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(device, family, i, &queues[i]);
+        queue = queues[0];
+        fn<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(device, compute_family, 0, &compute_queue);
+        fn<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(device, copy_family, 0, &copy_queue);
         instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(physical,
                                                                                                     &memory_);
         VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -508,6 +616,7 @@ public:
         info.arrayLayers = layers;
         info.samples = VkSampleCountFlagBits(samples);
         info.usage = usage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        share(info);
         VkImage image = VK_NULL_HANDLE;
         if (fn<PFN_vkCreateImage>("vkCreateImage")(device, &info, nullptr, &image) != VK_SUCCESS) return VK_NULL_HANDLE;
         VkMemoryRequirements requirements{};
@@ -524,6 +633,7 @@ public:
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = size;
         info.usage = usage | (buffer_device_address ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u);
+        share(info);
         VkBuffer buffer = VK_NULL_HANDLE;
         if (fn<PFN_vkCreateBuffer>("vkCreateBuffer")(device, &info, nullptr, &buffer) != VK_SUCCESS)
             return VK_NULL_HANDLE;
@@ -607,6 +717,16 @@ public:
     }
 
 private:
+    std::vector<std::uint32_t> sharing_;
+
+    template<typename Info>
+    void share(Info& info) const {
+        if (sharing_.size() < 2) return;
+        info.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        info.queueFamilyIndexCount = std::uint32_t(sharing_.size());
+        info.pQueueFamilyIndices = sharing_.data();
+    }
+
     VkDeviceMemory allocate(const VkMemoryRequirements& requirements, VkMemoryPropertyFlags flags) {
         for (std::uint32_t i = 0; i < memory_.memoryTypeCount; ++i) {
             if (!(requirements.memoryTypeBits & (1u << i))) continue;
@@ -628,6 +748,7 @@ private:
     VkDebugUtilsMessengerEXT messenger_ = VK_NULL_HANDLE;
     VkCommandPool pool_ = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memory_{};
+    leonida::Vulkan13Features v13_;  // the chosen device's dynamicRendering/synchronization2 path
     std::vector<std::pair<VkImage, VkDeviceMemory>> images_;
     std::vector<std::pair<VkBuffer, VkDeviceMemory>> buffers_;
 };

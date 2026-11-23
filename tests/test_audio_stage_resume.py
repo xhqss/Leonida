@@ -115,6 +115,8 @@ class AudioStageResumeTest(unittest.TestCase):
             name = os.path.splitext(os.path.basename(rel))[0]
             for mode in ("models", "textures"):
                 self.touch(self.work, "assets", name, mode, "manifest.json")
+                with open(os.path.join(self.work, "assets", name, mode, make_game.DECODER_RECORD), "w") as f:
+                    f.write(make_game.decoder_digest())
         self.touch(self.audio, "audio_manifest.json")
 
     def tearDown(self):

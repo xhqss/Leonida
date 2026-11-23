@@ -4,6 +4,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -45,6 +46,34 @@ class Interface(unittest.TestCase):
         self.assertNotIn("%out_clip", asm)
         self.assertIn("Location 3", asm)
 
+    def test_pair_f16_halves_for_high_param_producer(self):
+        """SHADER-378: a 16-param mesh-compute producer paired with a PS reading f16 on params (0, 4, 5, 6, 7) emits
+        only those 5 decoded-half pairs within locations 0..29, with zero overlap."""
+        lay = layout(params=tuple(range(16)))
+        ps_halves = {"0": [28, 29], "4": [26, 27], "5": [24, 25], "6": [22, 23], "7": [20, 21]}
+        paired = vs.pair_f16_halves(lay, ps_halves, ps_raw_inputs=range(15))
+        self.assertEqual(paired, ps_halves)
+        asm = vs.vs_spvasm(lay, f16_halves=paired)
+        for loc in range(16):
+            self.assertIn(f"OpDecorate %out{loc} Location {loc}", asm)
+        for lo, hi in paired.values():
+            self.assertIn(f"OpDecorate %out{lo} Location {lo}", asm)
+            self.assertIn(f"OpDecorate %out{hi} Location {hi}", asm)
+        self.assertNotIn("Location 30", asm)
+
+        # Collision with producer param15 relocates both halves into free slots <= 29.
+        reloc = vs.pair_f16_halves(lay, {"7": [15, 29]}, ps_raw_inputs=range(15))
+        self.assertEqual(reloc, {"7": [28, 29]})
+        asm_reloc = vs.vs_spvasm(lay, f16_halves=reloc)
+        self.assertIn("OpDecorate %out28 Location 28", asm_reloc)
+        self.assertIn("OpDecorate %out29 Location 29", asm_reloc)
+
+        # Missing producer param and colliding explicit override are rejected cleanly.
+        with self.assertRaises(ValueError):
+            vs.pair_f16_halves(layout(params=(0, 1)), {"7": [28, 29]})
+        with self.assertRaises(ValueError):
+            vs.vs_spvasm(layout(params=(0, 1)), f16_halves={"0": [1, 29]})
+
     def test_the_index_drives_write_for_index(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(vs.write_for_index(tmp), [])       # no index.json: nothing to do
@@ -75,6 +104,38 @@ class Assembly(unittest.TestCase):
             for spv in built:
                 self.assertGreater(os.path.getsize(spv), 0)
                 self.assertTrue(os.path.isfile(spv[: -len(".spv")] + ".spvasm"))
+
+    def test_only_validated_binary_reaches_the_final_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            write_index(tmp, {"ms_a": {"mesh_compute": layout()}})
+            final = os.path.join(tmp, "ms_a.mesh_vs.spv")
+            with open(final, "wb") as f:
+                f.write(b"previous shader")
+
+            def assemble_and_validate(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                if cmd[0] == "spirv-as":
+                    with open(cmd[-1], "wb") as f:
+                        f.write(b"new shader")
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+                self.assertEqual(cmd[0], "spirv-val")
+                with open(cmd[-1], "rb") as f:
+                    self.assertEqual(f.read(), b"new shader")
+                return subprocess.CompletedProcess(cmd, validation_code, "", "validator output")
+
+            with (mock.patch.object(vs, "tool_path", side_effect=lambda name: name),
+                  mock.patch.object(vs.subprocess, "run", side_effect=assemble_and_validate)):
+                validation_code = 1
+                with self.assertRaisesRegex(RuntimeError, "spirv-val failed"):
+                    vs.build_for_index(tmp)
+                with open(final, "rb") as f:
+                    self.assertEqual(f.read(), b"previous shader")
+
+                validation_code = 0
+                self.assertEqual(vs.build_for_index(tmp), [final])
+                with open(final, "rb") as f:
+                    self.assertEqual(f.read(), b"new shader")
+
+            self.assertEqual(sorted(os.listdir(tmp)), ["index.json", "ms_a.mesh_vs.spv", "ms_a.mesh_vs.spvasm"])
 
     def test_a_rejected_shader_names_the_tool(self):
         if not HAVE_SPIRV_TOOLS:

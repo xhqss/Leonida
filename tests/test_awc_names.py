@@ -9,8 +9,10 @@ import io
 import json
 import os
 import struct
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -91,6 +93,24 @@ class TestBanks(unittest.TestCase):
             with self.assertRaises(ValueError):
                 A.bank_ids(path)
 
+    def test_truncated_stream_table_reads_only_header(self):
+        # A truncated ordinary bank with a stream count larger than the file holds must fail from the header
+        # and file size alone: os.fstat reports the real size without a seek, so only the 16-byte header is
+        # ever read before the size check fails.
+        n = 12
+        header = b"ADAT" + struct.pack("<III", 0, n, 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.awc")
+            with open(path, "wb") as f:
+                f.write(header + bytes(3))
+
+            with open(path, "rb") as source:
+                spy = mock.Mock(wraps=source)
+                with mock.patch.object(A, "open", create=True, return_value=contextlib.nullcontext(spy)):
+                    with self.assertRaisesRegex(ValueError, "stream table extends past"):
+                        A.bank_ids(path)
+            self.assertEqual(spy.read.call_args_list, [mock.call(16)])
+
 
 class TestRules(unittest.TestCase):
     def index(self, banks):
@@ -150,6 +170,32 @@ class TestRules(unittest.TestCase):
         self.assertEqual(stats["family_min_size"], 2)
         self.assertEqual(stats["control_dialogue"] + stats["control_family"], 0)
 
+    def test_rejected_dialogue_hit_does_not_shadow_accepted_family_member(self):
+        d = A.Dictionary(["zz_fooau_abcd_01"])
+        bases = ["zz_fooau_abcd"]
+        # Including SALT + zz_fooau_abcd_01 makes the salted control reject the dialogue rule;
+        # zz_fooau_abcd_01 must still be named via its 3-member family alongside _02 and _03.
+        index = self.index({
+            "b0": [
+                "zz_fooau_abcd_01",
+                "zz_fooau_abcd_02",
+                "zz_fooau_abcd_03",
+                A.SALT + "zz_fooau_abcd_01",
+            ]
+        })
+        real, stats = A.name_source(d, bases, index)
+        self.assertFalse(stats["dialogue_rule"])
+        self.assertEqual(stats["family_min_size"], 2)
+        self.assertEqual(stats["named"], 3)
+        self.assertEqual(
+            sorted(real.values()),
+            [
+                ("zz_fooau_abcd_01", "family", 3),
+                ("zz_fooau_abcd_02", "family", 3),
+                ("zz_fooau_abcd_03", "family", 3),
+            ],
+        )
+
 
 class TestConversations(unittest.TestCase):
     def test_waves_per_label(self):
@@ -163,6 +209,24 @@ class TestConversations(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_sources_with_same_basename_keep_separate_summaries_and_streams(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sources = []
+            for parent, count in (("first", 1), ("second", 2)):
+                folder = os.path.join(tmp, parent, "banks")
+                os.makedirs(folder)
+                sources.append(folder)
+                write(os.path.join(folder, "one.awc"), make_bank(["zz_rootau_abcd_01"], extra_ids=range(count - 1)))
+            words = write(os.path.join(tmp, "words.txt"), "zz_rootau_abcd_01\n")
+            out = os.path.join(tmp, "names.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(A.main([*sources, "--words", words, "--out", out]), 0)
+            with open(out, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            self.assertEqual({k: v["streams"] for k, v in doc["summary"].items()},
+                             {"first/banks": 1, "second/banks": 2})
+            self.assertEqual([row["source"] for row in doc["streams"]], ["first/banks", "second/banks"])
+
     def test_end_to_end(self):
         with tempfile.TemporaryDirectory() as tmp:
             banks = os.path.join(tmp, "banks")
@@ -188,6 +252,69 @@ class TestCli(unittest.TestCase):
             with open(json_out, encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh)["summary"]["banks"]["streams"], 3)
 
+    def test_rejects_output_aliasing_conversation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bank = write(os.path.join(tmp, "one.awc"), make_bank(["zz_rootau_abcd_01"]))
+            original = b"ZZ_ROOTAU_ABCD\x00ZZ_A\x00"
+            conv = write(os.path.join(tmp, "c.pso"), original)
+            alias = os.path.join(tmp, ".", "c.pso")
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([bank, "--conversations", conv, "--out", alias])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("--out must not overwrite an input", err.getvalue())
+            with open(conv, "rb") as f:
+                self.assertEqual(f.read(), original)
+
+    def test_rejects_output_aliasing_recursive_inputs(self):
+        for source in ("bank", "conversation"):
+            for alias in ("path", "parent", "hardlink"):
+                with self.subTest(source=source, alias=alias), tempfile.TemporaryDirectory() as tmp:
+                    banks = os.path.join(tmp, "banks")
+                    conversations = os.path.join(tmp, "conversations")
+                    os.makedirs(os.path.join(banks, "nested"))
+                    os.makedirs(os.path.join(conversations, "nested"))
+                    bank_data = make_bank(["zz_rootau_abcd_01"])
+                    conv_data = b"ZZ_ROOTAU_ABCD\x00ZZ_A\x00"
+                    bank = write(os.path.join(banks, "nested", "one.AWC"), bank_data)
+                    conv = write(os.path.join(conversations, "nested", "labels.bin"), conv_data)
+                    target = bank if source == "bank" else conv
+                    if alias == "parent":
+                        out = os.path.join(os.path.dirname(target), "..", "nested", os.path.basename(target))
+                    elif alias == "hardlink":
+                        out = os.path.join(tmp, "names.csv")
+                        os.link(target, out)
+                    else:
+                        out = target
+                    err = io.StringIO()
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                        with self.assertRaises(SystemExit) as cm:
+                            A.main([banks, "--conversations", conversations, "--out", out])
+                    self.assertEqual(cm.exception.code, 2)
+                    self.assertIn("--out must not overwrite an input", err.getvalue())
+                    for path, original in ((bank, bank_data), (conv, conv_data)):
+                        with open(path, "rb") as fh:
+                            self.assertEqual(fh.read(), original)
+
+    def test_allows_report_inside_bank_directory(self):
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as tmp:
+                banks = os.path.join(tmp, "banks")
+                os.makedirs(os.path.join(banks, "nested"))
+                bank_data = make_bank(["zz_rootau_abcd_01"])
+                bank = write(os.path.join(banks, "nested", "one.awc"), bank_data)
+                conv = write(os.path.join(tmp, "labels.bin"), b"ZZ_ROOTAU_ABCD\x00ZZ_A\x00")
+                out = os.path.join(banks, "nested", "names.csv")
+                if existing:
+                    write(out, "old report\n")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(A.main([banks, "--conversations", conv, "--out", out]), 0)
+                with open(out, encoding="utf-8", newline="") as fh:
+                    self.assertEqual(len(list(csv.DictReader(fh))), 1)
+                with open(bank, "rb") as fh:
+                    self.assertEqual(fh.read(), bank_data)
+
     def test_hashdict_json_words(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = write(os.path.join(tmp, "hashes.json"), json.dumps({"0000abcd": "Some_Word"}))
@@ -197,9 +324,53 @@ class TestCli(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             A.main([ROOT])
 
+    def test_malformed_banks_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            words = write(os.path.join(tmp, "words.json"), json.dumps(["x"]))
+            for doc in ([1], [["Path"]]):
+                banks = write(os.path.join(tmp, "banks.json"), json.dumps(doc))
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    self.assertEqual(A.main(["--words", words, banks]), 2)
+                self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
+                self.assertIn("awc_names: error:", err.getvalue())
+
     def test_missing_input(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(A.main(["/nonexistent", "--words", "/nonexistent.txt"]), 2)
+
+    @unittest.skipUnless(sys.platform == "win32", "the exclusive-lock repro needs Windows")
+    def test_locked_words_input_reports_rc_2_without_traceback(self):
+        # An exclusively locked (share-none) existing file passes the os.path.exists check, so the
+        # read_words() open must turn PermissionError into the one-line rc-2 error, not a traceback.
+        import ctypes
+        with tempfile.TemporaryDirectory() as tmp:
+            blob = os.path.join(tmp, "locked.awc")
+            with open(blob, "wb") as fh:
+                fh.write(b"\x00" * 16)
+            k32 = ctypes.windll.kernel32
+            handle = k32.CreateFileW(blob, 0x80000000, 0, None, 3, 0x80, None)
+            self.assertNotIn(handle, (0, -1), "could not lock the probe file")
+            try:
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    rc = A.main([blob, "--words", blob])
+            finally:
+                k32.CloseHandle(handle)
+            self.assertEqual(rc, 2)
+            self.assertIn("cannot read", err.getvalue())
+            self.assertIn("Permission denied", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
+    def test_unreadable_json_words_report_rc_2_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            words = write(os.path.join(tmp, "words.json"), "{not json")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = A.main([tmp, "--words", words])
+            self.assertEqual(rc, 2)
+            self.assertIn("cannot read", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
 
 
 if __name__ == "__main__":

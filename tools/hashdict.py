@@ -3,9 +3,11 @@
 Sources: printable runs in carved blobs (selected archives fully; PSO/RBF blobs everywhere), shader names, and
 any extra text/binary files given (e.g. the exe once it arrives: run with --extra path\\to\\exe).
 When multiple names share a hash, the dictionary keeps the lexicographically first spelling.
+The output cannot overwrite an input index, extra file, or harvested blob (including hard-link aliases).
 
 Usage:
     python -I hashdict.py <carve dir> --out hashes.json [--archives a,b] [--extra f1 f2 ...] [--min 3]
+      <carve dir> holds one folder per archive (<work>/carve), or is one archive's folder (<work>/carve/common).
     python -I hashdict.py --lookup <hashes.json> 0x28cca8df ...
 """
 import argparse
@@ -91,11 +93,17 @@ def main():
         what = "is not a folder" if os.path.exists(a.carve) else "does not exist"
         print(f"ERROR: the carve folder {a.carve} {what}", file=sys.stderr)
         return 2
+    # A folder with its own index.json is one archive's carve (<work>\carve\common, the folder the gamedata_*
+    # tools take): harvest it as that archive. Otherwise each subfolder with an index.json is one archive.
+    if os.path.isfile(os.path.join(a.carve, "index.json")):
+        archives = [(os.path.basename(os.path.normpath(os.path.abspath(a.carve))), a.carve)]
+    else:
+        archives = [(d, os.path.join(a.carve, d)) for d in sorted(os.listdir(a.carve))]
     # The dictionary is written after the harvest: an --out naming one of the inputs would replace it.
     # samefile also catches a case-only difference on Windows and macOS's default volume.
     if os.path.exists(a.out):
         inputs = [x for x in a.extra if os.path.isfile(x)]
-        inputs += [os.path.join(a.carve, d, "index.json") for d in os.listdir(a.carve)]
+        inputs += [os.path.join(d, "index.json") for _, d in archives]
         for x in inputs:
             try:
                 same = os.path.isfile(x) and os.path.samefile(a.out, x)
@@ -105,11 +113,18 @@ def main():
                 print(f"ERROR: --out {a.out} is one of the inputs ({x}); choose another output file",
                       file=sys.stderr)
                 return 2
+    # A report can also alias a harvested <offset>.bin, including through a hard link.
+    # Snapshot its file identity once; compare against the input's already-open handle
+    # rather than statting every carve path (there may be millions of entries).
+    try:
+        output_stat = os.stat(a.out)
+    except OSError:
+        output_stat = None
     strings = set()
     full = set(a.archives.split(","))
     missing = []                    # carved blobs an index.json lists that can't be read: skipped, reported
-    for arch in sorted(os.listdir(a.carve)):
-        p = os.path.join(a.carve, arch, "index.json")
+    for arch, arch_dir in archives:
+        p = os.path.join(arch_dir, "index.json")
         if not os.path.isfile(p):
             continue
         try:
@@ -121,14 +136,28 @@ def main():
             reason = getattr(e, "strerror", None) or (f"no {e} key" if isinstance(e, KeyError) else e)
             print(f"ERROR: cannot read {p}: {reason}", file=sys.stderr)
             return 2
-        for r in rows:
+        for row_idx, r in enumerate(rows):
             if r.get("type") == "bink2":
                 continue
-            meta = r["head"].startswith("5053494e") or r["head"].startswith("52424630")
+            head = r.get("head")
+            off = r.get("off")
+            err = None
+            if not isinstance(head, str):
+                err = f"row {row_idx} has a non-string head"
+            elif not isinstance(off, int) or isinstance(off, bool) or off < 0:
+                err = f"row {row_idx} has an invalid offset"
+            if err is not None:
+                print(f"ERROR: cannot read {p}: {err}", file=sys.stderr)
+                return 2
+            meta = head.startswith("5053494e") or head.startswith("52424630")
             if arch in full or meta:
-                blob = os.path.join(a.carve, arch, f"{r['off']:012x}.bin")
+                blob = os.path.join(arch_dir, f"{off:012x}.bin")
                 try:
                     with open(blob, "rb") as f:
+                        if output_stat is not None and os.path.samestat(os.fstat(f.fileno()), output_stat):
+                            print(f"ERROR: --out {a.out} is one of the inputs ({blob}); choose another output file",
+                                  file=sys.stderr)
+                            return 2
                         data = f.read()
                 except OSError:
                     missing.append(blob)
@@ -152,7 +181,7 @@ def main():
     # Other tools create the output parent too: a long harvest must not be lost to a missing folder.
     try:
         os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-        with open(a.out, "w", encoding="utf-8") as f:
+        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(d, f)
     except OSError as e:
         print(f"ERROR: cannot write {a.out}: {e}", file=sys.stderr)

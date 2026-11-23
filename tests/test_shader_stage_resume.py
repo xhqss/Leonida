@@ -88,16 +88,24 @@ class ShaderStageResumeTest(unittest.TestCase):
     def touch(self, *parts):
         p = os.path.join(*parts)
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        open(p, "w").close()
+        with open(p, "w", encoding="utf-8") as f:
+            if p == os.path.join(self.dxbc, "index.json"):
+                json.dump([{"file": "s0.dxbc"}], f)
+            elif p == os.path.join(self.dxbc, "fssm_index.json"):
+                json.dump([{"name": "s0"}], f)
+            elif p.endswith(".s"):
+                f.write("synthetic listing\n")
 
     def fake_py(self, tool, *args):
         self.ran.append(tool)
         if tool == "shader_carve.py":
             self.touch(self.dxbc, "index.json")
         elif tool == "fssm_unpack.py":
+            self.assertEqual(args[-2:], ("--carve-index", os.path.join(self.dxbc, "index.json")))
             self.touch(self.dxbc, "fssm_index.json")
         elif tool == "shader_disasm.py":
-            os.makedirs(os.path.join(self.dxbc, "disasm"), exist_ok=True)
+            self.assertEqual(args[1:3], ("--unpack-index", os.path.join(self.dxbc, "fssm_index.json")))
+            self.touch(self.dxbc, "disasm", "s0.s")
 
     def fake_translate(self, disasm, spirv, jobs, emulate=False, fallbacks=()):
         self.ran.append("translate (emulated)" if emulate else "translate")
@@ -173,6 +181,85 @@ class ShaderStageResumeTest(unittest.TestCase):
             self.touch(self.dxbc, "disasm", f"s{i}.s")
         self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
 
+    def test_disassembly_resume_keeps_completed_listings_for_the_same_llvm(self):
+        self.touch(self.dxbc, "index.json")
+        self.touch(self.dxbc, "fssm_index.json")
+        listing = os.path.join(self.dxbc, "disasm", "s0.s")
+
+        def stop(tool, *args):
+            self.assertEqual(tool, "shader_disasm.py")
+            self.assertNotIn("--skip-existing", args)
+            self.touch(listing)
+            raise KeyboardInterrupt
+
+        for change_llvm in (False, True):
+            with self.subTest(change_llvm=change_llvm):
+                if change_llvm:
+                    os.remove(os.path.join(self.dxbc, "disasm.done"))
+                with mock.patch.object(self, "fake_py", side_effect=stop):
+                    with self.assertRaises(KeyboardInterrupt):
+                        self.run_stage()
+                if change_llvm:
+                    self.llvm_mc_signature.return_value = "different llvm-mc"
+                disassemble = self.fake_py
+
+                def check_reuse(tool, *args):
+                    self.assertEqual("--skip-existing" in args, not change_llvm)
+                    self.assertEqual(os.path.isfile(listing), not change_llvm)
+                    disassemble(tool, *args)
+
+                with mock.patch.object(self, "fake_py", side_effect=check_reuse):
+                    self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+                self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm.done")))
+                self.assertFalse(os.path.exists(os.path.join(self.dxbc, "disasm.started")))
+
+    def test_finished_disassembly_repairs_missing_recorded_listing_before_translation(self):
+        self.touch(self.dxbc, "index.json")
+        self.touch(self.dxbc, "fssm_index.json")
+        with open(os.path.join(self.dxbc, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump([{"file": name + ".dxbc"} for name in ("s0", "s1", "unsupported")], f)
+        with open(os.path.join(self.dxbc, "fssm_index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump([{"name": name} for name in ("s0", "s1", "unsupported")], f)
+
+        original = self.fake_py
+
+        def disassemble(tool, *args):
+            original(tool, *args)
+            self.touch(self.dxbc, "disasm", "s1.s")
+
+        with mock.patch.object(self, "fake_py", side_effect=disassemble):
+            self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+        self.assertEqual(self.run_stage(), [])
+        os.remove(os.path.join(self.dxbc, "disasm", "s1.s"))
+        self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False))
+
+        with mock.patch.object(make_game, "fail", side_effect=SystemExit(1)) as fail:
+            with self.assertRaises(SystemExit):
+                self.run_stage()
+        fail.assert_called_once_with("Shader disassembly did not restore all expected listings")
+        self.assertFalse(os.path.isfile(os.path.join(self.spirv, "index.json")))
+        self.assertFalse(os.path.isfile(os.path.join(self.dxbc, "disasm.done")))
+
+        def repair(tool, *args):
+            self.assertIn("--skip-existing", args)
+            self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm", "s0.s")))
+            disassemble(tool, *args)
+
+        with mock.patch.object(self, "fake_py", side_effect=repair):
+            self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+        self.assertTrue(make_game.shader_outputs_reusable(self.work, False, False))
+
+    def test_finished_disassembly_repairs_a_zero_byte_listing(self):
+        self.assertEqual(self.run_stage(), ["shader_carve.py", "fssm_unpack.py", "shader_disasm.py", "translate"])
+        listing = os.path.join(self.dxbc, "disasm", "s0.s")
+        self.assertGreater(os.path.getsize(listing), 0)
+        open(listing, "wb").close()
+
+        self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False))
+        self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+        self.assertGreater(os.path.getsize(listing), 0)
+        self.assertEqual(self.run_stage(), [])
+
     def test_translation_stopped_after_many_files_runs_again(self):
         self.run_stage()
         os.remove(os.path.join(self.spirv, "index.json"))   # stopped before --merge
@@ -198,6 +285,22 @@ class ShaderStageResumeTest(unittest.TestCase):
         os.remove(os.path.join(self.dxbc, "fssm_index.json"))
         self.assertEqual(self.run_stage(), ["fssm_unpack.py", "shader_disasm.py", "translate"])
 
+    def test_old_unpack_index_with_a_noncurrent_shader_is_refreshed(self):
+        self.run_stage()
+        with open(os.path.join(self.dxbc, "fssm_index.json"), "w", encoding="utf-8") as f:
+            json.dump([{"name": "s0"}, {"name": "removed"}], f)
+        self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False))
+        self.assertEqual(self.run_stage(), ["fssm_unpack.py", "shader_disasm.py", "translate"])
+        self.assertEqual(self.run_stage(), [])
+
+    def test_old_disassembly_with_a_noncurrent_shader_is_refreshed(self):
+        self.run_stage()
+        self.touch(self.dxbc, "disasm", "removed.s")
+        self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False))
+        self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+        self.assertFalse(os.path.exists(os.path.join(self.dxbc, "disasm", "removed.s")))
+        self.assertEqual(self.run_stage(), [])
+
     def test_legacy_folder_without_llvm_version_refreshes_disassembly_once(self):
         self.touch(self.dxbc, "index.json")
         self.touch(self.dxbc, "fssm_index.json")
@@ -210,11 +313,11 @@ class ShaderStageResumeTest(unittest.TestCase):
     def test_old_disassembly_layout_is_rebuilt_in_the_current_location(self):
         self.touch(self.dxbc, "index.json")
         self.touch(self.dxbc, "fssm_index.json")
-        self.touch(self.work, "shaders", "disasm", "s0.s")  # disasm next to the carve folder, the old layout
+        self.touch(self.work, "shaders", "disasm", "old.s")  # disasm next to the carve folder, the old layout
         self.touch(self.spirv, "index.json")
         self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
-        self.assertTrue(os.path.isdir(os.path.join(self.dxbc, "disasm")))
-        self.assertFalse(os.path.exists(os.path.join(self.dxbc, "disasm", "s0.s")))
+        self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm", "s0.s")))
+        self.assertFalse(os.path.exists(os.path.join(self.dxbc, "disasm", "old.s")))
 
     # SHADER-11: the translation depends on --wave64-emulate, so a change of mode translates again.
     def mode(self):

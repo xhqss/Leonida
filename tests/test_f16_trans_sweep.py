@@ -1,7 +1,10 @@
 """tools/f16_trans_sweep.py: the f16 reference and its rounding, which input each kernel thread computes and where it
 stores it, the classification, and the exit-77 contract. The last test runs on the hardware when the oracle tools
 are present and is skipped otherwise. Standard library only."""
+import io
+import json
 import os
+from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal
 from pathlib import Path
 import shutil
@@ -9,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 sys.path.insert(0, str(TOOLS))
@@ -122,6 +126,121 @@ class Cli(unittest.TestCase):
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)
         self.assertIn("v_exp_f32", r.stderr)
+
+    def test_empty_and_malformed_selections_fail_before_opening_oracle(self):
+        cases = [
+            (["--ops", ""], "--ops"),
+            (["--modes", ","], "--modes"),
+            (["--waves", ""], "--waves"),
+            (["--waves", "32,nope"], "--waves"),
+            (["--waves", "16"], "16"),
+        ]
+        for argv, message in cases:
+            with self.subTest(argv=argv), mock.patch.object(runner, "open_oracle") as open_oracle:
+                error = io.StringIO()
+                with self.assertRaises(SystemExit) as raised, redirect_stderr(error):
+                    sw.main(argv)
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(message, error.getvalue())
+                open_oracle.assert_not_called()
+
+    def test_json_empty_string_exits_1_before_opening_oracle(self):
+        err = io.StringIO()
+        with mock.patch.object(runner, "open_oracle") as open_oracle, redirect_stderr(err):
+            rc = sw.main(["--ops", "v_exp_f16", "--modes", "keep16", "--waves", "32", "--json", ""])
+        self.assertEqual(rc, 1)
+        self.assertIn("error:", err.getvalue())
+        open_oracle.assert_not_called()
+
+    def test_json_existing_directory_exits_1_before_sweep_or_probe(self):
+        with tempfile.TemporaryDirectory() as d:
+            err = io.StringIO()
+            with mock.patch.object(runner, "open_oracle") as open_oracle, redirect_stderr(err):
+                rc = sw.main(["--ops", "v_exp_f16", "--modes", "keep16", "--waves", "32", "--json", d])
+            self.assertEqual(rc, 1)
+            self.assertIn("error:", err.getvalue())
+            open_oracle.assert_not_called()
+
+            env = dict(os.environ, LEONIDA_AMD_CLANG=str(TOOLS / "no-such-clang.exe"), LEONIDA_HW_DRM_NODE="")
+            r = subprocess.run([sys.executable, "-I", str(TOOLS / "f16_trans_sweep.py"),
+                                "--ops", "v_exp_f16", "--json", d],
+                               capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("error:", r.stderr)
+
+    def test_json_creates_nested_parent_and_writes_lf_endings(self):
+        ref = [0] * 65536
+        fake_oracle = mock.MagicMock(device="fake-gpu", arch="gfx1030")
+        with tempfile.TemporaryDirectory() as d:
+            out_path = Path(d) / "nested" / "deep" / "report.json"
+            self.assertFalse(out_path.parent.exists())
+            out = io.StringIO()
+            err = io.StringIO()
+            with mock.patch.object(runner, "open_oracle", return_value=fake_oracle), \
+                    mock.patch.object(sw, "check_modes"), \
+                    mock.patch.object(sw, "reference", return_value=ref), \
+                    mock.patch.object(sw, "sweep", return_value=list(ref)), \
+                    redirect_stdout(out), redirect_stderr(err):
+                rc = sw.main(["--ops", "v_exp_f16", "--modes", "keep16", "--waves", "32", "--json", str(out_path)])
+            self.assertEqual(rc, 0, err.getvalue())
+            self.assertEqual(err.getvalue(), "")
+            self.assertTrue(out_path.is_file())
+            raw = out_path.read_bytes()
+            self.assertIn(b"\n", raw)
+            self.assertNotIn(b"\r\n", raw)
+            data = json.loads(raw.decode("utf-8"))
+            self.assertEqual(data["device"], "fake-gpu")
+            self.assertEqual(data["arch"], "gfx1030")
+            self.assertIn("keep16", data["ops"]["v_exp_f16"])
+            fake_oracle.close.assert_called_once()
+
+    def test_json_blocked_by_regular_file_parent_exits_1(self):
+        with tempfile.TemporaryDirectory() as d:
+            blocker = Path(d) / "blocker"
+            blocker.write_text("not a dir\n", encoding="utf-8", newline="\n")
+            for target in (blocker / "report.json", blocker / "sub" / "report.json"):
+                err = io.StringIO()
+                with mock.patch.object(runner, "open_oracle") as open_oracle, redirect_stderr(err):
+                    rc = sw.main(["--ops", "v_exp_f16", "--modes", "keep16", "--waves", "32", "--json", str(target)])
+                self.assertEqual(rc, 1)
+                self.assertIn("error:", err.getvalue())
+                open_oracle.assert_not_called()
+
+            env = dict(os.environ, LEONIDA_AMD_CLANG=str(TOOLS / "no-such-clang.exe"), LEONIDA_HW_DRM_NODE="")
+            r = subprocess.run([sys.executable, "-I", str(TOOLS / "f16_trans_sweep.py"),
+                                "--ops", "v_exp_f16", "--json", str(blocker / "sub" / "report.json")],
+                               capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("error:", r.stderr)
+
+    def test_json_write_oserror_reports_cleanly_and_exits_1(self):
+        ref = [0] * 65536
+        fake_oracle = mock.MagicMock(device="fake-gpu", arch="gfx1030")
+        with tempfile.TemporaryDirectory() as d:
+            out_path = Path(d) / "nested" / "report.json"
+            with mock.patch.object(runner, "open_oracle", return_value=fake_oracle), \
+                    mock.patch.object(sw, "check_modes"), \
+                    mock.patch.object(sw, "reference", return_value=ref), \
+                    mock.patch.object(sw, "sweep", return_value=list(ref)), \
+                    mock.patch.object(sw.os, "makedirs", side_effect=PermissionError(13, "Permission denied")):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    rc = sw.main(["--ops", "v_exp_f16", "--modes", "keep16", "--waves", "32", "--json", str(out_path)])
+            self.assertEqual(rc, 1)
+            self.assertIn("error:", err.getvalue())
+            self.assertIn("Permission denied", err.getvalue())
+
+            with mock.patch.object(runner, "open_oracle", return_value=fake_oracle), \
+                    mock.patch.object(sw, "check_modes"), \
+                    mock.patch.object(sw, "reference", return_value=ref), \
+                    mock.patch.object(sw, "sweep", return_value=list(ref)), \
+                    mock.patch("builtins.open", side_effect=OSError(28, "No space left on device")):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    rc = sw.main(["--ops", "v_exp_f16", "--modes", "keep16", "--waves", "32", "--json", str(out_path)])
+            self.assertEqual(rc, 1)
+            self.assertIn("error:", err.getvalue())
+            self.assertIn("No space left on device", err.getvalue())
 
 
 class OnHardware(unittest.TestCase):

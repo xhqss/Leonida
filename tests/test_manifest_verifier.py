@@ -12,11 +12,12 @@ import hashlib
 import io
 import json
 import os
+import posixpath
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "manifest_verifier.py")
@@ -101,6 +102,27 @@ class TestManifestVerifier(unittest.TestCase):
         for rel in items:
             self.assertNotIn("\\", rel)
 
+    def test_posix_backslash_filename_cannot_match_a_nested_path(self) -> None:
+        payload = b"same bytes as the expected file"
+        nested = "nested/echo.bin"
+        literal_name = r"nested\echo.bin"
+        self.write_manifest(self.manifest_path, {nested: payload})
+
+        # Simulate POSIX directory entries even on Windows, where a filename cannot contain a literal backslash.
+        target = "/target"
+        posix_os = Mock(sep="/", path=Mock(wraps=posixpath))
+        posix_os.path.isdir.return_value = True
+        posix_os.path.isfile.side_effect = os.path.isfile
+        posix_os.path.getsize.return_value = len(payload)
+        posix_os.walk.return_value = [(target, [], [literal_name])]
+        with (patch.object(mv, "os", posix_os),
+              patch.object(mv, "sha256_file", return_value=hashlib.sha256(payload).hexdigest()) as hash_file):
+            report = mv.verify_manifest(target, self.manifest_path)
+        self.assertFalse(report.passed)
+        self.assertEqual(report.missing, [nested])
+        self.assertEqual(report.untracked, [literal_name])
+        hash_file.assert_not_called()
+
     def test_load_manifest_valid_and_case_insensitive(self) -> None:
         manifest_upper = os.path.join(self.root, "manifest_upper.json")
         self.write_manifest(manifest_upper, self.payloads, upper_hash=True)
@@ -149,6 +171,25 @@ class TestManifestVerifier(unittest.TestCase):
                     mv.load_manifest(bad_path)
                 self.assertIn(bad_path, str(cm.exception))
                 self.assertIn("nested/a.bin", str(cm.exception))
+
+    def test_cli_rejects_duplicate_json_keys(self) -> None:
+        digest = hashlib.sha256(self.payloads["alpha.bin"]).hexdigest()
+        entries = f'{{"alpha.bin": "wrong", "alpha.bin": "{digest}"}}'
+        cases = (
+            ("alpha.bin", entries),
+            ("alpha.bin", f'{{"files": {entries}}}'),
+            ("files", '{"files": {"missing.bin": "wrong"}, "files": {}}'),
+            ("sha256", f'{{"files": {{"alpha.bin": {{"sha256": "wrong", "sha256": "{digest}"}}}}}}'),
+        )
+        for key, document in cases:
+            with self.subTest(document=document):
+                with open(self.manifest_path, "w", encoding="utf-8") as f:
+                    f.write(document)
+                result = self.run_cli(self.game_dir, "--manifest", self.manifest_path, "--quiet")
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("duplicate JSON key", result.stderr)
+                self.assertIn(repr(key), result.stderr)
+                self.assertIn(self.manifest_path, result.stderr)
 
     def test_load_manifest_single_spelling_control(self) -> None:
         digest = hashlib.sha256(b"x").hexdigest()
@@ -263,6 +304,19 @@ class TestManifestVerifier(unittest.TestCase):
             json.dump({"files": {"bad.bin": {"size": "not-an-int", "sha256": "abc"}}}, f)
         with self.assertRaises(mv.ManifestError):
             mv.load_manifest(invalid_entries)
+
+    def test_cli_rejects_malformed_sha256_digests(self) -> None:
+        for digest in ("a" * 63, "a" * 65, "g" * 64):
+            for entry in (digest, {"size": len(self.payloads["alpha.bin"]), "sha256": digest}):
+                with self.subTest(digest=digest, entry=entry):
+                    with open(self.manifest_path, "w", encoding="utf-8", newline="\n") as f:
+                        json.dump({"files": {"alpha.bin": entry}}, f)
+                    result = self.run_cli(self.game_dir, "--manifest", self.manifest_path, "--json")
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn(self.manifest_path, result.stderr)
+                    self.assertIn("alpha.bin", result.stderr)
+                    self.assertIn("64 hexadecimal characters", result.stderr)
 
     def test_verify_target_dir_missing(self) -> None:
         with self.assertRaises(mv.ManifestError):
@@ -384,7 +438,7 @@ class TestManifestVerifier(unittest.TestCase):
 
     def test_unreadable_file_graceful_handling(self) -> None:
         # Simulate unreadable file by patching sha256_file to raise OSError
-        def mock_sha(path: str, chunk_size: int = mv.CHUNK) -> str:
+        def mock_sha(path: str, chunk_size: int = mv.CHUNK, *, expected_size: int | None = None) -> str:
             if "alpha.bin" in path:
                 raise OSError("Simulated permission denied")
             with open(path, "rb") as f:
@@ -506,6 +560,135 @@ class TestManifestVerifier(unittest.TestCase):
         res_quiet = self.run_cli(self.game_dir, "--manifest", self.manifest_path, "--quiet")
         self.assertEqual(res_quiet.returncode, 0)
         self.assertEqual(res_quiet.stderr.strip(), "")
+
+
+class TestStableHashing(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.game = os.path.join(self.tmp.name, "game")
+        os.mkdir(self.game)
+        self.path = os.path.join(self.game, "sample.bin")
+        self.manifest = os.path.join(self.tmp.name, "manifest.json")
+        self.original = b"abcdefgh"
+        self.write_file(self.original)
+
+    def write_file(self, data: bytes) -> None:
+        with open(self.path, "wb") as f:
+            f.write(data)
+
+    def write_manifest(self, size: int, data: bytes) -> None:
+        entry = {"size": size, "sha256": hashlib.sha256(data).hexdigest()}
+        with open(self.manifest, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"files": {"sample.bin": entry}}, f)
+
+    def run_with_read_mutation(self, mutate, action):
+        real_open = open
+        changed = False
+
+        @contextlib.contextmanager
+        def hooked_open(*args, **kwargs):
+            with real_open(*args, **kwargs) as f:
+                if os.fspath(args[0]) != self.path:
+                    yield f
+                    return
+                reader = Mock(wraps=f)
+
+                def read(*read_args):
+                    nonlocal changed
+                    data = f.read(*read_args)
+                    if data and not changed:
+                        changed = True
+                        mutate()
+                    return data
+
+                reader.read.side_effect = read
+                yield reader
+
+        with patch.object(mv, "open", hooked_open, create=True):
+            return action()
+
+    def test_resize_between_scheduling_and_hashing_cannot_pass(self) -> None:
+        replacement = b"x"
+        self.write_manifest(len(self.original), replacement)
+        real_hash = mv.sha256_file
+
+        def resize_before_open(path, *args, **kwargs):
+            self.write_file(replacement)
+            return real_hash(path, *args, **kwargs)
+
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                self.write_file(self.original)
+                with patch.object(mv, "sha256_file", side_effect=resize_before_open):
+                    report = mv.verify_manifest(self.game, self.manifest, jobs=jobs)
+                self.assertFalse(report.passed)
+                self.assertEqual(report.problems, {"sample.bin": "UNREADABLE"})
+                self.assertIn("size changed before hashing", report.unreadable[0][1])
+
+    def test_truncation_during_read_cannot_pass_a_valid_manifest(self) -> None:
+        self.write_manifest(len(self.original), self.original)
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                self.write_file(self.original)
+                report = self.run_with_read_mutation(
+                    lambda: self.write_file(b"x"),
+                    lambda: mv.verify_manifest(self.game, self.manifest, jobs=jobs),
+                )
+                self.assertFalse(report.passed)
+                self.assertEqual(report.problems, {"sample.bin": "UNREADABLE"})
+                self.assertIn("changed while hashing", report.unreadable[0][1])
+
+    def test_growth_shrinkage_and_rewrite_during_hashing_are_rejected(self) -> None:
+        for replacement in (b"abcdefghijklmnop", b"ab", b"abcdWXYZ"):
+            with self.subTest(replacement=replacement):
+                self.write_file(self.original)
+
+                def change():
+                    before = os.stat(self.path)
+                    self.write_file(replacement)
+                    os.utime(self.path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+
+                with self.assertRaisesRegex(OSError, "changed while hashing"):
+                    self.run_with_read_mutation(change, lambda: mv.sha256_file(self.path, chunk_size=4))
+
+    def test_replaced_path_during_hashing_is_rejected(self) -> None:
+        def replace():
+            replacement = os.path.join(self.tmp.name, "replacement.bin")
+            with open(replacement, "wb") as f:
+                f.write(b"replaced")
+            try:
+                os.replace(replacement, self.path)
+            except PermissionError:
+                self.skipTest("filesystem does not allow replacing an open file")
+
+        with self.assertRaisesRegex(OSError, "changed while hashing"):
+            self.run_with_read_mutation(replace, lambda: mv.sha256_file(self.path, chunk_size=4))
+
+    def test_stable_files_and_custom_chunk_sizes_still_verify(self) -> None:
+        for payload in (self.original, b""):
+            self.write_file(payload)
+            expected = hashlib.sha256(payload).hexdigest()
+            for chunk_size in (1, 3, 32):
+                with self.subTest(size=len(payload), chunk_size=chunk_size):
+                    self.assertEqual(mv.sha256_file(self.path, chunk_size=chunk_size), expected)
+            self.write_manifest(len(payload), payload)
+            for jobs in (1, 2):
+                with self.subTest(size=len(payload), jobs=jobs):
+                    report = mv.verify_manifest(self.game, self.manifest, jobs=jobs)
+                    self.assertTrue(report.passed)
+                    self.assertEqual(report.matched, ["sample.bin"])
+                    self.assertEqual(report.bytes_verified, len(payload))
+
+    def test_nonempty_file_with_reported_size_zero_is_rejected(self) -> None:
+        path = "/proc/self/cmdline"
+        if not os.path.isfile(path):
+            self.skipTest("requires a procfs file whose reported size is zero")
+        self.assertEqual(os.path.getsize(path), 0)
+        with open(path, "rb") as f:
+            self.assertTrue(f.read(1))
+        with self.assertRaisesRegex(OSError, "changed while hashing"):
+            mv.sha256_file(path)
 
 
 if __name__ == "__main__":

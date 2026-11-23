@@ -257,6 +257,15 @@ fallback names match an item name or its joaat hash, and ten `prefix + x + y + s
 2,112 tiles match nothing in three atlases and one hash in the fourth. The tile textures are therefore either
 outside the scanned archives or named another way; this is unresolved.
 
+In the 1.0.2.1 exports, one content change set lists four grid metadata registrations and three candidate
+archive paths as siblings. The list gives no per-grid archive assignment. The two fog grids share a tile
+prefix, while the shore-wave and water-height grids each have a distinct prefix. A case-insensitive search
+of the 30,516 other plain export blobs (30,520 total, excluding the four grid documents) found none of the
+three prefixes or the grids' global or sector fallback names in ASCII or UTF-16LE. None of the three
+archive filenames appeared as a loose file in the local package. The single catalog hash match above
+remains uncorroborated. The tile payloads and the mapping from tile coordinates to archive entries remain
+unverified.
+
 A fifth grid uses the same base fields: one `TextureGridInfo` document has `origin`, `width`, `height`,
 `tileSize`, `streamRadius` and `zInflation`, plus a low- and a high-detail fallback name, but no sector
 overrides. It is 32,768 x 32,768 units with the same 512 tile, so **64 x 64 tiles**, the same 512 stream
@@ -460,7 +469,7 @@ Measured over the 267 payloads (43,284,925 B):
 
 | Measure | Value |
 |---|---:|
-| Well-formed | 259 (257 with a declaration, 2 tail-only) |
+| Well-formed | 259 (257 with a declaration, 2 complete without a declaration) |
 | Truncated at the start | 7 |
 | Rootless fragment | 1 |
 | Malformed | 0 |
@@ -856,6 +865,93 @@ alive.
 Not measured here (hypothesis): whether the distances are metres from the camera or the player, and what the
 not-visible and interior scale factors multiply.
 
+## Damage and tuning XML documents
+
+Three repeated roots in the top-ten table above cover the damage and tuning tables: `CDamageDataManager` (5 documents,
+485,482 B), `CTuningFile` (10 documents, 27,718 B), and `CCoverProcessorTuning` (3 documents, 34,380 B). All 18 parse
+cleanly. Counts and schemas only; no entry names or parameter values.
+
+### `CDamageDataManager` (5 documents, 485,482 B, 10 streams)
+
+Rather than repeating one table type, the five documents partition the damage system by sub-table:
+
+| Document | Inflated B | Streams | Top-level section | Measured structure |
+|---|---:|---:|---|---|
+| Doc 0 | 257,008 | 4 | `DamageCleanlinessDatas/Item` (5) | `25` `RegionData/Item` blocks (5 per entry) containing `528` keyed `WeaponData/Item` records (`key=`), with `616` `CleanlinessResults/Item` and `328` `CleanlinessResultsLegendary/Item` pairs `{MaxBulletHits, MaxDamageCleanliness}` |
+| Doc 1, Doc 4 | 104,082 / 107,078 | 2 / 2 | `DamageModifiers/Item` (147 / 96) | `243` top-level modifiers across 19 polymorphic `CDamageModifier*` classes (`CDamageModifierMultiply` 63, `CDamageModifierMultiReference` 58, `CDamageModifierClamp` 39, `CDamageModifierFirstSuccessfulReference` 36, `CDamageModifierMulti` 19, `CDamageModifierInstantKill` 5, 13 others) and `336` nested `Modifiers/Item` entries, gated by `Condition` trees across 65 `CDamageCondition*` classes (`CDamageConditionAnd` 144, `CDamageConditionNot` 126, `CDamageConditionOr` 72, `CDamageConditionFromDamageType` 60, `CDamageConditionFromWeaponType` 49, `CDamageConditionIsPlayerBuddy` 44) |
+| Doc 2 | 12,498 | 1 | `DismembermentData` (1) | Dismemberment thresholds and bone/region rules |
+| Doc 3 | 4,816 | 1 | `HitReactData` (13), `HitReactGripData` (2) | Hit-reaction and weapon-grip impulse parameters |
+
+### `CTuningFile` (10 documents, 27,718 B) and `CCoverProcessorTuning` (3 documents, 34,380 B)
+
+- **`CTuningFile` (10 single-stream documents, 266 to 11,727 B, median 1,875 B):** each wraps a `<Tunables>` list of
+  polymorphic `<Item type="...">` blocks (`14` items total across 14 distinct `type` classes, including
+  `CConversationManager__Tunables`, `CDeadeyeSpecialAbility__Tunables`, `CLasso__Tunables`, and
+  `CPlayerFocusSpecialAbility__Experimental__Tunables`). Sub-structures include `36` keyed
+  `EntityMaskConfig/EntityMaskProfiles/Item` records (`MaskValue` 4D `x/y/z/w`, `MaskValueExtras` 2D `x/y` on 33,
+  `BlendOutCurveType` on 4) and a nested `ClipSetTree` (`5` `TransportMotionHelpers__ClipsetTransportConditionNode`
+  branches over `8` `GameplayHelpers__ClipsetLeafNode` leaves).
+- **`CCoverProcessorTuning` (3 single-stream documents: 11,554, 11,422, and 11,404 B):** flat scalar tables with
+  `212`, `211`, and `210` direct `value=` children per document (`fAdditionalDistanceFromTreeToRejectAdditionalCoverpoints`,
+  `fAICanAimSweepCount`, `fCornerCoverPointDotThreshold`, `fCornerDistanceCheckResolutionFine`, etc.).
+
+## Combat, AI behaviour and weapon animation documents
+
+The representative roots of the combat/AI (13 documents, 809,074 B) and weapon-animation (6 documents, 162,778 B)
+categories use typed polymorphic `<Item type="...">` and keyed map tables:
+
+| Root | Inflated B (streams) | Status | Measured schema |
+|---|---:|---|---|
+| `CCombatInfoMgr` | 237,621 (4) | well-formed | `CombatInfos/Item` × 66 (`type="CCombatInfo"`), each with `Name`, `CombatMovement`, `BehaviourFlags`, `CombatAbility`, `AttackRanges`, `CoverHeightPreference`, `WeaponShootRateModifier` (`value=`), `FiringPatternSetHash`, `AccuracyProfile`, and `CombatFloats` (`BlindFireChance` and related scalars) |
+| `CFiringPatternInfoManager` | 208,240 (4) | tail-only | One of the 7 start-truncated XML payloads whose first block fell in an unread RPF9 gap; identified by its closing tag |
+| `CFleeDecisionMakerData` | 17,561 (1) | well-formed | `Profiles/Item` × 8 (`key=`), each defining `{Weight, Weights}` blocks for `Cower`, `RunAway`, `Mount`, and `TakeVehicle` (8 each), plus `Fly/Weights` (14 entries) |
+| `Combat__GoalData__Store` | 4,550 (1) | well-formed | `RoleSettings` (`Default` + `DataMap/Item` × 5 keyed `StyleMod` entries) and `PriorityCalculators/DataMap/Item` × 8 (`type="Combat__GoalData__EntityDistanceBasedPriorityCalculator"` with `13` `{MaxDistSq, Priority}` pairs) |
+| `WeaponAnimations__FullbodyControllerData` | 21,281 (1) | well-formed | `AnimRequestConfigMap/Item` × 11 (`type="WeaponAnimations__FBAnimRequestConfig"`, `DefaultRequestType` on 11, polymorphic `RequiredCondition` on 9, `7` `Variants/Item`) and `AnimRequestDataMap/Item` × 17 (`type="WeaponAnimations__FBRequestData"`, `LocoParams` on 16, `ControlGraphParams` on 11), plus `Timeouts` (1) |
+| `WeaponAnimations__ConfigData` | 1,733 (1) | well-formed | `AIHandPoseRules` and `BuddyHandPoseRules` (`type="WeaponAnimations__HandPoseRules"`), with nested `CAIConditionOr` / `CAIConditionAnd` / `CAIConditionBlackboardBool` trees under `PosePrefOverrides/ForceTwoHanded` |
+| `CAimUpperBodyDataBlock` | 1,813 (1) | tail-only | Start-truncated single-stream payload identified from its closing root tag |
+
+## Ped schedules, body variation, formations and energy
+
+Four representative roots account for 1,032,473 B (18 streams) of the 29-document peds/schedules/appearance category:
+
+| Root | Inflated B (streams) | Top-level sections and counts |
+|---|---:|---|
+| `CPedScheduleInfoManager` | 784,294 (12) | `Schedules/Item` × 4,861 (`{Name, Pack}` pairs), `PedScheduleTuning` (18 children), `PedDynamicScheduleTuning` (19 children), `Volumes/Item` × 9 (`VolumeType`, 3D `Position`/`Orientation`/`Scale`, `IsPenVolume`, and `SpawnPositions` `content="vec3v_array"`), `Routes` (1) |
+| `CPedVariationBodyTypeManager` | 77,462 (2) | `BodyShapePresets/Item` × 16 containing `432` `Expressions/Item` records (`27` per preset, `{Id, Values content="float_array"}`), `ScaleVariationProfiles/Item` × 26 (`key=`, `34` `ScaleVariations/Item` with `{Min, Max, SelectionWeight, ValueType}`), `BodyShapeVariationProfiles/Item` × 22 (`key=`, `53` `BodyShapeVariations/Item` with `{BodyShapePreset, SelectionWeight}`), `ScaleProfiles` (2), `HeightPresets` (1) |
+| `CPairedPedDataBlock` | 10,011 (1) | `SpacingData/Item` × 4 (seven 2D `x/y` distance pairs per item: `Spacing`, `MiddleSpacing`, `MinSpacing`, `MinSpacing_Crossing`, `MinMiddleSpacing`, `MinMiddleSpacing_Crossing`, `MaxSpacing`), `BespokeSpacingData` (2), `VehicleSpacingData` (1), `AmbientFormationData` (3, 6 2D `Pos` slots), `BespokeFormationData` (3, 11 2D `Pos` slots), `VehicleFormationData` (1) |
+| `CEnergyConfigInfos` | 160,706 (3) | `HealthConfig/Item` × 63 (`key=`, `parentFile` on 3, `MeleeProperties/KnockedOutWakeUpCount` on 62, `FireVulnerability` on 61, `EnergyReserveProperties/Reserves` `content="float_array"` on 59), `EnergyReserveConfigs/Item` × 58 (`153` `EnergyReserves/Item` with `{Type, EnergyAmount, Enabled, RechargeRate, RechargeEnabled, RechargeThreshold}`), `EnergyConfig` (54), `StaminaConfig` (8), `EnergyHealthStateMap` (4), `HealthRechargeConfig` (3), `SpecialAbilityConfig` (2) |
+
+In `CEnergyConfigInfos`, **60 of 60** `HealthConfig/Item/EnergyReserveConfig` references resolve case-insensitively to
+an `EnergyReserveConfigs/Item` entry in the same document.
+
+## World locations, pathing styles, trains and hazard nodes
+
+Four representative roots in the world/navigation/map category (826,397 B across 15 streams; all 4 well-formed):
+
+- **`GameShape__Data__LocationNameLoopkup` (1 document, 671,393 B, 11 streams):** (root spelling preserves the double
+  `o` in `Loopkup`.) Contains four keyed lookup tables (`key=`):
+  - `LocationNames/Item` × 2,318 (`Name` on all 2,318; `TextureDictionary` and `Texture` on 46).
+  - `InteriorNames/Item` × 1,358, holding `2,280` nested `<Item>` records with `{Name, Pos}`. Their 2,280 3D positions
+    span `x = -9,673.0..4,705.3`, `y = -7,308.0..8,589.9`, `z = -78.0..820.9` — 100% inside the world bounds of the
+    `PAMH` heightmap and `GridAtlasInfo` grids above.
+    span `x = -9,673.0..4,705.3`, `y = -7,308.0..8,589.9`, `z = -78.0..820.9` — their 2D `x`/`y` coordinates fall 100%
+    inside the `x`/`y` extent of the `PAMH` heightmap (`-13,312..5,120`, `-9,728..11,264`) and `GridAtlasInfo` grids
+    above, while `z` reaches `820.9` (above the `PAMH` `404` m ceiling).
+  - `RoadNames/Item` × 409 (`Name` on all 409) and `RiverNames/Item` × 66.
+- **`PathingStyleData` (1 document, 5,993 B, 1 stream):** `StyleProfiles/Item` × 12 (`key=`), each defining
+  `CurvatureStyle`, `CorneringStyle`, `ApproachStyle`, `ContinuityStyle`, `SlowdownStyle`, `SplineConfig`, and
+  `AvoidanceStyle`, plus optional `Flags` (9) and `DoorPathingStyle` (5).
+- **`CTrainConfigs` (1 document, 125,494 B, 2 streams):** `trainConfigs/Item` × 46, each carrying `name`,
+  `populateTrainDist`, three station stop-duration scalars (`stopAtStationDurationNormal`,
+  `stopAtStationDurationPlayer`, `stopAtStationDurationPlayerWithGang`), `announceStations`, `doorsBeep`, and `1..17`
+  `carriages/Item` entries (median 8, **314 carriages** total, each with `maxPedsPerCarriage`, `flipModelDir`,
+  `doInteriorLights`, `modelName` on 304, and `modelSetName` on 300).
+- **`CHazardNodes` (1 document, 23,517 B, 1 stream):** a 20-state hazard state machine (`Nodes/Item` × 20,
+  `type="CHazardNode"`, `key=`, `Name`, `ClipSet`, `ClipVictim`, `ClipThreat`, `UseMTH`, `RumbleCurve`,
+  `RumbleCurveStart`) linked by `43` `Successes/Item` transitions (`type="CHazardTransition"`, gated by
+  `CAIConditionGatorPit` [36], `CAIConditionAmbientEventDirection` [5], `CAIConditionOr` [1], `CAIConditionAnd` [1]).
+  All **18 of 18** non-empty transition target `<Node>` references resolve to one of the 20 `CHazardNode` keys.
+
 ## No-sharing rule
 
 The archive, every carved `.bin`, `index.json` (its `head`/`pre` fields contain payload bytes), XML
@@ -864,10 +960,54 @@ aggregate counts, sizes and schema/category names belong in git, issues or pull 
 synthetic data; CI never reads a game folder. This is the same rule as `AGENTS.md` and `CONTRIBUTING.md`, and
 it applies to this note as well.
 
+## Streaming reader (`tools/gamedata_reader.py`, ASSET-139)
+
+`tools/gamedata_reader.py` reads the carved documents with `iterparse` and turns each into plain Python values,
+without a schema per tag. Each top-level field is converted when its end tag arrives and then dropped, so memory is
+bounded by the largest field. The generic conversion follows the parser's own conventions:
+
+- `value=` is a scalar: bool, decimal or `0x` integer, float (a C `f` suffix allowed), else text.
+- `x/y/z/w` is a vector tuple.
+- `content=` is the array body. `short_array`, `float_array` and `float16_array` give number lists;
+  `vector2_array`, `vec3v_array`, `matrix33` and `matrix34` give tuples.
+- `type="Class"` is a polymorphic object `{"$type": ...}`, and `type="NULL"` is `None`.
+- `ref=` is `{"$ref": ...}`.
+- All-`Item` children are a list, or a dict when every one carries `key=`. A repeated tag is a list. A text-only
+  element is its text. Any other attribute is kept as `"@name"`.
+
+`register_root(tag)` and `register_type(name)` plug in a handler where a schema is known. Everything else stays
+generic.
+
+```
+python -I tools/gamedata_reader.py <work>/common [--root TAG] [--out DIR]   # counts; --out: one JSON per document (local only)
+```
+
+On the 1.0.2.1 carve of `common.rpf` the run takes about 5 s, with 0 conversion errors:
+
+| | count |
+|---|---:|
+| documents read | 259 of the 267 payloads |
+| roots | 111 |
+| not well-formed (the tail-only and incomplete carves counted above) | 8 |
+| scalars | 84,585 |
+| vectors | 20,825 |
+| arrays | 13,449 |
+| lists | 13,465 |
+| keyed maps | 526 |
+| polymorphic objects | 6,490 (317 `type` classes over 6,903 typed elements) |
+| `NULL` pointers | 278 |
+| references | 924 |
+| elements with extra attributes | 5,262 |
+
+The 7 roots missing from the 118 occur only in documents that are not well-formed. Counts only: the JSON that
+`--out` writes is the game's data and stays local. `tests/test_gamedata_reader.py` checks every convention,
+both dispatch tables, that streaming equals a whole-tree conversion, and the CLI, on synthetic XML.
+
 ## Next step
 
-The most useful next step is a **schema bridge**, not more carving: check whether the 118 XML root tags match
-RTTI class names in the executable, then build a streaming reader that dispatches on root and `type`. That
-turns the measured XML into the runtime's config layer without hand-writing 5,293 tags. The `MHIU`/`PAMH`
+The most useful next step is the other half of the **schema bridge**: check whether the 118 XML root tags (and the
+317 `type` classes) match RTTI class names in the executable, then register typed handlers for them in
+`tools/gamedata_reader.py`. That turns the measured XML into the runtime's config layer without hand-writing 5,293
+tags. The streaming reader that dispatches on root and `type` exists now (above). The `MHIU`/`PAMH`
 heightmaps are decoded by `tools/gamedata_maps.py`; every MHIU header field is identified (0x28 is the
 default height), and the row-table layouts and the value-to-Z mapping are measured.

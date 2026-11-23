@@ -171,6 +171,27 @@ def test_desc_probe_defers_index_load_to_hit_block():
     assert has_c9 and has_load and has_store, f"dl_hit missing deferred load: {hit_block}"
 
 
+def test_lookup_result_is_broadcast_before_use():
+    # Mesa ANV 26.2.7 (Alder Lake Xe-LP) segfaults compiling a sampler index that comes straight out of the probe
+    # loop when one sampler serves a float and an integer image (cs_sample_lz_int_d16, ps_ssharp). Each lookup's
+    # result goes through OpGroupNonUniformBroadcastFirst, and only the broadcast id indexes the descriptor arrays.
+    asm = translate([SAMPLE, LOAD, EXP, "s_endpgm"])
+    lines = [ln.strip() for ln in asm.splitlines()]
+    results = {ln.split()[0] for ln in lines if CALL in ln}
+    bcast = {}
+    for ln in lines:
+        if "OpGroupNonUniformBroadcastFirst" in ln:
+            bcast[ln.split()[0]] = ln.split()[-1]
+    assert results and sorted(bcast.values()) == sorted(results), (results, bcast)
+    assert "OpCapability GroupNonUniform" in lines
+    assert "OpCapability GroupNonUniformBallot" in lines
+    assert "OpCapability GroupNonUniformShuffle" not in lines
+    assert "%sg_lane = OpVariable %_ptr_Input_uint Input" not in lines
+    for ln in lines:
+        if ln.split()[1:2] == ["="] and "OpAccessChain" in ln and ("%images" in ln or "%samplers" in ln):
+            assert not results & set(ln.split()), ln
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -101,12 +101,14 @@ to it holds the same save. The wrapper's header is the only place the autosave's
 
 ## Importing into the runtime
 
-`runtime/shims/xgameruntime_services.cpp` (#279) keeps `XGameSave` data in
+The runtime's offline `XGameSaveImpl` (`runtime/shims/xgameruntime_gamesave.cpp`,
+[runtime_imports.md](runtime_imports.md)) keeps `XGameSave` data in
 `LEONIDA_SAVE_DIR\local-user\<container>\<blob>`, defaulting to `%LOCALAPPDATA%\Leonida\saves`, with names
 %-encoded. `python -I tools/saves.py import <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB]` writes payloads
 in that layout with the same encoding, plus `import-manifest.json` (source, size, SHA-256).
 
-Checked: four imported blobs (2 KB to 1.2 MB) read back byte-identical through the shim's `XGameSaveReadBlobData`.
+Checked earlier with the shim of the open #279, which used the same layout: four imported blobs (2 KB to 1.2 MB)
+read back byte-identical through its `XGameSaveReadBlobData`.
 
 **VERIFY:** the title's real container and blob names. The default is container = slot name and blob = payload file
 name, and `--map` overrides it. Confirm or fix them from the executable's `XGameSaveCreateContainer` and

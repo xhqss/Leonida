@@ -2,7 +2,8 @@
 //
 //   gameinput_probe [--seconds N] [--rumble]
 //
-// Lists the gamepads the shim sees, then prints the live gamepad reading of each for N seconds (default 10). With
+// Lists the gamepads the shim sees, with the raw HID report tables of each pad opened through HID, then prints the
+// live gamepad reading (and its newest raw input report, when there is one) for N seconds (default 10). With
 // --rumble it first plays, on every pad: the low-frequency motor, the high-frequency motor, the left and the right
 // impulse trigger, one second each. On a DualSense the trigger steps run in the LEONIDA_DS_TRIGGERS mode (rumble by
 // default; set it to resistance to feel that one). Everything goes through GameInputCreate from the shim registry,
@@ -26,8 +27,26 @@ std::vector<IGameInputDevice*> g_devices;
 
 void CALLBACK on_device(GameInputCallbackToken, void*, IGameInputDevice* device, uint64_t, uint32_t current, uint32_t previous) {
     const GameInputDeviceInfo* i = device->GetDeviceInfo();
-    std::printf("\n%s %s (%04x:%04x) motors=0x%x\n", (current & GameInputDeviceConnected) ? "connected   " : "disconnected",
-                i->displayName ? i->displayName->data : "?", i->vendorId, i->productId, i->supportedRumbleMotors);
+    std::printf("\n%s %s (%04x:%04x) motors=0x%x forcefeedback=%u haptic=%u\n",
+                (current & GameInputDeviceConnected) ? "connected   " : "disconnected",
+                i->displayName ? i->displayName->data : "?", i->vendorId, i->productId, i->supportedRumbleMotors,
+                i->forceFeedbackMotorCount, i->hapticFeedbackMotorCount);
+    // Raw HID (RT-175): the report tables read from the pad's HID report descriptor, or why there are none.
+    if (current & GameInputDeviceConnected) {
+        if (!(current & GameInputDeviceRawIoEnabled)) {
+            std::printf("raw hid: no raw I/O (no HID device the backend could open, or no readable descriptor)\n");
+        } else {
+            const auto list = [](const char* kind, uint32_t n, const void* p) {
+                const auto* r = static_cast<const GameInputRawDeviceReportInfo*>(p);
+                std::printf("raw hid: %u %s report(s):", n, kind);
+                for (uint32_t k = 0; k < n; ++k) std::printf(" id %u = %u bytes;", r[k].id, r[k].size);
+                std::printf("\n");
+            };
+            list("input", i->inputReportCount, i->inputReportInfo);
+            list("output", i->outputReportCount, i->outputReportInfo);
+            list("feature", i->featureReportCount, i->featureReportInfo);
+        }
+    }
     if ((current & GameInputDeviceConnected) && !(previous & GameInputDeviceConnected)) {
         device->AddRef();
         g_devices.push_back(device);
@@ -96,6 +115,16 @@ int main(int argc, char** argv) {
             if (motion)  // fractions of motionInfo's maxima: accel includes gravity, so a resting pad shows ~0.5 g
                 std::printf("\n[a]=(%+.2f,%+.2f,%+.2f) [w]=(%+.2f,%+.2f,%+.2f)   ", m.accelerationX, m.accelerationY,
                             m.accelerationZ, m.angularVelocityX, m.angularVelocityY, m.angularVelocityZ);
+            void* raw = nullptr;
+            if (r->GetRawReport(&raw) && raw) {  // the newest raw input report: id and its first 16 bytes
+                auto* rr = static_cast<IGameInputRawDeviceReport*>(raw);
+                unsigned char b[16] = {};
+                const size_t n = rr->GetRawData(sizeof b, b);
+                std::printf("\nraw id %u (%zu bytes):", rr->GetReportInfo()->id, rr->GetRawDataSize());
+                for (size_t k = 0; k < n; ++k) std::printf(" %02x", b[k]);
+                std::printf("   ");
+                rr->Release();
+            }
             std::fflush(stdout);
             r->Release();
         }

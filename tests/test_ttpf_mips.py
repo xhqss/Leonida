@@ -14,7 +14,7 @@ import sys
 import tempfile
 import unittest
 import zlib
-from contextlib import redirect_stdout
+from contextlib import ExitStack, closing, redirect_stderr, redirect_stdout
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -659,7 +659,7 @@ class BcDecodeTest(unittest.TestCase):
         self.assertAlmostEqual(sign_err, 255.0, places=5)
 
 
-class Bc3CheckTest(unittest.TestCase):
+class Bc2AndBc3CheckTest(unittest.TestCase):
     def run_check(self, fmt, lower_colour):
         import io
         from contextlib import redirect_stdout
@@ -669,11 +669,12 @@ class Bc3CheckTest(unittest.TestCase):
         payload = bytearray(layout["size"])
         for mip in layout["mips"]:
             colour = top_colour if mip["index"] == 0 else lower_colour
-            block = solid_bc4(255) + colour
+            alpha = b"\xff" * 8 if fmt in (74, 75) else solid_bc4(255)
+            block = alpha + colour
             retile_to(layout, mip, block * (mip["blocks_w"] * mip["blocks_h"]), payload)
         record = pack_etpf_record(256, 256, 6, 1, fmt, 1, 1, 4, 4096, 0x103)
         with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "bc3.ttpf")
+            path = os.path.join(tmp, "rgb-mips.ttpf")
             write_rds5_pool(path, [record], [payload])
             pool = ttpf.Pool(path)
             buf = io.StringIO()
@@ -684,10 +685,19 @@ class Bc3CheckTest(unittest.TestCase):
                 pool.close()
         return code, json.loads(buf.getvalue())
 
+    def test_bc2_decodes_all_four_rgb_selectors(self) -> None:
+        # Explicit alpha bytes precede the color block. Black comes before
+        # white, but BC2 still uses both interpolated colors.
+        block = struct.pack("<QHHI", 0xFEDCBA9876543210, 0, 0xFFFF, 0xE4E4E4E4)
+        expected = [(value, value, value) for value in (0.0, 255.0, 85.0, 170.0)] * 4
+        for fmt in (74, 75):
+            with self.subTest(fmt=fmt):
+                self.assertEqual(ttpf.decode_pixels(fmt, block, 1, 1), expected)
+
     def test_gray_chain_passes_whatever_the_endpoint_order(self):
         # Reversed endpoints with selector 2 describe the same gray as the top level.
         gray = struct.pack("<HHI", 0xFFFF, 0, 0xAAAAAAAA)
-        for fmt in (77, 78):
+        for fmt in (74, 75, 77, 78):
             with self.subTest(fmt=fmt):
                 code, result = self.run_check(fmt, gray)
                 self.assertEqual(code, 0, result)
@@ -695,7 +705,7 @@ class Bc3CheckTest(unittest.TestCase):
 
     def test_black_child_under_gray_top_fails(self):
         black = struct.pack("<HHI", 0, 0, 0)
-        for fmt in (77, 78):
+        for fmt in (74, 75, 77, 78):
             with self.subTest(fmt=fmt):
                 code, result = self.run_check(fmt, black)
                 self.assertEqual(code, 1, result)
@@ -1090,6 +1100,49 @@ class SyntheticPoolTest(unittest.TestCase):
         linear = solid_chain(self.layout)
         self.assertEqual(data[148:], b"".join(linear[m["index"]] for m in self.layout["mips"]))
 
+    def test_export_requested_mip_prefix_with_unavailable_lower_mips(self) -> None:
+        layout = self.layout
+        linear = solid_chain(layout)
+        payload = bytearray(layout["size"])
+        for mip in layout["mips"]:
+            retile_to(layout, mip, linear[mip["index"]], payload)
+        top_start = layout["mips"][0]["offset"]
+        path = os.path.join(self.tmp.name, "partially-readable.ttpf")
+        record = pack_etpf_record(256, 256, 6, 1, 71, 1, 1, 4, 4096, meta=0x103)
+        write_rds5_pool(path, [record], [payload[:top_start], payload[top_start:]])
+        # Give the lower mip chunk an unsupported codec. The second chunk is still valid zlib.
+        with open(path, "r+b") as f:
+            f.seek(24)
+            entry, = struct.unpack("<Q", f.read(8))
+            f.seek(24)
+            f.write(struct.pack("<Q", (entry & ~(15 << 26)) | (15 << 26)))
+
+        out = os.path.join(self.tmp.name, "top.dds")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ttpf.main(["export", path, "0", out, "--mips", "1"]), 0)
+        with open(out, "rb") as f:
+            data = f.read()
+        self.assertEqual(struct.unpack_from("<I", data, 28), (1,))
+        self.assertTrue(data[148:] == linear[0], "DDS payload differs from the source top mip")
+
+        full = os.path.join(self.tmp.name, "full.dds")
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(ttpf.main(["export", path, "0", full]), 2)
+        self.assertIn("not every requested mip uses a supported codec", err.getvalue())
+        self.assertFalse(os.path.exists(full))
+
+    def test_export_write_error_names_the_output_without_a_traceback(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        out = os.path.join(self.tmp.name, "destination")
+        os.mkdir(out)
+        error = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(error):
+            self.assertEqual(ttpf.export(self.pool, 0, out, force=True), 1)
+        self.assertIn(out, error.getvalue())
+        self.assertIn("cannot write", error.getvalue())
+
     def test_scan_reports_the_whitelist_gate(self):
         # The synthetic tuple is validated, so it is not gated: the partial export is
         # the descriptor non_tail limit, not the 319-byte profile table.
@@ -1269,6 +1322,23 @@ def build_bc1_bcpack_pool(path, width=64, height=64, mips=5, non_tail=1, mode=4,
     with open(path, "wb") as f:
         f.write(blob)
     return layout, linear, bytes(payload)
+
+
+class PoolCacheTest(unittest.TestCase):
+    def test_shared_cache_keeps_matching_chunk_offsets_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, ExitStack() as stack:
+            record = pack_etpf_record(4, 4, 1, 0, 71, 1, 1, 4, 4096)
+            pools = []
+            payloads = (bytes((0x11,)) * 4096, bytes((0x22,)) * 4096)
+            for i, payload in enumerate(payloads):
+                path = os.path.join(temp, f"pool_{i}.ttpf")
+                write_rds5_pool(path, [record], [payload])
+                pools.append(stack.enter_context(closing(ttpf.Pool(path))))
+            self.assertEqual(pools[0].chunks, pools[1].chunks)
+            cache = {}
+            for pool, payload in zip(pools, payloads):
+                self.assertEqual(pool.read_range(4096, 4096, cache), payload)
+            self.assertEqual(pools[0].read_range(4096, 4096, cache), payloads[0])
 
 
 class SyntheticBcpackPoolTest(unittest.TestCase):
@@ -1623,6 +1693,25 @@ class BadPoolTest(unittest.TestCase):
             code, err = self.run_main("layout", self.good, index)
             self.assertEqual(code, 2)
             self.assertIn("out of range", err)
+
+    def test_export_force_protects_input_files(self):
+        metadata = os.path.join(self.tmp.name, "metadata.json")
+        with open(metadata, "wb") as f:
+            f.write(b"{}")
+        cases = [
+            (self.good, [], "input pool"),
+            (metadata, ["--calibration", metadata], "--calibration profile"),
+            (metadata, ["--history", metadata], "--history file"),
+        ]
+        for source, options, message in cases:
+            with self.subTest(options=options):
+                with open(source, "rb") as f:
+                    before = f.read()
+                code, err = self.run_main("export", self.good, "0", source, "--force", *options)
+                self.assertEqual(code, 2)
+                self.assertIn(message, err)
+                with open(source, "rb") as f:
+                    self.assertEqual(f.read(), before)
 
 
 class SyntheticArrayPoolTest(unittest.TestCase):
@@ -2303,6 +2392,55 @@ class Uncompressed2DTest(unittest.TestCase):
             self.assertEqual(ttpf.check(pool_u, 0), 2)
         with redirect_stderr(io.StringIO()):
             self.assertEqual(ttpf.export(pool_u, 0, os.path.join(self.tmp.name, "dxgi2.dds")), 2)
+
+
+class UnmappedSentinelSpanTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_span_skips_unmapped_sentinels_and_rejects_unmapped_base(self):
+        # A valid 256x256 BC1 texture followed by unmapped ETPF records (base=0 and base=0x1FFFFF*4096),
+        # and then a second valid texture, must resolve both mapped spans cleanly and return None for
+        # the unmapped records (including in scan_pools, which previously passed a negative span).
+        layout = ttpf.surface_layout(256, 256, 71, 7, ttpf.tile_bytes(4))
+        size = layout["size"]
+        base0 = 4096
+        base1 = base0 + size
+        rec0 = pack_etpf_record(256, 256, 5, 2, 71, 1, 1, 4, base0)
+        rec_zero = pack_etpf_record(256, 256, 5, 2, 71, 1, 1, 4, 0)
+        rec_max = pack_etpf_record(256, 256, 5, 2, 71, 1, 1, 4, 0x1FFFFF * 4096)
+        rec1 = pack_etpf_record(256, 256, 5, 2, 71, 1, 1, 4, base1)
+
+        for label, recs, chunks, mapped_indices in (
+            ("zero_between", [rec0, rec_zero, rec1], [bytes(size), bytes(size)], (0, 2)),
+            ("max_between", [rec0, rec_max, rec1], [bytes(size), bytes(size)], (0, 2)),
+            ("trailing_zero_and_max", [rec0, rec_zero, rec_max], [bytes(size)], (0,)),
+        ):
+            with self.subTest(case=label):
+                path = os.path.join(self.tmp.name, f"{label}.ttpf")
+                write_rds5_pool(path, recs, chunks)
+                pool = ttpf.Pool(path)
+                self.addCleanup(pool.close)
+                for idx in mapped_indices:
+                    d = pool.descriptor(idx)
+                    self.assertEqual(pool.span(idx, d["base"]), size)
+                    a = ttpf.analyze(pool, idx)
+                    self.assertTrue(a["span_matches"], a)
+                    self.assertNotIn("blocked", a)
+                for idx in range(len(recs)):
+                    if idx not in mapped_indices:
+                        d = pool.descriptor(idx)
+                        self.assertIsNone(pool.span(idx, d["base"]))
+                        a = ttpf.analyze(pool, idx)
+                        self.assertEqual(a["blocked"], "no mapped allocation")
+                scan_out = os.path.join(self.tmp.name, f"{label}.json")
+                with redirect_stdout(io.StringIO()):
+                    ttpf.scan_pools([path], scan_out)
+                with open(scan_out, encoding="utf-8") as f:
+                    total = json.load(f)["total"]
+                self.assertEqual(total["chunk_metadata_fail"], 0)
+                self.assertEqual(total["chunk_metadata_ok"], len(mapped_indices))
 
 
 if __name__ == "__main__":

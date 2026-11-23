@@ -552,7 +552,7 @@ class DdsPngTest(unittest.TestCase):
         expected = bytes([
             6, 46, 86, 206,
             150, 20, 150, 252,
-            40, 50, 60, 70,
+            47, 57, 67, 70,         # colours weighted by alpha (dds_png, 62804d0d): sum(c*a) / sum(a)
             255, 255, 255, 255,
         ])
         self.assertEqual(out, expected)

@@ -1,9 +1,11 @@
 // Milestone M0 (docs/d3d12_vulkan.md section 6): a window shows a stable clear colour for 60 frames, through the
 // Vulkan-backed device behind the Xbox-ABI proxy, with no Vulkan validation errors. Each frame resets the list,
 // moves the back buffer PRESENT -> RENDER_TARGET, clears it, moves it back, executes, presents and signals a fence.
-// The window is then resized, which recreates the swapchain and scales the blit. Last, the colour on screen is read
-// back with GDI when the window is in front and the display is in SDR (skipped otherwise, e.g. in HDR
-// or on a locked desktop). No shaders or game data.
+// The window is then resized, which recreates the swapchain and scales the blit. The presented images are copied
+// back (the presenter's capture) and must hold the clear colour at the swapchain's size. Last, the colour on screen
+// is read back with GDI on native Windows when the window is in front with no other window over its centre, the
+// display is in SDR and GDI can read the screen. Under Wine, rootless XWayland can return black for desktop reads,
+// so the swapchain checks confirm the colour there. No shaders or game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
@@ -88,6 +90,17 @@ bool has_interactive_window_station() {
     return (flags.dwFlags & WSF_VISIBLE) != 0;
 }
 
+// True when the window manager reports this window as the top-level window at a screen point. Being the foreground
+// window does not make it so: an always-on-top window, or one another process showed without taking the foreground,
+// can lie over it, and a GDI read of the screen then returns that window's pixel. WindowFromPoint passes over hidden
+// and disabled windows and over windows that are transparent to hit testing (a click-through overlay,
+// WS_EX_LAYERED | WS_EX_TRANSPARENT), so an overlay of that kind drawn over the point is not noticed, and neither
+// is anything the compositor draws there itself.
+bool is_top_window_at(HWND window, POINT screen_point) {
+    const HWND hit = WindowFromPoint(screen_point);
+    return hit && GetAncestor(hit, GA_ROOT) == window;
+}
+
 void set_client_size(HWND window, int width, int height) {
     RECT rect{0, 0, width, height};
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
@@ -115,6 +128,8 @@ int fail_semaphore_in = 0;               // armed: the n-th vkCreateSemaphore fr
 bool fail_surface_formats = false;       // armed: the next surface-format query fails before creation
 bool observe_next_swapchain = false;
 bool report_undefined_extent = false;    // armed: surface capabilities reports undefined extent (0xFFFFFFFF)
+bool undefined_extent_queried = false;
+VkExtent2D last_swapchain_extent{};
 VkSwapchainKHR last_created_swapchain = VK_NULL_HANDLE;
 VkSwapchainKHR observed_old_swapchain = VK_NULL_HANDLE;
 unsigned out_of_date = 0;                // presents the real driver reported out of date
@@ -170,6 +185,7 @@ VKAPI_ATTR VkResult VKAPI_CALL surface_formats(VkPhysicalDevice physical, VkSurf
 
 VKAPI_ATTR VkResult VKAPI_CALL create_swapchain(VkDevice device, const VkSwapchainCreateInfoKHR* info,
                                                 const VkAllocationCallbacks* allocator, VkSwapchainKHR* out) {
+    if (info) last_swapchain_extent = info->imageExtent;
     if (observe_next_swapchain) {
         observed_old_swapchain = info->oldSwapchain;
         observe_next_swapchain = false;
@@ -185,6 +201,7 @@ VKAPI_ATTR VkResult VKAPI_CALL get_surface_capabilities(VkPhysicalDevice physica
     if (result == VK_SUCCESS && report_undefined_extent && caps) {
         caps->currentExtent.width = 0xFFFFFFFF;
         caps->currentExtent.height = 0xFFFFFFFF;
+        undefined_extent_queried = true;
     }
     return result;
 }
@@ -259,8 +276,7 @@ int main() {
         std::fprintf(stderr, "FAIL: cannot create the presentation window (Win32 error %lu)\n", GetLastError());
         return 1;
     }
-    ShowWindow(window, SW_SHOWNORMAL);
-    SetForegroundWindow(window);
+    ShowWindow(window, SW_SHOWNOACTIVATE);
     UpdateWindow(window);
     pump();
 
@@ -284,6 +300,7 @@ int main() {
         rt::d3d12::set_device_outer(inner, device.p);
         auto presenter = rt::d3d12::create_window_presenter(inner, window);
         EXPECT(presenter);
+        EXPECT(presenter->enable_capture());  // every presented frame is copied back, for the colour checks
 
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;
@@ -323,6 +340,28 @@ int main() {
         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         ID3D12CommandList* lists[] = {list.p};
         UINT64 signalled = 0;
+        // The last presented frame as the swapchain holds it: the whole image is the cleared colour at the size the
+        // presenter reports. This reads the image the presentation engine was given, so it holds wherever the screen
+        // itself cannot be read back.
+        const auto presented_image_is_clear_colour = [&]() -> bool {
+            std::vector<std::uint8_t> pixels;
+            VkExtent2D size{};
+            VkFormat format = VK_FORMAT_UNDEFINED;
+            if (!presenter->read_back(pixels, &size, &format)) return false;
+            const VkExtent2D current = presenter->extent();
+            if (size.width != current.width || size.height != current.height) return false;
+            const bool bgra = format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+            for (std::size_t i = 0; i < pixels.size(); i += 4) {
+                const int r = pixels[i + (bgra ? 2 : 0)], g = pixels[i + 1], b = pixels[i + (bgra ? 0 : 2)];
+                if (std::abs(r - 51) > 1 || std::abs(g - 153) > 1 || std::abs(b - 230) > 1) {
+                    const std::size_t texel = i / 4;
+                    std::fprintf(stderr, "presented image %ux%u: %d,%d,%d at %zu,%zu (cleared to 51,153,230)\n",
+                                 size.width, size.height, r, g, b, texel % size.width, texel / size.width);
+                    return false;
+                }
+            }
+            return true;
+        };
         // `arm` runs just before the present, so an injection it sets up hits the presenter, not the list's work.
         const auto frame = [&](UINT sync_interval, const std::function<void()>& arm = {}) -> bool {
             pump();
@@ -355,6 +394,7 @@ int main() {
         EXPECT(presenter->presented() == 60 - driver::out_of_date);
         const VkExtent2D first = presenter->extent();
         EXPECT(first.width == width && first.height == height);
+        EXPECT(presented_image_is_clear_colour());
 
         // A resize recreates the swapchain; the 320x240 back buffer is scaled to the new size. Unsynchronised
         // presents (sync interval 0) switch the present mode on the way.
@@ -362,8 +402,14 @@ int main() {
         for (int i = 0; i < 10; ++i) EXPECT(frame(i < 5 ? 1 : 0));
         EXPECT(presenter->extent().width == 400 && presenter->extent().height == 300);
         EXPECT(presenter->presented() == 70 - driver::out_of_date);
+        EXPECT(presented_image_is_clear_colour());  // the 320x240 back buffer scaled to the whole 400x300 image
         EXPECT(SUCCEEDED(fence->SetEventOnCompletion(signalled, nullptr)));
         const unsigned real_out_of_date = driver::out_of_date;
+
+        // Three of the failures below make the runtime log "[rt] d3d12: present failed"; say so first, so the log is
+        // not read as a fault.
+        std::fprintf(stderr, "injecting presenter failures: the next three \"present failed\" lines (VkResult "
+                             "-1000001004 twice, then -1) are expected\n");
 
         // Failures injected by the driver double (VictorJulianiR's review of the presenter):
         // 1. Present statuses: OUT_OF_DATE was not shown, so it is not counted; SUBOPTIMAL was, so it is.
@@ -409,21 +455,33 @@ int main() {
         EXPECT(SUCCEEDED(fence->SetEventOnCompletion(signalled, nullptr)));
 
         // 4. Undefined surface extent (0xFFFFFFFF, reported by Intel UHD graphics / Win32 WSI; D3D-165):
-        //    the presenter queries the window client extent and clamps to surface bounds.
+        //    switch vsync to 0 to force swapchain recreation, verifying that vkGetPhysicalDeviceSurfaceCapabilitiesKHR
+        //    is reached while armed and that vkCreateSwapchainKHR receives the clamped client extent (400x300)
+        //    instead of 0xFFFFFFFF.
         driver::report_undefined_extent = true;
-        EXPECT(frame(1));
+        driver::undefined_extent_queried = false;
+        EXPECT(frame(0));
+        EXPECT(driver::undefined_extent_queried);
+        EXPECT(driver::last_swapchain_extent.width == 400 && driver::last_swapchain_extent.height == 300);
         EXPECT(presenter->extent().width == 400 && presenter->extent().height == 300);
         driver::report_undefined_extent = false;
+        EXPECT(presented_image_is_clear_colour());
 
         std::printf("injected: out-of-date and suboptimal presents counted apart, a failed swapchain recreation "
                     "released and retried, a failed blit submission recovered, undefined surface extent resolved "
                     "(%u real out-of-date presents)\n",
                     real_out_of_date);
 
-        // What reached the screen: the centre of the client area, if the window is in front.
-        Sleep(200);
-        pump();
-        if (GetForegroundWindow() == window && !IsIconic(window)) {
+        // Wine's desktop GDI read can return black even when the compositor presents the right colour.
+        // The swapchain checks above also cover Wine drivers that cannot read the desktop at all.
+        const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+        if (!wine) {
+            Sleep(200);
+            pump();
+        }
+        if (wine) {
+            std::printf("Wine: on-screen colour check skipped after swapchain readback\n");
+        } else if (GetForegroundWindow() == window && !IsIconic(window)) {
             if (is_hdr_monitor(window)) {
                 std::printf("the monitor is in HDR mode: on-screen colour check skipped\n");
             } else {
@@ -431,14 +489,46 @@ int main() {
                 GetClientRect(window, &client);
                 POINT centre{(client.right - client.left) / 2, (client.bottom - client.top) / 2};
                 ClientToScreen(window, &centre);
-                HDC screen = GetDC(nullptr);
-                const COLORREF pixel = GetPixel(screen, centre.x, centre.y);
-                ReleaseDC(nullptr, screen);
-                const int r = GetRValue(pixel), g = GetGValue(pixel), b = GetBValue(pixel);
-                std::printf("screen pixel at the window centre: %d,%d,%d (cleared to 51,153,230)\n", r, g, b);
-                EXPECT(pixel != CLR_INVALID);
-                EXPECT(std::abs(r - 51) <= 3 && std::abs(g - 153) <= 3 && std::abs(b - 230) <= 3);
-                screen_checked = true;
+                const auto is_clear_colour = [](COLORREF c) {
+                    return std::abs(GetRValue(c) - 51) <= 3 && std::abs(GetGValue(c) - 153) <= 3 &&
+                           std::abs(GetBValue(c) - 230) <= 3;
+                };
+                // The foreground window can still be covered at its centre, so a read counts only when this window
+                // was the top one there both before and after it. How long the compositor takes to show the last
+                // frame, or to stop showing a window that has just gone, is not known (the 200 ms above is a guess),
+                // so a pixel that is not the clear colour is read again for up to a second. Nothing is presented
+                // meanwhile: a late frame passes, a wrong colour that stays fails.
+                COLORREF pixel = CLR_INVALID, first_pixel = CLR_INVALID;
+                bool covered = false;
+                int reads = 0;
+                for (;;) {
+                    covered = !is_top_window_at(window, centre);
+                    if (covered) break;
+                    HDC screen = GetDC(nullptr);
+                    pixel = GetPixel(screen, centre.x, centre.y);
+                    ReleaseDC(nullptr, screen);
+                    covered = !is_top_window_at(window, centre);
+                    if (covered) break;
+                    if (++reads == 1) first_pixel = pixel;
+                    if (pixel == CLR_INVALID || is_clear_colour(pixel) || reads > 20) break;
+                    Sleep(50);
+                    pump();
+                }
+                if (covered) {
+                    std::printf("another window covers the window centre: on-screen colour check skipped, the "
+                                "colour was checked in the presented images\n");
+                } else if (pixel == CLR_INVALID) {
+                    std::printf("GDI cannot read the screen here (GetPixel on the screen DC returns CLR_INVALID): "
+                                "on-screen colour check skipped, the colour was checked in the presented images\n");
+                } else {
+                    const int r = GetRValue(pixel), g = GetGValue(pixel), b = GetBValue(pixel);
+                    std::printf("screen pixel at the window centre: %d,%d,%d (cleared to 51,153,230)\n", r, g, b);
+                    if (reads > 1)
+                        std::printf("read %d times, 50 ms apart; the first read was %d,%d,%d\n", reads,
+                                    GetRValue(first_pixel), GetGValue(first_pixel), GetBValue(first_pixel));
+                    EXPECT(is_clear_colour(pixel));
+                    screen_checked = true;
+                }
             }
         } else {
             std::printf("the window is not in front: on-screen colour check skipped\n");
@@ -454,6 +544,6 @@ int main() {
         return 1;
     }
     std::printf("M0: 70 frames cleared and presented through the Xbox-ABI proxy on Vulkan, swapchain recreated on "
-                "resize%s\n", screen_checked ? ", colour confirmed on screen" : "");
+                "resize, colour confirmed in the presented images%s\n", screen_checked ? " and on screen" : "");
     return 0;
 }

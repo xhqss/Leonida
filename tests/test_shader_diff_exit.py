@@ -10,6 +10,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import shader_diff as sd  # noqa: E402
+from spirv_mini_interp import UnsupportedConstruct  # noqa: E402
 
 
 class HarnessErrorExit(unittest.TestCase):
@@ -18,6 +19,45 @@ class HarnessErrorExit(unittest.TestCase):
             raise RuntimeError("broken harness")
         with mock.patch.object(sd, "run_one", boom), mock.patch("sys.stdout"):
             self.assertEqual(sd.main(["--programs", "2"]), 2)
+
+    def test_unexpected_translator_failures_exit_2(self):
+        for error_type in (IndexError, KeyError, ValueError):
+            with self.subTest(error=error_type.__name__):
+                out = io.StringIO()
+                with (
+                    mock.patch.object(sd.rdna2spirv, "translate", side_effect=error_type("broken translator")),
+                    contextlib.redirect_stdout(out),
+                ):
+                    self.assertEqual(sd.main(["--programs", "1"]), 2)
+                self.assertIn("0 skipped, 1 harness errors", out.getvalue())
+                self.assertIn(f"{error_type.__name__}:", out.getvalue())
+                self.assertIn("broken translator", out.getvalue())
+
+    def test_unsupported_translation_is_a_skip(self):
+        out = io.StringIO()
+        with (
+            mock.patch.object(sd.rdna2spirv, "translate", side_effect=sd.rdna2spirv.Unsupported("test opcode")),
+            contextlib.redirect_stdout(out),
+        ):
+            self.assertEqual(sd.main(["--programs", "1"]), 0)
+        self.assertIn("1 skipped, 0 harness errors", out.getvalue())
+        self.assertIn("translator unsupported: test opcode", out.getvalue())
+
+    def test_unexpected_interpreter_failure_exits_2(self):
+        out = io.StringIO()
+        with mock.patch.object(sd, "run_fragment", side_effect=RuntimeError("broken interpreter")):
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(sd.main(["--programs", "1"]), 2)
+        self.assertIn("0 skipped, 1 harness errors", out.getvalue())
+        self.assertIn("RuntimeError: broken interpreter", out.getvalue())
+
+    def test_unsupported_interpreter_construct_is_a_skip(self):
+        out = io.StringIO()
+        with mock.patch.object(sd, "run_fragment", side_effect=UnsupportedConstruct("test construct")):
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(sd.main(["--programs", "1"]), 0)
+        self.assertIn("1 skipped, 0 harness errors", out.getvalue())
+        self.assertIn("test construct", out.getvalue())
 
     def test_mismatch_still_exits_1(self):
         with mock.patch.object(sd, "run_one", lambda *_a: ("mismatch", "lane word 0")), mock.patch("sys.stdout"):

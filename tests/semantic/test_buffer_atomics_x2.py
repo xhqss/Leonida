@@ -1,8 +1,9 @@
 """Value tests for RDNA2 buffer_atomic_{and,or,xor,swap}_x2, run through spirv_mini_interp on the CPU.
 
 M = op(M, DATA) on the 64-bit element (two dwords, low first) at the MUBUF address; with glc the old 64 bits come
-back in vdata[0:1]. The translator does one 32-bit atomic per dword (exact memory for a bitwise op or an exchange) and
-checks bounds for the whole 8-byte element, all or nothing. The V# here is raw (OOB_SELECT 3): an access is in range
+back in vdata[0:1]. The translator does one 32-bit atomic per dword (exact memory for a bitwise op, and for an exchange
+by one lane at a time: two lanes swapping into one element at once can tear it) and checks bounds for the whole 8-byte
+element, all or nothing. The V# here is raw (OOB_SELECT 3): an access is in range
 when offset + 8 <= num_records. Standard library only; no GPU, no game files.
 """
 import os

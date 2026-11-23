@@ -153,6 +153,16 @@ struct hash, byte size, `u64` pointer. The pointers are `0x50000000 | file offse
 reach an appended graphics page. Fields are not named on disk. Their 32-bit hashes are the **case-sensitive
 joaat** of the engine names; matching those hashes is how the fields below were identified.
 
+The member `type` byte uses the PSIN type enum ([psin.md](psin.md#layouts)). Measured in the `CMapData`
+(`d3593fa6`) and `CEntityDef` (`ce501483`) member tables of three carved `levels.rpf` maps: `0x34` is the
+`4×f32` quaternion (`rotation`), `0x32` a 12-byte vec3 (`position`), `0x33` its 16-byte padded form (the four
+extent triples), `0x21` f32 (`scaleXY`, `scaleZ`, `lodDist`, `childLodDist`), `0x12` i16 (`parentIndex`,
+`parentInstance`), `0x15` u32 (`flags`, `numChildren`), `0x08` u64 (`entity id`), `0x60` an 8-bit enum
+(`lodLevel`, `priorityLevel`), `0x4A` a u32 name hash, `0x52` and `0x5C` the two array forms, and `0x05` a struct
+reference whose `extra` word is the referenced struct hash. `0x0C` is a 16-byte vector in the PSIN table but did
+not occur in these schemas. 6stars independently reads these members with the same codes; no code or table was
+copied, and its repository has no licence.
+
 Every 0x7a header is checked the same way: the struct/instance table pointers must lie inside the stream, every
 struct's member table must lie inside the stream, and at least one block must have a known struct and a
 resolvable pointer. A block whose struct hash is not in the table is kept opaque rather than guessed (some
@@ -201,6 +211,7 @@ world rotation (conjugate it for rendering). `scaleXY` applies to X/Y, `scaleZ` 
 | entity id | `1b60404d` | +0x08 | u64 | per-entity id (not a name key; not unique, see world_names.md) |
 | archetype key | `c8a7b90a` | +0x20 | u64 | per-archetype key: MurmurHash3 x64 128 low 64 of the name |
 | `lodLevel` | `6c8f1715` | +0x7e | u8 | 0 HD, 1 LOD, 2 SLOD1, 3 SLOD2, 4 SLOD3, 5 ORPHAN_HD, 6 SLOD4 |
+| terrain parent-map selector | `84799847` | +0x7f | i8 | zero-based slot in the source map's parent-map reference array, or -1 in the measured terminal rows |
 | `parentIndex` | `d89231bd` | +0x5c | i16 | parent entity index (signed; -1 = none) |
 | `parentInstance` | `e74c3c23` | +0x5e | i16 | parent batch instance |
 | `numChildren` | `a687ac89` | +0x68 | u32 | linked children |
@@ -228,6 +239,80 @@ The same dictionary resolved 5/23,535 map names and 1/2,089 parent rows, all con
 name-source lower bound, not a formula limit: with the names `tools/rpf9_names.py` lists in `levels.rpf`, 99.85%
 of the 1,670,435 entities a whole-archive `world_index.py` run reads resolve, all verified by the 64-bit key. See [world_names.md](world_names.md) and
 `tools/world_names.py`.
+
+## Archetype definitions (`CMapTypes`)
+
+The `.ytyp` role. A `CMapTypes` resource (root `d98bb561`, 0x50 bytes) is a `0x7a` metadata resource like a map
+file, counted as `meta` by `world_index.py`. Its archetypes are stored the way entities are: one block of
+fixed-size instances per struct, `CBaseArchetypeDef` (`82d6fc83`, 0xb8 bytes) and `CMloArchetypeDef`
+(`10506455`, 0x220 bytes). The interior struct repeats the base members at the same offsets and adds its own
+from +0xb8. `CTimeArchetypeDef` (`76b0c56c`) did not occur in the measured window. All three names, and the
+member names below, are case-sensitive joaat. `tools/world_archetypes.py` finds every field by hash in the
+resource's own member table.
+
+| Field | Hash | Offset | Type | Meaning |
+|---|---|---:|---|---|
+| `lodDist` | `bf74dfa7` | +0x38 | f32 | default LOD distance (an entity's `lodDist` of -1 uses it) |
+| `specialAttribute` | `6c1523e4` | +0x3c | u32 | |
+| `bbMin` / `bbMax` | `d9ef8236` / `e78aa618` | +0x40 / +0x4c | 3×f32 | model-space bounding box |
+| `bsCentre` / `bsRadius` | `d61872ff` / `82e8c5de` | +0x58 / +0x64 | 3×f32 / f32 | bounding sphere |
+| `flags` | `67d26872` | +0x68 | u32 | |
+| `hdTextureDist` | `ad5d5b4c` | +0x70 | f32 | |
+| `name` | `e6e17f14` | +0x78 | u32 | lower-cased joaat of the archetype name; what `CEntityDef.archetypeName` holds |
+| `clipDictionary` | `19471791` | +0x7c | u32 | hash |
+| `physicsDictionary` | `d3c717fc` | +0x80 | u32 | hash |
+| `assetType` | `069004b2` | +0x84 | enum (u32) | see below |
+| `assetName` | `9a77c7c5` | +0x88 | u32 | hash of the model resource name |
+| `extensions` | `f17e7f28` | +0x90 | array | |
+
+Unnamed members: five u64 (type `0x4f`) at +0x08..+0x28, `c067a638` (+0x30), `8f215e15` (u32, +0x6c),
+`66d9cb52` and `96b4753e` (u32 hashes, +0x74 and +0x8c), `9a7b6e6d` (+0xa0), `1b60404d` (u64, +0xa8, the same
+member hash as the entity id) and the enum `07d164a8` (+0xb0).
+
+Measured in the 8–9 GiB window of `levels.rpf`: 119
+`CMapTypes` resources hold 31,800 definitions (31,785 base, 15 interior) for 14,955 distinct names. Where a
+name is defined more than once, every copy has the same box.
+
+`assetType`, measured by name: each distinct `name` of the window against the `name.#dr` / `name.#ft` strings
+that `tools/rpf9_names.py --types dr,ft,dd` lists in the whole `levels.rpf` (266,456 `.#dr`, 50,801 `.#ft`, no
+`.#dd`):
+
+| `assetType` | names | listed as `.#ft` | listed as `.#dr` | not listed |
+|---:|---:|---:|---:|---:|
+| 1 | 3,614 | 3,611 | 0 | 3 |
+| 2 | 8,689 | 0 | 8,681 | 8 |
+| 3 | 2,637 | 0 | 2,327 | 310 |
+| 0 | 15 | 0 | 0 | 15 |
+
+1 is a fragment and 2 a drawable; no name crosses over. 3 is named like a drawable but is a different type;
+that it is the drawable-dictionary type is an inference (no `.#dd` string confirms it). The 15 type-0
+definitions are the interiors. For types 1–3, `assetName` equals `name` in every definition; for the
+interiors it does not.
+
+### Checking transforms against the map extents
+
+A map root's `entitiesExtentsMin`/`Max` is a box the map's own entities fill. With the definitions, that box can
+be rebuilt independently: transform each entity's archetype box and take the union. `world_archetypes.py
+--check-extents` does this for every map whose entities all have a definition in the window, with a 5 cm
+tolerance per bound. In the 8–9 GiB window, 1,088 of 1,398 maps are fully defined:
+
+| 827 maps with a rotated entity | stored quaternion | conjugated quaternion |
+|---|---:|---:|
+| union equals the stored extents | 236 | **616** |
+| median of the largest bound error | 0.627 m | **0.00016 m** |
+
+This confirms the conjugate rule of [Map placement records](#map-placement-records) on box geometry, not only
+on positions. The 211 maps that match neither have extents larger than the union, never smaller (827/827
+inside): something the entity list does not hold also widens them.
+
+**The stored extents ignore the entity scale.** Of the 179 fully-defined maps with a scaled entity, 155 match
+the union built without scale and 101 the union built with `scaleXY`/`scaleZ`; with scale, 41 unions are larger
+than the stored extents, without scale none is. This says how the extents were computed, not how the renderer
+applies scale; the scale rule of [Map placement records](#map-placement-records) stays as it is.
+
+```powershell
+python -I tools\world_archetypes.py <game>\levels.rpf --start 8589934592 --limit 1073741824 --check-extents --out <work>\world\archetypes_8-9.json
+```
 
 ### Measured placement summary
 
@@ -276,6 +361,8 @@ lists; interiors and entity groups need the transform of whatever places them.
 Readable:
 - the 0x7a header, schema, struct/member tables and instance blocks;
 - map file count, per-file streaming/entity extents;
+- archetype definitions in `CMapTypes`: name, asset name and type, bounding box and sphere, default LOD
+  distance and flags ([Archetype definitions](#archetype-definitions-cmaptypes));
 - every entity's position, rotation, scale, flags, per-entity id, per-archetype 64-bit key, archetype hash and LOD
   fields;
 - in `common.rpf`, the full XML content-definition path list and cell names.
@@ -314,10 +401,66 @@ The place names shown to the player come from one `GameShape__Data__LocationName
   sections.
 - **All 2,280 interior positions lie inside the world rectangle** shared by the `PAMH` heightmap and the region
   tint map (x -13,312..5,120, y -9,728..11,264); none is at the origin. Heights run from -78 to 821 (median 5).
-- None of the keys is an archive entry name or the joaat of a model archetype name in the local catalog, the two
-  texture-dictionary names match archive entries but not `.ytd` ones, so the keys are their own namespace (probably shape
-  or zone ids resolved elsewhere at runtime; not measured). The 46 textures match no texture-dictionary item
-  in the catalog either.
+- **Interior keys are interior archetype names.** 1,357 of the 1,358 `InteriorNames` keys, lower-cased, are the
+  joaat `name` of a `CMloArchetypeDef` in `levels.rpf`, and all 1,357 are confirmed by that archetype's 64-bit key
+  (MurmurHash3 x64 low 64 of the lower-cased key at +0x08, member `8bfb6095`). The remaining key names no interior
+  and its hash occurs in no hash member of `levels.rpf`. The earlier "own namespace" reading came from a 1 GiB
+  window holding 15 of the 1,706 interior archetypes and from the model catalog, which has no interiors. See
+  [Interior keys and interior placements](#interior-keys-and-interior-placements).
+- None of the location, river or road keys is an archive entry name or the joaat of a model archetype name in the
+  local catalog; the two texture-dictionary names match archive entries but not `.ytd` ones. The 46 textures
+  match no texture-dictionary item in the catalog either.
+
+### Interior keys and interior placements
+
+`tools/world_interior_names.py` reads every interior definition and every interior placement in `levels.rpf`
+and joins them with the `InteriorNames` section (full archive, `--jobs 15`, about 2 minutes):
+
+| Measured | Count |
+|---|---:|
+| `CMloArchetypeDef` definitions / distinct names | 1,706 / 1,706 |
+| `CMloInstanceDef` placements / distinct interiors placed | 2,590 / 1,704 |
+| keys naming an interior (confirmed by the 64-bit key) | 1,357 (1,357) |
+| keys whose interior is placed | 1,356 |
+| ... with as many positions as placements | 1,268 |
+| ... with more positions than placements | 64 |
+| ... with fewer positions than placements | 24 |
+
+So a key selects one interior archetype, and its inner items are, in most cases, one per placed copy of that
+interior: the `Name` of each item labels that copy.
+
+Interiors are not placed by `CEntityDef`: no entity in the 1,670,435 rows of `world_index.py --entities-out`
+uses an interior name. They are placed by `CMloInstanceDef` (`09cc28be`, 0x250 bytes), which carries the entity
+members `rotation` (+0x10), `position` (+0x38), `archetypeName` (+0x44), `scaleXY` (+0x54) and `scaleZ` (+0x58)
+plus interior-specific members. These 2,590 placements are separate from the 23,535 map / 1,670,442 entity
+census, which counts `CEntityDef` only.
+
+The positions sit at the edge of their own interior, not at its origin or centre. Distance from each of the 2,278
+positions to the nearest placed copy of its own interior's box (0 = inside):
+
+| Rotation | Inside | ≤ 1 m | ≤ 2 m | ≤ 5 m | ≤ 25 m | ≤ 100 m | Median | In a non-`limbo` room box |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| stored quaternion | 315 | 1,015 | 1,189 | 1,443 | 1,867 | 2,199 | 1.72 m | 213 |
+| conjugated | 571 | 950 | 1,121 | 1,416 | 1,863 | 2,199 | 2.10 m | 482 |
+
+The interior box's largest side has a median of 16.7 m. Most positions are therefore just outside or just inside
+the interior shell, which fits an entry or label point; that they are doors is a hypothesis (portals were not
+compared). The conjugated rotation puts more positions inside rooms, consistent with the entity rule in
+[Map placement records](#map-placement-records); it is not a separate proof of it. 79 positions are more than
+100 m from every copy of their interior.
+
+Interior rooms (`CMloRoomDef` `0b1811f1`, 0x70 bytes: `name` +0x00, `bbMin` +0x10, `bbMax` +0x20) are reached
+through the interior's array members, which use the `InstanceList` reference of
+[Instanced props and grass](#instanced-props-and-grass) (1-based block index, offset from bit 20, u16 count). Room
+names are lower-cased joaat; in all 908 resources that hold one interior, its first room is `limbo`. A room's hash member `a261e0a9` (+0x34)
+holds the hash of 267 interior keys.
+
+```powershell
+python -I tools\gamedata_reader.py <work>\common --root GameShape__Data__LocationNameLoopkup --out <work>\gamedata
+python -I tools\world_interior_names.py <game>\levels.rpf --names <work>\gamedata\GameShape__Data__LocationNameLoopkup_<offset>.json `
+    --jobs 15 --out <work>\world\interior_names.json
+python -I tests\test_world_interior_names.py
+```
 
 ## What a runtime needs
 
@@ -376,6 +519,16 @@ and the continuation join. It does not decrypt anything and does not extract mod
 output is aggregate (one row per resource). `--entities-out` adds a local-only JSON-lines file with one row per
 complete entity (archetype hash and key, position, stored rotation, scales, LOD fields), the input of
 `world_build.py --placements` below.
+
+For a complete placement uniquely referenced by the map root, `map_name` is the source map's 32-bit name
+hash (eight lowercase hex digits) and `entity_index` is its zero-based ordinal in the authored `entities`
+array. Other classes may occupy slots in that array. The JSONL keeps its physical record order.
+For the ordinary terrain case (`parentInstance == -1`, a nonnegative `parent_index` and a valid signed
+map selector), `parent_map_name` holds the selected map hash in the same format. Match
+`(parent_map_name, parent_index)` to a unique `(map_name, entity_index)` across the input maps.
+These fields are optional. Older exports, unavailable references and unsupported parent forms can lack
+the corresponding keys. A missing or ambiguous target stays unresolved, including when a scan covers only
+part of the map set.
 
 `tools/world_census.py` scans the whole `levels.rpf` data area in shards and counts every validated
 `0x7a` map resource and placement entity. The measured full pass is 23,535 maps / 1,670,442 entities
@@ -475,21 +628,44 @@ From HD to SLOD2, each tier's median `lodDist` is within 5% of the next tier's m
 450/450, 1,000/1,000, 2,000/1,976), so the two fields agree on the bands. For SLOD3 they differ (4,000 and
 6,043.5), and the band follows `childLodDist`.
 
-This is an approximation of point 5, per cell and per tier. Per-entity `lodDist` overrides and the
-`parentIndex`/`numChildren` links are not used: an entity row doesn't say which map file it came from, and
-`parentIndex` is an index into that file's entity table.
+The viewer approximates point 5 with distance bands per cell and tier. To follow an individual parent link,
+a loader needs the selected map's name and the target placement's original ordinal in that map's `entities` array.
+
+Two terrain regions on Xbox 1.0.2.1 give a cross-map example. In each tested HD and LOD map, `CMapData.parent` is zero.
+The schema member `75d16adf` at +0x58 is an array with one 32-bit hash in a block of type `0x4a`. That hash
+matches the next map's `CMapData.name`. The child's signed `parentIndex` selects an ordinal in **that map's**
+`entities` reference array. Looking up the index in the HD map itself returns the child in all 127 cases.
+
+For all 127 HD/LOD pairs, the same name stem with the respective tier suffix reproduced both stored archetype
+keys (JOAAT and Murmur3-64). Following the reference from LOD grouped the 127 children under 32 SLOD1 entities.
+At both steps, every parent's incoming count matched its `numChildren`, and its `childLodDist` matched each
+child's `lodDist`.
+
+Four terrain maps with two references show how an entity selects its parent map. Schema member `84799847` at
++0x7f is a signed byte (type `0x10`). Use its value as a zero-based index in the stored `75d16adf` array,
+then apply `parentIndex` to that map's `entities` array. In these maps, 64 children select slot 0 and 18
+select slot 1. For 42 children the same parent ordinal, tier and distance fields fit both maps. In every
+one of these cases the selected parent is closer to the child's XY position. Reversing
+the array while keeping the selector fixed sends those 42 to the other map and the remaining 40 to an
+out-of-range ordinal. Remapping the selector along with the array restores all 82 links.
+
+Including the adjacent single-reference maps, all 324 links agree with the declared child counts of all 34
+parents. Always selecting slot 0 gives incorrect child counts for ten parents. The six terminal entities
+have an empty map reference array, selector -1 and `parentIndex` -1.
+All 330 entities have `parentInstance` -1. These checks establish authored associations for the measured
+terrain records. Nondefault batch instances and the runtime switching distance remain open.
 
 ### Measured
 
 On the 1.0.2.1 package, `levels.rpf`, Linux, 88 cores, `--no-textures`, 256 m chunks. Models were exported with
-rpf9-explorer at Leonida's pin (917e9b9) and with breadbbbb/rpf9-explorer#8 and #10 applied. Each placement was
+rpf9-explorer at the baseline revision (`917e9b9`) and with breadbbbb/rpf9-explorer#8 and #10 applied. Each placement was
 counted against the first export and built from the second.
 
 | Step | Result |
 |---|---|
 | `--entities-out` over the whole data area (24 parallel `--start/--limit` windows) | 1,670,435 rows, 66 s |
 | `lodLevel` split | 0: 1,153,122 · 5: 396,871 · 1: 100,953 · 2: 16,828 · 3: 1,708 · 4: 601 · 6: 352 |
-| HD + ORPHAN_HD placements with a recovered model (joaat + Murmur3-64) | 640,080 of 1,549,993 (41.3%) at the pin; 1,549,347 (99.96%) with #8/#10, from 121,411 resources |
+| HD + ORPHAN_HD placements with a recovered model (joaat + Murmur3-64) | 640,080 of 1,549,993 (41.3%) at `917e9b9`; 1,549,347 (99.96%) with #8/#10, from 121,411 resources |
 | 700 m × 700 m downtown box, 10,729 placements, `--jobs 16` | `bake` (#1183): 5 min, 22 GB peak RSS. `gpu`: 35 s; 0.43 GB in the largest process, 1.93 GB for all 17 processes; same 16 chunks and 29,331,138 triangles |
 | **whole city**, HD + ORPHAN_HD, `gpu`, `--jobs 40` | 1,549,343 placed (646 `unresolved_archetype`, 4 `model_not_loadable`, 0 `key_mismatch`, 0 `mirrored`), 121,407 distinct models → 2,940 chunks; 7.31 G triangles drawn, 3.34 G stored; 125 GB of GLB, median chunk 17 MB, largest 926 MB; 21 min; 3.4 GB in the largest process, 38 GB for all 41 processes |
 | **whole city, all tiers, `--lod-sets`, `gpu`, `--jobs 24`** | 1,669,771 placed (660 `unresolved_archetype`, 4 `model_not_loadable`), 228,566 distinct models → 12,340 chunks: HD 2,911 (median 16.9 MB), LOD 2,836 (0.6 MB), SLOD1 2,811, SLOD2 1,222, SLOD3 501, SLOD4 284 (all ≤ 0.1 MB median), ORPHAN_HD 1,775 (3.0 MB); bands as in the table above; 33 min; 2.6 GB in the largest process, 30 GB for all 25 |
@@ -512,7 +688,19 @@ Checks:
 
 The pin's 41.3% is a model-recovery gap, not a naming gap: almost every archetype name resolves (99.85%, see
 *What is readable* above), but only recovered models can be placed. The archetypes that #8/#10 add are `.#ft`
-fragments, whose headers the pinned `LooksLikeFragment` rejects (breadbbbb/rpf9-explorer#8).
+fragments. The pinned `LooksLikeFragment` now accepts the null optional pointers covered by
+`breadbbbb/rpf9-explorer#8`, so that header filter no longer explains the remaining model-recovery gap.
+Although 99.85% of archetype names resolve (see *What is readable* above), only 41.3% of HD and ORPHAN_HD
+placements had a recovered model at `917e9b9`. The additional archetypes recovered with #8/#10 were `.#ft`
+fragments. The pinned explorer (`e2939175`) includes both changes. Its fragment check accepts null pointers
+at header offsets 16, 32 and 40 and requires system pointers at offsets 8, 24 and 168.
+[Fragment check at the pinned revision](https://github.com/breadbbbb/rpf9-explorer/blob/e2939175c36a02d6ed25fa2c217b9d6ddcb8b516/Core/RageModelDecoder.cs#L66-L84)
+The 41.3% at the earlier pin (917e9b9) was a model-recovery gap, not a naming gap: almost every archetype name
+resolves (99.85%, see *What is readable* above), but only recovered models can be placed. The archetypes that
+#8/#10 add are `.#ft` fragments, whose headers `LooksLikeFragment` rejected before breadbbbb/rpf9-explorer#8 (it
+now accepts null optional pointers at `+16`/`+32`/`+40` and range-checks the 16-bit fields at `+48..+54`).
+Leonida's pin is now e2939175, which contains #8 and #10, so the pinned `LooksLikeFragment` accepts these headers;
+the 99.96% was measured on 917e9b9 with both applied and has not been recounted at e2939175.
 
 **Not verified or limited:**
 - Nothing here was looked at in a browser. The checks above are structural and numeric.

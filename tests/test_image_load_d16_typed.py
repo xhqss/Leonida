@@ -6,12 +6,28 @@ fetch of an integer view is undefined in Vulkan. A d16 load used to skip the T# 
 sampled view, then pack f16: a Texture2D<min16uint> Load came back as garbage.
 """
 import re
+from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
-from conftest import requires_tools
+from conftest import Shader, requires_tools
+from test_image_load_typed import Module
 
 pytestmark = requires_tools
+
+
+def test_cube_load_d16_selects_the_format_at_the_array_binding(make_shader: Callable[[str], Shader]) -> None:
+    fixture = Path(__file__).parent / "semantic" / "fixtures" / "cube_load_d16.asm"
+    shader = make_shader(fixture.read_text(encoding="utf-8"))
+    mod = Module(shader.translate())
+    shader.validate(mod.text)
+    assert {image[0] for _, _, image in mod.fetches()} == {"%uint", "%int", "%float"}
+    for _, var, image in mod.fetches():
+        assert (mod.binding[var], image[1:4]) == (3, ["2D", "0", "1"])
+    for fmt, kind in ((20, "uint"), (21, "sint"), (22, "float")):  # GFX10 32_UINT/SINT/FLOAT
+        assert mod.branch(fmt << 20, 5) == kind
+        assert mod.branch(fmt << 20, 0) == "float"
 
 
 @pytest.mark.parametrize("mask,dst", [("0x1", "v3"), ("0x3", "v3"), ("0x7", "v[3:4]")])
@@ -27,8 +43,9 @@ def test_d16_image_load_reads_integer_views(make_shader, mask, dst):
     sh.validate(spv)
 
 
-def test_d16_integer_fetch_saturates_before_packing(make_shader):
-    shader = make_shader("image_load v3, v[1:2], s[8:15] dmask:0x9 dim:SQ_RSRC_IMG_2D d16\n"
+@pytest.mark.parametrize("load,addr,dim", [("image_load", "v[1:2]", "2D"), ("image_load_mip", "v[4:7]", "3D")])
+def test_d16_integer_fetch_saturates_before_packing(make_shader, load, addr, dim):
+    shader = make_shader(f"{load} v3, {addr}, s[8:15] dmask:0x9 dim:SQ_RSRC_IMG_{dim} d16\n"
                          "s_waitcnt vmcnt(0)\nexp mrt0 v3, v3, v3, v3 done vm\ns_endpgm\n", name="ps_d16_sat")
     text = shader.translate()
     # R and A are both narrowed on each integer path. Full-width and float paths have different conversions.

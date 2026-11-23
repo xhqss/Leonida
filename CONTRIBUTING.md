@@ -27,10 +27,17 @@ methods are still open.
 ## Working on the code
 
 - Python tools run with `python -I` and use only the standard library unless a file says otherwise.
+- A text file a tool writes (JSON, CSV, a manifest, an assembly listing) names its line ending: `open(path, "w",
+  encoding="utf-8", newline="\n")` (the same for `Path.open`, `Path.write_text` and a text-mode
+  `tempfile.NamedTemporaryFile`), so the output is LF on Windows too and the same input gives the same bytes on every
+  platform. `tests/test_text_write_line_endings.py` fails for a writer that forgets it.
 - `tools/rpf9dump` needs the submodule: `git submodule update --init`.
 - A new shader-translator rule goes into the contract table in `docs/design.md`, with how it was confirmed: a GPU
   test, a Mesa/LLVM reference, or a count over the corpus.
-- `python -I tests/test_<name>.py` runs one of the unit tests (standard library only; CI runs them all).
+- `python -I tests/test_<name>.py` runs one of the unit tests (standard library only; CI runs them all). The test
+  files with no `__main__` block or an `import pytest` (they need the packages in `tests/requirements.txt`) run with
+  `python -m pytest tests/test_<name>.py` instead, as [AGENTS.md](AGENTS.md) describes; under `python -I` they fail
+  to import or run nothing.
 - Runtime tests: `cmake -S runtime -B runtime/build`, `cmake --build runtime/build --config RelWithDebInfo`, then
   `ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure`. The CPU tests that need no game data are configured
   on Windows. Tests that need the retail package read `LEONIDA_GAME_DIR` (and `LEONIDA_MOVIE` for the Bink

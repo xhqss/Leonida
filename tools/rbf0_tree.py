@@ -375,7 +375,8 @@ def _rows(source):
         unnamed = []
         for name in sorted(os.listdir(source)):
             full = os.path.join(source, name)
-            if not os.path.isfile(full):
+            # rpf9_carve.py's index.json and any .csv/.json report sit next to the streams; they are not payloads.
+            if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
                 continue
             with open(full, "rb") as f:
                 head = f.read(8)
@@ -429,7 +430,7 @@ def decode_source(source, roots=None, offset=None, limit=None, progress=None):
         while (doc["status"] == "truncated" and chunks < MAX_CHUNKS and len(blob) < MAX_BYTES
                and rows[i + chunks - 1]["size"] == MAX_CHUNK and i + chunks < len(rows)):
             nxt = rows[i + chunks]
-            if nxt["head"][:4] in (MAGIC, b"PSIN"):
+            if nxt["size"] > MAX_CHUNK or nxt["head"][:4] in (MAGIC, b"PSIN"):
                 break
             blob += read(nxt)
             chunks += 1
@@ -582,14 +583,16 @@ def write_xml(directory, docs):
             root.set("error", _xml_safe(doc["error"]))
         if doc["tree"] is not None:
             _xml_node(root, doc["tree"])
-        tree = ET.ElementTree(root)
-        ET.indent(tree, space=" ")
+        ET.indent(root, space=" ")
         name = f"{doc['offset']:08x}.xml"
         if name in used:
             name = f"{doc['offset']:08x}-{i:04d}.xml"
         used.add(name)
         path = os.path.join(directory, name)
-        tree.write(path, encoding="utf-8", xml_declaration=True)
+        # XML readers normalize literal carriage returns. Escape them after serializing ordinary XML text.
+        xml = ET.tostring(root, encoding="utf-8", xml_declaration=True).replace(b"\r", b"&#13;")
+        with open(path, "wb") as f:
+            f.write(xml)
         paths.append(path)
     return paths
 
@@ -657,7 +660,7 @@ def write_json(path, docs, summary):
     directory = os.path.dirname(os.path.abspath(path))
     temp = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=directory,
                                          prefix=".rbf0_tree-", suffix=".tmp", delete=False) as f:
             temp = f.name
             json.dump({"tool": "rbf0_tree", "format": 1, "summary": summary, "resources": docs},

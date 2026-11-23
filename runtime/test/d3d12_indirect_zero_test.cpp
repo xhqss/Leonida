@@ -1,6 +1,7 @@
-// ExecuteIndirect with MaxCommandCount 0 on the Vulkan-backed device against Windows D3D12 (the default adapter and
-// WARP): the list's Close() result. A zero-command ExecuteIndirect is a no-op, not an error that fails the list.
+// ExecuteIndirect with MaxCommandCount 0 on the Vulkan-backed device against Windows D3D12 (the layer's own adapter
+// and WARP): the list's Close() result. A zero-command ExecuteIndirect is a no-op, not an error that fails the list.
 #include "vk_test_device.h"
+#include "host_adapter.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
@@ -77,7 +78,8 @@ int main() {
         for (const bool warp : {false, true}) {
             Ref<IDXGIAdapter> adapter;
             Ref<ID3D12Device> host;
-            if (warp && FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p)))) continue;
+            std::string adapter_name;
+            if (!hostadapter::reference(factory.p, vk, warp, &adapter.p, adapter_name)) continue;
             if (FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) continue;
             ++references;
             for (const Case& c : cases) {
@@ -86,7 +88,7 @@ int main() {
                 const bool same = SUCCEEDED(a) == SUCCEEDED(e);
                 if (!same) ++mismatched;
                 std::printf("%s %s, MaxCommandCount 0: ours Close 0x%08lx, %s 0x%08lx\n", same ? "[ok]  " : "[FAIL]",
-                            c.name, static_cast<unsigned long>(a), warp ? "WARP" : "default adapter",
+                            c.name, static_cast<unsigned long>(a), adapter_name.c_str(),
                             static_cast<unsigned long>(e));
             }
         }

@@ -220,10 +220,18 @@ def required_stubs_for_meta(meta):
 def generate_for_index(spirv_dir, index):
     """Write all deduplicated partner stubs needed by `index` into <spirv_dir>/stubs/. Returns filenames written."""
     needed = set()
-    for meta in index.values():
+    for name, meta in index.items():
         if isinstance(meta, dict):
-            for spec in required_stubs_for_meta(meta):
-                needed.add(spec)
+            try:
+                for spec in required_stubs_for_meta(meta):
+                    needed.add(spec)
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"{name}: invalid graphics interface locations: {e}") from e
+    # Validate the entire requested set before writing any stubs: negative or
+    # oversized locations cannot be encoded as SPIR-V unsigned literals.
+    for kind, locs in needed:
+        if any(not 0 <= loc <= 0xFFFFFFFF for loc in locs):
+            raise ValueError(f"invalid Location in {kind} partner stub: {locs}")
     if not needed:
         return []
     stubs_dir = os.path.join(spirv_dir, "stubs")
@@ -256,7 +264,10 @@ def main(argv=None):
         sys.exit(f"cannot read {idx_path}: {e}")
     if not isinstance(index, dict):
         sys.exit(f"cannot read {idx_path}: expected a JSON object of shader -> metadata entries")
-    written = generate_for_index(spirv_dir, index)
+    try:
+        written = generate_for_index(spirv_dir, index)
+    except (OSError, ValueError, struct.error) as e:
+        sys.exit(f"cannot generate stubs from {idx_path}: {e}")
     print(f"wrote {len(written)} stubs to {os.path.join(spirv_dir, 'stubs')}")
     return 0
 

@@ -76,6 +76,18 @@ std::vector<uint8_t> build_payload() {
 int main() {
     using namespace rt::rootsig;
 
+    // The public packer also validates callers that construct the model directly.
+    {
+        RootSignature sig;
+        RootParameter invalid;
+        invalid.type = static_cast<ParamType>(0xffffffffu);
+        invalid.num_values = 1;
+        sig.params = {invalid};
+        const auto result = pack(sig);
+        check(!result.ok && result.error.find("unknown") != std::string::npos,
+              "invalid parameter enum cannot produce a successful zero-cost layout");
+    }
+
     // Mixed signature: 4 constants + CBV + table + 1 static sampler.
     {
         RootSignature sig;

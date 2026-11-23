@@ -1,4 +1,4 @@
-// Real Win32 HWND GPU test for the Vulkan-backed IDXGIFactory4 / IDXGISwapChain3 COM shim
+// Real Win32 HWND GPU test for the Vulkan-backed IDXGIFactory7 / IDXGISwapChain3 COM shim
 // (runtime/shims/dxgi_swapchain.h, runtime/shims/dxgi_com.{h,cpp}).
 // No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation
 // (Core + Synchronization Validation); any validation error fails the test.
@@ -9,12 +9,14 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/dxgi_com.h"
 #include "vulkan_loader.h"
+#include "../src/vulkan_device_filter.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <vector>
 
 namespace {
@@ -90,7 +92,219 @@ bool check_statistics_disjoint(IDXGISwapChain* swapchain) {
     return swapchain->GetFrameStatistics(&stats) == S_OK;
 }
 
+// Counts references: AddRef/Release of the private-data interface are observable through refs.
+struct CountedUnknown final : IUnknown {
+    ULONG refs = 1;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** out) override {
+        if (out) *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+    ULONG STDMETHODCALLTYPE Release() override { return --refs; }
+};
+
+// IDXGIObject private data (Microsoft: IDXGIObject::SetPrivateData / SetPrivateDataInterface / GetPrivateData):
+// the bytes are copied, an interface is held with a reference until it is replaced or removed, and the same GUID
+// replaces the entry. Returns null on success or the failing step.
+const char* check_private_data(IDXGIObject* object) {
+    static constexpr GUID key{0x6c2c5b0e, 0x4d9a, 0x4f43, {0x9e, 0x1b, 0x3a, 0x57, 0x0c, 0x91, 0x2d, 0x44}};
+    UINT size = 99;
+    if (object->GetPrivateData(key, &size, nullptr) != DXGI_ERROR_NOT_FOUND) return "GetPrivateData before any Set";
+    std::uint32_t value = 0x12345678u;
+    if (object->SetPrivateData(key, sizeof(value), &value) != S_OK) return "SetPrivateData";
+    value = 0;  // SetPrivateData copies
+    size = 0;
+    if (object->GetPrivateData(key, &size, nullptr) != S_OK || size != sizeof(value)) return "GetPrivateData size query";
+    std::uint32_t read = 0;
+    size = sizeof(read);
+    if (object->GetPrivateData(key, &size, &read) != S_OK || size != sizeof(read) || read != 0x12345678u)
+        return "GetPrivateData did not return the stored bytes";
+    std::uint16_t too_small = 0;
+    size = sizeof(too_small);
+    if (object->GetPrivateData(key, &size, &too_small) != DXGI_ERROR_MORE_DATA || size != sizeof(read))
+        return "GetPrivateData with a small buffer should be DXGI_ERROR_MORE_DATA and report the size";
+    CountedUnknown counted;
+    if (object->SetPrivateDataInterface(key, &counted) != S_OK || counted.refs != 2) return "SetPrivateDataInterface";
+    IUnknown* got = nullptr;
+    size = sizeof(got);
+    if (object->GetPrivateData(key, &size, &got) != S_OK || got != &counted || counted.refs != 3)
+        return "GetPrivateData did not return the interface with a reference added";
+    got->Release();
+    if (object->SetPrivateData(key, sizeof(read), &read) != S_OK || counted.refs != 1)
+        return "SetPrivateData with the same GUID should release the held interface";
+    if (object->SetPrivateDataInterface(key, &counted) != S_OK || counted.refs != 2) return "SetPrivateDataInterface again";
+    if (object->SetPrivateDataInterface(key, nullptr) != S_OK || counted.refs != 1)
+        return "SetPrivateDataInterface(null) should remove the entry and release the interface";
+    size = 99;
+    if (object->GetPrivateData(key, &size, nullptr) != DXGI_ERROR_NOT_FOUND) return "GetPrivateData after removal";
+    return nullptr;
+}
+
 }  // namespace
+
+
+// CreateSwapChainForHwnd on a guarded call: a host runtime that faults on a case reports it instead of ending the test.
+HRESULT create_guarded(IDXGIFactory4* factory, IUnknown* queue, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
+                       IDXGISwapChain1** out) {
+    __try {
+        return factory->CreateSwapChainForHwnd(queue, hwnd, desc, nullptr, nullptr, out);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return HRESULT(0xC0000005);
+    }
+}
+
+// CreateSwapChainForHwnd with descriptions D3D12 refuses (and the valid ones next to them), against the host runtime's
+// DXGI: each case gets its own window on each side, and the HRESULTs must match. Returns the number of mismatches,
+// or -1 without a host D3D12 device.
+int compare_swap_chain_arguments(IDXGIFactory4* ours, ID3D12Device* our_device, ID3D12CommandQueue* our_queue) {
+    using CreateDevice = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+    using CreateFactory2 = HRESULT(WINAPI*)(UINT, REFIID, void**);
+    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const HMODULE dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto create_device = d3d12 ? reinterpret_cast<CreateDevice>(
+                                           reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
+                                     : nullptr;
+    const auto create_factory = dxgi ? reinterpret_cast<CreateFactory2>(
+                                           reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory2")))
+                                     : nullptr;
+    ID3D12Device* host_device = nullptr;
+    IDXGIFactory4* host_factory = nullptr;
+    ID3D12CommandQueue* host_queue = nullptr;
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+    if (!create_device || !create_factory ||
+        FAILED(create_device(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host_device))) ||
+        FAILED(create_factory(0, IID_PPV_ARGS(&host_factory))) ||
+        FAILED(host_device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&host_queue)))) {
+        if (host_factory) host_factory->Release();
+        if (host_device) host_device->Release();
+        return -1;
+    }
+    DXGI_SWAP_CHAIN_DESC1 base{};
+    base.Width = 64;
+    base.Height = 64;
+    base.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    base.SampleDesc.Count = 1;
+    base.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    base.BufferCount = 2;
+    base.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    enum class Pass { queue, null_queue, device, null_window, null_desc, null_out };
+    struct Case {
+        const char* name;
+        DXGI_SWAP_CHAIN_DESC1 desc;
+        Pass pass = Pass::queue;
+    };
+    const auto with = [&](void (*edit)(DXGI_SWAP_CHAIN_DESC1&)) {
+        DXGI_SWAP_CHAIN_DESC1 d = base;
+        edit(d);
+        return d;
+    };
+    const Case cases[] = {
+        {"valid", base},
+        {"flip sequential, 3 buffers", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+             d.BufferCount = 3;
+         })},
+        {"effect DISCARD", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.SwapEffect = DXGI_SWAP_EFFECT_DISCARD; })},
+        {"effect SEQUENTIAL", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.SwapEffect = DXGI_SWAP_EFFECT_SEQUENTIAL; })},
+        {"effect 99", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.SwapEffect = DXGI_SWAP_EFFECT(99); })},
+        {"scaling NONE", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Scaling = DXGI_SCALING_NONE; })},
+        {"scaling ASPECT_RATIO_STRETCH",
+         with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Scaling = DXGI_SCALING_ASPECT_RATIO_STRETCH; })},
+        {"scaling 7", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Scaling = DXGI_SCALING(7); })},
+        {"alpha IGNORE", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.AlphaMode = DXGI_ALPHA_MODE_IGNORE; })},
+        {"alpha PREMULTIPLIED", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED; })},
+        {"alpha STRAIGHT", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.AlphaMode = DXGI_ALPHA_MODE_STRAIGHT; })},
+        {"alpha 9", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.AlphaMode = DXGI_ALPHA_MODE(9); })},
+        {"flag NONPREROTATED", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = DXGI_SWAP_CHAIN_FLAG_NONPREROTATED; })},
+        {"flag ALLOW_MODE_SWITCH",
+         with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH; })},
+        {"flag GDI_COMPATIBLE", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE; })},
+        {"flag DISPLAY_ONLY", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = DXGI_SWAP_CHAIN_FLAG_DISPLAY_ONLY; })},
+        {"flag FRAME_LATENCY_WAITABLE_OBJECT", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+         })},
+        {"flag FOREGROUND_LAYER",
+         with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = DXGI_SWAP_CHAIN_FLAG_FOREGROUND_LAYER; })},
+        {"flag HW_PROTECTED", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED; })},
+        {"flag ALLOW_TEARING", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING; })},
+        {"flag 0x1000", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = 0x1000; })},
+        {"flag 0x2000", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = 0x2000; })},
+        {"flag 0x4000", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = 0x4000; })},
+        {"flag 0x80000000", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = 0x80000000u; })},
+        {"usage 0", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.BufferUsage = 0; })},
+        {"usage SHADER_INPUT", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.BufferUsage = DXGI_USAGE_SHADER_INPUT | DXGI_USAGE_RENDER_TARGET_OUTPUT;
+         })},
+        {"usage SHARED", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.BufferUsage = DXGI_USAGE_SHARED; })},
+        {"usage READ_ONLY", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.BufferUsage = DXGI_USAGE_READ_ONLY; })},
+        {"usage DISCARD_ON_PRESENT",
+         with([](DXGI_SWAP_CHAIN_DESC1& d) { d.BufferUsage = DXGI_USAGE_DISCARD_ON_PRESENT; })},
+        {"usage UNORDERED_ACCESS", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_UNORDERED_ACCESS;
+         })},
+        {"16384 x 16", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.Width = 16384;
+             d.Height = 16;
+         })},
+        {"width 16385", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Width = 16385; })},
+        {"height 16385", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Height = 16385; })},
+        {"one buffer", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.BufferCount = 1; })},
+        {"MSAA 4", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.SampleDesc.Count = 4; })},
+        {"width 16385 and MSAA 4", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.Width = 16385;
+             d.SampleDesc.Count = 4;
+         })},
+        {"width 16385 and one buffer", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.Width = 16385;
+             d.BufferCount = 1;
+         })},
+        {"width 16385 and format UNKNOWN", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.Width = 16385;
+             d.Format = DXGI_FORMAT_UNKNOWN;
+         })},
+        {"height 16385 and format BC1", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.Height = 16385;
+             d.Format = DXGI_FORMAT_BC1_UNORM;
+         })},
+        {"width 16385 and effect DISCARD", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.Width = 16385;
+             d.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+         })},
+        {"null queue", base, Pass::null_queue},
+        {"a device, not a queue", base, Pass::device},
+        {"null window", base, Pass::null_window},
+        {"null description", base, Pass::null_desc},
+        {"null output", base, Pass::null_out},
+    };
+    int mismatches = 0;
+    for (const Case& c : cases) {
+        HRESULT result[2];
+        for (int side = 0; side < 2; ++side) {
+            IDXGIFactory4* factory = side ? host_factory : ours;
+            IUnknown* queue = side ? static_cast<IUnknown*>(host_queue) : static_cast<IUnknown*>(our_queue);
+            if (c.pass == Pass::null_queue) queue = nullptr;
+            if (c.pass == Pass::device) queue = side ? static_cast<IUnknown*>(host_device) : our_device;
+            HWND hwnd = create_test_window(64, 64);
+            IDXGISwapChain1* chain = nullptr;
+            result[side] = create_guarded(factory, queue, c.pass == Pass::null_window ? nullptr : hwnd,
+                                          c.pass == Pass::null_desc ? nullptr : &c.desc,
+                                          c.pass == Pass::null_out ? nullptr : &chain);
+            if (chain) chain->Release();
+            if (hwnd) DestroyWindow(hwnd);
+        }
+        if (result[0] != result[1]) {
+            ++mismatches;
+            std::fprintf(stderr, "CreateSwapChainForHwnd %s: ours 0x%08lx, host 0x%08lx\n", c.name,
+                         static_cast<unsigned long>(result[0]), static_cast<unsigned long>(result[1]));
+        }
+    }
+    std::printf("CreateSwapChainForHwnd: %zu descriptions compared with the host runtime, %d mismatches\n",
+                std::size(cases), mismatches);
+    host_queue->Release();
+    host_factory->Release();
+    host_device->Release();
+    return mismatches;
+}
 
 int main() {
     const PFN_vkGetInstanceProcAddr gipa = load_vulkan();
@@ -184,17 +398,21 @@ int main() {
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     std::uint32_t family = 0;
     VkPhysicalDeviceProperties chosen{};
+    int best_rank = -1;
     for (auto cand : physicals) {
         VkPhysicalDeviceProperties props{};
         get_props(cand, &props);
-        if (props.apiVersion < VK_API_VERSION_1_3) continue;
+        if (props.apiVersion < VK_API_VERSION_1_3 || !leonida::vulkan_device_wanted(props.deviceName)) continue;
         std::uint32_t fcnt = 0;
         get_qf(cand, &fcnt, nullptr);
         std::vector<VkQueueFamilyProperties> fams(fcnt);
         get_qf(cand, &fcnt, fams.data());
         for (std::uint32_t i = 0; i < fcnt; ++i) {
             if (!(fams[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
-            if (!physical || props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            // the runtime's pick: the first usable device of the highest rank (native driver over Dozen, #915)
+            if (const int rank = leonida::vulkan_device_rank(static_cast<int>(props.deviceType), props.vendorID);
+                rank > best_rank) {
+                best_rank = rank;
                 physical = cand;
                 family = i;
                 chosen = props;
@@ -203,9 +421,12 @@ int main() {
         }
     }
     if (!physical) {
-        std::printf("SKIP: no Vulkan 1.3 GPU found\n");
+        const std::string filter = leonida::vulkan_device_filter();
+        if (filter.empty()) std::printf("SKIP: no Vulkan 1.3 GPU found\n");
+        else std::fprintf(stderr, "LEONIDA_VK_DEVICE=%s: no Vulkan 1.3 GPU matches\n", filter.c_str());
         if (messenger && destroy_dbg) destroy_dbg(instance, messenger, nullptr);
         destroy_inst(instance, nullptr);
+        if (!filter.empty()) return 1;  // a filter matching nothing fails, never skips
         return 77;  // ctest skips
     }
 
@@ -255,6 +476,17 @@ int main() {
     if (FAILED(rt::d3d12::create_dxgi_factory(dev, IID_PPV_ARGS(&factory))) || !factory)
         return fail("create_dxgi_factory");
 
+    // Host-measured on Windows 11: MakeWindowAssociation takes DXGI_MWA_NO_WINDOW_CHANGES, DXGI_MWA_NO_ALT_ENTER
+    // and DXGI_MWA_NO_PRINT_SCREEN together or alone; any other bit is DXGI_ERROR_INVALID_CALL.
+    {
+        constexpr UINT known = DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_PRINT_SCREEN;
+        if (FAILED(factory->MakeWindowAssociation(hwnd, known))) return fail("MakeWindowAssociation(known flags)");
+        for (const UINT bad : {0x8u, 0x40u, known | 0x8u}) {
+            if (factory->MakeWindowAssociation(hwnd, bad) != DXGI_ERROR_INVALID_CALL)
+                return fail("MakeWindowAssociation accepted an unknown flag bit");
+        }
+    }
+
     D3D12_COMMAND_QUEUE_DESC qd{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
     ID3D12CommandQueue* queue = nullptr;
     ID3D12CommandAllocator* alloc = nullptr;
@@ -267,6 +499,11 @@ int main() {
         return fail("queue/alloc/cl/fence");
     cl->Close();
 
+    // Before the test's own swap chain: the host comparison creates and releases its own windows and chains.
+    const int argument_mismatches = compare_swap_chain_arguments(factory, dev, queue);
+    if (argument_mismatches < 0) std::printf("CreateSwapChainForHwnd: no host D3D12 device to compare with, skipped\n");
+    if (argument_mismatches > 0) return fail("CreateSwapChainForHwnd answers differ from the host runtime");
+
     DXGI_SWAP_CHAIN_DESC1 scd{};
     scd.Width = 128;
     scd.Height = 128;
@@ -276,6 +513,31 @@ int main() {
     scd.BufferCount = 2;
     scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
+    for (const UINT count : {0u, 1u, DXGI_MAX_SWAP_CHAIN_BUFFERS + 1u}) {
+        DXGI_SWAP_CHAIN_DESC1 invalid = scd;
+        invalid.BufferCount = count;
+        IDXGISwapChain1* rejected = nullptr;
+        const HRESULT hr = factory->CreateSwapChainForHwnd(queue, hwnd, &invalid, nullptr, nullptr, &rejected);
+        if (rejected) {
+            rejected->Release();
+            return fail("CreateSwapChainForHwnd returned a swapchain for an invalid buffer count");
+        }
+        if (hr != DXGI_ERROR_INVALID_CALL) return fail("CreateSwapChainForHwnd invalid buffer count HRESULT");
+    }
+
+    constexpr DXGI_SAMPLE_DESC invalid_samples[] = {{0, 0}, {2, 0}, {4, 0}, {1, 1}};
+    for (const auto& samples : invalid_samples) {
+        DXGI_SWAP_CHAIN_DESC1 invalid = scd;
+        invalid.SampleDesc = samples;
+        IDXGISwapChain1* rejected = nullptr;
+        const HRESULT hr = factory->CreateSwapChainForHwnd(queue, hwnd, &invalid, nullptr, nullptr, &rejected);
+        if (rejected) {
+            rejected->Release();
+            return fail("CreateSwapChainForHwnd returned a swapchain for an invalid sample description");
+        }
+        if (hr != DXGI_ERROR_INVALID_CALL) return fail("CreateSwapChainForHwnd invalid sample description HRESULT");
+    }
+
     IDXGISwapChain1* sc1 = nullptr;
     if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd, &scd, nullptr, nullptr, &sc1)) || !sc1)
         return fail("CreateSwapChainForHwnd");
@@ -283,19 +545,74 @@ int main() {
     if (FAILED(sc1->QueryInterface(IID_PPV_ARGS(&sc))) || !sc) return fail("QI IDXGISwapChain3");
     sc1->Release();
 
+    // DXGI reports the BufferCount the app created with, never a larger native/Vulkan image count (D3D-389).
+    {
+        DXGI_SWAP_CHAIN_DESC1 created_desc{};
+        DXGI_SWAP_CHAIN_DESC created_desc0{};
+        if (FAILED(sc->GetDesc1(&created_desc)) || created_desc.BufferCount != scd.BufferCount)
+            return fail("GetDesc1 BufferCount is not the requested count");
+        if (FAILED(sc->GetDesc(&created_desc0)) || created_desc0.BufferCount != scd.BufferCount)
+            return fail("GetDesc BufferCount is not the requested count");
+    }
+
     if (!check_statistics_disjoint(sc)) return fail("initial frame-statistics disjoint notification");
 
-    ID3D12CommandQueue* got_queue = nullptr;
-    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&got_queue))) || got_queue != queue) {
-        if (got_queue) got_queue->Release();
-        return fail("GetDevice");
+    ID3D12Device* got_device = nullptr;
+    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&got_device))) || got_device != dev) {
+        if (got_device) got_device->Release();
+        return fail("GetDevice did not return the command queue's parent device");
     }
-    got_queue->Release();
+    got_device->Release();
+
+    IUnknown* got_unknown = nullptr;
+    IUnknown* expected_device_unknown = nullptr;
+    IUnknown* queue_unknown = nullptr;
+    const HRESULT got_unknown_hr = sc->GetDevice(IID_PPV_ARGS(&got_unknown));
+    if (FAILED(got_unknown_hr) || !got_unknown) {
+        if (got_unknown) got_unknown->Release();
+        return fail("GetDevice(IUnknown) failed");
+    }
+    if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&expected_device_unknown))) || !expected_device_unknown) {
+        got_unknown->Release();
+        return fail("QueryInterface(IUnknown) on device failed");
+    }
+    if (FAILED(queue->QueryInterface(IID_PPV_ARGS(&queue_unknown))) || !queue_unknown) {
+        expected_device_unknown->Release();
+        got_unknown->Release();
+        return fail("QueryInterface(IUnknown) on queue failed");
+    }
+    const bool has_device_identity = got_unknown == expected_device_unknown && got_unknown != queue_unknown;
+    queue_unknown->Release();
+    expected_device_unknown->Release();
+    got_unknown->Release();
+    if (!has_device_identity)
+        return fail("GetDevice(IUnknown) returned the queue identity instead of its parent device");
     DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen{};
     if (FAILED(sc->GetFullscreenDesc(&fullscreen)) || !fullscreen.Windowed ||
         fullscreen.Scaling != DXGI_MODE_SCALING_UNSPECIFIED ||
         fullscreen.ScanlineOrdering != DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED)
         return fail("GetFullscreenDesc");
+
+    // Factory::GetParent: root DXGI object has no parent; native DXGI returns E_NOINTERFACE
+    void* parent_out = reinterpret_cast<void*>(1);
+    if (factory->GetParent(IID_IUnknown, nullptr) != E_POINTER)
+        return fail("Factory::GetParent with null out should return E_POINTER");
+    if (factory->GetParent(IID_IUnknown, &parent_out) != E_NOINTERFACE || parent_out != nullptr)
+        return fail("Factory::GetParent should return E_NOINTERFACE and set null out");
+
+    // SwapChain::GetCoreWindow: HWND swapchain is not associated with a CoreWindow
+    void* cw_out = reinterpret_cast<void*>(1);
+    if (sc->GetCoreWindow(IID_IUnknown, nullptr) != DXGI_ERROR_INVALID_CALL)
+        return fail("GetCoreWindow with null out should return DXGI_ERROR_INVALID_CALL");
+    if (sc->GetCoreWindow(IID_IUnknown, &cw_out) != DXGI_ERROR_INVALID_CALL || cw_out != nullptr)
+        return fail("GetCoreWindow on HWND swapchain should return DXGI_ERROR_INVALID_CALL and set null out");
+
+    // SwapChain::GetRestrictToOutput: unrestricted swapchain returns DXGI_ERROR_NOT_FOUND
+    IDXGIOutput* restrict_out = reinterpret_cast<IDXGIOutput*>(1);
+    if (sc->GetRestrictToOutput(nullptr) != E_INVALIDARG)
+        return fail("GetRestrictToOutput with null out should return E_INVALIDARG");
+    if (sc->GetRestrictToOutput(&restrict_out) != DXGI_ERROR_NOT_FOUND || restrict_out != nullptr)
+        return fail("GetRestrictToOutput on unrestricted swapchain should return DXGI_ERROR_NOT_FOUND and set null out");
 
     D3D12_DESCRIPTOR_HEAP_DESC rtv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     ID3D12DescriptorHeap* rtv_heap = nullptr;
@@ -312,6 +629,7 @@ int main() {
             return 1;
         }
         const UINT idx = sc->GetCurrentBackBufferIndex();
+        if (idx >= cur_desc.BufferCount) return fail("GetCurrentBackBufferIndex >= BufferCount");
         ID3D12Resource* bb = nullptr;
         if (FAILED(sc->GetBuffer(idx, IID_PPV_ARGS(&bb))) || !bb) return fail("GetBuffer");
 
@@ -421,12 +739,92 @@ int main() {
         return 0;
     };
 
+    {
+        DXGI_SWAP_CHAIN_DESC1 before{}, after{};
+        if (FAILED(sc->GetDesc1(&before)) || before.BufferCount < 2)
+            return fail("GetDesc1 before ResizeBuffers1 argument tests");
+        std::vector<UINT> masks(before.BufferCount, 1);
+        std::vector<IUnknown*> queues(before.BufferCount, queue);
+        const auto resize = [&](UINT count) {
+            return sc->ResizeBuffers1(count, before.Width + 1, before.Height, DXGI_FORMAT_UNKNOWN, 0,
+                                      masks.data(), queues.data());
+        };
+        for (UINT invalid_mask : {2u, 3u}) {
+            masks.back() = invalid_mask;
+            if (resize(0) != DXGI_ERROR_INVALID_CALL) return fail("ResizeBuffers1 invalid node mask with count zero");
+        }
+        masks.back() = 1;
+        queues.back() = dev;
+        if (resize(before.BufferCount) != DXGI_ERROR_INVALID_CALL)
+            return fail("ResizeBuffers1 should reject a non-queue object");
+
+        D3D12_COMMAND_QUEUE_DESC copy_desc{};
+        copy_desc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+        ID3D12CommandQueue* copy = nullptr;
+        if (FAILED(dev->CreateCommandQueue(&copy_desc, IID_PPV_ARGS(&copy))) || !copy)
+            return fail("CreateCommandQueue for ResizeBuffers1 copy queue test");
+        queues.back() = copy;
+        const HRESULT copy_hr = resize(0);
+        copy->Release();
+        if (copy_hr != DXGI_ERROR_INVALID_CALL) return fail("ResizeBuffers1 should reject a copy queue");
+
+        if (FAILED(sc->GetDesc1(&after)) || after.Width != before.Width || after.Height != before.Height ||
+            after.BufferCount != before.BufferCount)
+            return fail("Invalid ResizeBuffers1 arguments changed the swapchain");
+        queues.back() = queue;
+        masks.front() = 0;
+        if (FAILED(sc->ResizeBuffers1(0, before.Width, before.Height, DXGI_FORMAT_UNKNOWN, 0, masks.data(), queues.data())))
+            return fail("ResizeBuffers1 should accept node masks zero and one with direct queues");
+    }
+
+    // Invalid counts must leave the initial back buffers usable for the first frame.
+    {
+        DXGI_SWAP_CHAIN_DESC1 before_resize{};
+        if (FAILED(sc->GetDesc1(&before_resize))) return fail("GetDesc1 before invalid resizes");
+        const std::vector<UINT> node_masks(DXGI_MAX_SWAP_CHAIN_BUFFERS + 1, 1);
+        const std::vector<IUnknown*> present_queues(DXGI_MAX_SWAP_CHAIN_BUFFERS + 1, queue);
+        for (const UINT count : {1u, DXGI_MAX_SWAP_CHAIN_BUFFERS + 1u}) {
+            if (sc->ResizeBuffers(count, 64, 64, DXGI_FORMAT_UNKNOWN, 0) != E_INVALIDARG)
+                return fail("ResizeBuffers invalid buffer count HRESULT");
+            if (sc->ResizeBuffers1(count, 64, 64, DXGI_FORMAT_UNKNOWN, 0, node_masks.data(), present_queues.data()) !=
+                E_INVALIDARG)
+                return fail("ResizeBuffers1 invalid buffer count HRESULT");
+        }
+        DXGI_SWAP_CHAIN_DESC1 after_resize{};
+        if (FAILED(sc->GetDesc1(&after_resize)) || after_resize.BufferCount != before_resize.BufferCount ||
+            after_resize.Width != before_resize.Width || after_resize.Height != before_resize.Height)
+            return fail("Invalid resize changed swapchain buffers");
+    }
+
+    {
+        DXGI_SWAP_CHAIN_DESC1 buffer_desc{};
+        if (FAILED(sc->GetDesc1(&buffer_desc)) || buffer_desc.BufferCount == 0)
+            return fail("GetDesc1 before testing GetBuffer indices");
+        ID3D12Resource* last = nullptr;
+        if (FAILED(sc->GetBuffer(buffer_desc.BufferCount - 1, IID_PPV_ARGS(&last))) || !last)
+            return fail("GetBuffer should return the last back buffer");
+        last->Release();
+
+        for (UINT index : {buffer_desc.BufferCount, buffer_desc.BufferCount + 1, ~0u}) {
+            void* rejected = reinterpret_cast<void*>(1);
+            const HRESULT hr = sc->GetBuffer(index, __uuidof(ID3D12Resource), &rejected);
+            if (hr != DXGI_ERROR_INVALID_CALL || rejected != nullptr) {
+                std::fprintf(stderr, "FAIL: GetBuffer(%u) returned 0x%08lx, expected DXGI_ERROR_INVALID_CALL and null\n",
+                             index, static_cast<unsigned long>(hr));
+                return 1;
+            }
+        }
+    }
+
     // Frame 1: 128x128 clear to (64, 128, 255, 255), read back all 16,384 pixels, Present.
     const float blue_ish[4] = {64.0f / 255.0f, 128.0f / 255.0f, 1.0f, 1.0f};
     if (run_clear_readback_present(128, 128, blue_ish, 64, 128, 255) != 0) return 1;
 
     // Frame 2: ResizeBuffers to explicit 37x19 on the unchanged 128x128 HWND, clear to green, read back all 703 pixels, Present.
     if (FAILED(sc->ResizeBuffers(2, 37, 19, DXGI_FORMAT_UNKNOWN, 0))) return fail("ResizeBuffers");
+    DXGI_SWAP_CHAIN_DESC1 preserved_format{};
+    if (FAILED(sc->GetDesc1(&preserved_format)) || preserved_format.Format != scd.Format)
+        return fail("ResizeBuffers with DXGI_FORMAT_UNKNOWN changed the format");
     const float green[4] = {0.0f, 1.0f, 0.0f, 1.0f};
     if (run_clear_readback_present(37, 19, green, 0, 255, 0) != 0) return 1;
 
@@ -441,6 +839,7 @@ int main() {
             return fail("GetDesc1 did not preserve 37x19 R10G10B10A2_UNORM");
 
         const UINT idx = sc->GetCurrentBackBufferIndex();
+        if (idx >= d10.BufferCount) return fail("GetCurrentBackBufferIndex >= BufferCount (10-bit)");
         ID3D12Resource* bb = nullptr;
         if (FAILED(sc->GetBuffer(idx, IID_PPV_ARGS(&bb))) || !bb) return fail("GetBuffer (10-bit)");
         const D3D12_RESOURCE_DESC bb_desc = bb->GetDesc();
@@ -587,9 +986,28 @@ int main() {
             return fail("GetRotation(nullptr) should return E_INVALIDARG");
     }
 
-    // Unsupported swapchain format must fail explicitly instead of silently downgrading to BGRA8.
-    if (sc->ResizeBuffers(2, 37, 19, DXGI_FORMAT_R32_UINT, 0) != DXGI_ERROR_UNSUPPORTED)
-        return fail("ResizeBuffers should reject unsupported format DXGI_FORMAT_R32_UINT");
+    constexpr DXGI_FORMAT invalid_formats[] = {
+        DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+        DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R32_UINT,
+    };
+    {
+        DXGI_SWAP_CHAIN_DESC1 before{}, after{};
+        if (FAILED(sc->GetDesc1(&before))) return fail("GetDesc1 before invalid formats");
+        const UINT node_masks[2] = {1, 1};
+        IUnknown* const present_queues[2] = {queue, queue};
+        for (DXGI_FORMAT format : invalid_formats) {
+            if (sc->ResizeBuffers(2, 64, 64, format, 0) != E_INVALIDARG ||
+                sc->ResizeBuffers1(2, 64, 64, format, 0, node_masks, present_queues) != E_INVALIDARG)
+                return fail("ResizeBuffers and ResizeBuffers1 should reject invalid flip-model formats");
+        }
+        if (FAILED(sc->GetDesc1(&after)) || after.Format != before.Format || after.BufferCount != before.BufferCount ||
+            after.Width != before.Width || after.Height != before.Height)
+            return fail("Invalid format changed the existing swapchain");
+        ID3D12Resource* buffer = nullptr;
+        if (FAILED(sc->GetBuffer(sc->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&buffer))) || !buffer)
+            return fail("GetBuffer after invalid swapchain formats");
+        buffer->Release();
+    }
 
     // Measured on host DXGI (RTX 5070 and WARP): DXGI_PRESENT_TEST returns S_OK without presenting, so the back
     // buffer index and last present count stay; a sync interval above 4 is DXGI_ERROR_INVALID_CALL and presents nothing.
@@ -632,6 +1050,16 @@ int main() {
         if (sc->SetMaximumFrameLatency(3) != DXGI_ERROR_INVALID_CALL ||
             sc->SetMaximumFrameLatency(1) != DXGI_ERROR_INVALID_CALL)
             return fail("Non-waitable SetMaximumFrameLatency should return DXGI_ERROR_INVALID_CALL");
+    }
+
+    // IDXGIObject private data on the swapchain, the factory and an adapter.
+    {
+        if (const char* step = check_private_data(sc)) return fail(step);
+        if (const char* step = check_private_data(factory)) return fail(step);
+        IDXGIAdapter1* pd_adapter = nullptr;
+        if (FAILED(factory->EnumAdapters1(0, &pd_adapter)) || !pd_adapter) return fail("EnumAdapters1(0) for private data");
+        if (const char* step = check_private_data(pd_adapter)) return fail(step);
+        pd_adapter->Release();
     }
 
     // IDXGIFactory4 adapter enumeration, IDXGIAdapter3 descriptors, EnumAdapterByLuid, and QueryVideoMemoryInfo.
@@ -727,6 +1155,20 @@ int main() {
             adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, nullptr) != E_INVALIDARG)
             return fail("QueryVideoMemoryInfo invalid args should return E_INVALIDARG");
 
+        // Budget-change notification (Microsoft: IDXGIAdapter3::RegisterVideoMemoryBudgetChangeNotificationEvent
+        // returns a success code and a cookie for UnregisterVideoMemoryBudgetChangeNotification).
+        HANDLE budget_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        DWORD budget_cookie = 0, budget_cookie2 = 0;
+        if (adapter3->RegisterVideoMemoryBudgetChangeNotificationEvent(budget_ev, &budget_cookie) != S_OK ||
+            budget_cookie == 0)
+            return fail("RegisterVideoMemoryBudgetChangeNotificationEvent should succeed with a cookie");
+        if (adapter3->RegisterVideoMemoryBudgetChangeNotificationEvent(budget_ev, &budget_cookie2) != S_OK ||
+            budget_cookie2 == 0 || budget_cookie2 == budget_cookie)
+            return fail("a second budget-change registration should get its own cookie");
+        adapter3->UnregisterVideoMemoryBudgetChangeNotification(budget_cookie);
+        adapter3->UnregisterVideoMemoryBudgetChangeNotification(budget_cookie2);
+        CloseHandle(budget_ev);
+
         adapter3->Release();
         adapter1->Release();
     }
@@ -747,6 +1189,8 @@ int main() {
     // Zero width or height means the window's client area, in ResizeBuffers (the usual WM_SIZE call) and at
     // creation; host DXGI: ResizeBuffers(0, 0, 0) after resizing the window gives the new client size.
     {
+        DXGI_SWAP_CHAIN_DESC1 before_zero{};
+        if (FAILED(sc->GetDesc1(&before_zero))) return fail("GetDesc1 before zero-count resize");
         RECT wr{0, 0, 300, 200};
         AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
         SetWindowPos(hwnd, nullptr, 0, 0, wr.right - wr.left, wr.bottom - wr.top, SWP_NOMOVE | SWP_NOZORDER);
@@ -754,7 +1198,8 @@ int main() {
         GetClientRect(hwnd, &cr);
         if (FAILED(sc->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0))) return fail("ResizeBuffers(0, 0, 0)");
         DXGI_SWAP_CHAIN_DESC1 d{};
-        sc->GetDesc1(&d);
+        if (FAILED(sc->GetDesc1(&d)) || d.BufferCount != before_zero.BufferCount)
+            return fail("ResizeBuffers(0, 0, 0) changed the buffer count");
         if (d.Width != UINT(cr.right) || d.Height != UINT(cr.bottom)) {
             std::fprintf(stderr, "FAIL: ResizeBuffers(0, 0, 0) gave %ux%u, client area is %ldx%ld\n", d.Width, d.Height,
                          cr.right, cr.bottom);
@@ -764,6 +1209,21 @@ int main() {
         HWND hwnd2 = create_test_window(200, 150);
         if (!hwnd2) return fail("CreateWindowExW (second)");
         GetClientRect(hwnd2, &cr);
+        const auto rejects_creation_format = [&](DXGI_FORMAT format) {
+            DXGI_SWAP_CHAIN_DESC1 invalid = scd;
+            invalid.Format = format;
+            IDXGISwapChain1* rejected = nullptr;
+            const HRESULT hr = factory->CreateSwapChainForHwnd(queue, hwnd2, &invalid, nullptr, nullptr, &rejected);
+            if (rejected) {
+                rejected->Release();
+                return false;
+            }
+            return hr == DXGI_ERROR_INVALID_CALL;
+        };
+        if (!rejects_creation_format(DXGI_FORMAT_UNKNOWN))
+            return fail("CreateSwapChainForHwnd accepted DXGI_FORMAT_UNKNOWN");
+        for (DXGI_FORMAT format : invalid_formats)
+            if (!rejects_creation_format(format)) return fail("CreateSwapChainForHwnd invalid flip-model format");
         DXGI_SWAP_CHAIN_DESC1 zd = scd;
         zd.Width = 0;
         zd.Height = 0;
@@ -776,6 +1236,37 @@ int main() {
         if (d.Width != UINT(cr.right) || d.Height != UINT(cr.bottom)) {
             std::fprintf(stderr, "FAIL: 0x0 swapchain is %ux%u, client area is %ldx%ld\n", d.Width, d.Height, cr.right,
                          cr.bottom);
+            return 1;
+        }
+    }
+
+    // ResizeTarget on a windowed swapchain resizes the target's client area to the mode; the back buffers keep
+    // their size until ResizeBuffers(0, 0, 0) takes the new client area.
+    {
+        // Host-measured on Windows 11 / RX 7900 XTX: a null target is DXGI_ERROR_INVALID_CALL, and 0x0 is accepted
+        // (the window's minimum tracking size decides the resulting client area).
+        if (sc->ResizeTarget(nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("ResizeTarget(nullptr) should be DXGI_ERROR_INVALID_CALL");
+        DXGI_MODE_DESC mode{};
+        mode.Width = 234;
+        mode.Height = 156;
+        mode.RefreshRate.Numerator = 60;
+        mode.RefreshRate.Denominator = 1;
+        mode.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        if (FAILED(sc->ResizeTarget(&mode))) return fail("ResizeTarget");
+        RECT cr{};
+        GetClientRect(hwnd, &cr);
+        if (cr.right != 234 || cr.bottom != 156) {
+            std::fprintf(stderr, "FAIL: ResizeTarget gave a %ldx%ld client area, want 234x156\n", cr.right, cr.bottom);
+            return 1;
+        }
+        DXGI_SWAP_CHAIN_DESC1 d{};
+        if (FAILED(sc->GetDesc1(&d))) return fail("GetDesc1 after ResizeTarget");
+        if (d.Width != 300 || d.Height != 200)
+            return fail("ResizeTarget should leave the back buffers for ResizeBuffers");
+        if (FAILED(sc->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0))) return fail("ResizeBuffers after ResizeTarget");
+        if (FAILED(sc->GetDesc1(&d)) || d.Width != 234 || d.Height != 156) {
+            std::fprintf(stderr, "FAIL: ResizeBuffers after ResizeTarget gave %ux%u, want 234x156\n", d.Width, d.Height);
             return 1;
         }
     }
@@ -794,11 +1285,115 @@ int main() {
             return fail("CheckFeatureSupport should reject null data or wrong size with E_INVALIDARG");
         factory5->Release();
 
+        // IDXGIFactory6/7 (D3D-2). Every answer below is the host dxgi.dll's (Windows 11, RTX 3070).
+        IDXGIFactory6* factory6 = nullptr;
+        IDXGIFactory7* factory7 = nullptr;
+        if (FAILED(factory->QueryInterface(IID_PPV_ARGS(&factory6))) || !factory6 ||
+            FAILED(factory->QueryInterface(IID_PPV_ARGS(&factory7))) || !factory7)
+            return fail("QueryInterface(IDXGIFactory6/7) failed");
+        IDXGIFactory7* created7 = nullptr;
+        if (FAILED(rt::d3d12::create_dxgi_factory(dev, IID_PPV_ARGS(&created7))) || !created7)
+            return fail("create_dxgi_factory(IID_IDXGIFactory7) failed");
+        created7->Release();
+
+        DXGI_ADAPTER_DESC1 enum_desc{};
+        {
+            IDXGIAdapter1* first = nullptr;
+            if (FAILED(factory->EnumAdapters1(0, &first)) || !first || FAILED(first->GetDesc1(&enum_desc)))
+                return fail("EnumAdapters1(0) for the preference comparison");
+            first->Release();
+        }
+        // The host accepts a preference outside the enum, so -1 and 3 are checked as well.
+        for (const int preference : {0, 1, 2, 3, -1}) {
+            const auto pref = static_cast<DXGI_GPU_PREFERENCE>(preference);
+            IDXGIAdapter1* by_pref = nullptr;
+            DXGI_ADAPTER_DESC1 pref_desc{};
+            if (FAILED(factory6->EnumAdapterByGpuPreference(0, pref, IID_PPV_ARGS(&by_pref))) || !by_pref ||
+                FAILED(by_pref->GetDesc1(&pref_desc)))
+                return fail("EnumAdapterByGpuPreference(0) failed");
+            by_pref->Release();
+            if (pref_desc.AdapterLuid.LowPart != enum_desc.AdapterLuid.LowPart ||
+                pref_desc.AdapterLuid.HighPart != enum_desc.AdapterLuid.HighPart)
+                return fail("EnumAdapterByGpuPreference(0) is not EnumAdapters1(0)'s adapter");
+            void* missing = reinterpret_cast<void*>(1);
+            if (factory6->EnumAdapterByGpuPreference(1, pref, __uuidof(IDXGIAdapter1), &missing) !=
+                    DXGI_ERROR_NOT_FOUND || missing != nullptr)
+                return fail("EnumAdapterByGpuPreference past the last adapter should be DXGI_ERROR_NOT_FOUND");
+        }
+        if (factory6->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_UNSPECIFIED, __uuidof(IDXGIAdapter1),
+                                                 nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("EnumAdapterByGpuPreference(out = null) should be DXGI_ERROR_INVALID_CALL");
+        {
+            void* wrong = reinterpret_cast<void*>(1);
+            if (factory6->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_UNSPECIFIED, __uuidof(IDXGIFactory),
+                                                     &wrong) != E_NOINTERFACE || wrong != nullptr)
+                return fail("EnumAdapterByGpuPreference with a non-adapter riid should be E_NOINTERFACE");
+        }
+
+        HANDLE changed = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        HANDLE changed2 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!changed || !changed2) return fail("CreateEventW (adapters changed)");
+        DWORD c_null = 0xDEAD, c1 = 0, c2 = 0, c3 = 0;
+        if (factory7->RegisterAdaptersChangedEvent(nullptr, &c_null) != DXGI_ERROR_INVALID_CALL || c_null != 0xDEAD)
+            return fail("RegisterAdaptersChangedEvent(null event) should be DXGI_ERROR_INVALID_CALL");
+        if (factory7->RegisterAdaptersChangedEvent(changed, nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("RegisterAdaptersChangedEvent(null cookie) should be DXGI_ERROR_INVALID_CALL");
+        if (FAILED(factory7->RegisterAdaptersChangedEvent(changed, &c1)) || c1 != 1)
+            return fail("RegisterAdaptersChangedEvent should succeed with cookie 1");
+        if (factory7->RegisterAdaptersChangedEvent(changed, &c2) != DXGI_ERROR_INVALID_CALL)
+            return fail("RegisterAdaptersChangedEvent with an event already registered should be DXGI_ERROR_INVALID_CALL");
+        if (FAILED(factory7->RegisterAdaptersChangedEvent(changed2, &c3)) || c3 == c1)
+            return fail("RegisterAdaptersChangedEvent with a second event should get its own cookie");
+        if (WaitForSingleObject(changed, 0) != WAIT_TIMEOUT)
+            return fail("registering must not signal the adapters-changed event");
+        DWORD occlusion = 0;
+        if (FAILED(factory7->RegisterOcclusionStatusEvent(changed, &occlusion)))
+            return fail("RegisterOcclusionStatusEvent (cookie space check)");
+        if (occlusion != c1 && occlusion != c3 &&
+            factory7->UnregisterAdaptersChangedEvent(occlusion) != DXGI_ERROR_NOT_FOUND)
+            return fail("an occlusion cookie should not unregister an adapters-changed event");
+        factory7->UnregisterOcclusionStatus(occlusion);
+        if (FAILED(factory7->UnregisterAdaptersChangedEvent(c1)) ||
+            factory7->UnregisterAdaptersChangedEvent(c1) != DXGI_ERROR_NOT_FOUND ||
+            factory7->UnregisterAdaptersChangedEvent(0) != DXGI_ERROR_NOT_FOUND ||
+            factory7->UnregisterAdaptersChangedEvent(12345) != DXGI_ERROR_NOT_FOUND)
+            return fail("UnregisterAdaptersChangedEvent: a cookie unregisters once, an unknown one is NOT_FOUND");
+        // After unregistering, the same event can be registered again.
+        DWORD c4 = 0;
+        if (FAILED(factory7->RegisterAdaptersChangedEvent(changed, &c4)) ||
+            FAILED(factory7->UnregisterAdaptersChangedEvent(c4)) ||
+            FAILED(factory7->UnregisterAdaptersChangedEvent(c3)))
+            return fail("re-registering an unregistered event");
+        CloseHandle(changed);
+        CloseHandle(changed2);
+        factory7->Release();
+        factory6->Release();
+
+        constexpr UINT tearing_flag = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        constexpr UINT waitable_flag = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        constexpr UINT both_flags = tearing_flag | waitable_flag;
+        const UINT node_masks[2] = {1, 1};
+        IUnknown* const present_queues[2] = {queue, queue};
+        const auto rejects_flag_change = [&](IDXGISwapChain3* chain, UINT flags) {
+            DXGI_SWAP_CHAIN_DESC1 before{}, after{};
+            if (FAILED(chain->GetDesc1(&before))) return false;
+            const UINT width = before.Width + 1;
+            return chain->ResizeBuffers(0, width, before.Height, DXGI_FORMAT_UNKNOWN, flags) == E_INVALIDARG &&
+                   chain->ResizeBuffers1(2, width, before.Height, DXGI_FORMAT_UNKNOWN, flags,
+                                         node_masks, present_queues) == E_INVALIDARG &&
+                   SUCCEEDED(chain->GetDesc1(&after)) && after.Flags == before.Flags &&
+                   after.BufferCount == before.BufferCount && after.Width == before.Width &&
+                   after.Height == before.Height;
+        };
+
         // Non-waitable, non-tearing swapchain: GetFrameLatencyWaitableObject is null and ALLOW_TEARING is rejected.
+        for (UINT flags : {waitable_flag, tearing_flag, both_flags})
+            if (!rejects_flag_change(sc, flags)) return fail("Resize accepted adding a creation-only flag");
         if (sc->GetFrameLatencyWaitableObject() != nullptr)
             return fail("Non-waitable swapchain should return nullptr from GetFrameLatencyWaitableObject");
         if (sc->Present(0, DXGI_PRESENT_ALLOW_TEARING) != DXGI_ERROR_INVALID_CALL)
             return fail("Present(ALLOW_TEARING) on non-tearing swapchain should return DXGI_ERROR_INVALID_CALL");
+        if (FAILED(sc->Present(0, 0))) return fail("Present after rejected resize on a plain swapchain");
 
         HWND hwnd3 = create_test_window(128, 96);
         if (!hwnd3) return fail("CreateWindowExW (third)");
@@ -806,7 +1401,7 @@ int main() {
         wdesc.Width = 128;
         wdesc.Height = 96;
         wdesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;  // also tests presenting an untouched offscreen backbuffer
-        wdesc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        wdesc.Flags = both_flags;
         IDXGISwapChain1* wsc1 = nullptr;
         if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd3, &wdesc, nullptr, nullptr, &wsc1)) || !wsc1)
             return fail("CreateSwapChainForHwnd (tearing + waitable)");
@@ -814,14 +1409,17 @@ int main() {
         if (FAILED(wsc1->QueryInterface(IID_PPV_ARGS(&wsc))) || !wsc) return fail("QI IDXGISwapChain3 (waitable)");
         wsc1->Release();
 
+        for (UINT flags : {0u, waitable_flag, tearing_flag})
+            if (!rejects_flag_change(wsc, flags)) return fail("Resize accepted removing a creation-only flag");
         DXGI_SWAP_CHAIN_DESC1 got_desc{};
         if (FAILED(wsc->GetDesc1(&got_desc)) || got_desc.Flags != wdesc.Flags)
             return fail("Waitable swapchain GetDesc1 did not preserve Flags");
         UINT lat = 0;
         if (FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 1)
             return fail("Waitable swapchain default GetMaximumFrameLatency should be 1");
-        if (wsc->SetMaximumFrameLatency(0) != E_INVALIDARG || wsc->SetMaximumFrameLatency(17) != E_INVALIDARG)
-            return fail("Waitable SetMaximumFrameLatency should reject 0 and > 16 with E_INVALIDARG");
+        if (wsc->SetMaximumFrameLatency(0) != DXGI_ERROR_INVALID_CALL ||
+            FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 1)
+            return fail("Waitable SetMaximumFrameLatency(0) should return INVALID_CALL and preserve latency");
         if (FAILED(wsc->SetMaximumFrameLatency(2)) || FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 2)
             return fail("Waitable SetMaximumFrameLatency(2) round-trip failed");
         HANDLE waitable = wsc->GetFrameLatencyWaitableObject();
@@ -836,9 +1434,220 @@ int main() {
         if (!check_statistics_disjoint(wsc)) return fail("first statistics query after Present should be disjoint");
         if (WaitForSingleObject(waitable, 5000) != WAIT_OBJECT_0)
             return fail("Post-Present WaitForSingleObject on waitable swapchain failed");
+        if (FAILED(wsc->ResizeBuffers(0, wdesc.Width + 1, wdesc.Height, DXGI_FORMAT_UNKNOWN, both_flags)) ||
+            FAILED(wsc->GetDesc1(&got_desc)) || got_desc.Width != wdesc.Width + 1 || got_desc.Flags != both_flags)
+            return fail("ResizeBuffers with matching creation flags failed");
+        if (FAILED(wsc->Present(0, DXGI_PRESENT_ALLOW_TEARING)) ||
+            WaitForSingleObject(waitable, 5000) != WAIT_OBJECT_0)
+            return fail("Present or wait after resizing the waitable swapchain failed");
+        if (FAILED(wsc->SetMaximumFrameLatency(40)) || FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 40)
+            return fail("Waitable SetMaximumFrameLatency(40) round-trip failed");
+        if (WaitForSingleObject(waitable, 0) != WAIT_OBJECT_0)
+            return fail("Waitable handle was not signaled after increasing latency from 2 to 40");
+        if (wsc->SetMaximumFrameLatency(41) != DXGI_ERROR_INVALID_CALL ||
+            FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 40)
+            return fail("Waitable SetMaximumFrameLatency(41) should return INVALID_CALL and preserve latency");
         CloseHandle(waitable);
         wsc->Release();
         DestroyWindow(hwnd3);
+    }
+
+    // CreateSwapChainForCoreWindow & Occlusion status registration
+    {
+        // 1. Parameter validation
+        IDXGISwapChain1* sc_dummy = nullptr;
+        if (factory->CreateSwapChainForCoreWindow(queue, nullptr, &scd, nullptr, &sc_dummy) != E_INVALIDARG)
+            return fail("CreateSwapChainForCoreWindow(null window) should return E_INVALIDARG");
+        if (factory->CreateSwapChainForCoreWindow(nullptr, queue, &scd, nullptr, &sc_dummy) != E_INVALIDARG)
+            return fail("CreateSwapChainForCoreWindow(null device) should return E_INVALIDARG");
+        if (factory->CreateSwapChainForCoreWindow(queue, queue, nullptr, nullptr, &sc_dummy) != E_INVALIDARG)
+            return fail("CreateSwapChainForCoreWindow(null desc) should return E_INVALIDARG");
+        if (factory->CreateSwapChainForCoreWindow(queue, queue, &scd, nullptr, nullptr) != E_POINTER)
+            return fail("CreateSwapChainForCoreWindow(null out) should return E_POINTER");
+
+        // Non-CoreWindow IUnknown
+        if (factory->CreateSwapChainForCoreWindow(queue, queue, &scd, nullptr, &sc_dummy) != DXGI_ERROR_INVALID_CALL)
+            return fail("CreateSwapChainForCoreWindow with non-CoreWindow should return DXGI_ERROR_INVALID_CALL");
+
+        // 2. Mock ICoreWindow with ICoreWindowInterop
+        static constexpr GUID kIID_ICoreWindowInterop = {
+            0x45D64A29, 0xA63E, 0x4CB6, {0xB4, 0x98, 0x57, 0x81, 0xD2, 0x98, 0xCB, 0x4F}};
+        struct MockCoreWindow final : public IUnknown {
+            HWND window_handle = nullptr;
+            std::atomic<ULONG> refs{1};
+
+            HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+                if (!out) return E_POINTER;
+                if (riid == IID_IUnknown || riid == kIID_ICoreWindowInterop) {
+                    *out = this;
+                    AddRef();
+                    return S_OK;
+                }
+                *out = nullptr;
+                return E_NOINTERFACE;
+            }
+            ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+            ULONG STDMETHODCALLTYPE Release() override {
+                ULONG r = --refs;
+                if (!r) delete this;
+                return r;
+            }
+            virtual HRESULT STDMETHODCALLTYPE get_WindowHandle(HWND* hwnd) {
+                if (!hwnd) return E_POINTER;
+                *hwnd = window_handle;
+                return S_OK;
+            }
+            virtual HRESULT STDMETHODCALLTYPE put_MessageHandled(unsigned char) { return S_OK; }
+        };
+
+        auto* mock_cw = new MockCoreWindow();
+        // Null HWND in interop
+        if (factory->CreateSwapChainForCoreWindow(queue, mock_cw, &scd, nullptr, &sc_dummy) != DXGI_ERROR_INVALID_CALL) {
+            mock_cw->Release();
+            return fail("CreateSwapChainForCoreWindow with null HWND should return DXGI_ERROR_INVALID_CALL");
+        }
+
+        // Valid HWND in mock CoreWindow
+        HWND hwnd4 = create_test_window(160, 120);
+        if (!hwnd4) {
+            mock_cw->Release();
+            return fail("CreateWindowExW (fourth)");
+        }
+        mock_cw->window_handle = hwnd4;
+        for (const auto& samples : invalid_samples) {
+            DXGI_SWAP_CHAIN_DESC1 invalid = scd;
+            invalid.SampleDesc = samples;
+            IDXGISwapChain1* rejected = nullptr;
+            const HRESULT hr = factory->CreateSwapChainForCoreWindow(queue, mock_cw, &invalid, nullptr, &rejected);
+            if (rejected || hr != DXGI_ERROR_INVALID_CALL) {
+                if (rejected) rejected->Release();
+                mock_cw->Release();
+                DestroyWindow(hwnd4);
+                return fail("CreateSwapChainForCoreWindow should reject invalid sample descriptions");
+            }
+        }
+        IDXGISwapChain1* cw_sc1 = nullptr;
+        if (FAILED(factory->CreateSwapChainForCoreWindow(queue, mock_cw, &scd, nullptr, &cw_sc1)) || !cw_sc1) {
+            mock_cw->Release();
+            DestroyWindow(hwnd4);
+            return fail("CreateSwapChainForCoreWindow with valid MockCoreWindow failed");
+        }
+        IDXGISwapChain3* cw_sc = nullptr;
+        if (FAILED(cw_sc1->QueryInterface(IID_PPV_ARGS(&cw_sc))) || !cw_sc) {
+            cw_sc1->Release();
+            mock_cw->Release();
+            DestroyWindow(hwnd4);
+            return fail("QI IDXGISwapChain3 on CoreWindow swapchain failed");
+        }
+        cw_sc1->Release();
+        DXGI_SWAP_CHAIN_DESC1 cw_desc{};
+        if (FAILED(cw_sc->GetDesc1(&cw_desc)) || cw_desc.Width != scd.Width || cw_desc.Height != scd.Height ||
+            cw_desc.SampleDesc.Count != 1 || cw_desc.SampleDesc.Quality != 0) {
+            cw_sc->Release();
+            mock_cw->Release();
+            DestroyWindow(hwnd4);
+            return fail("GetDesc1 on CoreWindow swapchain mismatch");
+        }
+        if (FAILED(cw_sc->Present(0, 0))) {
+            cw_sc->Release();
+            mock_cw->Release();
+            DestroyWindow(hwnd4);
+            return fail("Present on CoreWindow swapchain failed");
+        }
+        cw_sc->Release();
+        mock_cw->Release();
+        DestroyWindow(hwnd4);
+
+        // 3. Occlusion status registration
+        DWORD cookie1 = 0, cookie2 = 0;
+        if (factory->RegisterOcclusionStatusWindow(nullptr, WM_USER, &cookie1) != DXGI_ERROR_INVALID_CALL)
+            return fail("RegisterOcclusionStatusWindow(null hwnd) should return DXGI_ERROR_INVALID_CALL");
+        if (factory->RegisterOcclusionStatusWindow(hwnd, WM_USER, nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("RegisterOcclusionStatusWindow(null cookie) should return DXGI_ERROR_INVALID_CALL");
+        if (FAILED(factory->RegisterOcclusionStatusWindow(hwnd, WM_USER, &cookie1)) || cookie1 == 0)
+            return fail("RegisterOcclusionStatusWindow failed");
+
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (factory->RegisterOcclusionStatusEvent(nullptr, &cookie2) != DXGI_ERROR_INVALID_CALL)
+            return fail("RegisterOcclusionStatusEvent(null event) should return DXGI_ERROR_INVALID_CALL");
+        if (factory->RegisterOcclusionStatusEvent(ev, nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("RegisterOcclusionStatusEvent(null cookie) should return DXGI_ERROR_INVALID_CALL");
+        if (FAILED(factory->RegisterOcclusionStatusEvent(ev, &cookie2)) || cookie2 == 0 || cookie2 == cookie1)
+            return fail("RegisterOcclusionStatusEvent failed or duplicated cookie");
+        factory->UnregisterOcclusionStatus(cookie1);
+        factory->UnregisterOcclusionStatus(cookie2);
+        CloseHandle(ev);
+    }
+
+    // Classic IDXGIFactory::CreateSwapChain delegation
+    {
+        if (factory->CreateSwapChain(nullptr, nullptr, nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("CreateSwapChain(null out) should return DXGI_ERROR_INVALID_CALL");
+        IDXGISwapChain* legacy_sc = nullptr;
+        if (factory->CreateSwapChain(nullptr, nullptr, &legacy_sc) != DXGI_ERROR_INVALID_CALL)
+            return fail("CreateSwapChain(null device, null desc) should return DXGI_ERROR_INVALID_CALL");
+        if (factory->CreateSwapChain(queue, nullptr, &legacy_sc) != DXGI_ERROR_INVALID_CALL)
+            return fail("CreateSwapChain(valid device, null desc) should return DXGI_ERROR_INVALID_CALL");
+
+        HWND hwnd_legacy = create_test_window(160, 120);
+        if (!hwnd_legacy) return fail("CreateWindowExW (legacy)");
+
+        DXGI_SWAP_CHAIN_DESC leg_desc{};
+        leg_desc.BufferDesc.Width = 160;
+        leg_desc.BufferDesc.Height = 120;
+        leg_desc.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        leg_desc.SampleDesc.Count = 1;
+        leg_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        leg_desc.BufferCount = 2;
+        leg_desc.OutputWindow = hwnd_legacy;
+        leg_desc.Windowed = TRUE;
+        leg_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+
+        if (FAILED(factory->CreateSwapChain(queue, &leg_desc, &legacy_sc)) || !legacy_sc) {
+            DestroyWindow(hwnd_legacy);
+            return fail("CreateSwapChain failed");
+        }
+
+        DXGI_SWAP_CHAIN_DESC got_leg_desc{};
+        if (FAILED(legacy_sc->GetDesc(&got_leg_desc)) || got_leg_desc.BufferDesc.Width != 160 ||
+            got_leg_desc.BufferDesc.Height != 120) {
+            legacy_sc->Release();
+            DestroyWindow(hwnd_legacy);
+            return fail("GetDesc on legacy swapchain mismatch");
+        }
+
+        // Fullscreen request fallback: when exclusive fullscreen is unavailable,
+        // CreateSwapChain falls back to windowed chain and returns DXGI_STATUS_OCCLUDED.
+        HWND hwnd_fs = create_test_window(160, 120);
+        if (!hwnd_fs) return fail("CreateWindowExW (fullscreen fallback)");
+        DXGI_SWAP_CHAIN_DESC fs_req_desc = leg_desc;
+        fs_req_desc.OutputWindow = hwnd_fs;
+        fs_req_desc.Windowed = FALSE;
+        IDXGISwapChain* fs_sc = nullptr;
+        const HRESULT fs_hr = factory->CreateSwapChain(queue, &fs_req_desc, &fs_sc);
+        if (fs_hr != DXGI_STATUS_OCCLUDED || !fs_sc) {
+            if (fs_sc) fs_sc->Release();
+            DestroyWindow(hwnd_fs);
+            return fail("CreateSwapChain(Windowed == FALSE) should return DXGI_STATUS_OCCLUDED fallback");
+        }
+        BOOL is_fs = TRUE;
+        fs_sc->GetFullscreenState(&is_fs, nullptr);
+        if (is_fs != FALSE) {
+            fs_sc->Release();
+            DestroyWindow(hwnd_fs);
+            return fail("GetFullscreenState should remain FALSE on fallback windowed swapchain");
+        }
+        fs_sc->Release();
+        DestroyWindow(hwnd_fs);
+
+        if (FAILED(legacy_sc->Present(0, 0))) {
+            legacy_sc->Release();
+            DestroyWindow(hwnd_legacy);
+            return fail("Present on legacy swapchain failed");
+        }
+
+        legacy_sc->Release();
+        DestroyWindow(hwnd_legacy);
     }
 
     rtv_heap->Release();
@@ -860,7 +1669,7 @@ int main() {
         return 1;
     }
     std::printf("device: %s (validation %s)\n", chosen.deviceName, val_active ? "on" : "off");
-    std::printf("dxgi_swapchain_test: PASS (CreateSwapChainForHwnd, GetBuffer+GetDesc, clear+readback, Present, "
-                "ResizeBuffers; 0 validation errors)\n");
+    std::printf("dxgi_swapchain_test: PASS (CreateSwapChain, CreateSwapChainForHwnd, CreateSwapChainForCoreWindow, occlusion status, "
+                "GetBuffer+GetDesc, clear+readback, Present, ResizeBuffers; 0 validation errors)\n");
     return 0;
 }

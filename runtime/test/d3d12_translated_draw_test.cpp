@@ -63,8 +63,8 @@ struct Vertex {
 };
 
 using Pixel = std::array<float, 4>;
-constexpr UINT extent = 64;
-constexpr UINT pitch = extent * sizeof(Pixel);  // 1024, a multiple of 256
+constexpr UINT target_extent = 64;
+constexpr UINT pitch = target_extent * sizeof(Pixel);  // 1024, a multiple of 256
 
 // A V# for the vertex records: stride 32, `records` records, format 32_32_32_32_FLOAT, identity swizzle. The
 // out-of-range mode is structured (an index checked against num_records), which is what the hardware does with an
@@ -83,7 +83,9 @@ std::array<std::uint32_t, 4> make_vsharp(std::uint64_t base, std::uint32_t recor
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU: ctest skips
+    EXPECT(device_status == vktest::DeviceStatus::ready);
 
     // The translator-style library the build wrote, and the FSSM programs its index entries are keyed by.
     const std::filesystem::path root_dir = LEONIDA_TEST_M15_DIR;
@@ -113,7 +115,7 @@ int main() {
                                 vertex(-1, 0, c2), vertex(-1, -1, c2), vertex(0, -1, c2)};
     static_assert(sizeof(Vertex) == 32 && sizeof(vertices) == 288);
 
-    std::vector<Pixel> pixels(extent * extent);
+    std::vector<Pixel> pixels(target_extent * target_extent);
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -178,13 +180,13 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                          IID_PPV_ARGS(&upload.p))));
-        const auto readback_desc = buffer_desc(pitch * extent);
+        const auto readback_desc = buffer_desc(pitch * target_extent);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&readback.p))));
         D3D12_RESOURCE_DESC rt_desc{};
         rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        rt_desc.Width = rt_desc.Height = extent;
+        rt_desc.Width = rt_desc.Height = target_extent;
         rt_desc.DepthOrArraySize = 1;
         rt_desc.MipLevels = 1;
         rt_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
@@ -245,8 +247,8 @@ int main() {
         ID3D12DescriptorHeap* heaps[] = {srv_heap.p};
         list->SetDescriptorHeaps(1, heaps);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        const D3D12_VIEWPORT viewport{0, 0, float(extent), float(extent), 0, 1};
-        const D3D12_RECT scissor{0, 0, LONG(extent), LONG(extent)};
+        const D3D12_VIEWPORT viewport{0, 0, float(target_extent), float(target_extent), 0, 1};
+        const D3D12_RECT scissor{0, 0, LONG(target_extent), LONG(target_extent)};
         list->RSSetViewports(1, &viewport);
         list->RSSetScissorRects(1, &scissor);
         list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -271,7 +273,7 @@ int main() {
         D3D12_TEXTURE_COPY_LOCATION dst{};
         dst.pResource = readback.p;
         dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst.PlacedFootprint = {0, {DXGI_FORMAT_R32G32B32A32_FLOAT, extent, extent, 1, pitch}};
+        dst.PlacedFootprint = {0, {DXGI_FORMAT_R32G32B32A32_FLOAT, target_extent, target_extent, 1, pitch}};
         D3D12_TEXTURE_COPY_LOCATION src{};
         src.pResource = target.p;
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -302,10 +304,10 @@ int main() {
     const Pixel top_left = {0.125f, 1.0f, 0.75f, 1.0f}, bottom_right = {0.25f, 1.125f, 0.875f, 1.0f};
     const Pixel bottom_left = {0.75f, 0.25f, 0.75f, 1.0f};
     unsigned mismatches = 0, edge = 0, edge_triangle = 0, edge_clear = 0;
-    for (UINT row = 0; row < extent; ++row) {
-        for (UINT col = 0; col < extent; ++col) {
-            const bool top = row < extent / 2, left = col < extent / 2;
-            const Pixel& got = pixels[row * extent + col];
+    for (UINT row = 0; row < target_extent; ++row) {
+        for (UINT col = 0; col < target_extent; ++col) {
+            const bool top = row < target_extent / 2, left = col < target_extent / 2;
+            const Pixel& got = pixels[row * target_extent + col];
             const auto bits_equal = [&](const Pixel& want) { return std::memcmp(&got, &want, sizeof(Pixel)) == 0; };
             const Pixel* want;
             if (top) {
@@ -340,6 +342,6 @@ int main() {
                 "pixels on the triangle's diagonal (%u its colour, %u the clear colour). User data from a descriptor "
                 "table and root constants, V# vertex fetch from the arena, PS constants "
                 "through the code base\n",
-                extent * extent - edge, extent * extent, edge, edge_triangle, edge_clear);
+                target_extent * target_extent - edge, target_extent * target_extent, edge, edge_triangle, edge_clear);
     return 0;
 }

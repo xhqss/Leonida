@@ -30,3 +30,5 @@ jobs:
             echo "$bad"
             exit 1
           fi
+      - name: No game data under another name
+        run: python3 -I scripts/check_no_game_data.py

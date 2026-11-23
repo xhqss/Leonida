@@ -115,7 +115,8 @@ def test_masks_through_a_vgpr():
     blocks = [masks + via + [use]]
     got, writes = L.analyse(blocks, [[]])
     assert set(got[id(use)]) == {3, 47, ("v", 51)}
-    assert writes == {id(via[0]), id(via[1])}
+    # Only the v_or3 is a mask write: the v_mov copy is an ordinary VALU write (SHADER-21 part 2).
+    assert writes == {id(via[1])}
     # Mixed with data, or with the VGPR written by anything else in between, it is data.
     data = ins("s_buffer_load_dword", s(47), s(0, 4), imm(0))
     assert masks_at_last([[masks[0], data] + via + [use]], [[]]) == set()
@@ -123,6 +124,20 @@ def test_masks_through_a_vgpr():
     # A constant alone does not make a VGPR a mask (v_mov_b32 v, 0 is everywhere).
     blocks = [[ins("v_mov_b32_e32", v(51), imm(0)), ins("v_readfirstlane_b32", s(3), v(51)), use]]
     assert L.analyse(blocks, [[]]) == ({id(i): {} for i in blocks[0]}, set())
+
+
+def test_vmov_mask_copy_is_exec_gated():
+    # SHADER-21 part 2: a mask copied into a VGPR with v_mov_b32 is an ordinary
+    # VALU write, so inactive lanes keep the old VGPR; only per-lane mask
+    # computations (v_or3_b32 etc.) take the all-lanes store.
+    cmp_ = ins("v_cmp_lt_u32_e64", sp("vcc_lo"), v(5), v(6))
+    copy = ins("v_mov_b32_e32", v(2), sp("vcc_lo"))
+    calc = ins("v_or3_b32", v(3), sp("vcc_lo"), sp("vcc_lo"), sp("vcc_lo"))
+    use = ins("s_bcnt1_i32_b64", s(8), s(6, 2))
+    blocks = [[cmp_, copy, calc, use]]
+    got, writes = L.analyse(blocks, [[]])
+    assert ("v", 2) in got[id(use)] and ("v", 3) in got[id(use)]
+    assert writes == {id(calc)}
 
 
 def test_bfm64_and_half_kinds():
@@ -150,10 +165,117 @@ def test_bfm64_and_half_kinds():
     assert got3 == {6: L.MASK}
 
 
+def test_b64_mask_imm_and_include_either():
+    use64 = ins("s_bcnt1_i32_b64", s(8), s(6, 2))
+    use32 = ins("s_bcnt1_i32_b32", s(8), s(6))
+    vcmp = ins("v_cmp_eq_u32_e32", sp("vcc"), imm(0), v(0))
+    # 64-bit bitwise op of a lane mask with a non-0/-1 immediate stores a per-lane mask via mask_src/mask_dst.
+    got_and64 = L.analyse([[vcmp, ins("s_and_b64", s(6, 2), sp("vcc"), imm(0xFF)), use64]], [[]])[0][id(use64)]
+    assert got_and64 == {"vcc": L.MASK, 6: L.MASK_LO, 7: L.MASK_HI}
+    # 64-bit copy of a constant into vcc stores mask_src(imm) per lane into %vcc.
+    got_mov_vcc = L.analyse([[ins("s_mov_b64", sp("vcc"), imm(0x3F)), use64]], [[]])[0][id(use64)]
+    assert got_mov_vcc == {"vcc": L.MASK}
+    # Plain 64-bit data combined with an immediate stays data; 32-bit mask + non-0/-1 immediate into an SGPR stays data.
+    assert L.analyse([[ins("s_and_b64", s(6, 2), s(20, 2), imm(0xFF)), use64]], [[]])[0][id(use64)] == {}
+    assert L.analyse([[ins("s_and_b32", s(6), sp("exec_lo"), imm(1)), use32]], [[]])[0][id(use32)] == {}
+    # include_either=True exposes registers holding constant 0 / -1 (EITHER) alongside cur_masks.
+    blocks = [[ins("s_mov_b32", s(6), sp("exec_lo")), ins("s_mov_b32", s(7), imm(0)), use64]]
+    out, writes, either = L.analyse(blocks, [[]], include_either=True)
+    assert out[id(use64)] == {6: L.MASK_LO}
+    assert writes == set()
+    assert either[id(use64)] == {7}
+
+
+def test_writelane_sdwa_dpp_swaps_stores_and_div_scale():
+    use_s = ins("s_bcnt1_i32_b32", s(8), s(6))
+    use_v = ins("v_readfirstlane_b32", s(8), v(5))
+    mk = ins("v_cmp_eq_u32_e64", s(6), v(0), v(1))
+
+    # v_writelane_b32 writes one lane of v5, so v5 no longer holds a whole-VGPR mask ("v", 5),
+    # while the parked slot ("lane", 5, 0) reflects the written scalar operand.
+    wl_data = ins("v_writelane_b32", v(5), s(9), imm(0))
+    got_wl = L.analyse([[mk, ins("v_or_b32_e32", v(5), s(6), s(6)), wl_data, use_v]], [[]])[0][id(use_v)]
+    assert ("v", 5) not in got_wl
+    wl_mask = ins("v_writelane_b32", v(5), s(6), imm(0))
+    got_wl2 = L.analyse([[mk, ins("v_or_b32_e32", v(5), s(6), s(6)), wl_mask, use_v]], [[]])[0][id(use_v)]
+    assert ("v", 5) not in got_wl2 and ("lane", 5, 0) in got_wl2
+
+    # SDWA and DPP variants of VECTOR_BITWISE are not whole-dword per-lane mask computations:
+    # they must neither mark ("v", dst) nor enter mask_writes.
+    dpp_or = {"op": "v_or_b32_dpp", "args": [v(5), v(4), v(4)], "mods": ["row_shr:1", "row_mask:0x0"]}
+    sdwa_or = {"op": "v_or_b32_sdwa", "args": [v(5), s(6), s(6)],
+               "mods": ["dst_sel:BYTE_0", "dst_unused:UNUSED_PRESERVE", "src0_sel:BYTE_0", "src1_sel:BYTE_0"]}
+    dpp_mov = {"op": "v_mov_b32_dpp", "args": [v(5), v(4)], "mods": ["row_shr:1"]}
+    for op_ins in (dpp_or, sdwa_or, dpp_mov):
+        blk = [mk, ins("v_mov_b32_e32", v(4), s(6)), op_ins, use_v]
+        got, writes = L.analyse([blk], [[]])
+        assert ("v", 5) not in got[id(use_v)], op_ins["op"]
+        assert id(op_ins) not in writes, op_ins["op"]
+
+    # v_swap_b32 writes both operands, invalidating parked/VGPR masks in a[1] as well as a[0].
+    got_swap = L.analyse([[mk, ins("v_writelane_b32", v(5), s(6), imm(0)),
+                           ins("v_swap_b32_e32", v(4), v(5)), use_v]], [[]])[0][id(use_v)]
+    assert ("lane", 5, 0) not in got_swap and ("v", 5) not in got_swap
+
+    # Relative-destination writes invalidate all registers at or above the base register.
+    for rel_op in ("v_movreld_b32_e32", "v_movrelsd_b32_e32", "v_movrelsd_2_b32_e32"):
+        got_rel = L.analyse([[mk, ins("v_writelane_b32", v(6), s(6), imm(0)),
+                              ins("v_writelane_b32", v(3), s(6), imm(0)),
+                              ins(rel_op, v(4), v(7)), use_v]], [[]])[0][id(use_v)]
+        assert ("lane", 6, 0) not in got_rel and ("lane", 3, 0) in got_rel, rel_op
+    got_swaprel = L.analyse([[mk, ins("v_writelane_b32", v(6), s(6), imm(0)),
+                              ins("v_writelane_b32", v(2), s(6), imm(0)),
+                              ins("v_swaprel_b32_e32", v(5), v(3)), use_v]], [[]])[0][id(use_v)]
+    assert ("lane", 6, 0) not in got_swaprel and ("lane", 2, 0) in got_swaprel
+    for srel_op in ("s_movreld_b32", "s_movreld_b64", "s_movrelsd_2_b32"):
+        got_srel = L.analyse([[ins("s_mov_b32", s(2), sp("exec_lo")),
+                               ins("s_mov_b32", s(6), sp("exec_lo")),
+                               ins(srel_op, s(4), s(8)), use_s]], [[]])[0][id(use_s)]
+        assert 6 not in got_srel and 2 in got_srel, srel_op
+
+    # Store instructions, LDS-targeted buffer loads, and non-returning atomics do not write a[0].
+    got_sstore = L.analyse([[mk, ins("s_store_dword", s(6), s(0, 2), imm(0)),
+                             ins("s_buffer_store_dword", s(6), s(0, 4), imm(0)), use_s]], [[]])[0][id(use_s)]
+    assert 6 in got_sstore
+    for non_dst in (
+        ins("global_store_dword", v(5), v(6), sp("off")),
+        ins("buffer_store_dword", v(5), v(6), s(0, 4), imm(0)),
+        ins("tbuffer_store_format_x", v(5), v(6), s(0, 4), imm(0)),
+        ins("flat_store_dword", v(5), v(6)),
+        ins("image_store", v(5), v(6), s(0, 8)),
+        ins("ds_write_b32", v(5), v(6)),
+        {"op": "buffer_load_dword", "args": [v(5), s(0, 4), imm(0)], "mods": ["offen", "lds"]},
+        ins("global_atomic_add", v(5), v(6), sp("off")),
+        ins("buffer_atomic_add", v(5), v(6), s(0, 4), imm(0)),
+        ins("image_atomic_add", v(5), v(6), s(0, 8)),
+        ins("ds_add_u32", v(5), v(6)),
+    ):
+        got_keep = L.analyse([[mk, ins("v_writelane_b32", v(5), s(6), imm(0)),
+                               non_dst, use_v]], [[]])[0][id(use_v)]
+        assert ("lane", 5, 0) in got_keep, non_dst["op"]
+    # Returning atomics (glc / _rtn) DO write a[0] and must still invalidate it.
+    for rtn_op in (
+        {"op": "global_atomic_add", "args": [v(5), v(6), v(7), sp("off")], "mods": ["glc"]},
+        {"op": "buffer_atomic_add", "args": [v(5), v(6), s(0, 4), imm(0)], "mods": ["glc"]},
+        ins("ds_add_rtn_u32", v(5), v(6), v(7)),
+    ):
+        got_kill = L.analyse([[mk, ins("v_writelane_b32", v(5), s(6), imm(0)),
+                               rtn_op, use_v]], [[]])[0][id(use_v)]
+        assert ("lane", 5, 0) not in got_kill, rtn_op["op"]
+
+    # v_div_scale_f32 / v_div_scale_f64 write a per-lane scale mask to a[1].
+    for ds_op in ("v_div_scale_f32", "v_div_scale_f64"):
+        got_ds = L.analyse([[ins(ds_op, v(0), s(6, 2), v(1), v(2), v(1)), use_s]], [[]])[0][id(use_s)]
+        assert got_ds == {6: L.MASK_LO, 7: L.MASK_HI}, ds_op
+
+
 if __name__ == "__main__":
     test_straight_line()
     test_joins()
     test_parked_masks()
     test_masks_through_a_vgpr()
+    test_vmov_mask_copy_is_exec_gated()
     test_bfm64_and_half_kinds()
+    test_b64_mask_imm_and_include_either()
+    test_writelane_sdwa_dpp_swaps_stores_and_div_scale()
     print("ok")

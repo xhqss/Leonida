@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -247,9 +248,25 @@ class GamedataMapsTest(unittest.TestCase):
         self.assertEqual(mhiu["grid"]["width"], 300)
         self.assertEqual(mhiu["grid"]["height"], 1)
 
+    def test_groups_a_continuation_after_a_128k_first_stream(self):
+        # The header's size bounds the join, so a first stream of any whole number of 64 KiB blocks continues.
+        payload = mhiu_payload(300, 1, [(0, 300, [i % 256 for i in range(300)])], pixels=b"\x07" * 150000)
+        self.assertGreater(len(payload), 2 * 65536)
+        self.add(payload, [payload[:2 * 65536], payload[2 * 65536:]])
+        self.finish()
+
+        p, data = self.run_tool()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        mhiu = data["payloads"][0]
+        self.assertEqual(mhiu["chunks"], 2)
+        self.assertEqual(mhiu["grid"]["width"], 300)
+
     def test_reports_an_unwritable_json_destination(self):
         self.finish()
-        out = os.path.join(self.root, "missing", "maps.json")
+        blocker = os.path.join(self.root, "blocker")
+        with open(blocker, "wb") as f:
+            f.write(b"not a directory")
+        out = os.path.join(blocker, "maps.json")
         result = subprocess.run(
             [sys.executable, "-I", TOOL, self.carve, "--json", out],
             capture_output=True, text=True,
@@ -258,6 +275,182 @@ class GamedataMapsTest(unittest.TestCase):
         self.assertIn(f"cannot write {out}", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         self.assertNotIn("wrote", result.stdout)
+
+    def test_creates_missing_parent_directories_for_json_with_lf_endings(self):
+        self.add(pamh_payload(3, 2, [1, 2, 3, 4, 5, 6], [0, 1, 2, 3, 4, 5]))
+        self.finish()
+        out = os.path.join(self.root, "missing", "nested", "maps.json")
+        result = subprocess.run(
+            [sys.executable, "-I", TOOL, self.carve, "--json", out],
+            cwd=self.root, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(os.path.isfile(out))
+        with open(out, "rb") as f:
+            raw = f.read()
+        self.assertIn(b"\n", raw)
+        self.assertNotIn(b"\r\n", raw)
+        data = json.loads(raw.decode("utf-8"))
+        self.assertEqual(len(data["payloads"]), 1)
+        self.assertEqual(data["payloads"][0]["type"], "PAMH")
+
+    def test_refuses_json_colliding_with_index_json_and_case_variants(self):
+        self.add(pamh_payload(2, 2, [1, 2, 3, 4], [0, 1, 2, 3]))
+        self.finish()
+        index_path = os.path.join(self.carve, "index.json")
+        with open(index_path, "rb") as f:
+            original = f.read()
+
+        targets = [index_path, os.path.join(self.carve, ".", "index.json")]
+        cased_index = os.path.join(self.carve, "INDEX.JSON")
+        if os.path.exists(cased_index):
+            targets.append(cased_index)
+            targets.append(os.path.join(self.root, "CARVE", "INDEX.JSON"))
+
+        for out in targets:
+            with self.subTest(out=out):
+                result = subprocess.run(
+                    [sys.executable, "-I", TOOL, self.carve, "--json", out],
+                    cwd=self.root, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace",
+                )
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("error:", result.stderr)
+                self.assertIn("would overwrite", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertNotIn("wrote", result.stdout)
+                with open(index_path, "rb") as f:
+                    self.assertEqual(f.read(), original)
+
+    def test_refuses_json_colliding_with_carved_bin_file(self):
+        self.add(pamh_payload(2, 2, [1, 2, 3, 4], [0, 1, 2, 3]))
+        self.finish()
+        carved = os.path.join(self.carve, "000000001000.bin")
+        with open(carved, "rb") as f:
+            original = f.read()
+
+        targets = [carved]
+        cased_bin = os.path.join(self.carve, "000000001000.BIN")
+        if os.path.exists(cased_bin):
+            targets.append(cased_bin)
+
+        hardlink = os.path.join(self.root, "hardlink.json")
+        try:
+            os.link(carved, hardlink)
+        except (OSError, NotImplementedError):
+            hardlink = None
+        if hardlink is not None:
+            targets.append(hardlink)
+
+        symlink = os.path.join(self.root, "symlink.json")
+        try:
+            os.symlink(carved, symlink)
+        except (OSError, NotImplementedError):
+            symlink = None
+        if symlink is not None:
+            targets.append(symlink)
+
+        for out in targets:
+            with self.subTest(out=out):
+                result = subprocess.run(
+                    [sys.executable, "-I", TOOL, self.carve, "--json", out],
+                    cwd=self.root, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace",
+                )
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("error:", result.stderr)
+                self.assertIn("would overwrite", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertNotIn("wrote", result.stdout)
+                with open(carved, "rb") as f:
+                    self.assertEqual(f.read(), original)
+
+    def test_refuses_json_colliding_with_index_only_carved_stream(self):
+        self.add(pamh_payload(2, 2, [1, 2, 3, 4], [0, 1, 2, 3]))
+        self.finish()
+        carved = os.path.join(self.carve, "000000001000.bin")
+        os.remove(carved)
+
+        result = subprocess.run(
+            [sys.executable, "-I", TOOL, self.carve, "--json", carved],
+            cwd=self.root, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("error:", result.stderr)
+        self.assertIn("would overwrite", result.stderr)
+        self.assertFalse(os.path.exists(carved))
+
+    def test_refuses_json_pointing_to_existing_directory_or_carve_dir(self):
+        self.finish()
+        existing_dir = os.path.join(self.root, "reports_dir")
+        os.makedirs(existing_dir)
+
+        for out, expected in ((existing_dir, "directory"), (self.carve, "would overwrite")):
+            with self.subTest(out=out):
+                result = subprocess.run(
+                    [sys.executable, "-I", TOOL, self.carve, "--json", out],
+                    cwd=self.root, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace",
+                )
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("error:", result.stderr)
+                self.assertIn(expected, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertNotIn("wrote", result.stdout)
+
+    def test_validates_json_before_scanning_carve_dir(self):
+        # Leave index.json corrupt so a scan would fail with a JSON error instead of the path guard.
+        carved = os.path.join(self.carve, "000000001000.bin")
+        with open(carved, "wb") as f:
+            f.write(b"raw carved stream")
+        index_path = os.path.join(self.carve, "index.json")
+        with open(index_path, "wb") as f:
+            f.write(b"{corrupt json")
+        out_dir = os.path.join(self.root, "existing_dir")
+        os.makedirs(out_dir)
+
+        for out, expected in ((out_dir, "directory"),
+                              (index_path, "would overwrite"),
+                              (carved, "would overwrite")):
+            with self.subTest(out=out):
+                result = subprocess.run(
+                    [sys.executable, "-I", TOOL, self.carve, "--json", out],
+                    cwd=self.root, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace",
+                )
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(expected, result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_allows_non_input_json_report_inside_carve_dir(self):
+        self.add(pamh_payload(2, 2, [1, 2, 3, 4], [0, 1, 2, 3]))
+        self.finish()
+        out = os.path.join(self.carve, "maps.json")
+        for _ in range(2):
+            result = subprocess.run(
+                [sys.executable, "-I", TOOL, self.carve, "--json", out],
+                cwd=self.root, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            with open(out, encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(len(data["payloads"]), 1)
+
+    def test_macos_case_insensitive_volume_folds_case_and_nfd(self):
+        with mock.patch.object(gamedata_maps.os, "name", "posix"), \
+             mock.patch.object(gamedata_maps.sys, "platform", "darwin"), \
+             mock.patch.object(gamedata_maps.os, "pathconf", return_value=0, create=True):
+            self.assertTrue(gamedata_maps.same_report_path(
+                os.path.join(self.carve, "INDEX.JSON"),
+                os.path.join(self.carve, "index.json"),
+            ))
+            self.assertTrue(gamedata_maps.same_report_path(
+                os.path.join(self.carve, "caf\u00e9.json"),
+                os.path.join(self.carve, "CAFE\u0301.json"),
+            ))
 
     def test_complete_64k_map_leaves_the_next_stream_alone(self):
         payload = mhiu_payload(255, 1, [(0, 255, [7] * 255)], pixels=b"\x00" * 65229)

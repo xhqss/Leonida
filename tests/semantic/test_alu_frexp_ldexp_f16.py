@@ -7,11 +7,13 @@ exponent 0; infinities and NaNs pass through the mantissa and ldexp, and give ex
 a source and the last bit sends the result to the high half of the destination; the other half of the destination is
 kept. Each case translates a synthetic pixel shader with tools/rdna2spirv.py, runs it in
 tests/semantic/spirv_mini_interp.py and compares the exported word with a plain-Python reference (math.frexp /
-math.ldexp on the double value of the half).
+math.ldexp on the double value of the half; struct's binary16 packing rounds to nearest even).
 
-Not covered because the translator does not model them (docs/design.md): f16 denormal inputs and denormal results.
-ldexp results below the smallest normal are expected to be signed zero here, which is what the translator produces;
-this was not measured on hardware. Neither was the high half of the destination of v_frexp_exp_i16_f16.
+f16 denormals are kept, as in the MODE inferred for the game (denorm_mode_16_64 = 3): a denormal operand is normalized
+(mantissa in [0.5, 1), exponent down to -23) and an ldexp result below the smallest normal is a denormal rounded to
+nearest even. That is what an RDNA2 GPU (gfx1036) gives natively in that mode, for every one of the 65,536 f16 inputs
+of both frexp ops and for all of them under 16 exponents of v_ldexp_f16 (docs/design.md); the MEASURED cases below
+are words read back from it. The high half of v_frexp_exp_i16_f16's destination is kept on the hardware too.
 """
 import math
 import os
@@ -87,31 +89,39 @@ def run(line: str, v1: int, v2: int = 0, v0: int = 0) -> int:
     return si.run_fragment(spv)["%out_mrt0"][0]
 
 
+def is_finite_nonzero(h: int) -> bool:
+    return (h >> 10) & 0x1F != 31 and h & 0x7FFF != 0
+
+
 def ref_mant(h: int) -> int:
-    if not is_normal(h):
-        return (h & 0x8000) if (h >> 10) & 0x1F == 0 else h
+    if not is_finite_nonzero(h):
+        return h                                     # signed zero, infinity, NaN
     return f2h(math.frexp(h2f(h))[0])
 
 
 def ref_exp(h: int) -> int:
-    return math.frexp(h2f(h))[1] & 0xFFFF if is_normal(h) else 0
+    return math.frexp(h2f(h))[1] & 0xFFFF if is_finite_nonzero(h) else 0
 
 
 def ref_ldexp(h: int, n: int) -> int:
-    e = (h >> 10) & 0x1F
-    sgn = h & 0x8000
-    if e == 31:
+    if not is_finite_nonzero(h):
         return h
-    if e == 0:
-        return sgn
     n &= 0xFFFF
     n = n - (1 << 16) if n & 0x8000 else n
-    e2 = e + max(-64, min(64, n))
-    if e2 >= 31:
-        return sgn | INF
-    if e2 <= 0:
-        return sgn
-    return f2h(math.ldexp(h2f(h), n))
+    try:
+        return f2h(math.ldexp(h2f(h), max(-64, min(64, n))))   # exact, then rounded to nearest even
+    except OverflowError:
+        return (h & 0x8000) | INF
+
+
+# Read back from gfx1036 (RDNA2), IEEE 0, f16 denormals kept: (input, mantissa, exponent) and (input, n, ldexp).
+MEASURED_FREXP = ((0x0001, 0x3800, 0xFFE9), (0x8001, 0xB800, 0xFFE9), (0x0003, 0x3A00, 0xFFEA),
+                  (0x0200, 0x3800, 0xFFF2), (0x03FF, 0x3BFE, 0xFFF2), (0x83FF, 0xBBFE, 0xFFF2),
+                  (0x0400, 0x3800, 0xFFF3), (0x0010, 0x3800, 0xFFED))
+MEASURED_LDEXP = ((0x3C00, -23, 0x0002), (0x3C00, -15, 0x0200), (0x3C00, -24, 0x0001), (0x3E00, -23, 0x0003),
+                  (0x3E00, -15, 0x0300), (0x3E00, -24, 0x0002), (0x0001, 1, 0x0002), (0x0200, 1, 0x0400),
+                  (0x8001, 10, 0x8400), (0x0001, 30, 0x5400), (0x0400, -1, 0x0200), (0x0400, -10, 0x0001),
+                  (0x0400, -25, 0x0000), (0x7BFF, -24, 0x1BFF), (0x7BFF, -30, 0x0400), (0x3C00, -25, 0x0000))
 
 
 def sample_normals(seed: int, count: int):
@@ -162,10 +172,18 @@ class FrexpTests(unittest.TestCase):
             self.assertEqual(run("v_frexp_mant_f16_e32 v0, v1", h), h)       # passed through
             self.assertEqual(run("v_frexp_exp_i16_f16_e32 v0, v1", h), 0)
 
-    def test_denormal_is_read_as_zero(self):
-        for h in (0x0001, 0x03FF, 0x8001, 0x83FF):
-            self.assertEqual(run("v_frexp_mant_f16_e32 v0, v1", h), h & 0x8000)
-            self.assertEqual(run("v_frexp_exp_i16_f16_e32 v0, v1", h), 0)
+    def test_denormal_is_normalized_as_measured(self):
+        for h, mant, exp in MEASURED_FREXP:
+            with self.subTest(x=hex(h)):
+                self.assertEqual(run("v_frexp_mant_f16_e32 v0, v1", h), mant)
+                self.assertEqual(run("v_frexp_exp_i16_f16_e32 v0, v1", h), exp)
+                self.assertEqual((ref_mant(h), ref_exp(h)), (mant, exp))
+
+    def test_matches_python_on_denormals(self):
+        for h in list(range(1, 0x400, 37)) + [0x8000 | h for h in range(3, 0x400, 101)]:
+            with self.subTest(x=hex(h)):
+                self.assertEqual(run("v_frexp_mant_f16_e32 v0, v1", h), ref_mant(h))
+                self.assertEqual(run("v_frexp_exp_i16_f16_e32 v0, v1", h), ref_exp(h))
 
     def test_high_half_of_the_source_is_ignored_and_the_destination_high_half_kept(self):
         h = f2h(8.0)
@@ -189,8 +207,29 @@ class FrexpTests(unittest.TestCase):
         self.assertEqual(run("v_frexp_mant_f16_e32 v0, 8.0", 0), f2h(0.5))
         self.assertEqual(run("v_frexp_exp_i16_f16_e32 v0, 8.0", 0), 4)
 
+    def test_clamp(self):
+        cases = [
+            (f2h(1.0), f2h(0.5)),      # +1.0 -> mant 0.5 (in range, kept)
+            (f2h(-1.0), 0),            # -1.0 -> mant -0.5 -> clamped to +0.0
+            (0x8000, 0),               # -0.0 -> clamped to +0.0
+            (f2h(1.5), f2h(0.75)),     # +1.5 -> mant 0.75 (in range, kept)
+            (0x0001, f2h(0.5)),        # +min_sub -> normalized mant 0.5 (kept)
+            (0x8001, 0),               # -min_sub -> clamped to +0.0
+            (0x7C00, f2h(1.0)),        # +Inf -> clamped to 1.0 (0x3c00)
+            (0xFC00, 0),               # -Inf -> clamped to +0.0
+            (0x7E00, 0),               # +qNaN -> clamped to +0.0
+            (0x7C01, 0),               # +sNaN -> clamped to +0.0
+        ]
+        for val, want in cases:
+            with self.subTest(val=hex(val)):
+                self.assertEqual(run("v_frexp_mant_f16_e64 v0, v1 clamp", val), want)
+        # Dirty upper-16-bit source VGPR values must not leak into clamp or destination high half
+        self.assertEqual(run("v_frexp_mant_f16_e64 v0, v1 clamp", 0xDEAD0000, v0=0xBEEF1234), 0xBEEF0000)
+        self.assertEqual(run("v_frexp_mant_f16_e64 v0, v1 clamp", 0xDEAD0000 | f2h(0.5), v0=0xBEEF1234), 0xBEEF0000 | f2h(0.5))
+
     def test_output_modifiers_are_rejected(self):
-        for line in ("v_frexp_mant_f16_e64 v0, v1 clamp", "v_frexp_mant_f16_e64 v0, v1 mul:2"):
+        for line in ("v_frexp_mant_f16_e64 v0, v1 mul:2", "v_frexp_mant_f16_e64 v0, v1 div:2",
+                     "v_frexp_exp_i16_f16_e64 v0, v1 clamp", "v_frexp_exp_i16_f16_e64 v0, v1 mul:2"):
             with self.subTest(line=line), self.assertRaises(rdna2spirv.Unsupported):
                 run(line, f2h(1.0))
 
@@ -221,11 +260,12 @@ class LdexpTests(unittest.TestCase):
         self.assertEqual(run(L, f2h(-1.0), 16), NINF)
         self.assertEqual(run(L, f2h(1.0), 0x7FFF), INF)
         self.assertEqual(run(L, f2h(1.0), -14), MIN_NORMAL)
-        self.assertEqual(run(L, f2h(1.0), -15), 0)
-        self.assertEqual(run(L, f2h(-1.0), -15), 0x8000)
+        self.assertEqual(run(L, f2h(1.0), -15), 0x0200)              # a denormal, not zero
+        self.assertEqual(run(L, f2h(-1.0), -15), 0x8200)
+        self.assertEqual(run(L, f2h(1.0), -25), 0)                   # half the smallest denormal: ties to even 0
         self.assertEqual(run(L, f2h(-1.0), 0x8000), 0x8000)          # INT16_MIN
         self.assertEqual(run(L, MAX_FINITE, 1), INF)
-        self.assertEqual(run(L, MIN_NORMAL, -1), 0)
+        self.assertEqual(run(L, MIN_NORMAL, -1), 0x0200)
 
     def test_the_exponent_is_a_signed_16_bit_integer(self):
         L = "v_ldexp_f16_e64 v0, v1, v2"
@@ -243,9 +283,17 @@ class LdexpTests(unittest.TestCase):
             for n in (0, 5, -200, 0x7FFF):
                 self.assertEqual(run("v_ldexp_f16_e64 v0, v1, v2", h, n), h)
 
-    def test_denormal_input_is_read_as_zero(self):
-        for h in (0x0001, 0x03FF, 0x8001):
-            self.assertEqual(run("v_ldexp_f16_e64 v0, v1, v2", h, 5), h & 0x8000)
+    def test_denormals_as_measured(self):
+        for h, n, want in MEASURED_LDEXP:
+            with self.subTest(x=hex(h), n=n):
+                self.assertEqual(run("v_ldexp_f16_e64 v0, v1, v2", h, n), want)
+                self.assertEqual(ref_ldexp(h, n), want)
+
+    def test_denormal_inputs_and_results_match_python(self):
+        for h in (0x0001, 0x0003, 0x0155, 0x03FF, 0x8001, 0x82AB, f2h(1.5), f2h(-1.75), MAX_FINITE):
+            for n in (-30, -26, -25, -24, -20, -16, -14, 0, 3, 9, 10, 11, 24):
+                with self.subTest(x=hex(h), n=n):
+                    self.assertEqual(run("v_ldexp_f16_e64 v0, v1, v2", h, n), ref_ldexp(h, n))
 
     def test_op_sel(self):
         L = "v_ldexp_f16_e64 v0, v1, v2"
@@ -268,8 +316,27 @@ class LdexpTests(unittest.TestCase):
         self.assertEqual(run("v_ldexp_f16_e32 v0, 1.0, v2", 0, 3), f2h(8.0))
         self.assertEqual(run("v_ldexp_f16_e64 v0, v1, 5", f2h(1.0)), f2h(32.0))
 
+    def test_clamp(self):
+        cases = [
+            (f2h(1.0), 1, f2h(1.0)),     # 1.0 * 2 = 2.0 -> clamped to 1.0
+            (f2h(1.0), -1, f2h(0.5)),    # 1.0 * 0.5 = 0.5 -> in range, kept
+            (f2h(-1.0), 0, 0),           # -1.0 -> clamped to +0.0
+            (0x8000, 0, 0),              # -0.0 -> clamped to +0.0
+            (0x7C00, 0, f2h(1.0)),       # +Inf -> clamped to 1.0 (0x3c00)
+            (0xFC00, 0, 0),              # -Inf -> clamped to +0.0
+            (0x7E00, 0, 0),              # +qNaN -> clamped to +0.0
+            (f2h(1.0), 16, f2h(1.0)),    # overflow -> clamped to 1.0
+            (0x0001, 0, 0x0001),         # +min_sub -> in range, kept
+        ]
+        for s0, s1, want in cases:
+            with self.subTest(s0=hex(s0), s1=s1):
+                self.assertEqual(run("v_ldexp_f16_e64 v0, v1, v2 clamp", s0, s1), want)
+        # Dirty upper-16-bit source VGPR values must not leak into clamp or destination high half
+        self.assertEqual(run("v_ldexp_f16_e64 v0, v1, v2 clamp", 0xDEAD0000, 0, v0=0xBEEF1234), 0xBEEF0000)
+        self.assertEqual(run("v_ldexp_f16_e64 v0, v1, v2 clamp", 0xDEAD0000 | f2h(0.5), 0, v0=0xBEEF1234), 0xBEEF0000 | f2h(0.5))
+
     def test_output_modifiers_are_rejected(self):
-        for line in ("v_ldexp_f16_e64 v0, v1, v2 clamp", "v_ldexp_f16_e64 v0, v1, v2 mul:2"):
+        for line in ("v_ldexp_f16_e64 v0, v1, v2 mul:2", "v_ldexp_f16_e64 v0, v1, v2 div:2"):
             with self.subTest(line=line), self.assertRaises(rdna2spirv.Unsupported):
                 run(line, f2h(1.0), 1)
 

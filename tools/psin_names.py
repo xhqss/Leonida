@@ -87,15 +87,25 @@ def hash_values(blob):
 
 
 def load_names(paths):
-    """The set of names in rpf9_names.py JSON files and one-name-per-line text files."""
+    """The set of names in rpf9_names.py JSON files and one-name-per-line text files. A .json file that is not
+    JSON, or not the shape rpf9_names.py writes, raises ValueError naming the file (--names is repeatable)."""
     names = set()
     for path in paths:
         if path.endswith(".json"):
-            with open(path, encoding="utf-8") as f:
-                doc = json.load(f)
-            for row in doc.get("files", []):
-                for n in row.get("names", []):
-                    names.add(SUFFIX.sub("", n))
+            try:
+                with open(path, encoding="utf-8") as f:
+                    doc = json.load(f)
+            except (ValueError, RecursionError) as e:   # ValueError: not JSON, or not UTF-8
+                raise ValueError(f"{path}: not JSON: {e}") from None
+            rows = doc.get("files", []) if isinstance(doc, dict) else None
+            if not isinstance(rows, list):
+                raise ValueError(f"{path}: expected rpf9_names.py JSON, an object with a 'files' array")
+            for row in rows:
+                listed = row.get("names", []) if isinstance(row, dict) else None
+                if not isinstance(listed, list) or not all(isinstance(n, str) for n in listed):
+                    raise ValueError(f"{path}: each 'files' row must be an object whose 'names' is an array of "
+                                     "strings")
+                names.update(SUFFIX.sub("", n) for n in listed)
         else:
             with open(path, encoding="utf-8", errors="replace") as f:
                 names.update(line.strip() for line in f)
@@ -188,14 +198,29 @@ def main():
     ap.add_argument("--refs", help="write every resolved value as TSV (local only: it holds game names)")
     ap.add_argument("--limit", type=psin_index.count, help="stop after this many PSIN files")
     a = ap.parse_args()
-    for path in [a.src] + a.names:
+    inputs = [a.src, *a.names]
+    for path in inputs:
         if not os.path.exists(path):
             print(f"ERROR: {path}: no such file or folder", file=sys.stderr)
             return 2
     try:
+        if a.refs:
+            if os.path.isdir(a.refs):
+                ap.error("--refs must be a file path, not a directory")
+            if os.path.exists(a.refs) and any(os.path.samefile(path, a.refs) for path in inputs):
+                ap.error("--refs must not overwrite an input")
+            if os.path.isdir(a.src):
+                src_real = os.path.realpath(a.src)
+                refs_real = os.path.realpath(a.refs)
+                try:
+                    inside_src = os.path.commonpath([src_real, refs_real]) == src_real
+                except ValueError:
+                    inside_src = False
+                if inside_src:
+                    ap.error("--refs must not overwrite an input")
         names = load_names(a.names)
         if a.refs:
-            with open(a.refs, "w", encoding="utf-8") as refs:
+            with open(a.refs, "w", encoding="utf-8", newline="\n") as refs:
                 refs.write("file\tstruct\tfield\ttype\tvalue\tname\n")
                 summary, table = scan(a.src, names, a.limit, refs)
         else:

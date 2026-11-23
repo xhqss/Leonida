@@ -72,7 +72,11 @@ int main(){
     EXPECT(statistics.begin_query({1,d3d12_query::pipeline_statistics,0}));
     EXPECT(statistics.copy_buffer({2,0,1,0,1}));
     EXPECT(statistics.end_query({1,d3d12_query::pipeline_statistics,0})&&statistics.close());
-    EXPECT(prepare(statistics,resolve,vk,result)==ReplayResult::unsupported);
+    const auto before=prepared;
+    EXPECT(prepare(statistics,resolve,vk,result)==ReplayResult::unsupported && prepared==before);
+    EXPECT(prepare(statistics,resolve,vk,result,true)==ReplayResult::success && prepared==before+1);
+    EXPECT(result.statistics_segment_count==2);
+    EXPECT(result.commands[2].statistics_end==0 && result.commands[2].statistics_begin==1);
     // Readback visibility follows the actual producer, including mixed command lists.
     destination.host_readable = false;
     EXPECT(check({2,0,1,0,1})==ReplayResult::success && !result.wrote_readback && !result.readback_src_stages);

@@ -339,6 +339,50 @@ class TestHistoryHelpers(unittest.TestCase):
 class TestLoadBc6h(unittest.TestCase):
     """Verifies load_bc6h() defaults, source resolution, and input validation."""
 
+    def test_legacy_confirmation_depth_defaults(self) -> None:
+        section = _make_bc6h_section()
+        eh, ih, ec, ic, ep_cb, ix_cb = bptc.load_bc6h(section, with_confirmed_bits=True)
+        self.assertEqual((eh, ih, ec, ic), bptc.load_bc6h(section))
+        self.assertEqual(ep_cb[0], ((16, 10, 6, 6),) * 3)
+        self.assertEqual(ep_cb[255], ((0, 0, 0, 0),) * 3)
+        self.assertEqual(ix_cb[255], (4,) * 16)
+        self.assertEqual(ix_cb[0], (0,) * 16)
+        empty = bptc.load_bc6h(with_confirmed_bits=True)
+        self.assertEqual(empty[4], empty[0])
+        self.assertEqual(empty[5], empty[1])
+
+    def test_explicit_sparse_and_full_confirmation_depths(self) -> None:
+        section = _make_bc6h_section()
+        section["endpointConfirmedBits"] = {"0": [[16, 4, 0, 0]] * 3}
+        section["indexConfirmedBits"] = {"0": [3] * 16}
+        *_, ep_cb, ix_cb = bptc.load_bc6h(section, with_confirmed_bits=True)
+        self.assertEqual(ep_cb[0], ((16, 4, 0, 0),) * 3)
+        # Explicit sparse tables do not inherit legacy class-3 precision.
+        self.assertEqual(ix_cb[255], (0,) * 16)
+        self.assertEqual(ix_cb[0], (3,) * 16)
+        section["endpointConfirmedBits"] = [list(map(list, row)) for row in ep_cb]
+        section["indexConfirmedBits"] = [list(row) for row in ix_cb]
+        self.assertEqual(bptc.load_bc6h(section, with_confirmed_bits=True)[4:], (ep_cb, ix_cb))
+
+    def test_invalid_confirmation_depths(self) -> None:
+        bad_rows = (
+            ("endpointConfirmedBits", [[0] * 4] * 2),
+            ("endpointConfirmedBits", [[0] * 3] * 3),
+            ("endpointConfirmedBits", [[17, 0, 0, 0]] * 3),
+            ("endpointConfirmedBits", [[0, 11, 0, 0]] * 3),
+            ("endpointConfirmedBits", [[0, 0, 7, 0]] * 3),
+            ("endpointConfirmedBits", [[0, 0, 0, -1]] * 3),
+            ("indexConfirmedBits", [0] * 15),
+            ("indexConfirmedBits", [5] * 16),
+            ("indexConfirmedBits", [-1] * 16),
+        )
+        for key, row in bad_rows:
+            with self.subTest(key=key, row=row):
+                section = _make_bc6h_section()
+                section[key] = {"0": row}
+                with self.assertRaises(ValueError):
+                    bptc.load_bc6h(section)
+
     def test_defaults_when_history_none_or_absent(self) -> None:
         eh, ih, ec, ic = bptc.load_bc6h()
         self.assertEqual(len(eh), 256)

@@ -75,6 +75,14 @@ class MiscExtFixture(unittest.TestCase):
             with self.subTest(word=k):
                 self.assertEqual(mem[4 * k], want)
 
+    def test_lds_ops_run_in_lane_0_only(self):
+        # spirv_mini_interp gives each invocation its own LDS, so lanes racing on one address are invisible here;
+        # the .asm must cut EXEC to lane 0 before its first ds_ op (#1850).
+        with open(os.path.join(ROOT, "runtime", "test", "shaders", "cs_w32_misc_ext.asm"), encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip() and not ln.startswith(";")]
+        self.assertLess(lines.index("v_cmpx_eq_u32_e32 0, v0"),
+                        min(i for i, ln in enumerate(lines) if ln.startswith("ds_")))
+
     def test_gpu_runners_expect_the_same_words(self):
         for rel in (("runtime", "test", "shaders", "check.py"), ("scripts", "run_gpu_tests.py")):
             with open(os.path.join(ROOT, *rel), encoding="utf-8") as f:

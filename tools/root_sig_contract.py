@@ -46,8 +46,8 @@ def pack_layout(sig):
         ptype = p.get("type", "")
         if ptype == "constants":
             count = p.get("count", 0)
-            if not isinstance(count, int) or count < 1:
-                return [], f"param {index}: constants need count >= 1"
+            if type(count) is not int or count < 1:
+                return [], f"param {index}: constants need an integer count >= 1"
             width, cost_add = count, count
         elif ptype in ("cbv", "srv", "uav"):
             width, cost_add = 2, 2
@@ -93,8 +93,8 @@ def reconcile(shader_reads, dwords):
                 issues.append(
                     f"s{sgpr} ({kind}) incompatible with param "
                     f"{slot['param']} ({slot['ptype']})")
-            elif kind == "ptr64_lo" and slot["sub"] != 0:
-                issues.append(f"s{sgpr} (ptr64_lo) reads the high half of the address")
+            elif kind in ("ptr32_lo", "ptr64_lo") and slot["sub"] != 0:
+                issues.append(f"s{sgpr} ({kind}) reads the high half of the address")
             if kind == "ptr64_hi":
                 lo = dwords[sgpr - 1] if sgpr > 0 else None
                 if slot["sub"] != 1 or lo is None or lo["param"] != slot["param"] \

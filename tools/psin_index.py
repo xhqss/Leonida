@@ -215,6 +215,8 @@ def parse(blob, schema=False):
         "error": "",
     }
     structs = enums = None
+    lsch_seen = lenm_seen = False
+    lsch_error = lenm_error = ""
     if first < HEADER or first > len(blob):
         record["error"] = f"first section offset {first} is outside the file"
         return _with_schema(record, schema, structs, enums)
@@ -258,32 +260,35 @@ def parse(blob, schema=False):
                 section["blocks"] = [{"kind": f"0x{k:x}", "bytes": b} for k, b in blocks]
                 record["lsns_blocks"] = len(blocks)
                 record["lsns_records"] = sum(b for _k, b in blocks) // LSNS_RECORD
-        elif tag == b"LSCH" and structs is None:
+        elif tag == b"LSCH" and not lsch_seen:
+            lsch_seen = True
             try:
                 structs = decode_lsch(blob[payload_off:offset + size])
             except ValueError as e:
-                record["schema_error"] = str(e)
+                lsch_error = str(e)
             else:
                 record["structs"] = len(structs)
                 record["members"] = sum(len(s["members"]) for s in structs)
-                record["schema_error"] = check_schema(structs)
-        elif tag == b"LENM" and enums is None:
+                lsch_error = check_schema(structs)
+        elif tag == b"LENM" and not lenm_seen:
+            lenm_seen = True
             try:
                 enums = decode_lenm(blob[payload_off:offset + size])
             except ValueError as e:
-                record["schema_error"] = record["schema_error"] or str(e)
+                lenm_error = str(e)
             else:
                 record["enums"] = len(enums)
                 record["enum_values"] = sum(len(e["values"]) for e in enums)
         record["sections"].append(section)
         offset += size
+    record["schema_error"] = "; ".join(e for e in (lsch_error, lenm_error) if e)
     if not record["error"] and offset != len(blob):
         record["error"] = f"section walk ended at {offset} of {len(blob)}"
     record["complete"] = not record["error"] and offset == len(blob)
-    return _with_schema(record, schema, structs, enums)
+    return _with_schema(record, schema, structs, enums, lsch_error, lenm_error)
 
 
-def _with_schema(record, schema, structs, enums):
+def _with_schema(record, schema, structs, enums, lsch_error="", lenm_error=""):
     """With `schema`, give every record the same "schema" shape, whether or not the sections were reached.
 
     "lsch" and "lenm" say whether each section was decoded; "reason" says why one was not (a structural error
@@ -295,11 +300,14 @@ def _with_schema(record, schema, structs, enums):
     entry["lsch"] = structs is not None
     entry["lenm"] = enums is not None
     reasons = []
-    for name, decoded in (("LSCH", entry["lsch"]), ("LENM", entry["lenm"])):
+    for name, decoded, section_error in (
+        ("LSCH", entry["lsch"], lsch_error),
+        ("LENM", entry["lenm"], lenm_error),
+    ):
         if decoded:
             continue
         if any(s["tag"] == name for s in record["sections"]):
-            reasons.append(record["schema_error"] or f"{name} not decoded")
+            reasons.append(section_error or f"{name} not decoded")
         elif record["error"]:
             reasons.append(f"no whole {name} section: {record['error']}")
         else:

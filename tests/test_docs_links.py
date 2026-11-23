@@ -11,6 +11,7 @@ import re
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from urllib.parse import unquote
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -57,9 +58,13 @@ def links(text):
 
 
 def markdown_files(root):
-    result = subprocess.run(["git", "ls-files", "*.md"], cwd=root, capture_output=True, text=True)
-    if result.returncode == 0:
-        return [os.path.join(root, name) for name in result.stdout.splitlines() if name]
+    try:
+        result = subprocess.run(["git", "ls-files", "*.md"], cwd=root, capture_output=True, text=True)
+    except FileNotFoundError:
+        pass  # Git is optional when scanning a source archive.
+    else:
+        if result.returncode == 0:
+            return [os.path.join(root, name) for name in result.stdout.splitlines() if name]
     found = []
     for base, dirs, names in os.walk(root):
         dirs[:] = [d for d in dirs if d not in (".git", "third_party", "node_modules", "__pycache__")]
@@ -125,6 +130,14 @@ class SlugTest(unittest.TestCase):
 
 
 class RepositoryLinksTest(unittest.TestCase):
+    def test_markdown_files_walks_the_tree_when_git_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            page = os.path.join(tmp, "README.md")
+            with open(page, "w", encoding="utf-8", newline="\n") as f:
+                f.write("# README\n")
+            with patch.object(subprocess, "run", side_effect=FileNotFoundError):
+                self.assertEqual(markdown_files(tmp), [page])
+
     def test_every_relative_link_resolves(self):
         files = markdown_files(ROOT)
         self.assertGreaterEqual(len(files), 30, "expected the tracked Markdown files to be found")

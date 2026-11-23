@@ -3,29 +3,90 @@
 name: Runtime
 
 on:
+  # What can break this build: the runtime and its vendored queue, the scripts the jobs run, this workflow, the
+  # line endings every checkout gets (.gitattributes), and everything the tools those scripts read depend on -
+  # their sibling imports, the data files they load by name (gfx10_formats.json is one a .py-only scan misses) and
+  # the hw_oracle directory. Any other file under tools/ used to start a full Windows and Wine build it cannot break
+  # (BUILD-856); paths-ignore cannot say "everything under tools/ except these", so the event lists what triggers
+  # it. tests/test_runtime_paths.py recomputes the tools/ part and fails when an entry is missing; keep the two
+  # lists identical.
   push:
     branches: [main]
-    paths-ignore:
-      - "docs/**"
-      - "*.md"
-      - "viewer/**"
-      - "tests/**"
-      - "assets/**"
-      - ".github/ISSUE_TEMPLATE/**"
-      - ".github/workflows/ci.yml"
-      - ".github/workflows/jactionlint.yml"
-      - ".github/workflows/no-game-data.yml"
+    paths:
+      - "runtime/**"
+      - "third_party/**"
+      - "scripts/**"
+      - ".github/workflows/runtime.yml"
+      - ".gitattributes"
+      - "tools/hw_oracle/**"
+      - "tools/bary_fallback_gs.py"
+      - "tools/cf_diff.py"
+      - "tools/cf_ref.py"
+      - "tools/cfg_structure.py"
+      - "tools/cpu_ref.py"
+      - "tools/f32_fuzz.py"
+      - "tools/first_light.py"
+      - "tools/fspx_unpack.py"
+      - "tools/fssm_header.py"
+      - "tools/fssm_unpack.py"
+      - "tools/gen_d3d12_stubs.py"
+      - "tools/gfx10_formats.json"
+      - "tools/lane_masks.py"
+      - "tools/mc_command.py"
+      - "tools/mesh_compute_vs.py"
+      - "tools/rdna2spirv.py"
+      - "tools/report_paths.py"
+      - "tools/shader_carve.py"
+      - "tools/shader_disasm.py"
+      - "tools/shader_ir.py"
+      - "tools/shader_meta.py"
+      - "tools/shader_stage_manifest.py"
+      - "tools/spirv_asm.py"
+      - "tools/spirv_asm_tables.py"
+      - "tools/spirv_opt.py"
+      - "tools/spirv_stubs.py"
+      - "tools/vk_subgroup_info.py"
+      - "tools/wave64_emulate_opt.py"
+      - "tools/wave64_halves.py"
+      - "tools/xdxr_bvh.py"
   pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "*.md"
-      - "viewer/**"
-      - "tests/**"
-      - "assets/**"
-      - ".github/ISSUE_TEMPLATE/**"
-      - ".github/workflows/ci.yml"
-      - ".github/workflows/jactionlint.yml"
-      - ".github/workflows/no-game-data.yml"
+    paths:
+      - "runtime/**"
+      - "third_party/**"
+      - "scripts/**"
+      - ".github/workflows/runtime.yml"
+      - ".gitattributes"
+      - "tools/hw_oracle/**"
+      - "tools/bary_fallback_gs.py"
+      - "tools/cf_diff.py"
+      - "tools/cf_ref.py"
+      - "tools/cfg_structure.py"
+      - "tools/cpu_ref.py"
+      - "tools/f32_fuzz.py"
+      - "tools/first_light.py"
+      - "tools/fspx_unpack.py"
+      - "tools/fssm_header.py"
+      - "tools/fssm_unpack.py"
+      - "tools/gen_d3d12_stubs.py"
+      - "tools/gfx10_formats.json"
+      - "tools/lane_masks.py"
+      - "tools/mc_command.py"
+      - "tools/mesh_compute_vs.py"
+      - "tools/rdna2spirv.py"
+      - "tools/report_paths.py"
+      - "tools/shader_carve.py"
+      - "tools/shader_disasm.py"
+      - "tools/shader_ir.py"
+      - "tools/shader_meta.py"
+      - "tools/shader_stage_manifest.py"
+      - "tools/spirv_asm.py"
+      - "tools/spirv_asm_tables.py"
+      - "tools/spirv_opt.py"
+      - "tools/spirv_stubs.py"
+      - "tools/vk_subgroup_info.py"
+      - "tools/wave64_emulate_opt.py"
+      - "tools/wave64_halves.py"
+      - "tools/xdxr_bvh.py"
   workflow_dispatch:
 
 permissions:
@@ -87,6 +148,7 @@ jobs:
           cmake -S runtime -B runtime/build -G Ninja
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DLEONIDA_D3D12_SHIM_TESTS=ON
+          -DLEONIDA_REQUIRE_VULKAN=ON
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           -DCMAKE_POLICY_DEFAULT_CMP0141=NEW
           -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
@@ -138,8 +200,13 @@ jobs:
   # shows up. The required ones are the loader and the stand-in game run end to end; the table in the job summary
   # shows the rest.
   # Two Wines: Ubuntu's own (9.0) and WineHQ's current stable, which is closer to what Proton users run.
+  # Not on pull requests: in 188 sampled pull request runs these two jobs never failed when the Windows job had passed,
+  # yet they took about a quarter of the account's 20 concurrent runner slots. They run on every push to main that
+  # touches these paths, and on demand from the Actions tab (workflow_dispatch). Pull requests still build and test the
+  # Windows runtime natively and upload runtime-windows for testers.
   wine:
     needs: windows
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -229,11 +296,12 @@ jobs:
           cmake -S runtime -B runtime/build -G Ninja
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          -DLEONIDA_REQUIRE_VULKAN=ON
       - name: Build
         run: cmake --build runtime/build --parallel
       - name: Check GPU tools exist
         run: |
-          for tool in vk_harness vk_pipeline_check vk_command_replay_test vk_predicate_capture_test vk_predicated_copy_test vk_compute_test vk_texture_test vk_store_test vk_bindless_test depth24_convert_test clear_color_test predicated_copy_test d3d12_state_map_test command_list_test descriptor_table_test gfx10_descriptors_test; do
+          for tool in vk_harness vk_pipeline_check vk_command_replay_test vk_queue_test vk_predicate_capture_test vk_predicated_copy_test vk_compute_test vk_texture_test vk_store_test vk_bindless_test depth24_convert_test clear_color_test predicated_copy_test d3d12_state_map_test command_list_test descriptor_table_test gfx10_descriptors_test; do
             if [ ! -f "runtime/build/$tool" ] && [ ! -f "runtime/build/$tool.exe" ]; then
               echo "Missing: $tool"
               exit 1
@@ -294,3 +362,25 @@ jobs:
         env:
           LEONIDA_W64_EMULATE: "1"
         run: python3 -I scripts/run_gpu_tests.py --build runtime/build --llvm-mc /usr/lib/llvm-18/bin/llvm-mc --work "$RUNNER_TEMP/gpu-w64" --filter cs_
+      - name: GPU tests on llvmpipe with the barycentric fallback
+        # llvmpipe has no VK_KHR_fragment_shader_barycentric, so the native run skips the pixel shaders that read raw
+        # barycentrics. Under --bary-fallback they read them from an input a pass-through geometry shader feeds
+        # (tools/bary_fallback_gs.py), the path for GPUs without the extension (NVIDIA Pascal). Every shader that
+        # got such a geometry shader has to pass here, not skip.
+        shell: bash
+        env:
+          LEONIDA_BARY_FALLBACK: "1"
+        run: |
+          log="$RUNNER_TEMP/gpu-bary.log"
+          python3 -I scripts/run_gpu_tests.py --build runtime/build --llvm-mc /usr/lib/llvm-18/bin/llvm-mc --work "$RUNNER_TEMP/gpu-bary" | tee "$log"
+          names=$(sed -n 's/^bary fallback GS: \(.*\)\.bary_gs\.spv$/\1/p' "$log")
+          if [ -z "$names" ]; then
+            echo "::error::no barycentric fallback geometry shader was built"
+            exit 1
+          fi
+          while read -r name; do
+            if ! grep -Eq "^  PASS  ${name}( |\$)" "$log"; then
+              echo "::error::$name did not pass under the barycentric fallback"
+              exit 1
+            fi
+          done <<< "$names"

@@ -6,6 +6,7 @@ tests/semantic/spirv_mini_interp.py).
 Hand-written SPIR-V only, standard library only. No translator, no game data.
 """
 import os
+import struct
 import sys
 import unittest
 
@@ -87,6 +88,35 @@ class BitcastKeepsBits(unittest.TestCase):
             with self.subTest(word=f"{word:#010x}"):
                 self.assertEqual(si.f2u(si.u2f(word)), word)
         self.assertEqual(si.f2u(1.5), 0x3FC00000)        # a plain float still converts as before
+
+
+class HalfNanRuleTests(unittest.TestCase):
+    """si.half_to_float / si.float_to_half pin one NaN rule on every Python version.
+
+    struct's '<e' format drops NaN payloads before Python 3.14 and keeps them from 3.14 (CPython gh-130317), so
+    the old struct-based helpers returned version-dependent words for NaN operands, while the suites feeding them
+    (test_f16_op_sel_values and friends) are pinned to the pre-3.14 behaviour CI's 3.12 sees. The helpers are
+    bit-level now with the chosen rule: a NaN keeps its sign and loses its payload to the canonical quiet NaN
+    (f16 0x7E00/0xFE00, f32 0x7FC00000/0xFFC00000).
+    """
+
+    def test_nan_operands_keep_sign_and_drop_payload(self):
+        for h, want in ((0x7E00, 0x7FC00000), (0xFE00, 0xFFC00000), (0x7C01, 0x7FC00000), (0x7FFF, 0x7FC00000),
+                        (0xFE01, 0xFFC00000), (0xFFFF, 0xFFC00000), (0x7C00, 0x7F800000), (0xFC00, 0xFF800000)):
+            with self.subTest(half=hex(h)):
+                self.assertEqual(si.f2u(si.half_to_float(h)), want)
+        for w, want in ((0x7FC00000, 0x7E00), (0xFFC00000, 0xFE00), (0x7F800000, 0x7C00), (0xFF800000, 0xFC00)):
+            with self.subTest(f32=hex(w)):
+                self.assertEqual(si.float_to_half(si.u2f(w)), want)
+        # a double NaN that still carries a payload (bytes -> double keeps it on every version) canonicalizes too
+        payload = struct.unpack("<d", struct.pack("<Q", 0x7FF8000000123456))[0]
+        self.assertEqual(si.float_to_half(payload), 0x7E00)
+        self.assertEqual(si.float_to_half(-payload), 0xFE00)
+        # non-NaN spot checks: exact grid values, the smallest half subnormal and both overflow boundaries
+        self.assertEqual(si.f2u(si.half_to_float(0x0001)), 0x33800000)
+        self.assertEqual(si.f2u(si.half_to_float(0x03FF)), 0x387FC000)
+        self.assertEqual(si.float_to_half(si.u2f(0x477FE000)), 0x7BFF)      # 65504, max finite
+        self.assertEqual(si.float_to_half(si.u2f(0x477FF000)), 0x7C00)      # 65520 RNE tie -> infinity
 
 
 if __name__ == "__main__":

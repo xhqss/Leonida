@@ -182,20 +182,59 @@ layout, fixed `0xF0`-byte header, `14.36 GiB` / `15,420,757,856` bytes inflated 
 | `+0x80` | 8 | `ptr64` | `aiSplitArray` of vertex indices (`2` B: `u16`) | Valid, total `== u32@0x90`, all `< u32@0xC0` on `27,644 / 27,644` |
 | `+0x88` | 8 | `ptr64` | `aiSplitArray` of adjacent-poly edges (`12` B) | Valid & total `== u32@0x90` on `27,644 / 27,644` |
 | `+0x90` | 4 | `u32` | Index / adjacency pool size | Sum `493,024,188`, max `235,411`; equals `sum(poly.num_verts)` on `27,644 / 27,644` |
-| `+0x98` | 8 | `ptr64` | `aiSplitArray` of polygons (`44` B) | Valid, total `== u32@0xC4` (`124,768,148` polys, max `71,803`), contiguous chain & `poly+0 == u32@0xC8` on `27,644 / 27,644` |
+| `+0x98` | 8 | `ptr64` | `aiSplitArray` of polygons (`44` B) | Valid, total `== u32@0xC4` (`124,768,148` polys, max `71,803`), contiguous chain, `poly+0 == u32@0xC8` and `poly+4 == (index start << 4) \| count` on `27,644 / 27,644` |
 | `+0xA0` | 8 | `ptr64` | Spatial quadtree root (`96` B nodes, `32` B leaves) | Full tree (`2,337,904` nodes, `1,760,339` leaves, max depth `9`) valid & all leaf indices `< u32@0xC4` on `27,644 / 27,644` |
 | `+0xA8` | 8 | `ptr64` | Nullable special-link array (`32` B, count `u32@0xD4`) | Non-null iff `flags & 2` (`8,817` pages); in-bounds `27,644 / 27,644` |
 | `+0xB0` | 8 | `ptr64` | Nullable special-link index table (`u16`, count `u32@0xD8`) | Non-null iff `flags & 2`; in-bounds & all entries `< u32@0xD4` on `27,644 / 27,644` (`2` tiles have `d8 < d4`) |
-| `+0xB8` | 8 | `ptr64` | Nullable 96-byte geometric/volume array (count `u32@0xDC`) | Present on `9,425` pages (`6,246,890` records); in-bounds `27,644 / 27,644`; semantics **open** |
+| `+0xB8` | 8 | `ptr64` | Nullable 96-byte obstacle footprint array (count `u32@0xDC`) | Present on `9,425` pages (`6,246,890` records = `3,123,445` outer/inner contour pairs); in-bounds & valid `27,644 / 27,644` |
 | `+0xC0` | 4 | `u32` | Vertex count | Min `4`, max `52,608`, sum `138,041,746` |
 | `+0xC4` | 4 | `u32` | Polygon count | Min `1`, max `71,803`, sum `124,768,148` |
 | `+0xC8` | 4 | `u32` | 512 Ã— 512 sector ID (`0` if `flags & 4`) | `0` iff `flags & 4` (`162` pages); exact `136 Ã— 180 = 24,480` static grid |
 | `+0xCC` | 4 | `u32` | Core mesh data byte size | `6*c0 + 14*pool + 44*c4 + 32*d4 == u32@0xCC` with **0 residual** on `27,644 / 27,644` |
 | `+0xD4` / `+0xD8` / `+0xDC` | 12 | `u32[3]` | Special-link, link-index, and `+0xB8` record counts | Sums `26,679,246` / `26,903,247` / `6,246,890` |
-| `+0xE8` | 4 | `u32` | Build stamp (`0` if `flags & 4`) | `7` distinct values (`0` on `162`, `0x09090516` on `24,474`, `0x160e3132` on `3,003`, 4 rare on `5`); encoding **open** |
+| `+0xE8` | 4 | `u8[4]` | Build stamp (`0` if `flags & 4`): second, minute, hour, day of month | `7` distinct values (`0` on `162`, `0x09090516` on `24,474`, `0x160e3132` on `3,003`, 4 rare on `5`); see [Build stamp](#build-stamp-0xe8) |
 
 Reserved slots `+0x18..+0x1f`, `+0x6c..+0x6f`, `+0x78..+0x7f`, `+0x94..+0x97`, `+0xd0..+0xd3`, `+0xe0..+0xe7`, and
 `+0xec..+0xef` are zero on `27,644 / 27,644` pages.
+
+### Build stamp (`+0xE8`)
+
+Read as four bytes from the lowest address, every nonzero value is a second, a minute, an hour and a day of month,
+the first four fields of C's `struct tm` in their order. No month or year is stored. The numbers are for the
+1.0.2.1 package (ASSET-282):
+
+| `u32@0xE8` | Bytes | Reads as | Tiles | Grid positions |
+|---|---|---|---:|---|
+| `0x09090516` | 22, 5, 9, 9 | day 9, 09:05:22 | 24,474 | 24,474 of 24,480: 23,536 alone, 938 shared |
+| `0x160e3132` | 50, 49, 14, 22 | day 22, 14:49:50 | 3,003 | 940, never alone |
+| `0x0f0e1b37` | 55, 27, 14, 15 | day 15, 14:27:55 | 2 | 2 adjacent, alone |
+| `0x1d07151c` | 28, 21, 7, 29 | day 29, 07:21:28 | 1 | alone |
+| `0x18101739` | 57, 23, 16, 24 | day 24, 16:23:57 | 1 | shared with 2 day-22 tiles |
+| `0x0b0a2f1a` | 26, 47, 10, 11 | day 11, 10:47:26 | 1 | alone |
+| `0` | | not a grid tile | 162 | the `flags & 4` meshes |
+
+- **Only the date and time reading fits all six nonzero values.** In each one, the low two bytes are below 60, the
+  third is below 24 and the top byte is 1 to 31. Six independent random words land in those ranges with a
+  probability of about 6 × 10⁻²⁰. The low two bytes could in principle be the other way round (minute first). The
+  `struct tm` order is the natural reading, but the data can't tell them apart.
+- **The day-22 stamp marks tiles added on top of the base grid.** The 27,482 static tiles sit on 24,480 grid
+  positions (the `u32@0xC8` sector, above). The 3,002 extra tiles are all on 940 positions that hold 2 to 40 tiles,
+  and every one of those positions has day-22 tiles. 2,984 of the 3,003 day-22 tiles share their position with a
+  day-9 tile, and on all 938 positions with both, the day-22 tiles come later in the archive. The other 19 are on two
+  positions without a day-9 tile: 17 at sector (255, 248), and 2 with the day-24 tile at (248, 246). On 450 of the 938, the first day-22 tile has the same vertex and polygon
+  counts as the day-9 tile. What the stacked tiles are for is not measured.
+- **Neighbouring tiles share a stamp.** Of the 48,644 pairs of grid neighbours (one tile per position), 98.12% have
+  the same stamp, against 92.58% for stamps placed at random with the same frequencies.
+
+Method: `tools/navmesh_decode.py`'s own scan of `navmeshes.rpf`, with each tile's `u32@0xE8`, `u32@0xC8`, flags,
+counts and archive offset recorded per tile. No geometry was kept.
+
+The `+4` word of a polygon packs `(index start << 4) | count`; the runs tile the index pool in order
+(`tools/navmesh_decode.py --deep` checks it on all `124,768,148` polygons, 0 failures), which caps a polygon at 15
+vertices. 6stars independently reads the same packing. Its polygon `+0x28` bit 17 and `+0x18` bit 27
+road/pavement labels were not adopted: a 1,027,984-polygon sample over 238 tiles sets both bits on 258 polygons, so
+they are not a partition and neither meaning is confirmed. No 6stars code was copied; the repository has no
+licence.
 
 ### Flags (`u32@0x10`) and 512 Ã— 512 world grid
 
@@ -217,6 +256,40 @@ world_min_y = (sector_y - 256) * 128.0  #  -9,856 .. +13,056 m (max +13,184 m)
 
 The `24,480` unique static sector IDs form a complete, gap-free `136 Ã— 180` rectangle (`Z âˆˆ [-78.55, +403.84]` m).
 
+### Adjacent-polygon edges (`+0x88`, `493,024,188` records) and special links (`+0xA8`/`+0xB0`, `26,679,246` records)
+
+- **12-byte adjacent-polygon edges (`+0x88`, count `u32@0x90`, `493,024,188` records across `27,644` tiles):**
+  Each record is `{u32 adj_sector, u16 adj_poly, u16 edge_meta, u32 edge_flags}`. Across all `493,024,188 / 493,024,188`
+  records (`0` exceptions):
+  - **`458,728,869`** (`93.04%`) are intra-tile neighbors with `adj_sector == u32@0xC8` and `adj_poly < u32@0xC4`
+    (`0` out-of-bounds polygon indices);
+  - **`34,295,319`** (`6.96%`) are open or tile-border edges with `adj_sector == 0xFFFFFFFF` and `adj_poly == 0xFFFF`
+    (cross-tile border stitching is performed at runtime rather than serialized in `+0x88`).
+- **Polygon `+0x20` special-link prefix-sum chain (`124,768,148` polygons across `27,644` tiles):**
+  In every 44-byte polygon at `+0x98`, `u32@0x20` packs `link_count = w20 & 0x3F` (bits `0..5`, range `0..63`),
+  `link_start = (w20 >> 6) & 0x1FFFF` (bits `6..22`, up to `17,459`), and a 9-bit polygon flag field `w20 >> 23`
+  (bits `23..31`). Across all `27,644 / 27,644` tiles (including polygons with `link_count == 0` and linkless tiles
+  with `u32@0xD8 == 0`), `link_start` equals the exact running prefix sum of `link_count` across preceding polygons,
+  and the tile total after polygon `u32@0xC4 - 1` equals `u32@0xD8` (`0` failures).
+- **32-byte special links (`+0xA8`, count `u32@0xD4`, `26,679,246` records across `8,817` tiles) and `+0xB0` index table
+  (`u16[u32@0xD8]`, `26,903,247` entries):**
+  Each 32-byte record at `+0xA8` is `{u16[3] pos0, u16[3] pos1, u16 poly0, u16 poly1, u32 sector0, u32 sector1,
+  u16 flags0, u16 flags1, u16 heading, u16 pad}`:
+  - `+0x00..+0x05` (`u16[3]`) and `+0x06..+0x0B` (`u16[3]`): quantized 3D link endpoints `pos0` and `pos1`.
+  - `+0x0C..+0x0F` (`u16 poly0, u16 poly1`) and `+0x10..+0x17` (`u32 sector0, u32 sector1`): endpoint polygon indices
+    and sector IDs. Across all `26,679,246 / 26,679,246` links, at least one endpoint sector equals the owning tile's
+    `u32@0xC8` (`26,398,281` intra-tile with `sector0 == sector1 == u32@0xC8`; `143,913` cross-tile with
+    `sector0 == u32@0xC8`; `137,052` cross-tile with `sector1 == u32@0xC8`; `0` with neither). Whenever
+    `sector0 == u32@0xC8`, `poly0 < u32@0xC4` (`26,542,194 / 26,542,194`); whenever `sector1 == u32@0xC8`,
+    `poly1 < u32@0xC4` (`26,535,333 / 26,535,333`).
+  - `+0x18..+0x1B` (`u16 flags0, u16 flags1`): link attribute and traversal type words (`flags1` top values: `0x0050`
+    on `11,492,614`, `0x0040` on `9,705,698`, `0x0030` on `4,281,168`, `0x0060` on `425,369`).
+  - `+0x1C..+0x1D` (`u16 heading`): 8-bit quantized heading angle (`0..254`, `< 256` on `26,679,246 / 26,679,246`).
+  - `+0x1E..+0x1F` (`u16 pad`): zero padding (`0` on `26,679,246 / 26,679,246`).
+  - Across all `26,903,247 / 26,903,247` entries of `+0xB0`, every entry `li = u16@(b0 + 2*k)` in polygon `pi`'s slice
+    `[link_start .. link_start + link_count)` indexes a 32-byte link at `+0xA8` satisfying
+    `(poly0 == pi or poly1 == pi) and (sector0 == u32@0xC8 or sector1 == u32@0xC8)` (`0` failures).
+
 ### Split arrays and quadtree layout
 
 - Each `aiSplitArray` descriptor (`48` B: `{u64 vtable, u64 total, ptr64 blocks, ptr64 starts, u64 nblocks, u64 0}`)
@@ -226,6 +299,22 @@ The `24,480` unique static sector IDs form a complete, gap-free `136 Ã— 180` 
 - Each `96`-byte quadtree node stores min bounds (`+0x00` `f32[3]`), max bounds (`+0x10` `f32[3]`), `i16[6]` bounds (`+0x20`), a 4-byte-aligned
   nullable leaf pointer (`+0x2C`), four 4-byte-aligned child pointers (`+0x34..+0x53`), and 12 trailing zero
   bytes (`+0x54..+0x5F`). Each `32`-byte leaf holds `{u64 0, ptr64 poly_indices, u64 0, u64 num_polys}`.
+
+### Paired 96-byte obstacle footprint records (`+0xB8`, `6,246,890` records)
+
+On all `9,425` tiles where `u32@0xDC > 0`, `u32@0xDC` is even (`9,425 / 9,425`) and the array at `+0xB8` holds
+`3,123,445` consecutive `(outer, inner)` pairs (`6,246,890` 96-byte records). Every pair `(rec[2*p], rec[2*p + 1])`
+shares the identical 20-byte prefix `+0x00..+0x13` (`3,123,445 / 3,123,445`):
+
+| Offset | Size | Type | Verified meaning (`6,246,890 / 6,246,890` records) |
+|---:|---:|---|---|
+| `+0x00` | 8 | `u64` | 64-bit obstacle/object UID (identical across `rec[2*p]` and `rec[2*p + 1]` on `3,123,445 / 3,123,445` pairs; repeated across adjacent tiles when a footprint crosses a 128 m tile border) |
+| `+0x08` | 12 | `f32[3]` | Finite 3D world-space anchor `(x, y, z)` (`6,246,890 / 6,246,890`, identical across each pair) |
+| `+0x14` | 1 | `u8` | Contour role/flags: `0x00` (`2,750,542`) or `0x04` (`372,903`) on `rec[2*p]` (expanded outer contour), and `0x08` (`3,123,445`) on `rec[2*p + 1]` (inner core contour) on `3,123,445 / 3,123,445` pairs |
+| `+0x15` | 1 | `u8` | 2D polygon vertex count `N` (`4` on `3,123,878` records, `8` on `3,123,012` records). `(rec[2*p].N, rec[2*p + 1].N)` is `(8, 4)` on `3,123,012` pairs (chamfered octagon around an inner quad, typically expanded by `128` fixed-point units) and `(4, 4)` on `433` pairs |
+| `+0x16` | 64 | `i16[32]` | Up to 16 relative 2D `(dx, dy)` footprint vertices in signed 16-bit fixed point around `(x, y)`; trailing unused slots `+0x16 + 4*N .. +0x55` are zero on `6,246,890 / 6,246,890` |
+| `+0x56` / `+0x58` | 4 | `i16`, `u16` | Vertical/extent words (`u16@0x56` range `0..65,535`, high bit set on `1,846,885`; `u16@0x58` range `3..65,534`, high bit set on `13,629`) |
+| `+0x5A` | 6 | `u8[6]` | Trailing zero padding (`0` on `6,246,890 / 6,246,890`) |
 
 ## Band-3 `grid` resources (`27,482` resources)
 
@@ -244,8 +333,23 @@ The final 433 MiB of `navmeshes.rpf` holds `27,482` `pgBase` resources (`+6` con
 Reserved slots `+0x38..+0x3f`, `+0x4c..+0x4f`, and `+0x54..+0x5f` are zero on `27,482 / 27,482`. Each 272-byte group at
 `+0x60` is a 16-way SwissTable block (`16` control bytes where `0x80` = empty and `< 0x80` = occupied tag, followed by
 `16 Ã— {u64 key, u64 value}`). Across all `27,482 / 27,482` resources, occupied slots equal `N` and their `value` fields
-form an exact bijection onto `[0 .. N - 1]`. The engine subsystem name, `u64` key encoding, and `u32[N]` bit semantics
-remain **open**.
+form an exact bijection onto `[0 .. N - 1]`: `value` indexes the `u32[N]` payload.
+
+**Keys (ASSET-287).** The `u64` keys are sentinel-bit linear octree keys over the cubic volume: `1` is the root and a
+child is `(parent << 3) | octant`, so the highest set bit sits at bit `3 × depth`. Measured on `27,482 / 27,482`
+resources: the root is present, no key appears in two slots, every key's highest set bit is a multiple of 3, and every non-root key's parent (`key >>
+3`) is in the same table. Octant bit 2 is the vertical axis (cells stack on it); which of bits 0/1 is x and where the
+cube sits against the sector are **open**. Depths run `0..10` (`53,835,068` keys). The cell size at a resource's deepest
+level (`extent >> depth`) is 16 m on `12,694` resources (`12,693` 128 m tiles at depth 3, one 256 m tile), 8 m on `859`
+and 4 m on `13,929`.
+
+**`u32[N]` words.** `51` distinct values over the whole package. Every inner node (a key with at least one child:
+`8,617,353`) holds `0x0000ff00`. Leaves (`45,217,715`) hold `0x0000ff00` (`1,791,096`, never at a resource's deepest
+level), a word with low byte `0x01` (`26,659,574`; bits `8-11` take `0, 5, 7, 9, B, D, F`; bits `17-18` are a 2-bit
+field), or a word with low byte `0x03` (`16,767,045`; bit 8 is a flag, bits `11-14` a 4-bit value `0..15`). What the two
+leaf kinds and their fields mean, and the engine subsystem name, are **open**. `navmesh_decode.py --deep` checks the key
+and inner-word rules (`keys_octree`, `inner_payload_ff00`) and reports `key_depth`, `inner_nodes` and `leaf_payload`
+counts.
 
 ## Remaining unknowns
 
@@ -257,10 +361,12 @@ remain **open**.
 3. **`0DRP` unnamed structs and fields.** Several `0x7a` struct/member hashes (including `0x4712787b`, `0x57ad0b12`,
    `0xdd53676a`, `0xf2dd6348`, `0xde5f1345`, and 3 of the 4 singletons) are not yet matched to engine names.
 4. **Per-record bitfields inside `0x00010015` tiles.** `u32@0x10` bit 3's secondary trigger on `289` tiles and bit 6's
-   name, `u32@0xE8` build-stamp encoding, polygon/adjacent-edge/special-link flag bitfields, and the C++ type of the
-   96-byte `+0xB8` records remain open.
-5. **Band-3 `grid` subsystem and EOF `PSIN` v79.** The Band-3 subsystem identity, `u64` key encoding and `u32[N]`
-   payload bits are open, as is why the final `PSIN` (version `79`) terminates before `LSNS` ends.
+   name, `u32@0xE8` build-stamp encoding, polygon/adjacent-edge/special-link flag bitfields, and the exact C++ class name
+   and `+0x56/+0x58` vertical unit of the paired 96-byte `+0xB8` footprint records remain open.
+5. **Band-3 `grid` subsystem and EOF `PSIN` v79.** The Band-3 subsystem identity, the x/y order of the octree key's
+   octant bits 0/1, the cube's placement against its sector and the meaning of the `u32[N]` leaf fields are open
+   (the key encoding and the inner-node word are decoded above), as is why the final `PSIN` (version `79`)
+   terminates before `LSNS` ends.
 
 ## Vehicle navmesh settings (`CVehiclePoints`, `common.rpf`)
 
@@ -300,12 +406,16 @@ stored elsewhere, and which vehicles the 31 are (wagons, boats and trains would 
 - `tools/navmesh_decode.py` (stdlib-only) decodes all four resource classes (`0DRP`, `0x00010015`, `grid`, `PSIN`),
   joins continuations (including tiny `< 64`-byte continuations), validates structural invariants, and writes aggregate
   JSON and optional numeric CSV metadata. It never writes payload bytes and never touches the TOC.
+- `tools/navmesh_links.py` (stdlib-only) decodes and verifies the 12-byte `+0x88` adjacent-polygon edges, the polygon
+  `+0x20` special-link prefix-sum chain, and the 32-byte `+0xA8` special links and `+0xB0` index table.
 
 ```powershell
 python -I tools/navmesh_decode.py <package>\navmeshes.rpf --out <temp>/navmesh-decode.json --csv <temp>/navmesh-decode.csv
 python -I tools/navmesh_decode.py <package>\navmeshes.rpf --deep --out <temp>/navmesh-decode-deep.json
 python -I tools/navmesh_decode.py <carve-dir> --out <temp>/carved-decode.json
+python -I tools/navmesh_links.py <package>\navmeshes.rpf --out <temp>/navmesh-links.json
 python -I -W error::ResourceWarning tests/test_navmesh_decode.py -v
+python -I tests/test_navmesh_links.py -v
 python -I tests/test_navmesh_index.py
 ```
 
@@ -314,8 +424,8 @@ For both tools, `--start` must be 0 or more and `--limit` at least 1; anything e
 Validation on the full real archive (`navmeshes.rpf`, `6,707,512,496` bytes) with `--deep`: `90,295` carver streams +
 `10` tiny continuations; `9,603` `0DRP` (`15,629,979` cover nodes), `27,644` `0x00010015` navmesh tiles (`138,041,746`
 vertices, `124,768,148` polygons, `2,337,904` quadtree nodes), `27,482` `grid` resources (`53,835,068` entries, `0`
-sector mismatches), `22` `PSIN` (`21` complete), **0 check failures**, in 236 s. Both test suites build synthetic
-archives in memory/tempdir and need no game files.
+sector mismatches, `keys_octree` and `inner_payload_ff00` pass on all), `22` `PSIN` (`21` complete), **0 check
+failures**, in 236 s. Both test suites build synthetic archives in memory/tempdir and need no game files.
 
 ## No-sharing rule
 

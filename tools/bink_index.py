@@ -285,7 +285,7 @@ def write_csv(path, rows, probe):
 def write_json(path, target, rows, summary, probe):
     fields = BASE_FIELDS + (PROBE_FIELDS if probe else [])
     streams = [_flat(row, fields) for row in rows]
-    with open(path, "w", encoding="utf-8") as fh:
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
         json.dump({"target": target, "summary": summary, "streams": streams},
                   fh, indent=1)
 
@@ -329,7 +329,12 @@ def main(argv=None):
     skip_report = None
     if a.out and os.path.isfile(a.out):
         skip_report = a.out
-    rows, summary = scan_target(a.target, skip_report)
+    try:
+        rows, summary = scan_target(a.target, skip_report)
+    except OSError as error:
+        path = error.filename or a.target
+        print(f"bink_index: error: cannot read {path}: {error.strerror or error}", file=sys.stderr)
+        return 2
     probe = False
     if a.probe:
         ffprobe = shutil.which("ffprobe")

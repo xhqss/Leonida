@@ -14,7 +14,7 @@ def compute_header(asm_path):
             continue
         if not line.startswith(";"):
             break
-        size = re.match(r";\s*group:\s*(\d+),(\d+),(\d+)", line)
+        size = re.match(r";\s*group:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)", line)
         if size:
             group = tuple(map(int, size.groups()))
         elif line[1:].lstrip().startswith("rsrc2:"):

@@ -6,7 +6,9 @@ Windows runs llvm-mc through WSL (the official Windows LLVM build has no AMDGPU 
 
     python -I tests/test_mc_command.py
 """
+import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -39,6 +41,33 @@ class SplitCommandTest(unittest.TestCase):
             raw = '"/opt/llvm 21/bin/llvm-mc" --version'
             want = ["/opt/llvm 21/bin/llvm-mc", "--version"]
         self.assertEqual(mc_command.split_command(raw), want)
+
+    def test_windows_backslashes_and_literal_quotes_round_trip(self):
+        argv = [r"C:\Program Files\LLVM\bin\llvm-mc.exe", "", 'label="wide value"',
+                "C:\\output folder\\", r"plain\path", 'a\\"b']
+        with mock.patch.object(mc_command.os, "name", "nt"):
+            self.assertEqual(mc_command.split_command(subprocess.list2cmdline(argv)), argv)
+            self.assertEqual(mc_command.split_command('llvm-mc "a""b"'), ["llvm-mc", 'a"b'])
+
+    def test_posix_keeps_quotes_that_are_part_of_an_argument(self):
+        argv = ["llvm-mc", '"literal quotes"', "", '--label="wide value"']
+        with mock.patch.object(mc_command.os, "name", "posix"):
+            self.assertEqual(mc_command.split_command(shlex.join(argv)), argv)
+
+    @unittest.skipUnless(os.name == "nt", "Windows command line and subprocess")
+    def test_windows_subprocess_receives_literal_quotes_and_a_trailing_backslash(self):
+        want = ['"keep these quotes"', "C:\\output folder\\", ""]
+        command = [sys.executable, "-c", "import json, sys; print(json.dumps(sys.argv[1:]))", *want]
+        args = mc_command.split_command(subprocess.list2cmdline(command))
+        result = mc_command.run(args, capture_output=True, check=True, text=True)
+        self.assertEqual(json.loads(result.stdout), want)
+
+    def test_windows_quoted_option_value_keeps_spaces_and_backslashes(self) -> None:
+        executable = r"C:\Program Files\LLVM\bin\llvm-mc.exe"
+        output = r"C:\shader builds\listing.s"
+        raw = f'"{executable}" -o="{output}" -show-encoding'
+        with mock.patch.object(mc_command.os, "name", "nt"):
+            self.assertEqual(mc_command.split_command(raw), [executable, f"-o={output}", "-show-encoding"])
 
     def test_path_with_spaces_is_kept_whole(self):
         with tempfile.TemporaryDirectory() as tmp:

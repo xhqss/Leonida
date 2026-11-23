@@ -12,6 +12,8 @@
 // Exit 77 with "unsupported: ..." when the device lacks a feature the shader or sampler needs.
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
+#include "../src/vulkan_device_filter.h"
+#include "vk_pc_tail.h"
 
 #include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
@@ -93,11 +95,23 @@ int main(int argc, char** argv) {
     vkEnumeratePhysicalDevices(inst, &n, pds.data());
     VkPhysicalDevice pd = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties props{};
+    int best_rank = -1;
     for (auto d : pds) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(d, &p);
-        if (p.apiVersion < VK_API_VERSION_1_2) continue;
-        if (!pd || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { pd = d; props = p; }
+        if (p.apiVersion < VK_API_VERSION_1_2 || !leonida::vulkan_device_wanted(p.deviceName)) continue;
+        // the runtime's pick: the first device of the highest rank (native driver over Dozen, #915)
+        if (const int rank = leonida::vulkan_device_rank(static_cast<int>(p.deviceType), p.vendorID);
+            rank > best_rank) {
+            best_rank = rank;
+            pd = d;
+            props = p;
+        }
+    }
+    if (!pd && !leonida::vulkan_device_filter().empty()) {  // a filter matching nothing fails, never skips
+        std::fprintf(stderr, "LEONIDA_VK_DEVICE=%s: no Vulkan 1.2 device matches\n",
+                     leonida::vulkan_device_filter().c_str());
+        return 1;
     }
     if (!pd) { std::printf("unsupported: no Vulkan 1.2 device\n"); return unsupported; }
     std::printf("device: %s, driver 0x%x, Vulkan %u.%u.%u\n", props.deviceName, props.driverVersion,
@@ -342,12 +356,19 @@ int main(int argc, char** argv) {
 
     // Pipeline.
     VkShaderModule modules[2];
+    // LEONIDA_PC_TAIL_UBO=1 (rdna2spirv.py --pc-tail-ubo): s0..s31 in 128 push-constant bytes; the heap base, if a
+    // stage reads it, in a uniform block at set 1 (vk_pc_tail.h).
+    const bool pc_tail = leonida::vk_test::pc_tail_requested();
+    const std::uint32_t push_bytes = pc_tail ? 128u : 144u;
+    bool tail_block = false;
     for (int stage = 0; stage < 2; ++stage) {
         const auto code = read_spv(argv[1 + stage]);
         if (code.empty()) {
             std::fprintf(stderr, "cannot read %s\n", argv[1 + stage]);
             return 1;
         }
+        if (pc_tail && leonida::vk_test::spirv_declares_set(code.data(), code.size() * 4, leonida::vk_test::pc_tail_set))
+            tail_block = true;
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         smi.codeSize = code.size() * 4;
         smi.pCode = code.data();
@@ -361,12 +382,20 @@ int main(int argc, char** argv) {
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = modules[1];
     stages[1].pName = "main";
-    const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 144};
+    const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, push_bytes};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1;
     pli.pSetLayouts = &dsl;
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &push;
+    leonida::vk_test::PcTail tail;
+    if (tail_block && !tail.create(vkGetDeviceProcAddr, dev, mp, props.limits.minUniformBufferOffsetAlignment,
+                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1)) {
+        std::fprintf(stderr, "FAILED creating the --pc-tail-ubo block\n");
+        return 1;
+    }
+    const VkDescriptorSetLayout set_layouts[] = {dsl, tail.set_layout};
+    if (tail_block) { pli.setLayoutCount = 2; pli.pSetLayouts = set_layouts; }
     VkPipelineLayout pipeline_layout;
     CHECK(vkCreatePipelineLayout(dev, &pli, nullptr, &pipeline_layout));
     const VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -459,7 +488,13 @@ int main(int argc, char** argv) {
     block[0] = table_va;  // s0:s1 = console VA of the T# (the shader's s1 stays 0)
     block[32] = std::uint32_t(heap_base);
     block[33] = std::uint32_t(heap_base >> 32);
-    vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(block), block);
+    vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, push_bytes, block);
+    if (tail_block) {
+        tail.write(0, block, 4);
+        const std::uint32_t offset = tail.offset(0);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, leonida::vk_test::pc_tail_set, 1,
+                                &tail.set, 1, &offset);
+    }
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy rc{};
