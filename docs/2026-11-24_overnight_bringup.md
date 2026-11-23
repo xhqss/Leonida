@@ -813,16 +813,53 @@ $env:LEONIDA_SKIP_ASSERTS='1'
 
 ## 14. 仓库状态
 
-- 分支 `main`，**领先 `origin/main` 100 个提交**（`origin/main` = `dfe4e4ad3`），0 落后，工作树干净
-  （只剩未跟踪的 `.idea/`、`tmp/`）。注意：`origin/main` 在 02:5x 被**本会话之外的进程** fast-forward 过
-  （reflog 里是 `fetch origin --recurse-submodules=no --progress --prune`，不是本会话发的），上游已到
-  `dfe4e4ad3`（`d3d12: guard null pInputElementDescs and validate graphics/compute PSO descriptors (#6689)`）；
-  按用户要求**没有合并**。
+- 分支 `main`，**领先 `origin/main` 105 个提交**（`origin/main` = `6312c05`，本轮结束时拉到的最新），0 落后，
+  工作树干净（只剩未跟踪的 `.idea/`、`tmp/`）。上游在 04:4x 之后又进了 62 个提交
+  （`dfe4e4ad3` → `6312c05`），**按判断没有合并**：
+  其中只有两个对我们有用——`b7a3fed28`（`/GA` 可执行文件在 index 0 拿自己的 TLS，正是我们用
+  `LEONIDA_GUEST_TLS_SLOT0` 绕过的那个 AV）和 `6312c05`（`XErrorReport` 按名导出，本地也已经有了）——
+  而这两个都动 `pe_loader.cpp`，正好压着我们的 TLS 改动；其余 60 个是文档/工具脚本的小修，
+  没有任何一条碰 FSPX 或翻译器。等这一段收尾再单独 cherry-pick 那条 TLS 提交更稳。
 - 本晚的提交（全部本地）：
   `13d2785b0`（本记录）、`d435276bb`（拓扑 19 + 四组诊断）、`946ef794c`（slot 81 参数 +
   `LEONIDA_COMMIT_ON_FAULT`）、`ed61a963b`（9.2b 更新）、`ee38ebbaa`（设备测试改问 `inner`）、
   `ad5e665cf` + `3f2481c8c`（文档）、`69183c269`（dump 带 `.dxbc`）、`091db69f2`（页表数组探针）、
-  `985a3e30e`（槽位 81 的两种答法）、`d770c68e9`（DStorage zlib）、`e45f1dbe3`（音频 9 个导入的桩）。
-- 语料在仓库外：`E:\temp\wait_work\leonida-work\shaders\spirv-561b65a`，本轮 26,556 → **26,557**（那条 PS）。
+  `985a3e30e`（槽位 81 的两种答法）、`d770c68e9`（DStorage zlib）、`e45f1dbe3`（音频 9 个导入的桩）、
+  `25e824342`（slot 67 整体 payload dump）、`a52fe7d23`（FSPX 记录）、`f072e446a` + `8b031fb9d`（present 计数
+  与白窗口的记录）、`13b163d0a`（首帧呈现目标的形状）。
+- 语料在仓库外：`E:\temp\wait_work\leonida-work\shaders\spirv-561b65a`，本轮 26,556 → **27,098**
+  （那条 PS + **541 条 FSPX**）。改动前的索引备份：`tmp/corpus-index-before-fspx.json`。
 - **从未推送**，也不打算推送（用户明确：不做 PR，改为同步上游）。
 - 本文档与代码提交分开：改文档时只提交这一个文件。
+
+---
+
+## 15. 继续做的时候，先跑这三条
+
+```powershell
+# 1. 看一眼现在的状态：窗口、PresentX、FSPX 缺多少
+$env:LEONIDA_GUEST_TLS_SLOT0='1'
+$env:LEONIDA_SHADERS='E:\temp\wait_work\leonida-work\shaders\spirv-561b65a'
+$env:LEONIDA_D3D12='vulkan'; $env:VK_LOADER_LAYERS_DISABLE='~implicit~'
+$env:LEONIDA_SKIP_ASSERTS='1'
+$env:LEONIDA_DUMP_SHADERS='E:\temp\wait_work\Leonida\tmp\dump-next'
+cd E:\temp\wait_work\Leonida
+.\runtime\build-561b65a\gta6rt.exe --run `
+    'E:\temp\wait_work\GTA6.Xbox.v1.0.2.1-CYBERLEEK\game_scarlett_master.exe' `
+    --game-dir 'E:\temp\wait_work\GTA6.Xbox.v1.0.2.1-CYBERLEEK' *> tmp\run-next.log
+
+# 2. 把这一轮抓到的 FSPX payload 翻成语料（跑 5~10 分钟，取决于数量）
+$env:LLVM_MC='wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'
+& .\.venv\Scripts\python.exe -I tools\fspx_unpack.py (Get-ChildItem tmp\dump-next -Filter *.fspx).FullName `
+    --out tmp\fspx-next --disasm
+$env:PATH="E:\VulkanSDK\1.4.363.1\Bin;$env:PATH"
+& .\.venv\Scripts\python.exe -I tools\rdna2spirv.py tmp\fspx-next\disasm --out tmp\fspx-next-spirv
+& .\.venv\Scripts\python.exe -I tmp\merge_shaders_into_corpus.py `
+    'E:\temp\wait_work\leonida-work\shaders\spirv-561b65a' tmp\fspx-next-spirv
+
+# 3. 再启动一次，比较 slot 67 的失败数（目标：从 ~220 降到只剩翻译器真正翻不出来的那些）
+```
+
+判断标准：`grep -c 'no translated compute' tmp\run-next.log` 与 `tmp\dump-next\*.fspx` 的数量。
+现在这两者**几乎相等**（每一条失败都被 dump 了），说明瓶颈已经不在收集，而在翻译器；
+下一步是补 `tools/rdna2spirv.py` 的那几类拒绝（§9.6 的表），每补一类就重跑第 2、3 步。
