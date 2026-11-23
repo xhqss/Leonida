@@ -71,7 +71,10 @@
 // Command queues and fences (device slots 8, 75, 36, and 32 for a shared fence) come back wrapped in queue and fence
 // proxies of the same kind: the public chain (19 queue slots, 11 or 12 fence slots in SDK 10.0.26100) is forwarded
 // in PC order, and a slot past it, up to the end of the proxy's table (128 queue, 64 fence slots), is logged with its
-// first four argument words and answered S_OK on a queue or refused with E_NOTIMPL on a fence or allocator. A slot
+// first four argument words and answered S_OK on a queue or refused with E_NOTIMPL on a fence or
+// allocator. Fence slot 12 is served instead: the retail executable reads its return as the address of
+// the fence's 64-bit completed value, so it returns a per-fence mirror that a wait on the real fence keeps
+// current (d3d12_xs_device.cpp, "Fence slot 12"). A slot
 // past the table faults on the vtable read inside a
 // reserved, never-committed region, and the fault is logged with the slot. That is where the console's queue methods
 // (PresentX, SuspendX, ResumeX) will show up; the sibling-layer measurement puts PresentX at queue slot 30 or 32
