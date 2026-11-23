@@ -36,8 +36,10 @@
    也就是说页表 AV 是"流数据没解压出来 → 布局表是垃圾"的下游症状，不是页表本身的问题。
 5. **音频的 9 个导入从"返回 0"改成"写出参"**（新的 `runtime/shims/audio.cpp`）：窗口 `Americas`
    起来之后**不再死**——实测一次运行活过 8 分钟、`Responding`、工作集 19.9 GB，一直在建 FSPX compute PSO
-   （每条都因为语料里没有译文而失败，标题不因此退出）。**这是本晚最好的状态：从"15 秒必死"到"能一直活着"**；
-   画面还停在白色（只有一次 `PresentX ready`，没有第二帧）。
+   （每条都因为语料里没有译文而失败，标题不因此退出）。**这是本晚最好的状态：从"15 秒必死"到"能一直活着"**。
+6. **最后确认了它其实在渲染**：`PresentX` 加了计数器之后，四分钟里 **71,518 次呈现**（~300 fps），
+   所以标题**早已进入渲染循环**；窗口还是白的，问题在呈现路径/画面内容，不是初始化卡死（§9.7）。
+   顺带记下：驱动侧在 2.5 分钟后会 `LLVM ERROR: out of memory`（工作集 ~20 GB + 失败编译重试）。
 
 ---
 
@@ -637,6 +639,31 @@ $env:PATH="E:\VulkanSDK\1.4.363.1\Bin;$env:PATH"
   所以"键对不上"这条可以排除；
 - 同一尺寸、不同启动的 payload 常常**整段不同**，但那是不同的程序（同尺寸的程序有十几个），不是标题在打补丁。
 
+### 9.7 它其实已经在渲染循环里：4 分钟 71,518 次 `PresentX`
+
+前面一直说"只有一次 `PresentX ready`、没有第二帧"，那是因为**我们自己没在 `PresentX` 调用处打日志**
+（`PresentX ready` 只是创建交换链时的横幅）。给 `queue_present_x` 加了一个计数器（每 60 次打一行）之后：
+
+```text
+[rt] d3d12_xs: PresentX call 1 (1 plane(s))
+[rt] d3d12_xs: PresentX call 60 (1 plane(s))
+…
+```
+
+四分钟里 **71,518 次**（约 300 帧/秒）——**标题已经进了渲染循环并在不停提交画面**，只是我们看到的是白窗口。
+所以"没画出东西"和"没在画"是两件事：现在已知是前者，问题在**呈现路径或画面内容**，不在初始化卡死。
+
+两个附带观测：
+
+1. **窗口是白的**，可能（a）`PresentX` 的合成/拷贝没把图像送到窗口，或（b）标题送上来的那张纹理本身就是空白
+   （237 个 FSPX compute PSO 没建成，后处理链断在里面）。下一步最省事的判别法是抓一帧：`WindowPresenter` 本来就有
+   `enable_capture()` / `read_back()`（测试用的截图支持），但**在活动交换链上调用它 `recreate()` 会失败**，
+   实测返回 false（这条死路记在这里，别再踩一遍）——要么在创建时就打开采集，要么走别的截图路径。
+2. **驱动侧的 OOM**：那次带采集实验的运行在大约 2.5 分钟后死在 `LLVM ERROR: out of memory` / `Allocation failed`
+   （AMD 的 shader 编译器）。进程工作集当时约 20 GB（标题自己按控制台预算就占这么多），再加上不断重试失败的
+   FSPX 编译，就会撞到这台机器的上限。所以"活多久"也要看内存：长时间跑要么先压掉 FSPX 的失败重试，要么确认
+   驱动 OOM 是可复现的（下一轮第一件事）。
+
 ---
 
 ## 10. 构建与测试
@@ -741,9 +768,11 @@ $env:LEONIDA_SKIP_ASSERTS='1'
    `CS thread-group-size SGPR`（31）、`ds_append`（10）、`s_flbit_i32_b64` / `s_bitreplicate_b64_b32` on a lane
    mask，以及 `v_fma_mix_f32` 的字段被 llvm-mc 丢掉（这条在反汇编层）。每补一类就用
    `tmp/merge_shaders_into_corpus.py` 并库、再启动看失败数是否下降。
-2. **画面为什么还是白的**：只有一次 `PresentX ready`，没有第二帧；标题一直停在"建 FSPX compute PSO"这一段，
-   没有任何 draw/clear。先确认它到底在等什么（`--trace` 里 8 分钟内有没有 `Present`），再看是不是交换链没把
-   图像拷出来。
+2. **画面为什么还是白的**（9.7）：标题**在**渲染（4 分钟 71,518 次 `PresentX`，~300 fps），但窗口全白。
+   两条待判的路径：`PresentX` 的合成/拷贝没有把图像送到窗口；或者标题送上来的纹理本身就是空白（237 个 FSPX
+   compute PSO 没建成，后处理链断在里面）。抓一帧最快：`WindowPresenter::enable_capture()` 在**活动**交换链上
+   会 `recreate()` 失败（实测 false），所以要么在创建时就打开采集，要么换别的截图路径。
+   另外驱动侧 2.5 分钟后会 `LLVM ERROR: out of memory`（工作集 ~20 GB + 失败编译重试），这条也要复现确认。
 3. **`xapu.dll` / `chad.dll` 的 10 个导入**：仍是未实现，标题现在已经在调 `XApuConnect`（三个出参）、
    `XApuGetResultCount`、`XDspConnectWithMaximumStreamLimit`。目前不致命，但音频命令队列一旦真被用到，
    这些出参就要像 9.5 那样写出真东西。

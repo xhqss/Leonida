@@ -1335,6 +1335,13 @@ PresentState* present_state_for(DeviceProxy* device) {
 std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::uint64_t planes,
                               std::uint64_t params) {
     PresentState* state = self->device ? present_state_for(self->device) : nullptr;
+    // Whether the title reaches its frame loop at all is the difference between "the picture is wrong" and "it never
+    // presented"; one line every 60 presents says which without flooding the log (PresentX itself is not logged).
+    static std::atomic<std::uint64_t> presents{0};
+    const std::uint64_t present = presents.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (present == 1 || present % 60 == 0)
+        std::fprintf(stderr, "[rt] d3d12_xs: PresentX call %llu (%llu plane(s))\n",
+                     static_cast<unsigned long long>(present), static_cast<unsigned long long>(plane_count));
     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
     return hr_to_u64(state->xbox->PresentX(
         static_cast<UINT>(plane_count),
