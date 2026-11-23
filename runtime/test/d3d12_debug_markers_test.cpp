@@ -100,7 +100,9 @@ HRESULT make_device(const vktest::Device& d, bool debug_utils, ID3D12Device** ou
     ID3D12Device* inner = nullptr;
     HRESULT hr = rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner));
     if (FAILED(hr)) return hr;
-    hr = rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device), reinterpret_cast<void**>(out));
+    // PC-shaped lists: this test calls the marker methods the console ABI does not have.
+    hr = rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device), reinterpret_cast<void**>(out),
+                                         /*console_lists=*/false);
     if (FAILED(hr)) {
         inner->Release();
         return hr;
@@ -135,6 +137,9 @@ int run_markers(ID3D12Device* device) {
     const char ansi[] = "ansi pass and more";
     const wchar_t spans[] = L"spans two lists";
     const std::uint64_t blob[2] = {0x1234, 0x5678};
+    // make_device passes console_lists=false, so first/second are the real PC-shaped lists — the console
+    // ABI has no SetMarker or BeginEvent, and its one marker slot (EndEvent at console 60) would land here
+    // on a shifted index. ExecuteCommandLists still unwraps the proxies below.
     first->SetMarker(0, frame, sizeof(frame));
     first->SetMarker(0, nullptr, 0);
     first->BeginEvent(1, ansi, 9);  // "ansi pass"

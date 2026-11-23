@@ -2800,7 +2800,7 @@ if(TARGET Vulkan::Headers)
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
-      target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com)
+      target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com user32)  # user32: the PresentX window
       target_compile_definitions(gta6rt PRIVATE LEONIDA_VULKAN_DEVICE)
 
       # A stand-in title that imports d3d12_xs.dll!D3D12XboxCreateDevice and runs a clear and a readback on the

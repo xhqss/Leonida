@@ -181,6 +181,14 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
                      "(slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).\n");
     }
 
+    // A console title gets the console-shaped list the Xbox ABI calls. A guest compiled against the PC
+    // headers (the tiny fixtures, which call the list through PC vtable indices) asks for PC-shaped lists
+    // with LEONIDA_D3D12_LISTS=pc — the device, queue and friends stay console-shaped either way.
+    char lists_mode[8] = {};
+    size_t lists_length = 0;
+    const bool pc_lists = getenv_s(&lists_length, lists_mode, "LEONIDA_D3D12_LISTS") == 0 &&
+                          std::strcmp(lists_mode, "pc") == 0;
+
 #ifdef LEONIDA_VULKAN_DEVICE
     // Opt-in until the Vulkan device covers the first frame: LEONIDA_D3D12=vulkan puts the Vulkan-backed device
     // behind the same proxy instead of the host's D3D12 device.
@@ -195,7 +203,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
                          static_cast<unsigned long>(vhr));
             return result(method, vhr);
         }
-        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out);
+        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out, /*console_lists=*/!pc_lists);
         if (FAILED(vhr)) {
             vulkan->Release();
             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: proxy over the Vulkan device failed "
@@ -223,7 +231,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         return result(method, FAILED(hr) ? hr : E_FAIL);
     }
 
-    hr = rt::d3d12_xs::create_device_proxy(real, *riid, out);
+    hr = rt::d3d12_xs::create_device_proxy(real, *riid, out, /*console_lists=*/!pc_lists);
     if (FAILED(hr)) {
         // create_device_proxy keeps the caller's reference on failure.
         real->Release();

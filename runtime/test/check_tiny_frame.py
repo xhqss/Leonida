@@ -124,7 +124,10 @@ def main():
             print("SKIP: no usable Vulkan device (the probe test skipped)")
             return SKIP
 
-    environment = dict(os.environ, LEONIDA_D3D12="vulkan")
+    # The fixture is compiled against the PC headers, so it calls the command list through PC vtable
+    # indices; LEONIDA_D3D12_LISTS=pc asks the proxy for PC-shaped lists. The console-shaped device,
+    # queue, heap and fence it checks stay console-shaped.
+    environment = dict(os.environ, LEONIDA_D3D12="vulkan", LEONIDA_D3D12_LISTS="pc")
     if options.queue_test_settings:
         environment.update(QUEUE_TEST_SETTINGS)
     run = subprocess.run([*options.runner, options.loader, "--run", os.path.basename(options.guest), "--trace-d3d12"],

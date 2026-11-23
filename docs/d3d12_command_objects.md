@@ -375,9 +375,10 @@ section 3.5a), and the console list has methods well past the PC tail: 71, 73, 8
 FSR DLL.
 
 Slot 148 matters beyond the builder: the address it returns is written by the CPU and passed unchanged to the GPU
-as a root SRV address, so console upload memory has the same address for the CPU and the GPU. A replacement must
-return memory whose CPU pointer is also a valid GPU address (for this layer: inside the arena of
-[d3d12_vulkan.md §3.3](d3d12_vulkan.md)).
+as a root SRV address, so console upload memory has the same address for the CPU and the GPU. On a PC the two
+address spaces differ, so `d3d12_xs_device.cpp` carves a bump arena out of persistently-mapped UPLOAD-heap
+buffers: the title writes the mapped memory and the six root descriptor setters and the IA/SO view setters
+translate the CPU pointer to the chunk's buffer device address before forwarding.
 
 The function at `0xd580` uses the 71/73 pair instead of the slot-146 barrier when the byte at RVA `0xd773c` is set.
 That byte is one of seven bools at `0xd7738`–`0xd773e` in zero-initialised `.bss`. The only accesses to them in

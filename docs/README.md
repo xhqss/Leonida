@@ -69,6 +69,7 @@ method, scope and caveats. No game data is included.
 | [descriptor_lookup_intel.md](descriptor_lookup_intel.md) | Intel UHD Graphics 770 (Xe-LP, Windows, driver 101.6129) timings for the same lookups at 1k–100k live entries; both memory placements within 0.6% of each other. |
 | [d3d12_xs_surface.md](d3d12_xs_surface.md) | The 116-slot `d3d12_xs.dll` export surface; 83/83 standard GUIDs match the PC SDK. |
 | [xdxr.md](xdxr.md) | `BATCHED_DESC2` (`0x50`) and `XDXR_STREAM_DESC` (`0x10`) from `XboxBvhBuilder.dll`'s reads; stream records' offsets and defaults; offline statistics not in the package. |
+| [d3d12_xs_console_abi.md](d3d12_xs_console_abi.md) | The D3D12.X console ABI the `d3d12_xs` shim must reproduce: device/queue/list vtable slots, command-list object fields and record encodings, root-argument SGPR rules, unified memory; sibling-layer measurements marked unverified here. |
 | [d3d12_command_objects.md](d3d12_command_objects.md) | Measured command queue/list/fence/`PresentX` surface; verified vs prior art vs open. |
 | [xbox_d3d12_xs.md](xbox_d3d12_xs.md) | The `d3d12_xs` graphics ABI quoted from Microsoft's public GDK reference: root signatures, state objects, DXIL libraries, hit groups, shader cache sessions; which pages are missing or NDA-gated. |
 | [runtime_imports.md](runtime_imports.md) | The 16 shipped modules' measured imports and shim/host/unimplemented split. |

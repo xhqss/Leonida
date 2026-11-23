@@ -5074,7 +5074,7 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                           reinterpret_cast<void**>(&device.p))));
+                                                           reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);  // the proxy now owns `inner`
         EXPECT(rt::d3d12_xs::is_device_proxy(device.p));
         EXPECT(rt::d3d12_xs::device_proxy_slot_count(device.p) == 80);  // ID3D12Device11
@@ -5402,7 +5402,7 @@ int main() {
             EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(fallback_info, IID_PPV_ARGS(&fallback_inner))));
             Ref<ID3D12Device> fallback_device;
             EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(fallback_inner, __uuidof(ID3D12Device),
-                                                               reinterpret_cast<void**>(&fallback_device.p))));
+                                                               reinterpret_cast<void**>(&fallback_device.p), /*console_lists=*/false)));
             rt::d3d12::set_device_outer(fallback_inner, fallback_device.p);
             D3D12_FEATURE_DATA_D3D12_OPTIONS8 options8{TRUE};
             EXPECT(fallback_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS8, &options8,
@@ -5564,7 +5564,14 @@ int main() {
             Ref<ID3D12CommandQueue> granted_q;
             EXPECT(SUCCEEDED(device->CreateCommandQueue(&rt_desc, IID_PPV_ARGS(&granted_q.p))) && granted_q.p);
             if (granted_q.p) {
-                EXPECT(granted_q->GetDesc().Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME);
+                // PC GetDesc shares console slot 18 with the newer layout's GetTimestampFrequency; the proxy
+                // serves the frequency getter while the layout is undetected, so the desc is read on the real
+                // queue instead.
+                if (auto* real_q = rt::d3d12_xs::queue_proxy_real_queue(granted_q.p)) {
+                    EXPECT(real_q->GetDesc().Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME);
+                } else {
+                    EXPECT(granted_q->GetDesc().Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME);
+                }
             }
             granted_q.reset();
             rt::d3d12::set_global_realtime_privilege_override_for_test(-1);

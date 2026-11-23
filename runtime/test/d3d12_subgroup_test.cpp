@@ -185,7 +185,7 @@ Result run(vktest::Device& d, const std::filesystem::path& library, const leonid
     CASE_EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
     Ref<ID3D12Device> device;
     CASE_EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                            reinterpret_cast<void**>(&device.p))));
+                                                            reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
     rt::d3d12::set_device_outer(inner, device.p);
 
     // Root signature: [0] four constants (s4..s7 in the console compute layout, D3D-448), the V# the shaders store
@@ -379,7 +379,7 @@ DrawResult draw(vktest::Device& d, const std::filesystem::path& library, const l
     CASE_EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
     Ref<ID3D12Device> device;
     CASE_EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                            reinterpret_cast<void**>(&device.p))));
+                                                            reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
     rt::d3d12::set_device_outer(inner, device.p);
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};

@@ -8,8 +8,9 @@
 //   - heap, queue and fence proxies are unwrapped where the real runtime receives them (Signal/Wait,
 //     SetEventOnMultipleFenceCompletion, MakeResident/Evict/SetResidencyPriority/EnqueueMakeResident,
 //     CreateSharedHandle), and OpenSharedHandle wraps a shared fence;
-//   - slots past the public chain are refused (E_NOTIMPL) up to the end of the table, and a slot past the table
-//     faults on the vtable read in the guard region and is counted;
+//   - slots past the public chain answer the console contract — a queue slot returns S_OK having signalled
+//     nothing (frame pacing flows through those methods), a fence slot is refused with E_NOTIMPL — and a
+//     slot past either table faults on the vtable read in the guard region and is counted;
 //   - calls from eight threads at once, and repeated device, queue and fence creation without leaks;
 //   - the child-process runner of the differential check itself: large output, hangs, crashes, failed starts.
 // No shaders, game data or Xbox DLLs. LEONIDA_VK_VALIDATION=1 runs the Vulkan device under
@@ -389,24 +390,41 @@ int check_slots(const Backend& b) {
             }
         }
 
-        // The refused tail: every slot from the end of the public chain to the end of the table.
+        // The console queue tail answers S_OK instead of refusing: frame pacing flows through those
+        // methods, the contract xs_proxy_mock checks too. The two methods the proxy models — SignalX at
+        // 23 and PresentX at 30 on the older layout the 16/17 calls above pinned — are checked below.
+        // The fence tail below is still refused — nothing console-shaped was measured past its public chain.
         for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot) {
+            if (slot == 23 || slot == 30) continue;
             before = qhits(slot);
-            EXPECT(as_hr(call_slot(queue.p, slot)) == E_NOTIMPL);
+            EXPECT(as_hr(call_slot(queue.p, slot)) == S_OK);
             EXPECT(qhits(slot) == before + 1 && xs::queue_slot_first_call_seen(slot));
         }
+        // SignalX forwards to the real queue's Signal with the extra word dropped: the fence reaching 9
+        // proves the call was forwarded rather than swallowed by the console-tail answer.
+        before = qhits(23);
+        EXPECT(as_hr(raw_call(queue.p, 23, reinterpret_cast<std::uint64_t>(fence.p), 9)) == S_OK);
+        EXPECT(qhits(23) == before + 1 && xs::queue_slot_first_call_seen(23));
+        if (wait_for(label, fence.p, 9)) return 1;
+        // PresentX is handled by the presentation front end, not refused: its status is the swapchain's
+        // (a black frame on the test window, or S_OK where it cannot present), so anything but E_NOTIMPL
+        // shows the modelled path ran.
+        before = qhits(30);
+        EXPECT(as_hr(call_slot(queue.p, 30)) != E_NOTIMPL);
+        EXPECT(qhits(30) == before + 1 && xs::queue_slot_first_call_seen(30));
         for (unsigned slot = fence_slots; slot < xs::fence_proxy_table_size(); ++slot) {
             before = fhits(slot);
             EXPECT(as_hr(call_slot(fence.p, slot)) == E_NOTIMPL);
             EXPECT(fhits(slot) == before + 1 && xs::fence_slot_first_call_seen(slot));
         }
-        // The objects still work after refused calls.
+        // The objects still work after the console-only calls.
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 10)));
         if (wait_for(label, fence.p, 10)) return 1;
         EXPECT(xs::command_object_proxy_ref_count(queue.p) == 1 && xs::command_object_proxy_ref_count(fence.p) == 1);
     }
     EXPECT(xs::device_proxy_ref_count(device) == device_refs);  // every queue and fence gave its reference back
-    std::printf("%s: every public queue and fence slot forwarded and counted; tail refused\n", label);
+    std::printf("%s: every public queue and fence slot forwarded and counted; queue tail S_OK, fence tail "
+                "refused\n", label);
     return 0;
 }
 
