@@ -399,18 +399,18 @@ tmp\configure-561b65a.cmd       :: 重新生成构建目录（构建目录 runti
 串行 `ctest -j 1`（推荐，理由见下）：
 
 ```text
-98% tests passed, 5 tests failed out of 268     Total Test time (real) = 237.95 sec
+99% tests passed, 4 tests failed out of 268
 ```
 
-失败项：
+最初是 5 项；`d3d12_vulkan_device` 在 03:0x 修好（见下表的说明），现在剩 4 项：
 
 | 测试 | 现象 | 归因 |
 | --- | --- | --- |
 | `run_module_names` | 未深查 | 不清楚，本次没有碰模块命名 |
-| `d3d12_vulkan_device` | `R10G10B10` 的拷贝/resolve 被 `invalid copy or resolve` 拒 | **怀疑**与今晚合进来的 A8/格式规则有关，尚未证实 |
 | `d3d12_depth_resolve` | 深度 resolve 路径 | 未深查 |
-| `d3d12_pipeline_library_host` | 管线库宿主路径 | 未深查 |
+| `d3d12_pipeline_library_host` | 与宿主逐项对比，74 项里 2 项不一致 | 宿主自己的格式/答案差异，未深查 |
 | `dxgi_swapchain` | 交换链 | 未深查 |
+| ~~`d3d12_vulkan_device`~~ | 已修 | 三项检查走的是**代理的 PC 槽位**，而代理的槽位是控制台的：61 = `CreateSamplerX`（#7115）、62 = `CreateComputePipelineState`（#7163）、78/79/80 = 帧事件。于是 `CreateMetaCommand` 变成了建采样器、`CreateReservedResource2` 变成了帧事件，`meta == nullptr` 和 `tiles == 1` 必然失败。这三段改成直接问 `inner`（代理包着的 Vulkan 设备）——它们本来测的就是设备对 PC 的答案。提交 `ee38ebbaa`。 |
 
 `-j 4` 时还会多挂 `d3d12_texture_tiles` 和 `d3d12_bindless_churn`，单独跑能过 —— 是 GPU 竞争导致的抖动，
 不是代码问题。**结论：跑 ctest 用串行。**
@@ -432,6 +432,11 @@ $env:LEONIDA_SKIP_ASSERTS='1'
   --game-dir "E:\temp\wait_work\GTA6.Xbox.v1.0.2.1-CYBERLEEK" `
   --trace tmp\trace-78.jsonl
 ```
+
+**直接双击 `game_scarlett_master.exe` 一定失败**，Windows 会报找不到 `d3d12_xs.dll`、`xmem.dll`、`xg_xs.dll`、
+`chad.dll`：这四个是控制台系统的 DLL，由 `gta6rt` 在**进程内**映射并提供，磁盘上根本没有对应的文件。所以只能经
+`gta6rt --run` 启动。仓库里有一个能双击的封装：`tmp\play-gta6.cmd`（不带参数就启动并把日志写到 `tmp\play.log`，
+带 `trace` 参数额外写 `tmp\play-trace.jsonl`，结束时打印最后 25 行并 `pause`）。
 
 可用的排查开关：
 
