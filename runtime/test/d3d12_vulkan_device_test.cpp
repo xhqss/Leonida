@@ -5755,8 +5755,12 @@ int main() {
                    E_INVALIDARG);
         }
         {
+            // On the inner device, not through the proxy: the proxy's vtable is the console's, where slot 61 is
+            // CreateSamplerX and slot 62 CreateComputePipelineState (Local: PR #7115 / #7163), so a PC-shaped
+            // CreateMetaCommand call on the proxy is a sampler creation. What this block checks is the device's
+            // host-like answers (upstream 09ba78556), which the console numbering does not touch.
             Ref<ID3D12Device5> device5;
-            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device5.p))));
+            EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&device5.p))));
             UINT meta_count = 7;
             EXPECT(device5->EnumerateMetaCommands(&meta_count, nullptr) == S_OK && meta_count == 0);
             EXPECT(device5->EnumerateMetaCommands(nullptr, nullptr) == E_INVALIDARG);
@@ -6567,17 +6571,21 @@ int main() {
             EXPECT(SUCCEEDED(device->CreateReservedResource(&xbox_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                             IID_PPV_ARGS(&xbox_tiled.p))));
             {
+                // On the inner device: PC slot 78 is ID3D12Device10::CreateReservedResource2, and the proxy's slot 78
+                // is the console's SetFrameIntervalX (measured, d3d12_xs_device.cpp), so through the proxy this call
+                // is a frame event and there is no reserved resource to ask for tiling. The proxy's own numbering is
+                // checked where the console slots are.
                 Ref<ID3D12Device4> device4;
                 Ref<ID3D12Device10> device10;
                 Ref<ID3D12Resource> one, two;
-                EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4.p))));
-                EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device10.p))));
+                EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&device4.p))));
+                EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&device10.p))));
                 EXPECT(SUCCEEDED(device4->CreateReservedResource1(&tiled_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                                   nullptr, IID_PPV_ARGS(&one.p))));
                 EXPECT(SUCCEEDED(device10->CreateReservedResource2(&tiled_desc, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
                                                                    nullptr, 0, nullptr, IID_PPV_ARGS(&two.p))));
                 UINT tiles = 0;
-                device->GetResourceTiling(two.p, &tiles, nullptr, nullptr, nullptr, 0, nullptr);
+                inner->GetResourceTiling(two.p, &tiles, nullptr, nullptr, nullptr, 0, nullptr);
                 EXPECT(tiles == 1);  // 8x8 RGBA8: one packed tile
             }
 
