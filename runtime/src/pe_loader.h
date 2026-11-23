@@ -61,6 +61,11 @@ struct Module {
     const uint8_t* tls_template = nullptr;  // raw template in the mapped image
     uint32_t tls_raw_size = 0;
     uint32_t tls_zero_fill = 0;
+
+    // Set for the loader's own executable, whose static TLS moves to a reserved index so that a mapped image can have
+    // index 0 (relocate_host_tls in pe_loader.cpp). Such a block is not a copy of a template: it is the block that
+    // thread already holds at index 0, which carries that thread's magic-static epoch.
+    bool tls_from_host_block = false;
 };
 
 class Loader {
@@ -124,6 +129,12 @@ private:
     static void set_initialised(Module& m, bool value);
     Module& map_image(const std::filesystem::path& path);
     void initialize_tls(Module& m);
+    // LEONIDA_GUEST_TLS_SLOT0=1: moves this executable's own static TLS to a reserved module index, so the first mapped
+    // image with a TLS directory can take index 0, which is the index the game's own code hard-codes (see the comment
+    // on the definition). Runs from the constructor, before any image is mapped; a no-op with the variable unset, when
+    // a previous Loader in this process already did it, when this executable does not hold index 0, or when it has no
+    // TLS of its own. The move is permanent for the process.
+    void relocate_host_tls();
     void bind_imports(Module& m);
     void* resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal);
     void* resolve_forwarder(const std::string& spec, Binding& binding, int depth);

@@ -82,7 +82,44 @@ IMAGE_TLS_DIRECTORY64* tls_directory(Module& m) {
 // module TLS index for each simultaneous module (up to kMaxMappedTlsModules).
 constexpr DWORD kMaxModuleTlsSlots = 64;
 constexpr size_t kMaxMappedTlsModules = 16;
+// Index 0 of TEB->ThreadLocalStoragePointer: the module index the OS loader gives the process's own executable,
+// because it is the first module loaded. relocate_host_tls() moves the executable's data out of it and
+// Loader::initialize_tls() puts the first mapped image there.
+constexpr uint32_t kImageTlsIndex = 0;
 void** module_tls_slots() { return reinterpret_cast<void**>(__readgsqword(0x58)); }
+
+// LEONIDA_GUEST_TLS_SLOT0 (see relocate_host_tls). Off by default: with it this process's own thread_local data moves
+// to a reserved module index, which is a change to the loader's own environment, not to a mapped image.
+// The value says how far to go, which also keeps the two halves separable while the feature is being proven:
+//   "1"    - move the executable's own TLS and give index 0 to the first mapped image with a TLS directory
+//   "host" - move the executable's own TLS only: the executable no longer holds index 0, an image keeps a reserved one
+bool guest_tls_slot0_requested() {
+    char value[8] = {};
+    // GetEnvironmentVariableA returns the length without its terminator, so a plain "1" is 1.
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_GUEST_TLS_SLOT0", value, sizeof value);
+    return n > 0 && n < sizeof value && value[0] != '0';
+}
+
+bool guest_tls_slot0_pins_image() {
+    char value[8] = {};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_GUEST_TLS_SLOT0", value, sizeof value);
+    return n > 0 && n < sizeof value && value[0] == '1';
+}
+
+// LEONIDA_TLS_AUDIT=1: every TLS slot a thread holds before and after its thread events goes to stderr, so a block left
+// in a thread's array at exit (ntdll!LdrpFreeTls then frees it as if it were the loader's own) can be traced to its
+// install. Read once: the thread events run under the Windows loader lock. The value is a call-local, not TLS: this
+// function runs where the executable's own TLS is being moved.
+bool tls_audit_enabled() {
+    static std::atomic<int> cached{0};  // constant-initialized: no guard, no TLS
+    int state = cached.load(std::memory_order_relaxed);
+    if (!state) {
+        char value[4] = {};
+        state = GetEnvironmentVariableA("LEONIDA_TLS_AUDIT", value, sizeof value) > 0 && value[0] != '0' ? 2 : 1;
+        cached.store(state, std::memory_order_relaxed);
+    }
+    return state == 2;
+}
 
 void __cdecl on_host_thread_event(DWORD reason);
 
@@ -125,6 +162,21 @@ std::array<std::atomic<Module*>, kMaxMappedTlsModules> g_tls_slot_owners{};
 std::array<std::atomic<uint64_t>, kMaxMappedTlsModules> g_tls_slot_generations{};
 std::atomic<uint64_t> g_next_tls_generation{1};
 std::vector<TlsCloneRecord> g_tls_clones;
+
+// The executable's own static TLS, once Loader::relocate_host_tls has moved it off module index 0. Process-wide and
+// permanent, like the slot tables above: the executable's _tls_index is one word that every thread reads, so a second
+// Loader reuses what the first one set up, and nothing moves it back (the comment on relocate_host_tls says why).
+struct HostTls {
+    Module module;                              // the executable as a TLS owner; never freed
+    uint32_t* index_word = nullptr;             // its own _tls_index, holding the moved index from then on
+    size_t record_offset = 0;                   // &g_thread_tls_slots inside its TLS block: the block moves, the offset does not
+    std::atomic<bool> relocated{false};
+    std::atomic<bool> image_owns_index{false};  // a mapped image holds index 0 right now
+};
+HostTls& host_tls() {
+    static auto* state = new HostTls;
+    return *state;
+}
 
 // Frees every TLS helper clone this process loaded and deletes its files. load() registers the wrapper with atexit;
 // the --run path in main() must also call this directly before ExitProcess, which skips the atexit table. Call it
@@ -324,13 +376,17 @@ void release_thread_slot(size_t slot) {
     if (slot >= kMaxMappedTlsModules) return;
     ThreadTlsSlot& entry = g_thread_tls_slots[slot];
     if (!entry.module && !entry.block) return;
-    if (entry.block) {
-        void** slots = module_tls_slots();
-        if (slots && entry.index < kMaxModuleTlsSlots && slots[entry.index] == entry.block)
-            slots[entry.index] = entry.saved;
-        VirtualFree(entry.block, 0, MEM_RELEASE);
-    }
+    void* block = entry.block;
+    void* saved = entry.saved;
+    const uint32_t index = entry.index;
+    // The record is cleared before the block is freed: the record of the executable's own slot (relocate_host_tls)
+    // lives inside the block being freed, so a write through `entry` afterwards would touch released memory.
     entry = ThreadTlsSlot{};
+    if (block) {
+        void** slots = module_tls_slots();
+        if (slots && index < kMaxModuleTlsSlots && slots[index] == block) slots[index] = saved;
+        VirtualFree(block, 0, MEM_RELEASE);
+    }
 }
 
 // A block load() put into a thread that was already running (install_on_existing_threads). Such a thread has no
@@ -401,17 +457,39 @@ void install_thread_block(Module& m) {
 
     void* block = VirtualAlloc(nullptr, static_cast<SIZE_T>(total), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!block) throw std::runtime_error(m.name + ": TLS block allocation failed");
-    if (m.tls_raw_size) std::memcpy(block, m.tls_template, m.tls_raw_size);
+    if (m.tls_from_host_block) {
+        // The executable's own TLS: what that thread already has at index 0 (its magic-static epoch included), which the
+        // thread events read before index 0 is given to the image. A thread whose array has nothing there yet (it is
+        // created and this runs before the OS loader filled it) falls back to the template below.
+        void* existing = slots[kImageTlsIndex];
+        if (existing)
+            std::memcpy(block, existing, static_cast<size_t>(total));
+        else if (m.tls_raw_size)
+            std::memcpy(block, m.tls_template, m.tls_raw_size);
+    } else if (m.tls_raw_size) {
+        std::memcpy(block, m.tls_template, m.tls_raw_size);
+    }
     if (m.tls_zero_fill)
         std::memset(static_cast<uint8_t*>(block) + m.tls_raw_size, 0, m.tls_zero_fill);
 
     void* saved = slots[m.tls_index];
     slots[m.tls_index] = block;
-    entry.module = &m;
-    entry.generation = m.tls_generation;
-    entry.saved = saved;
-    entry.block = block;
-    entry.index = m.tls_index;
+    // The record goes in after the switch, through a pointer into the block just installed: for the executable's own
+    // TLS (tls_from_host_block) the slot written above is the index this process reads its own thread_local data
+    // through, so g_thread_tls_slots itself lives in that block. A record written before the switch would land in the
+    // block being replaced and be lost, leaving the new block in this thread's array with nothing that puts the
+    // helper's block back at thread exit (ntdll!LdrpFreeTls then frees it as if the loader had allocated it).
+    ThreadTlsSlot record;
+    record.module = &m;
+    record.generation = m.tls_generation;
+    record.saved = saved;
+    record.block = block;
+    record.index = m.tls_index;
+    if (m.tls_from_host_block) {
+        *reinterpret_cast<ThreadTlsSlot*>(static_cast<uint8_t*>(block) + host_tls().record_offset) = record;
+    } else {
+        g_thread_tls_slots[slot] = record;
+    }
 }
 
 void uninstall_thread_block(Module& m) {
@@ -610,9 +688,19 @@ void install_on_existing_threads(Module& m) {
                 }
             }
             if (present) continue;
+            // The executable's own TLS (m.tls_from_host_block) is that thread's live block at index 0, not the template:
+            // it carries the thread's magic-static epoch, and it is the only place that value exists.
+            void* host_block = nullptr;
+            if (m.tls_from_host_block) {
+                void** slots0 = nullptr;
+                if (!read_thread_slot(vector, kImageTlsIndex, slots0, host_block) || !host_block) continue;
+            }
             void* block = VirtualAlloc(nullptr, static_cast<SIZE_T>(total), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
             if (!block) continue;
-            if (m.tls_raw_size) std::memcpy(block, m.tls_template, m.tls_raw_size);
+            if (host_block)
+                std::memcpy(block, host_block, static_cast<size_t>(total));
+            else if (m.tls_raw_size)
+                std::memcpy(block, m.tls_template, m.tls_raw_size);
 
             // Write, then look at the thread's array pointer again: if Windows has replaced the array meanwhile, the
             // write went into the old one, and it is made again in the new one.
@@ -717,6 +805,16 @@ void release_existing_blocks_of_this_thread() {
 // only after the module's DLL_PROCESS_ATTACH (initialise()), as the Windows loader orders them.
 void __cdecl on_host_thread_event(DWORD reason) {
     SharedTlsLock lock;
+    // LEONIDA_TLS_AUDIT=1: every slot this thread holds before and after the events (see tls_audit_enabled).
+    const bool audit_on = tls_audit_enabled();
+    if (audit_on) {
+        void** array = module_tls_slots();
+        std::fprintf(stderr, "[audit] tid=%lu %s", static_cast<unsigned long>(GetCurrentThreadId()),
+                     reason == DLL_THREAD_ATTACH ? "attach" : "detach");
+        for (size_t i = 0; i < 8; ++i)
+            std::fprintf(stderr, " [%zu]=%p", i, array ? array[i] : nullptr);
+        std::fprintf(stderr, "\n");
+    }
     // The try/catch is per slot: a throw from one module's install or callbacks must not take the thread events
     // away from the other slots. Nothing may leave DllMain.
     if (reason == DLL_THREAD_ATTACH) {
@@ -762,6 +860,21 @@ void __cdecl on_host_thread_event(DWORD reason) {
                 release_thread_slot(i);  // installed by a module whose Loader is gone (or nothing to do)
             }
         }
+    }
+    if (audit_on) {
+        void** array = module_tls_slots();
+        std::fprintf(stderr, "[audit] tid=%lu %s done", static_cast<unsigned long>(GetCurrentThreadId()),
+                     reason == DLL_THREAD_ATTACH ? "attach" : "detach");
+        for (size_t i = 0; i < 8; ++i)
+            std::fprintf(stderr, " [%zu]=%p", i, array ? array[i] : nullptr);
+        for (size_t i = 0; i < 3; ++i) {
+            Module* owner = g_tls_slot_owners[i].load();
+            std::fprintf(stderr, " rec%zu={owner=%p module=%p gen=%llu block=%p index=%u}", i, static_cast<void*>(owner),
+                         static_cast<void*>(g_thread_tls_slots[i].module),
+                         static_cast<unsigned long long>(g_thread_tls_slots[i].generation),
+                         g_thread_tls_slots[i].block, g_thread_tls_slots[i].index);
+        }
+        std::fprintf(stderr, "\n");
     }
 }
 
@@ -881,6 +994,8 @@ const shims::BundledModuleOps kBundledOps{
 Loader::Loader(std::filesystem::path game_dir) : game_dir_(std::move(game_dir)) {
     shims::add_module_lookup(this, &lookup_in_loader);
     shims::add_bundled_loader(this, &kBundledOps);
+    // Before the first mapping: an image that reads its TLS at index 0 needs that index by the time its code runs.
+    relocate_host_tls();
 }
 
 Loader::~Loader() {
@@ -924,6 +1039,8 @@ Loader::~Loader() {
         if (m->function_table) RtlDeleteFunctionTable(static_cast<PRUNTIME_FUNCTION>(m->function_table));
         if (m->tls_block) VirtualFree(m->tls_block, 0, MEM_RELEASE);
         if (m->base) VirtualFree(m->base, 0, MEM_RELEASE);
+        // Index 0 is free again for the next image. The executable's own TLS stays where relocate_host_tls put it.
+        if (m->tls_index == kImageTlsIndex) host_tls().image_owns_index.store(false);
         delete m;
     }
 }
@@ -1246,6 +1363,171 @@ Module& Loader::map_image(const std::filesystem::path& path) {
     return *m;
 }
 
+// A mapped image reads its static TLS at the module index its own code was compiled with, and the console build of the
+// game hard-codes that index as 0: 14,680 `mov reg, gs:[58h]` sites in game_scarlett_master.exe take the array slot at
+// offset 0, most of them without loading any index first. That is what the image saw on the console, where it is the
+// first module in the process. On Windows this executable holds index 0 for the same reason, so the image can only have
+// it if the executable's own block moves out of the way. Every access this executable makes goes through the module
+// index stored in its own _tls_index (measured: 52 TLS accesses in gta6rt.exe load that word with `mov e<reg>,
+// [rip+_tls_index]`, and the byte scan finds no access with a constant index), so rewriting that one word moves the
+// whole executable. Each thread's block is copied, because it carries that thread's magic-static epoch: a copy of the
+// template would restart the epoch and re-initialise functions that are already constructed.
+//
+// Reached only with LEONIDA_GUEST_TLS_SLOT0 set. Without it nothing here changes: the executable keeps index 0 and a
+// mapped image gets the helper's reserved index, as before.
+//
+// The move is permanent for the process, which is why its state lives in host_tls() and not in the Loader. Every thread
+// reads the same _tls_index word and keeps its own loader bookkeeping (g_thread_tls_slots) at that index, so moving the
+// word back on Loader destruction would leave the records of threads that are still running in a block nothing reads
+// any more. The block they had installed would then stay in their TLS array, and ntdll frees every non-null slot it
+// finds there at thread exit (`ntdll!LdrpFreeTls`: it treats the value as a heap allocation and reads its header at
+// -8), so it would fault on the loader's own allocation - measured, before this became process-wide.
+void Loader::relocate_host_tls() {
+    if (!guest_tls_slot0_requested()) return;
+    HostTls& state = host_tls();
+    if (state.relocated.load(std::memory_order_acquire)) return;  // a previous Loader in this process did it
+    Module host;
+    host.name = "the executable";
+    host.base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    if (!host.base) return;
+    host.size = at<IMAGE_NT_HEADERS64>(host.base, reinterpret_cast<IMAGE_DOS_HEADER*>(host.base)->e_lfanew)
+                    ->OptionalHeader.SizeOfImage;
+
+    size_t total = 0;
+    uint32_t* index_word = nullptr;
+    const uint8_t* template_bytes = nullptr;
+    try {
+        auto* tls = tls_directory(host);
+        if (!tls || !tls->AddressOfIndex) {
+            std::fprintf(stderr,
+                         "[rt] loader: LEONIDA_GUEST_TLS_SLOT0: the executable has no static TLS of its own; the image "
+                         "keeps a reserved module TLS index\n");
+            return;
+        }
+        if (tls->EndAddressOfRawData < tls->StartAddressOfRawData)
+            throw std::runtime_error("the executable: TLS template end precedes its start");
+        const uint64_t raw = tls->EndAddressOfRawData - tls->StartAddressOfRawData;
+        total = static_cast<size_t>(raw + tls->SizeOfZeroFill);
+        if (!total || total > 0xFFFFFFFFull) {
+            std::fprintf(stderr,
+                         "[rt] loader: LEONIDA_GUEST_TLS_SLOT0: the executable's TLS block is %zu bytes; the image keeps "
+                         "a reserved module TLS index\n",
+                         total);
+            return;
+        }
+        if (raw) {
+            const uint32_t raw_rva =
+                static_cast<uint32_t>(rva_in(host, tls->StartAddressOfRawData, "the TLS template"));
+            require_range(host.name, raw_rva, raw, host.size, "the TLS template");
+            template_bytes = host.base + raw_rva;
+        }
+        const uint32_t index_rva = static_cast<uint32_t>(rva_in(host, tls->AddressOfIndex, "the TLS index"));
+        require_range(host.name, index_rva, sizeof(uint32_t), host.size, "the TLS index");
+        index_word = reinterpret_cast<uint32_t*>(host.base + index_rva);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[rt] loader: %s\n", e.what());
+        return;
+    }
+    if (*index_word != kImageTlsIndex) {
+        std::fprintf(stderr,
+                     "[rt] loader: LEONIDA_GUEST_TLS_SLOT0: the executable holds module TLS index %u, not %u; the image "
+                     "keeps a reserved module TLS index\n",
+                     *index_word, kImageTlsIndex);
+        return;
+    }
+    void** slots = module_tls_slots();
+    if (!slots || !slots[kImageTlsIndex]) {
+        std::fprintf(stderr,
+                     "[rt] loader: LEONIDA_GUEST_TLS_SLOT0: this thread has no block at module TLS index %u; the image "
+                     "keeps a reserved module TLS index\n",
+                     kImageTlsIndex);
+        return;
+    }
+
+    void* block = nullptr;
+    void* clone_block = nullptr;
+    DWORD moved_index = TLS_OUT_OF_INDEXES;
+    {
+        std::lock_guard alloc_lock(g_tls_alloc_mutex);
+        // The primary helper (slot 0) is the one whose DllMain delivers the thread events, so it is the index the
+        // executable takes: every thread then gets its copy through the same events a mapped image uses.
+        moved_index = ensure_tls_host(0).index;
+        if (moved_index == TLS_OUT_OF_INDEXES) {
+            std::fprintf(stderr,
+                         "[rt] loader: LEONIDA_GUEST_TLS_SLOT0: gta6rt_tls_host.dll is missing or has no module TLS "
+                         "index; the image keeps a reserved module TLS index\n");
+            return;
+        }
+        if (moved_index == kImageTlsIndex) {
+            std::fprintf(stderr,
+                         "[rt] loader: LEONIDA_GUEST_TLS_SLOT0: the TLS helper itself got index %u, so there is nowhere "
+                         "to move the executable's block to; the image keeps a reserved module TLS index\n",
+                         kImageTlsIndex);
+            return;
+        }
+        block = VirtualAlloc(nullptr, total, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!block) {
+            std::fprintf(stderr,
+                         "[rt] loader: LEONIDA_GUEST_TLS_SLOT0: cannot allocate the %zu-byte copy of the executable's "
+                         "TLS block; the image keeps a reserved module TLS index\n",
+                         total);
+            return;
+        }
+        std::memcpy(block, slots[kImageTlsIndex], total);
+        {
+            ExclusiveTlsLock lock;
+            Module* expected = nullptr;
+            if (!g_tls_slot_owners[0].compare_exchange_strong(expected, &state.module)) {
+                VirtualFree(block, 0, MEM_RELEASE);
+                std::fprintf(stderr,
+                             "[rt] loader: LEONIDA_GUEST_TLS_SLOT0: the executable's TLS slot is already claimed; the "
+                             "image keeps a reserved module TLS index\n");
+                return;
+            }
+            state.module = host;
+            state.module.tls_slot = 0;
+            state.module.tls_generation = g_next_tls_generation.fetch_add(1, std::memory_order_relaxed);
+            g_tls_slot_generations[0].store(state.module.tls_generation);
+            state.module.tls_index = moved_index;
+            // One raw region and no zero fill: the helper copies the whole live block, not part of a template.
+            state.module.tls_raw_size = static_cast<uint32_t>(total);
+            state.module.tls_zero_fill = 0;
+            state.module.tls_block_size = static_cast<uint32_t>(total);
+            state.module.tls_template = template_bytes;
+            state.module.tls_from_host_block = true;
+            clone_block = slots[moved_index];
+            slots[moved_index] = block;
+            state.module.tls_block = block;
+            state.module.tls_saved_block = clone_block;
+            state.index_word = index_word;
+            // The switch happens here, under the same lock that published the owner: a thread that starts after this
+            // point takes this slot as its own TLS index, so its attach event records the copy it installs in the copy
+            // itself. A thread that starts before it cannot see the owner yet and gets its copy from
+            // install_on_existing_threads below, which needs no record in the block.
+            state.record_offset = reinterpret_cast<uintptr_t>(&g_thread_tls_slots) -
+                                  reinterpret_cast<uintptr_t>(slots[kImageTlsIndex]);
+            *index_word = moved_index;
+            ThreadTlsSlot record;
+            record.module = &state.module;
+            record.generation = state.module.tls_generation;
+            record.saved = clone_block;
+            record.block = block;
+            record.index = moved_index;
+            *reinterpret_cast<ThreadTlsSlot*>(static_cast<uint8_t*>(block) + state.record_offset) = record;
+            state.relocated.store(true, std::memory_order_release);
+        }
+    }
+    // Threads that already exist get their copy before the executable starts reading it. The record of such a block is
+    // kept for the process lifetime (host_tls() is never reset), so a thread that exits later still finds it and puts
+    // the helper's block back: ntdll frees every block it finds in a thread's TLS array at thread exit and would fault
+    // on one of ours.
+    install_on_existing_threads(state.module);
+    std::fprintf(stderr,
+                 "[rt] loader: LEONIDA_GUEST_TLS_SLOT0: the executable's own static TLS (%zu bytes) now lives at module "
+                 "index %lu; the first mapped image with a TLS directory takes index %u\n",
+                 total, static_cast<unsigned long>(moved_index), kImageTlsIndex);
+}
+
 // Static TLS for the thread that calls load(). The PE TLS directory only carries the template (Start..End) and the
 // zero-fill size; it has no field naming the TLS block. The Windows loader allocates a block per module per thread and
 // puts it in TEB->ThreadLocalStoragePointer[module index], which is what __declspec(thread) code reads via _tls_index.
@@ -1290,12 +1572,31 @@ void Loader::initialize_tls(Module& m) {
             throw std::runtime_error(m.name + ": all " + std::to_string(kMaxMappedTlsModules) +
                                      " manually mapped static TLS slots are in use");
 
-        // Load/clone gta6rt_tls_host.dll OUTSIDE ExclusiveTlsLock so LoadLibraryExW cannot deadlock with
-        // on_host_thread_event (which runs under the Windows loader lock and takes SharedTlsLock).
-        index = ensure_tls_host(slot).index;
-        if (index == TLS_OUT_OF_INDEXES)
-            throw std::runtime_error(m.name + ": gta6rt_tls_host.dll is missing or has no module TLS index");
-        if (index >= kMaxModuleTlsSlots) throw std::runtime_error(m.name + ": reserved TLS index is out of range");
+        if (host_tls().relocated.load(std::memory_order_acquire) && guest_tls_slot0_pins_image() &&
+            !host_tls().image_owns_index.exchange(true)) {
+            // relocate_host_tls() moved the executable's own TLS off index 0, so the image's code can read its data at
+            // the index it was compiled with. No helper is reserved for this slot: the primary one is loaded already
+            // and its DllMain delivers the thread events this module needs. The image's block has to fit in the
+            // executable's own block (tls_reserve.cpp): a thread the loader cannot reach keeps reading index 0 through
+            // the executable's array, and an image block larger than it would run past that allocation.
+            if (total > host_tls().module.tls_block_size) {
+                host_tls().image_owns_index.store(false);
+                std::fprintf(stderr,
+                             "[rt] loader: %s: TLS block is %zu bytes and the executable's is %u, so the image keeps a "
+                             "reserved module TLS index instead of index 0\n",
+                             m.name.c_str(), static_cast<size_t>(total), host_tls().module.tls_block_size);
+            } else {
+                index = kImageTlsIndex;
+            }
+        }
+        if (index == TLS_OUT_OF_INDEXES) {
+            // Load/clone gta6rt_tls_host.dll OUTSIDE ExclusiveTlsLock so LoadLibraryExW cannot deadlock with
+            // on_host_thread_event (which runs under the Windows loader lock and takes SharedTlsLock).
+            index = ensure_tls_host(slot).index;
+            if (index == TLS_OUT_OF_INDEXES)
+                throw std::runtime_error(m.name + ": gta6rt_tls_host.dll is missing or has no module TLS index");
+            if (index >= kMaxModuleTlsSlots) throw std::runtime_error(m.name + ": reserved TLS index is out of range");
+        }
 
         // The fields are complete before a thread event can see the owner.
         ExclusiveTlsLock lock;

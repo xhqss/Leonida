@@ -13,6 +13,13 @@
 
 __declspec(thread) unsigned char g_tls_host_anchor = 0;
 
+// With LEONIDA_GUEST_TLS_SLOT0=1 the loader moves the host executable's own static TLS to this module's index
+// (pe_loader.cpp, Loader::relocate_host_tls). Every thread then reads that executable's variables through a block at
+// this index: the copy the loader installs, or - for a thread whose TLS array the loader could not reach - this
+// module's own block. The reserve makes this module's block larger than the executable's (its own TLS plus
+// tls_reserve.cpp there), so those reads stay inside an allocation instead of running past the end of a 500-byte block.
+__declspec(thread) unsigned char g_tls_host_reserve[16384] = {1};
+
 namespace {
 
 using ThreadEventFn = void(__cdecl*)(DWORD reason);

@@ -104,6 +104,10 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_executable(gta6rt
     src/main.cpp
     src/pe_loader.cpp
+    # The executable's own static TLS reserve: with LEONIDA_GUEST_TLS_SLOT0=1 the loader gives index 0 to the mapped
+    # image and keeps the executable's TLS at a helper's index, and this reserve keeps those blocks large enough for
+    # both (the file's comment and Loader::relocate_host_tls in pe_loader.cpp explain the sizes).
+    src/tls_reserve.cpp
     shims/registry.cpp
     shims/file_system.cpp
     shims/winhttp_offline.cpp
