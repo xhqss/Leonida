@@ -2542,9 +2542,26 @@ HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SI
     const auto forward = reinterpret_cast<Fn>(self->real_vtable[41]);
     bool console = false;
     if (desc && desc->pArgumentDescs)
-        for (UINT i = 0; i < desc->NumArgumentDescs && !console; ++i)
-            console = argument_type(desc->pArgumentDescs[i]) == kXboxIndirectArgumentDispatch105;
-    if (!console) return forward(self->real, desc, root_signature, riid, out);
+        for (UINT i = 0; i < desc->NumArgumentDescs && !console; ++i) {
+            const std::uint32_t type = argument_type(desc->pArgumentDescs[i]);
+            console = type == kXboxIndirectArgumentDispatch105 ||
+                      type == static_cast<std::uint32_t>(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH);
+        }
+    if (!console) {
+        const HRESULT hr = forward(self->real, desc, root_signature, riid, out);
+        static std::atomic<unsigned> forwarded{0};
+        const unsigned n = forwarded.fetch_add(1, std::memory_order_relaxed);
+        if (n < 8 || FAILED(hr)) {
+            const unsigned type = desc && desc->pArgumentDescs && desc->NumArgumentDescs
+                                      ? argument_type(desc->pArgumentDescs[0]) : 0u;
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 41 forwarded call %u: %u argument(s), first type %u, stride %u, "
+                         "hr=0x%08x\n",
+                         n, desc ? desc->NumArgumentDescs : 0u, type, desc ? desc->ByteStride : 0u,
+                         static_cast<unsigned>(hr));
+        }
+        return hr;
+    }
 
     std::unique_ptr<D3D12_INDIRECT_ARGUMENT_DESC[]> args(new (std::nothrow)
                                                              D3D12_INDIRECT_ARGUMENT_DESC[desc->NumArgumentDescs]);
@@ -2554,7 +2571,12 @@ HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SI
     }
     for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
         args[i] = desc->pArgumentDescs[i];
-        if (argument_type(args[i]) == kXboxIndirectArgumentDispatch105)
+        const std::uint32_t type = argument_type(args[i]);
+        // Type 105 is the console's own dispatch and DISPATCH_MESH is a mesh dispatch; the host backend models neither,
+        // and both carry D3D12_DISPATCH_ARGUMENTS (12 bytes), so both are created as a compute dispatch. A mesh
+        // pipeline still cannot run without mesh shader support; this keeps the signature and the boot's shape.
+        if (type == kXboxIndirectArgumentDispatch105 ||
+            type == static_cast<std::uint32_t>(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH))
             args[i].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
     }
     static std::atomic<bool> logged{false};
@@ -2563,7 +2585,13 @@ HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SI
                      desc->ByteStride);
     D3D12_COMMAND_SIGNATURE_DESC pc = *desc;
     pc.pArgumentDescs = args.get();
-    return forward(self->real, &pc, root_signature, riid, out);
+    const HRESULT hr = forward(self->real, &pc, root_signature, riid, out);
+    static std::atomic<unsigned> calls{0};
+    const unsigned n = calls.fetch_add(1, std::memory_order_relaxed);
+    if (n < 8 || FAILED(hr))
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 41 call %u: %u argument(s), stride %u, hr=0x%08x\n", n,
+                     desc->NumArgumentDescs, desc->ByteStride, static_cast<unsigned>(hr));
+    return hr;
 }
 
 // The Xbox slot 61 is CreateSamplerX(desc, dest): a sampler written to a CPU descriptor handle, with the PC
@@ -3104,6 +3132,12 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             reinterpret_cast<void**>(a6)));
     } else if constexpr (Slot == kCreateCommittedResource3X) {
         return hr_to_u64(proxy_create_committed_resource3_x(self, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10));
+    } else if constexpr (Slot == 74) {
+        // PR #7323: a console call with no PC counterpart. The PC slot 74 is ShaderCacheControl(kinds, control), which
+        // reads the first word as flags and refuses with E_INVALIDARG; nothing is written here and the PC device is not
+        // called. The measured boot asks it once and treats a failure as fatal.
+        note_slot(74);
+        return hr_to_u64(S_OK);
     } else {
         note_slot(Slot);
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
@@ -3415,7 +3449,8 @@ bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 14 || (slot >= 17 && slot <= 24) ||
         slot == 25 || slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 || slot == 36 ||
         slot == 41 || slot == 45 || slot == 46 || slot == 50 || slot == 56 || slot == 61 || slot == 62 ||
-        slot == 67 || slot == 70 || slot == 75 || slot == 76 || slot == 133 || slot == kCreateCommittedResource3X)
+        slot == 67 || slot == 70 || slot == 74 || slot == 75 || slot == 76 || slot == 133 ||
+        slot == kCreateCommittedResource3X)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||

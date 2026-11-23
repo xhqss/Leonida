@@ -439,6 +439,32 @@ using namespace rt::process;
 #define COMMAND_LINE(dll) \
     {dll, "GetCommandLineA", reinterpret_cast<void*>(&game_get_command_line_a)}, \
     {dll, "GetCommandLineW", reinterpret_cast<void*>(&game_get_command_line_w)}
+// The title registers its window class through user32 (its API-set import), and the retail boot treats a zero
+// ATOM as fatal. user32 is the host's own, so this forwards and names the error once instead of guessing.
+ATOM WINAPI register_class_ex_a(const WNDCLASSEXA* wc) {
+    using Fn = ATOM(WINAPI*)(const WNDCLASSEXA*);
+    static const Fn real = [] {
+        const HMODULE user32 = LoadLibraryExA("user32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        return user32 ? reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(user32, "RegisterClassExA")))
+                      : nullptr;
+    }();
+    SetLastError(0);
+    const ATOM atom = real ? real(wc) : static_cast<ATOM>(0);
+    if (!atom) {
+        const DWORD error = GetLastError();
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                         "[rt] user32: RegisterClassExA(\"%s\") failed: error %lu, wndproc %p, instance %p, style "
+                         "0x%x\n",
+                         wc && wc->lpszClassName ? wc->lpszClassName : "(null)",
+                         static_cast<unsigned long>(error), wc ? reinterpret_cast<void*>(wc->lpfnWndProc) : nullptr,
+                         wc ? reinterpret_cast<void*>(wc->hInstance) : nullptr,
+                         wc ? static_cast<unsigned>(wc->style) : 0u);
+    }
+    return atom;
+}
+
 }  // namespace
 
 SHIM_TABLE(process,
@@ -460,4 +486,8 @@ SHIM_TABLE(process,
     COMMAND_LINE("kernel32.dll"),
     COMMAND_LINE("kernelbase.dll"),
     COMMAND_LINE("api-ms-win-core-processenvironment-l1-1-0.dll"),
+    // The window class the title registers; a failure would otherwise be a bare zero ATOM.
+    {"user32.dll", "RegisterClassExA", reinterpret_cast<void*>(&register_class_ex_a)},
+    {"ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll", "RegisterClassExA",
+     reinterpret_cast<void*>(&register_class_ex_a)},
 );
