@@ -334,8 +334,10 @@ int main() {
         EXPECT(presenter->enable_capture());
 
         leonida::ManualFrameClock clock;
-        auto owner = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), &clock);
+        auto owner = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), &clock,
+                                                                   rt::d3d12_xs::device_frame_tokens(device.p));
         rt::d3d12::XboxPresentation& xbox = *owner;
+        EXPECT(xbox.pacer().token_source() == rt::d3d12_xs::device_frame_tokens(device.p));
 
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;
@@ -593,6 +595,22 @@ int main() {
         EXPECT(grab(frame));
         EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
         EXPECT(xbox.presents() == presented_before + 3);
+
+        using DeviceWaitFrameEventFn = HRESULT(WINAPI*)(void*, UINT, UINT, void*, UINT, std::uint64_t*);
+        const auto device_wait =
+            reinterpret_cast<DeviceWaitFrameEventFn>((*reinterpret_cast<void***>(device.p))[80]);
+        std::uint64_t device_token = 0;
+        EXPECT(device_wait(device.p, rt::d3d12::xbox_frame_event_origin, 0, nullptr, 0, &device_token) == S_OK);
+        EXPECT(device_token != 0 && device_token == xbox.pacer().tokens_issued());
+        plane = plane_of(second, device_token + 1);
+        EXPECT(xbox.PresentX(1, &plane, nullptr) == E_INVALIDARG);
+        EXPECT(xbox.presents() == presented_before + 3);
+        plane = plane_of(rgba, device_token);
+        EXPECT(xbox.PresentX(1, &plane, nullptr) == S_OK);
+        EXPECT(xbox.presents() == presented_before + 4);
+        EXPECT(grab(frame));
+        EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
+        std::printf("a token from device slot 80 (WaitFrameEventX) presents: ok\n");
 
         // Sources the GPU cannot blit are refused with DXGI_ERROR_UNSUPPORTED and present nothing: multisampled,
         // integer and block-compressed. The last frame stays on screen and the token is still usable afterwards.

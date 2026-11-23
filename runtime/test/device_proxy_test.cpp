@@ -26,6 +26,7 @@
 #include "d3d12_xs_desc_clean.h"
 #include "d3d12_xs_device.h"
 #include "shims.h"
+#include "../src/frame_pacer.h"
 
 namespace {
 
@@ -416,6 +417,10 @@ int main(int argc, char** argv) {
         check(hr == S_OK && token2 != 0 && token2 != token, "slot 80 returns a fresh token on the next wait");
         hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, 0, nullptr, 0, nullptr);
         check(hr == E_POINTER, "slot 80 refuses a null token with E_POINTER");
+        const auto tokens = rt::d3d12_xs::device_frame_tokens(device.Get());
+        check(tokens && tokens->issued() == token2 && token2 == token + 1,
+              "slot 80 tokens come from the device's frame token source");
+        check(!rt::d3d12_xs::device_frame_tokens(nullptr), "a non-proxy has no frame token source");
         check(rt::d3d12_xs::device_slot_hits(78) == 1 && rt::d3d12_xs::device_slot_hits(79) == 1 &&
                   rt::d3d12_xs::device_slot_hits(80) == 3,
               "slots 78/79/80 hit counters are 1/1/3");

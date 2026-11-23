@@ -26,10 +26,11 @@ void log_once(bool& done, const char* text) {
 
 }  // namespace
 
-XboxPresentation::XboxPresentation(std::unique_ptr<WindowPresenter> presenter, leonida::FrameClock* clock)
+XboxPresentation::XboxPresentation(std::unique_ptr<WindowPresenter> presenter, leonida::FrameClock* clock,
+                                   std::shared_ptr<leonida::FrameTokenSource> tokens)
     : presenter_(std::move(presenter)),
       own_clock_(clock ? nullptr : std::make_unique<leonida::SteadyFrameClock>()),
-      pacer_(clock ? *clock : *own_clock_) {
+      pacer_(clock ? *clock : *own_clock_, std::move(tokens)) {
     // A present waiting for a swapchain image gives up once SuspendX has been called.
     presenter_->set_abort([this] { return pacer_.suspended(); });
     // LEONIDA_SDR_EOTF=gamma22 (or 2.2, any case) decodes SDR with a pure power of 2.2 instead of piecewise sRGB; "srgb" or

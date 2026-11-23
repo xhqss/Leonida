@@ -27,6 +27,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_alloc_size.h"
 #include "d3d12_xs_desc_clean.h"
+#include "../src/frame_pacer.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -102,7 +103,7 @@ struct DeviceProxy {
     std::atomic<std::uint32_t> frame_interval_us{0};
     std::atomic<std::uint32_t> frame_latency{1};
     std::atomic<bool> frame_event_scheduled{false};
-    std::atomic<std::uint64_t> frame_next_token{1};
+    std::shared_ptr<leonida::FrameTokenSource> frame_tokens = std::make_shared<leonida::FrameTokenSource>();
 };
 
 // Freed in proxy_release; defined where the states are complete.
@@ -1384,7 +1385,11 @@ PresentState* present_state_for(DeviceProxy* device) {
         std::fprintf(stderr, "[rt] d3d12_xs: no window presenter on this device; PresentX is a no-op\n");
         return state;
     }
-    state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter));
+    // The device's frame events issue the tokens a title hands to PresentX, so the presentation's pacer must number
+    // from the same source: with a counter of its own it refused every token the device had issued (E_INVALIDARG on
+    // every present, and a white window that never received a frame).
+    state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), nullptr,
+                                                                device_frame_tokens(device));
     std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (window %p)\n", static_cast<void*>(state->window));
     return state;
 }
@@ -2308,9 +2313,7 @@ HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::ui
     (void)flags;
     auto* token = reinterpret_cast<std::uint64_t*>(token_word);
     if (!token) return E_POINTER;
-    std::uint64_t value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);
-    if (value == 0) value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);  // skip the null token
-    *token = value;
+    *token = self->frame_tokens->issue();
     return S_OK;
 }
 
@@ -3853,6 +3856,11 @@ unsigned device_proxy_slot_count(const void* device) {
 ID3D12Device* device_proxy_real_device(const void* device) {
     if (!is_device_proxy(device)) return nullptr;
     return static_cast<const DeviceProxy*>(device)->real;
+}
+
+std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* device) {
+    if (!is_device_proxy(device)) return nullptr;
+    return static_cast<const DeviceProxy*>(device)->frame_tokens;
 }
 
 bool device_slot_overridden(unsigned slot) {

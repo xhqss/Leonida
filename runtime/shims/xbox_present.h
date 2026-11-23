@@ -92,7 +92,8 @@ class XboxPresentation {
 public:
     // `clock` null: real time (a steady high-resolution timer). Tests pass a leonida::ManualFrameClock, which must
     // outlive this object. `presenter` is what create_window_presenter returned.
-    explicit XboxPresentation(std::unique_ptr<WindowPresenter> presenter, leonida::FrameClock* clock = nullptr);
+    explicit XboxPresentation(std::unique_ptr<WindowPresenter> presenter, leonida::FrameClock* clock = nullptr,
+                              std::shared_ptr<leonida::FrameTokenSource> tokens = nullptr);
     ~XboxPresentation();
     XboxPresentation(const XboxPresentation&) = delete;
     XboxPresentation& operator=(const XboxPresentation&) = delete;

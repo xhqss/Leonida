@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <future>
 #include <limits>
+#include <memory>
 #include <thread>
 
 using namespace leonida;
@@ -84,6 +85,24 @@ int main() {
         r = second.get();
         EXPECT(r.hr == pacer_hr::ok && r.token == 2);
         EXPECT(pacer.tokens_issued() == 2);
+    }
+
+    {
+        ManualFrameClock clock;
+        auto tokens = std::make_shared<FrameTokenSource>();
+        FramePacer pacer(clock, tokens);
+        EXPECT(pacer.token_source() == tokens);
+        const std::uint64_t outside = tokens->issue();
+        EXPECT(outside == 1 && pacer.tokens_issued() == 1);
+        EXPECT(pacer.check_present_token(outside) == pacer_hr::ok);
+        EXPECT(pacer.check_present_token(outside + 1) == pacer_hr::invalid_arg);
+        EXPECT(setup(pacer, 1));
+        clock.advance_us(period);
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok && token == outside + 1);
+        EXPECT(tokens->issue() == outside + 2);
+        EXPECT(pacer.check_present_token(outside + 2) == pacer_hr::ok);
+        EXPECT(pacer.check_present_token(outside + 3) == pacer_hr::invalid_arg);
     }
 
     // An offset delays the event inside the period: origin n comes at n * period + offset.
