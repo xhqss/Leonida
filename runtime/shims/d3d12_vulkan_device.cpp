@@ -2949,6 +2949,7 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
     const auto round_up = [](std::size_t v, std::size_t a) { return (v + a - 1) / a * a; };
     std::uint64_t seen = 0;
     std::size_t at = 0;
+    const bool trace_stream = std::getenv("LEONIDA_TRACE_PSO") != nullptr;
     while (at < size) {
         D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
         if (size - at < sizeof(type)) return E_INVALIDARG;
@@ -2965,9 +2966,11 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
         if (unsigned(type) >= 64 || (seen >> unsigned(family) & 1)) return E_INVALIDARG;
         seen |= std::uint64_t(1) << unsigned(family);
         bool ok = true;
+        std::size_t payload_start = 0;  // for LEONIDA_TRACE_PSO
         const auto take = [&](auto& value) {
             using T = std::remove_reference_t<decltype(value)>;
             const std::size_t payload = round_up(at + sizeof(type), alignof(T));
+            payload_start = payload;
             if (payload > size || size - payload < sizeof(T)) {
                 ok = false;
                 return;
@@ -3095,10 +3098,67 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
             return E_INVALIDARG;
         }
         if (!ok) return E_INVALIDARG;
+        // LEONIDA_TRACE_PSO: the walk this layer took, to compare against the console's own bytes (the device proxy
+        // dumps them when the PC device refuses a stream). The retail title's stream does not decode: see
+        // docs/retail_boot_chain.md.
+        if (trace_stream)
+            std::fprintf(stderr, "[rt] d3d12: pso stream subobject %d at %zu, next %zu of %zu\n", int(type),
+                         payload_start, at, size);
     }
     if (out.has_cs && out.has_graphics_stage) return E_INVALIDARG;  // a compute stage with graphics stages
     if (!out.has_cs && !out.has_graphics_stage) return E_INVALIDARG;
     return S_OK;
+}
+
+// LEONIDA_DUMP_SHADERS=<dir>: write the program of a shader this layer has no translation for, named by its SHA-256,
+// beside a note of the stage and the pipeline shape that asked for it. The file is an FSSM (or FSPX kind-6) program as
+// the corpus holds them, so it goes straight into the carve/translate tools (tools/shader_carve.py,
+// tools/fssm_unpack.py, tools/rdna2spirv.py). A VS must match the input layout it is used with, so the note records the
+// layout and shape the pipeline asked for, to see whether a variant the corpus already has fits.
+void dump_untranslated_shader(const char* stage, const std::string& hash, const std::vector<std::uint8_t>& program,
+                              const D3D12_GRAPHICS_PIPELINE_STATE_DESC* graphics) {
+    char dir[1024] = {};
+    size_t length = 0;
+    if (getenv_s(&length, dir, sizeof dir, "LEONIDA_DUMP_SHADERS") != 0 || length <= 1) return;
+    CreateDirectoryA(dir, nullptr);  // an existing directory is what is wanted
+    const std::string base = std::string(dir) + "\\" + stage + "-" + hash.substr(0, 16);
+    std::ofstream out(base + ".fssm", std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(program.data()), static_cast<std::streamsize>(program.size()));
+    out.close();
+    if (!out) {
+        std::fprintf(stderr, "[rt] d3d12: could not write %s.fssm\n", base.c_str());
+        return;
+    }
+    std::ofstream note(base + ".txt", std::ios::trunc);
+    note << "stage " << stage << "\nfssm sha256 " << hash << "\nbytes " << program.size() << "\n";
+    if (graphics) {
+        note << "input layout elements " << graphics->InputLayout.NumElements << "\n";
+        for (UINT i = 0; i < graphics->InputLayout.NumElements; ++i) {
+            const D3D12_INPUT_ELEMENT_DESC& e = graphics->InputLayout.pInputElementDescs[i];
+            note << "  " << (e.SemanticName ? e.SemanticName : "?") << e.SemanticIndex << " format " << e.Format
+                 << " slot " << e.InputSlot << " offset " << e.AlignedByteOffset << "\n";
+        }
+        note << "render targets " << graphics->NumRenderTargets << " format0 " << graphics->RTVFormats[0] << " dsv "
+             << graphics->DSVFormat << " samples " << graphics->SampleDesc.Count << " topology type "
+             << unsigned(graphics->PrimitiveTopologyType) << "\n";
+    }
+    std::fprintf(stderr, "[rt] d3d12: wrote the untranslated %s program to %s.fssm\n", stage, base.c_str());
+}
+
+// A pipeline state stream as four-byte words with their offsets. The retail title's stream decodes to a primitive
+// topology this layer has no equivalent for (docs/retail_boot_chain.md), and the console's own layout can only be read
+// off its bytes: the layer then knows which subobject carries the value. Once per process, at most 2 KiB.
+void dump_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc) {
+    const auto* bytes = static_cast<const std::uint8_t*>(desc.pPipelineStateSubobjectStream);
+    std::fprintf(stderr, "[rt] d3d12: pipeline state stream %zu B, as four-byte words:",
+                 static_cast<std::size_t>(desc.SizeInBytes));
+    const std::size_t shown = desc.SizeInBytes < 2048 ? static_cast<std::size_t>(desc.SizeInBytes) : 2048;
+    for (std::size_t at = 0; at + 4 <= shown; at += 4) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, bytes + at, sizeof word);
+        std::fprintf(stderr, "%s%04zx:%08x", at % 64 == 0 ? "\n[rt]   " : " ", at, word);
+    }
+    std::fprintf(stderr, "\n");
 }
 
 class PipelineState final
@@ -3313,6 +3373,7 @@ public:
             });
             if (!stage.entry) {
                 std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
+                dump_untranslated_shader(stage.name, hash, stage.fssm, &desc);
                 return E_INVALIDARG;
             }
             if (stage.entry->binding_count) {
@@ -3503,6 +3564,15 @@ public:
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE: assembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE: assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
         default:
+            if (unsigned(desc.PrimitiveTopologyType) > unsigned(D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH)) {
+                // The console's topology enum goes past the PC one: the retail boot's blit PSO
+                // (VS_Blit_6e5520d1_Wrapped with PS_BlitColour_6e5520d1_Wrapped, one RGBA8 target, no depth state)
+                // asks for 19. The console draws rectangle lists as two triangles (docs/d3d12_xs_console_abi.md §10),
+                // so a value above PATCH is built as a triangle list.
+                log_once("console primitive topology type built as a triangle list:", desc.PrimitiveTopologyType);
+                assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+                break;
+            }
             log_once("primitive topology type not supported:", desc.PrimitiveTopologyType);
             return E_INVALIDARG;
         }
@@ -3791,6 +3861,9 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: no translated compute shader for %s sha256 %s\n",
                              fspx ? (program.state.empty() ? "FSPX kind-6" : "FSPX kind-6 and kind-0") : "FSSM",
                              leonida::sha256_hex(program.bytes).c_str());
+            // An FSPX program is keyed by its kind-6 and kind-0 parts: the dump holds the program the corpus would
+            // hold, and the note says which stage looked for it.
+            dump_untranslated_shader("cs", leonida::sha256_hex(program.bytes), program.bytes, nullptr);
             return E_INVALIDARG;
         }
         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
@@ -5967,6 +6040,13 @@ public:
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
         PipelineStream stream;
         if (const HRESULT hr = parse_pipeline_stream(*desc, stream); FAILED(hr)) return d3d12_trace::result(method, hr);
+        // A primitive topology this layer has no Vulkan equivalent for: print the console's own bytes, the only place
+        // its layout can be read from. One dump per process.
+        if (!stream.has_cs &&
+            unsigned(stream.graphics.PrimitiveTopologyType) > unsigned(D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH)) {
+            static std::atomic<bool> dumped{false};
+            if (!dumped.exchange(true, std::memory_order_relaxed)) dump_pipeline_stream(*desc);
+        }
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)

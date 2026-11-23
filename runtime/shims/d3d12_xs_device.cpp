@@ -3156,6 +3156,8 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
 
 
 // Xbox slot 86: CreatePipelineState(desc, riid, out), forwarded to PC ID3D12Device2::CreatePipelineState (PC slot 47).
+// The stream is not re-encoded: the console's layout is close enough to the PC one that the layer parses it, and where
+// the two differ the parse is what reports it (d3d12_vulkan_device.cpp, parse_pipeline_stream, dumps the stream).
 HRESULT proxy_create_pipeline_state(DeviceProxy* self, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, const IID* riid,
                                     void** out) {
     note_slot(86);

@@ -244,6 +244,20 @@ struct Section {
     ~Section() { CloseHandle(handle); }
 };
 
+// gta6rt --trace FILE: where every page-function call landed, and whether it worked. The attribute log above records
+// what the title asked for; this records the region the loader gave it, which is what matches a faulting address (the
+// startup trace's "region" field) to a window. Called from the public entry points below.
+void note_region(const char* api, const void* address, uint64_t size_or_pages, const void* result) {
+    if (!rt::startup_trace::enabled()) return;
+    std::string fields = std::string("\"api\":\"") + api +
+                         "\",\"address\":" + rt::startup_trace::quote(rt::startup_trace::hex(
+                                                 reinterpret_cast<uint64_t>(address))) +
+                         ",\"size\":" + std::to_string(size_or_pages) +
+                         ",\"result\":" + rt::startup_trace::quote(rt::startup_trace::hex(
+                                              reinterpret_cast<uint64_t>(result)));
+    rt::startup_trace::event("xmem_region", fields);
+}
+
 struct PhysicalPage {
     std::shared_ptr<Section> section;  // a mapped view holds its own reference to the section
     uint64_t offset;
@@ -320,7 +334,7 @@ PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
 // XMemMapPhysicalPages. The guest page size sets the alignment and rounding of the region; the host's own pages stay
 // 4 KiB (host large pages need SeLockMemoryPrivilege). A 2 MiB region the host places is reserved 2 MiB-aligned through
 // VirtualAlloc2.
-void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
+void* WINAPI xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
     note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -423,6 +437,28 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
                                                 &parameter, 1);
     }
     return VirtualAlloc(address, size, host_type, host_prot);
+}
+
+// The traced entry point: the request goes to xmem_virtual_alloc, and the region it produced is recorded with the host's
+// own answer for it (reserved, committed or neither), so a fault inside a window can be read against what the loader
+// actually did there.
+void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
+    void* const result = xmem_virtual_alloc(address, size, allocation_type, attributes, protect);
+    if (rt::startup_trace::enabled()) {
+        MEMORY_BASIC_INFORMATION info{};
+        const char* state = "none";
+        if (result && VirtualQuery(result, &info, sizeof info)) {
+            state = info.State == MEM_COMMIT ? "commit" : info.State == MEM_RESERVE ? "reserve" : "free";
+        }
+        note_region("XMemVirtualAlloc", address, size, result);
+        if (result && std::strcmp(state, "commit") != 0)
+            rt::startup_trace::event("xmem_reserved",
+                                     "\"address\":" + rt::startup_trace::quote(rt::startup_trace::hex(
+                                                          reinterpret_cast<uint64_t>(result))) +
+                                         ",\"attributes\":" + rt::startup_trace::quote(rt::startup_trace::hex(attributes)) +
+                                         ",\"state\":\"" + state + "\"");
+    }
+    return result;
 }
 
 // With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
@@ -558,7 +594,7 @@ BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_arra
 //
 // Each page is its own view (MapViewOfFile3 into a 64 KiB placeholder), so any page can be remapped or unmapped later
 // without touching its neighbours. A failure part-way leaves the pages before it mapped.
-void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint64_t* page_array) {
+void* WINAPI map_physical_pages(void* address, uint64_t page_count, const uint64_t* page_array) {
     const uintptr_t start = reinterpret_cast<uintptr_t>(address);
     if (!aligned_page_address(start) || page_count > (std::numeric_limits<uintptr_t>::max)() / kPhysicalPageSize ||
         start > (std::numeric_limits<uintptr_t>::max)() - page_count * kPhysicalPageSize) {
@@ -586,6 +622,21 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
         if (!map_page(start + i * kPhysicalPageSize, page_array[i], protect)) return nullptr;
     }
     return address;
+}
+
+// The traced entry point: a page the title expects to be able to write to is a page the loader said it mapped, so a
+// refused mapping is reported with the address it refused and the reason.
+void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint64_t* page_array) {
+    void* const result = map_physical_pages(address, page_count, page_array);
+    note_region("XMemMapPhysicalPages", address, page_count, result);
+    if (!result) {
+        static std::atomic<bool> once{false};
+        if (!once.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                         "[rt] xmem: XMemMapPhysicalPages(%p, %llu) refused, error %lu\n", address,
+                         static_cast<unsigned long long>(page_count), GetLastError());
+    }
+    return result;
 }
 
 // BOOL XMemMapPhysicalPagesScatter(PVOID* addresses, UINT32 pageCount, UINT64* pageArray). Measured at two call sites:

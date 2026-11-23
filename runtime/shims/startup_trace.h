@@ -181,8 +181,33 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                 const auto op = r.ExceptionInformation[0];
                 f += ",\"access\":" + quote(op == 0 ? "read" : op == 1 ? "write" : "execute") +
                      ",\"address\":" + quote(hex(r.ExceptionInformation[1]));
+                // What the process has there. An address the title took from a console-only allocator and the loader
+                // never mapped is MEM_FREE; a range reserved but never committed is MEM_RESERVE. Both fault the same
+                // way, and which one it is says whether a mapping is missing or only its commit.
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (VirtualQuery(reinterpret_cast<const void*>(r.ExceptionInformation[1]), &mbi, sizeof mbi)) {
+                    f += ",\"region\":" + quote(mbi.State == MEM_COMMIT    ? "commit"
+                                                : mbi.State == MEM_RESERVE ? "reserve"
+                                                                           : "free");
+                    f += ",\"region_base\":" + quote(hex(reinterpret_cast<uint64_t>(mbi.BaseAddress)));
+                    f += ",\"region_size\":" + quote(hex(uint64_t(mbi.RegionSize)));
+                }
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
+            // The general registers at the fault, in this order: rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13
+            // r14 r15. A console title keeps pointers the loader has to recognise (a page table, a resource's GPU
+            // address), and the registers are what say which one the faulting instruction was reading.
+            if (info.ContextRecord && r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+                const CONTEXT& c = *info.ContextRecord;
+                char regs[512];
+                std::snprintf(regs, sizeof regs,
+                              "[\"%llx\",\"%llx\",\"%llx\",\"%llx\",\"%llx\",\"%llx\",\"%llx\",\"%llx\",\"%llx\","
+                              "\"%llx\",\"%llx\",\"%llx\",\"%llx\",\"%llx\",\"%llx\",\"%llx\"]",
+                              c.Rax, c.Rbx, c.Rcx, c.Rdx, c.Rsi, c.Rdi, c.Rbp, c.Rsp, c.R8, c.R9, c.R10, c.R11,
+                              c.R12, c.R13, c.R14, c.R15);
+                f += ",\"gprs\":";
+                f += regs;
+            }
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);
         }
