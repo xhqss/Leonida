@@ -2842,89 +2842,6 @@ constexpr std::uint32_t kPcResourceFlagsMask =
     D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY | D3D12_RESOURCE_FLAG_VIDEO_ENCODE_REFERENCE_ONLY |
     D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE | kPcResourceFlagUseTightAlignment;
 
-// The XMem memory a committed resource took through the title's allocation hook (slot 127). The console D3D runtime
-// allocates a committed resource's memory with XMemAlloc, so a title's hook sees every such allocation and may count
-// it. The PC resource is not backed by this memory: it only keeps the title's accounting as the console's. The owner is
-// attached to the resource as private data, so the memory goes back through the hook's free when the resource dies.
-// {3c7a5e21-9b4d-4f08-8e6a-1d2c3b4a5f60}
-constexpr GUID kXmemBackingPrivateData{0x3c7a5e21, 0x9b4d, 0x4f08, {0x8e, 0x6a, 0x1d, 0x2c, 0x3b, 0x4a, 0x5f, 0x60}};
-
-struct XmemBackingOwner final : IUnknown {
-    std::atomic<ULONG> refs{1};
-    void* memory;
-    DescriptorHeapBackingFree free_fn;
-    std::uint64_t attributes;
-
-    XmemBackingOwner(void* m, DescriptorHeapBackingFree f, std::uint64_t a) : memory(m), free_fn(f), attributes(a) {}
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
-        if (!out) return E_POINTER;
-        *out = nullptr;
-        if (!IsEqualIID(riid, __uuidof(IUnknown))) return E_NOINTERFACE;
-        AddRef();
-        *out = static_cast<IUnknown*>(this);
-        return S_OK;
-    }
-    ULONG STDMETHODCALLTYPE AddRef() override { return refs.fetch_add(1, std::memory_order_relaxed) + 1; }
-    ULONG STDMETHODCALLTYPE Release() override {
-        const ULONG left = refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
-        if (left == 0) {
-            if (free_fn) free_fn(memory, attributes);
-            delete this;
-        }
-        return left;
-    }
-};
-
-// Allocates the resource's size through the installed hook and ties the memory to `resource`. Without a hook, a size
-// or the private-data slot, the resource is left as it is: the hook is the title's bookkeeping, never the PC's memory.
-void attach_xmem_backing(DeviceProxy* self, void* resource, const D3D12_RESOURCE_DESC1& desc1) {
-    if (!resource) return;
-    DescriptorHeapBackingAlloc alloc_fn = nullptr;
-    DescriptorHeapBackingFree free_fn = nullptr;
-    {
-        std::lock_guard lock(heap_alloc_mutex());
-        alloc_fn = g_heap_alloc;
-        free_fn = g_heap_free;
-    }
-    if (!alloc_fn) return;
-
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = desc1.Dimension;
-    desc.Alignment = desc1.Alignment;
-    desc.Width = desc1.Width;
-    desc.Height = desc1.Height;
-    desc.DepthOrArraySize = desc1.DepthOrArraySize;
-    desc.MipLevels = desc1.MipLevels;
-    desc.Format = desc1.Format;
-    desc.SampleDesc = desc1.SampleDesc;
-    desc.Layout = desc1.Layout;
-    desc.Flags = desc1.Flags;
-    const D3D12_RESOURCE_ALLOCATION_INFO info = self->real->GetResourceAllocationInfo(0, 1, &desc);
-    if (info.SizeInBytes == 0 || info.SizeInBytes == UINT64_MAX ||
-        info.SizeInBytes > (std::numeric_limits<std::size_t>::max)())
-        return;
-
-    void* const memory = alloc_fn(static_cast<std::size_t>(info.SizeInBytes), kXmemCommittedResourceAttributes);
-    static std::atomic<bool> logged{false};
-    if (first_call(logged))
-        std::fprintf(stderr, "[rt] d3d12_xs: slot 127 resource memory through the title's XMem hook: %llu bytes, %s\n",
-                     static_cast<unsigned long long>(info.SizeInBytes), memory ? "allocated" : "refused");
-    if (!memory) return;
-    auto* const owner = new (std::nothrow) XmemBackingOwner(memory, free_fn, kXmemCommittedResourceAttributes);
-    if (!owner) {
-        if (free_fn) free_fn(memory, kXmemCommittedResourceAttributes);
-        return;
-    }
-    ID3D12Object* object = nullptr;
-    if (SUCCEEDED(static_cast<IUnknown*>(resource)->QueryInterface(__uuidof(ID3D12Object),
-                                                                    reinterpret_cast<void**>(&object))) &&
-        object) {
-        object->SetPrivateDataInterface(kXmemBackingPrivateData, owner);  // the resource holds its own reference
-        object->Release();
-    }
-    owner->Release();  // frees now when the resource took no reference
-}
-
 HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap_word, std::uint64_t heap_flags,
                                            std::uint64_t desc_word, std::uint64_t layout_word,
                                            std::uint64_t clear_word, std::uint64_t session_word,
@@ -2981,7 +2898,20 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
                static_cast<std::uint32_t>(castable_count), reinterpret_cast<const DXGI_FORMAT*>(castable_formats), riid,
                out);
     static_cast<IUnknown*>(device10)->Release();
-    if (SUCCEEDED(hr)) attach_xmem_backing(self, *out, pc_desc);
+    if (SUCCEEDED(hr)) {
+        D3D12_RESOURCE_DESC plain{};  // D3D12_RESOURCE_DESC1 without SamplerFeedbackMipRegion
+        plain.Dimension = pc_desc.Dimension;
+        plain.Alignment = pc_desc.Alignment;
+        plain.Width = pc_desc.Width;
+        plain.Height = pc_desc.Height;
+        plain.DepthOrArraySize = pc_desc.DepthOrArraySize;
+        plain.MipLevels = pc_desc.MipLevels;
+        plain.Format = pc_desc.Format;
+        plain.SampleDesc = pc_desc.SampleDesc;
+        plain.Layout = pc_desc.Layout;
+        plain.Flags = pc_desc.Flags;
+        lease_title_resource_memory(self, *out, plain);
+    }
     return hr;
 }
 
