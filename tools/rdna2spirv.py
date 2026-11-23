@@ -10283,36 +10283,62 @@ class Gen:
                 self.emit(f"{prod} = OpIMul %ulong {nr64} {st64}")
                 self.emit(f"{raw} = OpIEqual %bool {stride} {self.cu(0)}")
                 self.emit(f"{lim} = OpSelect %ulong {raw} {nr64} {prod}")
+        guarded = {}
+        if lim is not None and not (lim_val is not None and reg is None):
+            # A run-time bound: dword i is in range when off + 4*i + 4 <= limit, and out of range it is 0 with memory
+            # not read. The ends grow with i, so "dword i in range" implies every dword before it is: one selection
+            # on dword 0 covers the load. Inside it each dword reads at index i when in range, else at index 0 (in
+            # range there, so nothing outside the buffer is touched), and the out-of-range ones are then 0. Before,
+            # each dword had its own selection: 2N blocks per s_buffer_load_dwordxN, 11,000 of the 17,000 blocks of
+            # the cascade-shadow CS whose pipeline NVIDIA's compiler could not build in 16 GB.
+            oks = []
+            for i in range(n):
+                end, ok = self.tmp(), self.tmp()
+                if reg is not None:
+                    self.emit(f"{end} = OpIAdd %ulong {o64} {self.cl(4 * i + 4)}")
+                else:
+                    end = self.cl(imm + 4 * i + 4)
+                self.emit(f"{ok} = OpUGreaterThanEqual %bool {lim} {end}")
+                oks.append(ok)
+            lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+            pre = self.current_label_placeholder()
+            self.emit(f"OpSelectionMerge {lbl_end} None")
+            self.emit(f"OpBranchConditional {oks[0]} {lbl_do} {lbl_end}")
+            self.emit(f"{lbl_do} = OpLabel")
+            got_in = []
+            for i in range(n):
+                idx, p, got, val = (self.tmp() for _ in range(4))
+                if i == 0:
+                    idx = self.cu(0)
+                else:
+                    self.emit(f"{idx} = OpSelect %uint {oks[i]} {self.cu(i)} {self.cu(0)}")
+                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {idx}")
+                self.emit(f"{got} = OpLoad %uint {p} Aligned 4")
+                if i == 0:
+                    val = got
+                else:
+                    self.emit(f"{val} = OpSelect %uint {oks[i]} {got} {self.cu(0)}")
+                got_in.append(val)
+            self.emit(f"OpBranch {lbl_end}")
+            self.emit(f"{lbl_end} = OpLabel")
+            for i in range(n):
+                v = self.tmp()
+                self.emit(f"{v} = OpPhi %uint {got_in[i]} {lbl_do} {self.cu(0)} {pre}")
+                guarded[i] = v
         for i in range(n):
             p, v = self.tmp(), self.tmp()
-            if lim is None:
+            if i in guarded:
+                v = guarded[i]
+            elif lim is None:
                 self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
                 self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
-            elif lim_val is not None and reg is None:
+            else:                   # a bound known at translate time (lim_val, constant offset): fold each dword
                 end_val = imm + 4 * i + 4
                 if lim_val >= end_val:
                     self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
                     self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
                 else:
                     v = self.cu(0)
-            else:
-                # dword i is in range when off + 4*i + 4 <= limit; outside it memory is not read and the result is 0
-                end, ok, got = self.tmp(), self.tmp(), self.tmp()
-                lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
-                if reg is not None:
-                    self.emit(f"{end} = OpIAdd %ulong {o64} {self.cl(4 * i + 4)}")
-                else:
-                    end = self.cl(imm + 4 * i + 4)
-                self.emit(f"{ok} = OpUGreaterThanEqual %bool {lim} {end}")
-                pre = self.current_label_placeholder()
-                self.emit(f"OpSelectionMerge {lbl_end} None")
-                self.emit(f"OpBranchConditional {ok} {lbl_do} {lbl_end}")
-                self.emit(f"{lbl_do} = OpLabel")
-                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
-                self.emit(f"{got} = OpLoad %uint {p} Aligned 4")
-                self.emit(f"OpBranch {lbl_end}")
-                self.emit(f"{lbl_end} = OpLabel")
-                self.emit(f"{v} = OpPhi %uint {got} {lbl_do} {self.cu(0)} {pre}")
             if single_special:
                 if n == 2:          # vcc pair: low dword -> vcc_lo, high dword -> vcc_hi (data, not a lane mask)
                     self.emit(f"OpStore {'%vcc' if i == 0 else '%vcc_hi'} {v}")
