@@ -7859,7 +7859,16 @@ private:
 
         const Format format = state_.texture_format(desc);
         if (!format.format) {
-            log_once("GetResourceAllocationInfo format not supported yet:", desc.Format);
+            static std::atomic<bool> refused{false};
+            if (!refused.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr,
+                             "[rt] d3d12: GetResourceAllocationInfo refuses format %u: dimension %d, %llux%u depth "
+                             "%u, %u mip(s), %u sample(s), flags 0x%x, layout 0x%x, alignment %llu\n",
+                             static_cast<unsigned>(desc.Format), static_cast<int>(desc.Dimension),
+                             static_cast<unsigned long long>(desc.Width), static_cast<unsigned>(desc.Height),
+                             static_cast<unsigned>(desc.DepthOrArraySize), static_cast<unsigned>(desc.MipLevels),
+                             static_cast<unsigned>(desc.SampleDesc.Count), static_cast<unsigned>(desc.Flags),
+                             static_cast<unsigned>(desc.Layout), static_cast<unsigned long long>(desc.Alignment));
             return kInvalidAllocation;
         }
         VkMemoryRequirements need{};
