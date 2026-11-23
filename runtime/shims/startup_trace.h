@@ -236,9 +236,30 @@ inline bool skip_int3(EXCEPTION_POINTERS* info) {
     return true;
 }
 
+// LEONIDA_COMMIT_ON_FAULT (diagnostic, with --trace): the console backs a title's reserved range when it is first
+// touched, so a write into a range this loader only reserved faults where the console would not have. The faulting page
+// is committed and the instruction retried; the first ones are logged. What the title does next says whether a missing
+// commit is the whole gap or whether that address was never meant to be written (docs/retail_boot_chain.md).
+inline bool commit_on_fault(EXCEPTION_POINTERS* info) {
+    static const bool on = GetEnvironmentVariableW(L"LEONIDA_COMMIT_ON_FAULT", nullptr, 0) != 0;
+    if (!on || !info || !info->ExceptionRecord) return false;
+    EXCEPTION_RECORD& r = *info->ExceptionRecord;
+    if (r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r.NumberParameters < 2) return false;
+    void* const address = reinterpret_cast<void*>(r.ExceptionInformation[1]);
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(address, &mbi, sizeof mbi) || mbi.State != MEM_RESERVE) return false;
+    void* const page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(address) & ~static_cast<uintptr_t>(0xFFF));
+    if (!VirtualAlloc(page, 0x1000, MEM_COMMIT, PAGE_READWRITE)) return false;
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+        event("commit_on_fault", "\"address\":" + quote(hex(reinterpret_cast<uint64_t>(address))));
+    return true;
+}
+
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     if (!enabled() || in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
     if (skip_int3(info)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (commit_on_fault(info)) return EXCEPTION_CONTINUE_EXECUTION;
     in_handler = true;
 #ifdef _MSC_VER
     // Under /EHsc, catch(...) does not catch SEH faults (e.g. a bad DBG_PRINTEXCEPTION_C pointer or corrupt unwind).

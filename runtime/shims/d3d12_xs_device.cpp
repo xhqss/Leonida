@@ -3382,8 +3382,18 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         // methods. The check is before the slot-count refusal because slot 80 is outside a PC ID3D12Device11 table.
         std::uint64_t routed = 0;
         if (route_xbox_device_slot(self, Slot, a1, a2, a3, a4, a5, routed)) return routed;
-        if (Slot >= self->slot_count)
+        if (Slot >= self->slot_count) {
+            // What the console-only slot was called with, once: a slot past the PC vtable has no known signature, and
+            // the arguments are what identify it (a description, two out pointers, a count).
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: device slot %u first call arguments: 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx\n",
+                             Slot, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                             static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
+                             static_cast<unsigned long long>(a5));
             return hr_to_u64(refuse_beyond_device(Slot, self->slot_count, _ReturnAddress()));
+        }
 
         // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
         // struct-return pointer and any stack arguments keep their positions; XMM registers are untouched.
