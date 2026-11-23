@@ -478,13 +478,19 @@ $env:LEONIDA_SKIP_ASSERTS='1'
    先按"返回 64 KiB 或 4 KiB 页大小 + 标志"去试，用 `--trace` 看 PTE 偏移是否变得合理。
 2. **`+0x25a087d` 的页表写入 AV**：有了第 1 条再回看这条。若仍然散射，说明数组本身来自别处
    （标题自己的 static），要顺着 `getter`（`0x1451d2260`）往里查。
-3. **`slot 67` 的 FSPX compute PSO**：两个 shader（`9e132485…`、`7b6436b0…`）已 dump 在
+3. **`d3d12_depth_resolve` 的"拒绝却改写了目标"**：测到的现象是 `Close` 已经是 `E_INVALIDARG`、
+   批处理也被拒（`list 0 is invalid; refusing batch`），但目标纹理的字节和清屏值不一致，
+   而 `resolve_and_read(..., run_invalid=true)` 这条路径期望目标一字不改。得查是"拒绝前已经在某处落盘"
+   还是测试自己复用了缓冲区。
+4. **`slot 67` 的 FSPX compute PSO**：两个 shader（`9e132485…`、`7b6436b0…`）已 dump 在
    `tmp/missing-shaders/`，但它们是 FSPX kind-6，反汇编要按 `docs/fspx.md` 的布局来，不是 FSSM 那条链。
-4. **其余 23 个 compute 程序的语料**：需要带 FSSM 头部的块（头部 0x138..0x144 是 `COMPUTE_PGM_RSRC2` 和线程组
+5. **其余 23 个 compute 程序的语料**：需要带 FSSM 头部的块（头部 0x138..0x144 是 `COMPUTE_PGM_RSRC2` 和线程组
    大小，dump 出来的"程序"不含它），所以要先从它们的来源（某个 DLL 或 `shaders.rpf`）取容器，再走 7.1 的链。
-5. **`d3d12_vulkan_device` 的 `R10G10B10` 拷贝失败**：唯一一条代码级红项，怀疑和 A8/格式规则合并有关。
-6. 音频 `AcpHal` / `xapu` / `chad` 的未实现导入（上游 A20 的 open ask）。
-7. `pipeline_cache` 里 `shard-7/9` 那两个 `indirect_diffuse_lighting_CS_ScreenProbes_*` 模块：需要先弄清是
+6. **代理的 PC 槽位与控制台槽位冲突**（`ee38ebbaa` 修了测试这一侧）：61/62/78/79/80 在两边含义不同。
+   以后任何"PC 形状的调用者"都不能直接拿代理当 `ID3D12Device*` 用；要么问 `inner`，要么让代理按调用者分流。
+7. 音频 `AcpHal` / `xapu` / `chad` 的未实现导入（上游 A20 的 open ask；`chad.dll` 现在有 5 个 `XDsp*` 走
+   未实现导入策略，不阻塞启动）。
+8. `pipeline_cache` 里 `shard-7/9` 那两个 `indirect_diffuse_lighting_CS_ScreenProbes_*` 模块：需要先弄清是
    翻译器不收敛还是驱动侧的问题，再决定要不要单独跑。
 
 ---
