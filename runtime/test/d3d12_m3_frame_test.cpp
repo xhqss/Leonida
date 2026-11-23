@@ -10,7 +10,9 @@
 //           EQUAL to reference 1, so it only reaches pixels N won). ResolveQueryData writes the probe's count to the
 //           readback buffer. Before F, a single-output probe of F uses the same depth/stencil tests without writing
 //           color, depth or stencil. Only that probe is inside BeginQuery/EndQuery(OCCLUSION): Vulkan permits MRT
-//           occlusion counts multiplied by the number of written color outputs even with PRECISE (D3D-209).
+//           occlusion counts multiplied by the number of written color outputs even with PRECISE (D3D-209). The same
+//           probe is also inside a BINARY_OCCLUSION query (it must report occlusion), and a second binary query wraps
+//           a probe of N's own pixels at N's own depth, which loses every depth test (0x0 samples).
 //   barrier the first target goes RENDER_TARGET -> PIXEL_SHADER_RESOURCE | COPY_SOURCE, the second to COPY_SOURCE.
 //   pass 2  a descriptor-table SRV of the first target (the M2 path: heaps, T#, S#, hash table) sampled by a translated PS
 //           that swaps red and blue and writes a root constant to alpha, into a third target.
@@ -330,7 +332,7 @@ int main(int argc, char** argv) {
         sampler_desc.MaxLOD = D3D12_FLOAT32_MAX;
         device->CreateSampler(&sampler_desc, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(sampler_cpu)});
 
-        D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, slots, 0};
+        D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 3 * slots, 0};
         Ref<ID3D12QueryHeap> query_heap;
         EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&query_heap.p))));
 
@@ -450,12 +452,24 @@ int main(int argc, char** argv) {
             list->BeginQuery(query_heap.p, D3D12_QUERY_TYPE_OCCLUSION, s);
             draw(list, fr.f, fr.f.stencil_ref);
             list->EndQuery(query_heap.p, D3D12_QUERY_TYPE_OCCLUSION, s);
+            // The same probe counted as a binary query (samples that pass, at least one), then a probe that loses every
+            // depth test: N already wrote 0.25 there and the probe tests LESS at the same depth. Both are in the frame
+            // between the real draws, so the resolve and the slot ring exercise them like any other query.
+            list->BeginQuery(query_heap.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, slots + s);
+            draw(list, fr.f, fr.f.stencil_ref);
+            list->EndQuery(query_heap.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, slots + s);
+            list->BeginQuery(query_heap.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 2 * slots + s);
+            draw(list, fr.n, fr.n.stencil_ref);
+            list->EndQuery(query_heap.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 2 * slots + s);
             list->SetPipelineState(pso_a.p);
             list->OMSetRenderTargets(2, rtvs[s], FALSE, &dsvs[s]);
             draw(list, fr.f, fr.f.stencil_ref);
             list->SetPipelineState(pso_c.p);
             draw(list, fr.g, fr.g.stencil_ref);
             list->ResolveQueryData(query_heap.p, D3D12_QUERY_TYPE_OCCLUSION, s, 1, slot_.readback.p, 0);
+            list->ResolveQueryData(query_heap.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, slots + s, 1, slot_.readback.p, 8);
+            list->ResolveQueryData(query_heap.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 2 * slots + s, 1,
+                                   slot_.readback.p, 16);
 
             D3D12_RESOURCE_BARRIER between[2] = {transition(slot_.rt0.p, D3D12_RESOURCE_STATE_RENDER_TARGET, rt0_rest),
                                                  transition(slot_.rt1.p, D3D12_RESOURCE_STATE_RENDER_TARGET, copy_rest)};
@@ -505,8 +519,10 @@ int main(int argc, char** argv) {
             void* mapped = nullptr;
             if (FAILED(slot_.readback->Map(0, nullptr, &mapped))) return false;
             const auto* base = static_cast<const std::uint8_t*>(mapped);
-            UINT64 samples = 0;
+            UINT64 samples = 0, binary_visible = 0, binary_hidden = 0;
             std::memcpy(&samples, base, 8);
+            std::memcpy(&binary_visible, base + 8, 8);
+            std::memcpy(&binary_hidden, base + 16, 8);
             const auto compare = [&](const char* what, UINT64 offset, const void* expected, std::size_t unit) {
                 const auto* got = base + offset;
                 const auto* exp = static_cast<const std::uint8_t*>(expected);
@@ -525,6 +541,14 @@ int main(int argc, char** argv) {
             if (precise ? samples != want.samples : samples == 0) {
                 std::fprintf(stderr, "frame %u: occlusion query counted %llu samples, want %llu\n", n,
                              static_cast<unsigned long long>(samples), static_cast<unsigned long long>(want.samples));
+                ++mismatches;
+            }
+            // The visible probe must report occlusion. An occluded one may do so conservatively on a device without
+            // precise occlusion, so only an exact device has to answer "not occluded" for it.
+            if (!binary_visible || (precise && binary_hidden)) {
+                std::fprintf(stderr, "frame %u: binary occlusion said visible %llu, fully occluded %llu\n", n,
+                             static_cast<unsigned long long>(binary_visible),
+                             static_cast<unsigned long long>(binary_hidden));
                 ++mismatches;
             }
             total_samples += samples;
@@ -559,7 +583,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    std::printf("M3: %u frames, %u in flight, two render targets + D24S8 depth/stencil, barriers, an occlusion query and "
+    std::printf("M3: %u frames, %u in flight, two render targets + D24S8 depth/stencil, barriers, an occlusion query with "
+                "a visible and a fully occluded binary probe and "
                 "%s matched all %u pixels of three targets per frame "
                 "(error 0) and every sample count (%llu samples in all%s)\n",
                 frames, slots, first_pass_only ? "first-pass isolation (third target stays clear)" :

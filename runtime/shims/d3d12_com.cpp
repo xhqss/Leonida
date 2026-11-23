@@ -213,6 +213,7 @@ public:
     HRESULT STDMETHODCALLTYPE Close() override {
         constexpr auto method = "ID3D12GraphicsCommandList::Close";
         if (list_.queries_open()) invalid_ = true;
+        if (render_pass_open_) invalid_ = true;  // a pass left open is a debug-layer error, as an open query is
         if (!list_.close()) return d3d12_trace::result(method, E_FAIL);
         stop_recording();
         return d3d12_trace::result(method, invalid_ ? E_INVALIDARG : S_OK);
@@ -229,6 +230,7 @@ public:
         if (!list_.reset()) return d3d12_trace::result(method, E_FAIL);  // D3D12 resets only closed lists
         record_into(command_allocator);
         invalid_ = false;
+        render_pass_open_ = false;
         calls_.clear();
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
         reset_state(state);  // Reset returns every list state to its default
@@ -636,6 +638,60 @@ public:
         if (!view.ptr) return check(false);
         check(list_.clear_depth_stencil(*reinterpret_cast<const leonida::TargetView*>(view.ptr), u(flags), depth,
                                         stencil, to_rects(count, rects)));
+    }
+
+    // D3D12 render passes (D3D-27). The layer renders through one dynamic-rendering scope per draw, so a pass is not
+    // a Vulkan scope here: what the pass asks for at its beginning is applied when it begins, and the end has nothing
+    // to undo on a desktop GPU (every attachment is written back to its image). BEGINNING_ACCESS CLEAR records the
+    // clear the explicit call would, through the same path, so a target clears the same way either way; LOAD and
+    // PRESERVE leave the contents, which are already there. ENDING_ACCESS STORE and PRESERVE need nothing; DISCARD
+    // leaves the contents undefined, which D3D12 permits, so it is not a discard here. Suspend and resume passes are
+    // refused rather than half-implemented.
+    void STDMETHODCALLTYPE BeginRenderPass(UINT NumRenderTargets,
+                                           const D3D12_RENDER_PASS_RENDER_TARGET_DESC* pRenderTargets,
+                                           const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* pDepthStencil,
+                                           D3D12_RENDER_PASS_FLAGS Flags) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList4::BeginRenderPass");
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (render_pass_open_) return check(false);  // passes do not nest
+        if (!NumRenderTargets && !pDepthStencil) return check(false);
+        if (NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT || (NumRenderTargets && !pRenderTargets))
+            return check(false);
+        if (Flags & (D3D12_RENDER_PASS_FLAG_SUSPENDING_PASS | D3D12_RENDER_PASS_FLAG_RESUMING_PASS)) {
+            stub("ID3D12GraphicsCommandList4::BeginRenderPass(suspend or resume pass)");
+            return check(false);
+        }
+        render_pass_open_ = true;
+        for (UINT i = 0; i < NumRenderTargets; ++i) {
+            const D3D12_RENDER_PASS_RENDER_TARGET_DESC& target = pRenderTargets[i];
+            if (!target.cpuDescriptor.ptr) return check(false);
+            if (target.BeginningAccess.Type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR) continue;
+            const auto& color = target.BeginningAccess.Clear.ClearValue.Color;
+            check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(target.cpuDescriptor.ptr),
+                                            {color[0], color[1], color[2], color[3]}, {}));
+        }
+        if (pDepthStencil) {
+            if (!pDepthStencil->cpuDescriptor.ptr) return check(false);
+            // Depth and stencil have their own beginning access; a CLEAR clears the plane whose access asks for it.
+            const auto depth_access = pDepthStencil->DepthBeginningAccess;
+            const auto stencil_access = pDepthStencil->StencilBeginningAccess;
+            const bool clear_depth = depth_access.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR;
+            const bool clear_stencil = stencil_access.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR;
+            if (clear_depth || clear_stencil) {
+                const D3D12_CLEAR_VALUE& clear =
+                    clear_depth ? depth_access.Clear.ClearValue : stencil_access.Clear.ClearValue;
+                check(list_.clear_depth_stencil(
+                    *reinterpret_cast<const leonida::TargetView*>(pDepthStencil->cpuDescriptor.ptr),
+                    (clear_depth ? D3D12_CLEAR_FLAG_DEPTH : 0) | (clear_stencil ? D3D12_CLEAR_FLAG_STENCIL : 0),
+                    clear.DepthStencil.Depth, clear.DepthStencil.Stencil, {}));
+            }
+        }
+    }
+
+    void STDMETHODCALLTYPE EndRenderPass(void) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList4::EndRenderPass");
+        if (!render_pass_open_) return check(false);
+        render_pass_open_ = false;
     }
 
     // A null region discards the whole resource. Not allowed in a bundle.
@@ -1061,6 +1117,7 @@ private:
     CommandAllocator* allocator_ = nullptr;  // referenced while the list is open
     leonida::CommandList list_;
     bool invalid_ = false;
+    bool render_pass_open_ = false;  // BeginRenderPass ran and EndRenderPass has not (D3D-27)
     UINT front_stencil_ref_ = 0;
     UINT back_stencil_ref_ = 0;
     RootState compute_;

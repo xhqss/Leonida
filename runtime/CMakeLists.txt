@@ -1722,6 +1722,14 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_clear COMMAND d3d12_clear_test)
     set_tests_properties(d3d12_clear PROPERTIES SKIP_RETURN_CODE 77)
 
+    # D3D-27: D3D12 render passes (BeginRenderPass/EndRenderPass) through the layer, with the targets read back.
+    add_executable(d3d12_render_pass_test test/d3d12_render_pass_test.cpp)
+    target_link_libraries(d3d12_render_pass_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_render_pass_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_render_pass_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_render_pass COMMAND d3d12_render_pass_test)
+    set_tests_properties(d3d12_render_pass PROPERTIES SKIP_RETURN_CODE 77)
+
     # Synthetic typed-view readbacks against Windows WARP; run explicitly on a Vulkan GPU.
     add_executable(d3d12_typeless_rtv_test test/d3d12_typeless_rtv_test.cpp)
     target_link_libraries(d3d12_typeless_rtv_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)

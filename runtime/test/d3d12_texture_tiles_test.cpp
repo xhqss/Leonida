@@ -306,10 +306,16 @@ int main() {
         std::printf("Vulkan replay: %u x %u, linear offset %u, initially unbound, aliased, row-major, gated remap%s\n",
                     width, height, linear_offset,
                     separate_copy_queue ? ", COPY-to-DIRECT handoff" : "");
-        if (native) {
+        // A byte-unaligned linear offset is legal for the layer (it stages those rows through transfer scratch), but
+        // it is not a texel-aligned D3D12 tile-copy footprint: on the RX 7800 XT the driver rounds the offset down to
+        // a multiple of 4, so the layer reads back the uploaded texels while direct D3D12 reads the source rotated by
+        // that many bytes. Such a replay has no native reference; the layer's own expectations above verify every texel.
+        if (native && linear_offset % sizeof(std::uint32_t) == 0) {
             if (!run(*native.Get(), width, height, linear_offset, expected, false, separate_copy_queue, sparse) ||
                 observed != expected) return 1;
             std::printf("Native D3D12 matched all %zu verified pixels\n", observed.size());
+        } else if (native) {
+            std::puts("Vulkan-only replay: D3D12 has no byte-unaligned linear tile offset to compare with");
         }
     }
     return 0;
