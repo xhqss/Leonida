@@ -3,12 +3,13 @@
 // How forwarding works: the proxy object's first word is a vtable built once from one thunk per slot. A thunk
 // receives the proxy in RCX, replaces it with the PC device pointer from offset 8, and tail-calls the PC method at
 // the same index through a 15-argument integer prototype. Every PC D3D12 device method takes integer/pointer
-// arguments only, so the x64 registers and stack words line up exactly; methods that return a struct keep their
-// hidden return pointer in RDX, which is passed through as the first argument unchanged. The measured exceptions
-// are IUnknown (0-2), slot 14 (which wraps the heap), 62 and 76, plus the heap proxy's 9/10 conversion from the
-// PC hidden-pointer form to the Xbox RAX form. Slots 8/75 (command queues), 36 (fences) and 32 (a shared fence) wrap
-// what they create in queue and fence proxies built the same way, and slots 31/34/35/45/46/50 hand the real objects
-// behind heap, queue and fence proxies to the real device (see the command queue and fence section).
+// arguments only, so the x64 registers and stack words line up exactly. The measured exceptions are IUnknown (0-2),
+// slot 14 (which wraps the heap), 62 and 76, 26 (the title passes the return buffer in RCX and the device in RDX), the
+// struct-returning slot 25 (same C ABI form: see "Struct-returning device methods" below), plus the heap proxy's 9/10
+// conversion from the PC hidden-pointer form to the Xbox RAX form. Slots 8/75 (command queues), 36 (fences) and 32
+// (a shared fence) wrap what they create in queue and fence proxies built the same way, and slots 31/34/35/45/46/50
+// hand the real objects behind heap, queue and fence proxies to the real device (see the command queue and fence
+// section).
 //
 // A thunk declares 14 argument words, but the title passes only as many as the method takes, so the caller's frame
 // may end right after the four register homes. The compiler owns a function's incoming stack-argument slots and may
@@ -24,7 +25,8 @@
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
-#include "shims.h"  // rt::shims::mapped_image_base, for the heap slot 9 diagnostic
+#include "d3d12_xs_alloc_size.h"
+#include "d3d12_xs_desc_clean.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -38,6 +40,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -247,7 +250,8 @@ const char* slot_name(unsigned slot) {
         case 22: return "CreateSampler (CPU handle translated)";
         case 23: return "CopyDescriptors (CPU handles translated)";
         case 24: return "CopyDescriptorsSimple (CPU handles translated)";
-        case 25: return "GetResourceAllocationInfo";
+        case 25: return "GetResourceAllocationInfo (C or PC form)";
+        case 26: return "GetCustomHeapProperties (C or PC form)";
         case 27: return "CreateCommittedResource (PC slot 27)";
         case 31: return "CreateSharedHandle (proxies unwrapped)";
         case 32: return "OpenSharedHandle (a fence comes back wrapped)";
@@ -259,6 +263,7 @@ const char* slot_name(unsigned slot) {
         case 46: return "SetResidencyPriority (proxies unwrapped)";
         case 48: return "Xbox CreateCommandQueueX -> queue proxy";
         case 50: return "EnqueueMakeResident (proxies unwrapped)";
+        case 56: return "GetResourceAllocationInfo1 (C or PC form)";
         case 62: return "Xbox CreateComputePipelineState";
         case 67: return "Xbox DeserializeComputePipelineStateX";
         case 70: return "Xbox shader-resource view from raw words";
@@ -2666,28 +2671,6 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
                                                clear_value, __uuidof(ID3D12Resource), out);
 }
 
-// Xbox device slot 25: GetResourceAllocationInfo. Same hidden-return convention as slot 26 (MSVC returns the
-// D3D12_RESOURCE_ALLOCATION_INFO by value), so the first word is the caller's buffer and the second the device; the
-// generic forward would read the device's vtable out of that buffer.
-std::uint64_t proxy_get_resource_allocation_info(void* first, std::uint64_t second, std::uint64_t third,
-                                                 std::uint64_t fourth, std::uint64_t fifth) {
-    const bool hidden_return = !is_device_proxy(first) && is_device_proxy(reinterpret_cast<void*>(second));
-    auto* proxy = static_cast<DeviceProxy*>(hidden_return ? reinterpret_cast<void*>(second) : first);
-    auto* out = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(
-        hidden_return ? first : reinterpret_cast<void*>(second));
-    static std::atomic<bool> logged{false};
-    if (first_call(logged))
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: slot 25 GetResourceAllocationInfo%s: out %p visible mask 0x%llx descriptions %llu\n",
-                     hidden_return ? " (hidden return buffer)" : "", static_cast<void*>(out),
-                     static_cast<unsigned long long>(third), static_cast<unsigned long long>(fourth));
-    if (proxy && out) {
-        *out = proxy->real->GetResourceAllocationInfo(static_cast<UINT>(third), static_cast<UINT>(fourth),
-                                                      reinterpret_cast<const D3D12_RESOURCE_DESC*>(fifth));
-    }
-    return reinterpret_cast<std::uint64_t>(out);
-}
-
 // Xbox device slot 26: GetCustomHeapProperties. MSVC's x64 ABI returns D3D12_HEAP_PROPERTIES by value, so the first
 // register holds the caller's buffer and the second the device: the console call `(output, device, node mask, heap
 // type)` is that same ABI, not the swapped order docs/retail_boot_chain.md §3.1 assumed, and the generic forward below
@@ -2835,8 +2818,6 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return proxy_add_ref(self);
     } else if constexpr (Slot == 2) {
         return proxy_release(self);
-    } else if constexpr (Slot == 25) {
-        return proxy_get_resource_allocation_info(self, a1, a2, a3, a4);
     } else if constexpr (Slot == 26) {
         return proxy_get_custom_heap_properties(self, a1, a2, a3);
     } else if constexpr (Slot == 8) {
@@ -2958,10 +2939,132 @@ void fill_vtable(void** vtable, std::index_sequence<I...>) {
     ((vtable[I] = reinterpret_cast<void*>(&proxy_slot<static_cast<unsigned>(I)>) ), ...);
 }
 
+// ---- Struct-returning device methods: the console title calls them with the C ABI ----
+//
+// The PC vtable (MSVC C++) takes `this` in RCX and, for a struct return, the hidden return pointer in RDX. The console
+// title does not. Measured with the retail game_scarlett_master.exe 1.0.2.1 under gta6rt --run: its first
+// GetCustomHeapProperties call (device slot 26) is `rcx = return buffer on the caller's stack, rdx = the device,
+// r8 = node mask 1, r9 = heap type` (DEFAULT, then UPLOAD), and it reads the result from that buffer. That is the C
+// convention, where a struct wider than 8 bytes comes back through a hidden *first* argument (an 8-byte one comes back
+// in RAX, which is what the heap proxy's slots 9/10 already measured). The generic forwarder took the return buffer
+// for the device and crashed on its vtable.
+//
+// The runtime's own code and tests still call the proxy through d3d12.h, in the PC form, so these thunks accept both,
+// as the heap proxy's 9/10 do: whichever of the first two arguments is the device proxy (its first word is the proxy
+// vtable) is `this`, and the other is the return buffer. A return buffer never starts with that vtable pointer: the
+// C-form caller hands over uninitialised memory to be written, and the PC-form caller is this runtime. The buffer is
+// returned in RAX, as both conventions require.
+//   slot 25 GetResourceAllocationInfo -> D3D12_RESOURCE_ALLOCATION_INFO (16 bytes): same rule as slot 26 (inferred,
+//           no call site measured yet)
+//   slot 26 GetCustomHeapProperties   -> D3D12_HEAP_PROPERTIES (20 bytes): measured; it has its own thunk above
+//           (proxy_get_custom_heap_properties), not this one
+// Not changed: slot 43 GetAdapterLuid (an 8-byte LUID; by the same rule the title would expect it in RAX, but no call
+// site is measured yet, so it still forwards in the PC form).
+void** get_vtable();
+
+struct StructReturnCall {
+    DeviceProxy* self;
+    void* ret;
+    bool console_abi;
+};
+
+StructReturnCall struct_return_call(std::uint64_t a0, std::uint64_t a1) {
+    void** const vtable = get_vtable();
+    if (a0 && *reinterpret_cast<void***>(a0) == vtable)  // PC form: this, return buffer
+        return {reinterpret_cast<DeviceProxy*>(a0), reinterpret_cast<void*>(a1), false};
+    return {reinterpret_cast<DeviceProxy*>(a1), reinterpret_cast<void*>(a0), true};  // C form: return buffer, this
+}
+
+// The console size of a list of descriptions (d3d12_xs_alloc_size.h): the PC device's answer with every console render
+// target laid out at its console size, each at its own alignment. `info` is the PC answer and is replaced only when
+// the console layout is larger. `each` is the per-description array of slot 56, or null.
+void apply_console_placement(const D3D12_RESOURCE_DESC* descs, UINT count, D3D12_RESOURCE_ALLOCATION_INFO& info,
+                             D3D12_RESOURCE_ALLOCATION_INFO1* each,
+                             const std::function<D3D12_RESOURCE_ALLOCATION_INFO(UINT)>& pc_one, unsigned slot) {
+    if (info.SizeInBytes == UINT64_MAX) return;
+    D3D12_RESOURCE_ALLOCATION_INFO console{};
+    if (!console_placement(descs, count, pc_one, console, each)) return;
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot %u: render targets sized as console tiles, %llu B for %llu B on %u "
+                     "description(s)\n",
+                     slot, static_cast<unsigned long long>(console.SizeInBytes),
+                     static_cast<unsigned long long>(info.SizeInBytes), static_cast<unsigned>(count));
+    if (console.SizeInBytes >= info.SizeInBytes) info = console;
+}
+
+void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t a1, std::uint64_t visible_mask,
+                                                std::uint64_t count, const D3D12_RESOURCE_DESC* descs) {
+    note_slot(25);
+    const StructReturnCall call = struct_return_call(a0, a1);
+    ID3D12Device* const real = call.self->real;
+    // Normalize console descriptors in a copy. PC calls can also pass the Xbox tiled layout explicitly. Otherwise
+    // their flags and layout reach the host unchanged so the host can validate them.
+    const UINT desc_count = static_cast<UINT>(count);
+    std::unique_ptr<D3D12_RESOURCE_DESC[]> clean;
+    if (descs && desc_count) {
+        clean.reset(new (std::nothrow) D3D12_RESOURCE_DESC[desc_count]);
+        if (!clean) {
+            *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = {UINT64_MAX, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+            return call.ret;
+        }
+        for (UINT i = 0; i < desc_count; ++i) {
+            const auto& desc = descs[i];
+            clean[i] = call.console_abi || desc.Layout == kXboxTiledResourceLayout ? pc_resource_desc(desc) : desc;
+        }
+        descs = clean.get();
+    }
+    const UINT mask = static_cast<UINT>(visible_mask);
+    D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, desc_count, descs);
+    apply_console_placement(descs, desc_count, info, nullptr,
+                            [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
+    *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = info;
+    return call.ret;
+}
+
+// Slot 56, ID3D12Device4::GetResourceAllocationInfo1: the same answer, and the per-description offsets follow the
+// padded sizes, so a title that places its resources at those offsets does not overlap them. The call is forwarded
+// as it came; the console layout then replaces the total and the offsets.
+void* WINAPI proxy_get_resource_allocation_info1(std::uint64_t a0, std::uint64_t a1, std::uint64_t visible_mask,
+                                                 std::uint64_t count, const D3D12_RESOURCE_DESC* descs,
+                                                 D3D12_RESOURCE_ALLOCATION_INFO1* each) {
+    const StructReturnCall call = struct_return_call(a0, a1);
+    DeviceProxy* const self = call.self;
+    note_slot(56);
+    if (56 >= self->slot_count) {
+        return reinterpret_cast<void*>(hr_to_u64(refuse_beyond_device(56, self->slot_count)));
+    }
+    using Fn = void*(WINAPI*)(void*, void*, UINT, UINT, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_ALLOCATION_INFO1*);
+    const UINT n = static_cast<UINT>(count);
+    // The per-resource array is optional (_Out_writes_opt_). The console total must not depend on whether the
+    // caller asked for it, so without one the host's per-resource answers go to a local array (found by Alpha325).
+    std::vector<D3D12_RESOURCE_ALLOCATION_INFO1> local;
+    if (!each && descs && n) {
+        try {
+            local.resize(n);
+            each = local.data();
+        } catch (const std::bad_alloc&) {
+            each = nullptr;  // the host total stands
+        }
+    }
+    void* const returned = reinterpret_cast<Fn>(self->real_vtable[56])(
+        self->real, call.ret, static_cast<UINT>(visible_mask), n, descs, each);
+    if (each) {
+        auto& info = *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret);
+        apply_console_placement(descs, n, info, each, [&](UINT i) {
+            return D3D12_RESOURCE_ALLOCATION_INFO{each[i].SizeInBytes, each[i].Alignment};
+        }, 56);
+    }
+    return returned;
+}
+
 void** get_vtable() {
     static void** vtable = [] {
         static void* storage[kMaxSlots];
         fill_vtable(storage, std::make_index_sequence<kMaxSlots>{});
+        storage[25] = reinterpret_cast<void*>(&proxy_get_resource_allocation_info);
+        storage[56] = reinterpret_cast<void*>(&proxy_get_resource_allocation_info1);
         return storage;
     }();
     return vtable;
@@ -3119,9 +3222,9 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 14 || (slot >= 17 && slot <= 24) ||
-        slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 || slot == 36 || slot == 45 ||
-        slot == 46 || slot == 50 || slot == 62 || slot == 67 || slot == 70 || slot == 75 || slot == 76 ||
-        slot == 133 || slot == kCreateCommittedResource3X)
+        slot == 25 || slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 || slot == 36 ||
+        slot == 45 || slot == 46 || slot == 50 || slot == 56 || slot == 62 || slot == 67 || slot == 70 ||
+        slot == 75 || slot == 76 || slot == 133 || slot == kCreateCommittedResource3X)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
