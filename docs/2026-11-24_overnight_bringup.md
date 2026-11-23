@@ -12,11 +12,14 @@
 一晚把启动链从"进入 guest 后很快停住"推进到两处可复现的硬停点：
 
 - **默认（不跳过 assert）**：`int3` 在 `game_scarlett_master.exe+0x344196`，进程启动后 **5.58 s**。
-- **跳过第一个 assert（`LEONIDA_SKIP_ASSERTS=1`）**：跑到 **11.27 s**，在 console PSO 的
-  `primitive topology type not supported: 19` 之后读空指针 AV（`+0x25a087d`）。
+- **跳过第一个 assert（`LEONIDA_SKIP_ASSERTS=1`）**：跑到 **11.3–11.5 s**，改一条 GPU 页表项时
+  写进一个"只保留、从未提交"的地址范围而 AV（`+0x25a087d`，见 9.2）。
 
 并且确认了此前 300 秒级"卡死"的真实原因：fence 槽位 12 返回 `E_NOTIMPL`，标题进自旋，最后由它自己的
-30 秒看门狗写给地址 0（`+0x2215c35`）。合并上游 PR #7290 后该自旋消失，单次启动从 309 s 掉到 11.27 s。
+30 秒看门狗写给地址 0（`+0x2215c35`）。合并上游 PR #7290 后该自旋消失，单次启动从 309 s 掉到 11.3 s。
+
+凌晨之后又往前推了一步：控制台原语拓扑 19 的 Blit PSO 现在按三角形列表建成，语料里缺的 Blit VS 已翻译
+并入（26,555 → 26,556），`no translated vs` 归零。剩下的停点就是上面那条页表写入（9.2、9.3）。
 
 ---
 
@@ -28,9 +31,9 @@
 | 本分支 | 刚从 `561b65a` 拉起 | `5bf5ad4f0`，领先 `origin/main` **102** 提交，落后 0，全是本地提交，未推送 |
 | 构建 | 部分目标 | 全量 `all` = BUILD-OK（466 个构建步骤） |
 | 测试 | 未跑 | 串行 ctest：**98% 通过，268 项里 5 项失败**，237.95 s |
-| 启动 | 内存表面/描述符堆一带停住 | 5.58 s（默认）/ 11.27 s（跳过 1 个 assert），停在 console PSO 拓扑 19 |
+| 启动 | 内存表面/描述符堆一带停住 | 5.58 s（默认）/ 11.3 s（跳过 1 个 assert），停在一条 GPU 页表项的写入 |
 | 管线缓存 | 无可用缓存（启动时现场编译） | `pipeline_cache.bin` 760,673,388 B，放在 `gta6rt.exe` 旁边 |
-| 着色器语料 | 26,503 条 | 26,555 条（新增 52 个 `XboxBvhBuilder.dll` 内的 compute shader） |
+| 着色器语料 | 26,503 条 | 26,556 条（52 个 `XboxBvhBuilder.dll` 的 compute + 1 个 Blit VS） |
 
 ---
 
@@ -151,6 +154,42 @@ tools/rdna2spirv.py ... --merge
 之前 `no translated compute shader for FSSM sha256 b5316b2e…` 就是这个坑，补完之后启动直接推到 32 秒
 （当时的停点是 fence 自旋，不是缺 shader）。
 
+### 7.1b 运行时抓缺失的 shader（本轮新增）
+
+不是所有缺译文都能靠 `shaders.rpf` 反查——有些程序只出现在标题运行时的请求里（比如那个 Blit VS）。
+现在运行时可以直接把它们写出来：
+
+```powershell
+$env:LEONIDA_DUMP_SHADERS='E:\temp\wait_work\Leonida\tmp\missing-shaders'
+```
+
+命中"语料里没有"的分支时，写两份文件：
+
+- `<stage>-<sha256 前 16 位>.fssm`：运行时用来算 `fssm_sha256` 的那段程序字节；
+- `<stage>-<sha256 前 16 位>.txt`：阶段、完整 sha256、字节数，以及当时的管线形状
+  （输入布局每个元素、MRT 数量与格式、DSV、采样数、拓扑类型）——VS 要用哪一份变体就是靠这个判断。
+
+此后一条命令走完反汇编与翻译（`shader_disasm.py` 只吃 `fssm/` 里的文件，翻译器要上两级目录的 `index.json`）：
+
+```powershell
+# 1. 只留 .fssm，并造出 carve 形状的 index.json（stage_of() 从这里读阶段）
+& .\.venv\Scripts\python.exe -I tmp\write_dump_index.py tmp\missing-shaders
+# 2. 反汇编（llvm-mc 在 WSL 里，Windows 官方 LLVM 没有 AMDGPU target）
+$env:LLVM_MC='wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'
+& .\.venv\Scripts\python.exe -I tools\shader_disasm.py tmp\missing-shaders\fssm --out tmp\missing-shaders\asm
+# 3. 翻译（spirv-val/spirv-as 来自 Vulkan SDK，要在 PATH 上）
+$env:PATH="E:\VulkanSDK\1.4.363.1\Bin;$env:PATH"
+& .\.venv\Scripts\python.exe -I tools\rdna2spirv.py tmp\missing-shaders\asm --out tmp\missing-shaders\spirv
+# 4. 并进语料（键已存在且 sha256 不同就停，不覆盖）
+& .\.venv\Scripts\python.exe -I tmp\merge_shaders_into_corpus.py `
+    'E:\temp\wait_work\leonida-work\shaders\spirv-561b65a' tmp\missing-shaders\spirv
+```
+
+本轮实测：40 个程序里 24 个能干净反汇编，其中 **1 个直接翻译成功**（Blit VS）；另外 23 个都是 compute
+（19 个报 `CS group size`、4 个报 `CS thread-group-size SGPR`），原因是翻译器要 `COMPUTE_PGM_RSRC2` 和
+线程组大小（FSSM 头部 0x138..0x144），而 dump 出来的是"程序"、不含头部；剩下 8 个反汇编失败
+（`no s_endpgm`）和 8 个 `scan failed` 的是 FSPX kind-6，不是 FSSM 布局。
+
 ### 7.2 管线缓存
 
 - 分片目录：`tmp/cache-shards-20261124`，12 个分片（`shard-0..11.bin`，每个 50–80 MB）。
@@ -194,20 +233,112 @@ tools/rdna2spirv.py ... --merge
 5.58 s，栈顶 `+0x344196` → `+0x51fbdb5` → `+0x164dee` → `+0x1df0038` → `+0xcc2cdd` …
 `LEONIDA_SKIP_ASSERTS=1` 可以跳过它。
 
-### 9.2 跳过后（11.27 s）
+### 9.2 跳过后：拓扑 19 已修掉，新停点是写 GPU 页表
+
+跳过第一个 assert 后，标题在 5.5 s 建 PSO 时被 `primitive topology type not supported: 19` 拒掉，
+连带读空指针 AV。**这条已修**（见 9.3）：那是一个 Blit PSO，控制台把它当矩形列表，PC 上当三角形列表。
+
+现在同一段路走到 11.3–11.5 s，停在一个和 PSO 无关的地方：
 
 ```text
-[rt] d3d12: primitive topology type not supported: 19
+[rt] d3d12: console primitive topology type built as a triangle list: 19
 [rt] d3d12_xs: device slot 81 (forwarded) is beyond the PC device vtable (80 slots), called from 0x142482716; returning E_NOTIMPL
 [rt] xgameruntime: XAccessibilityImpl slot 9 is not available offline (E_FAIL)
-... AV read 0x76cf73a8 at game_scarlett_master.exe+0x25a087d
+... AV read inside a reserved (never committed) region at game_scarlett_master.exe+0x25a087d
 ```
 
-这条链是自洽的：console PSO 用了一个 PC 没有的原语拓扑（19），我们的 PSO 翻译直接拒了，PSO 没建成，
-标题后面拿这个 PSO 去解引用就 AV。所以**下一个真正要修的是 console PSO 的原语拓扑 19**（以及紧随其后的
-设备槽位 81 超出 80 槽的 PC vtable）。
+`--trace` 给出的现场（`trace-86.jsonl`）：
 
-同一时刻日志里还有两处相关线索：
+```text
+at      game_scarlett_master.exe+0x25a087d      access=read
+address 0x76af8118      region=reserve  region_base=0x76af8000  region_size=0x6ad000
+gprs    rax=0x0e14b430  r9=0x689acce8  rsi=0x0da8e9b0  r14=0x0dc17580  rbx=0x1478d57e0
+```
+
+反汇编（`llvm-objdump`，`0x1425a0850`–`0x1425a088b`）：
+
+```asm
+1425a0861: movq 0x10(%rax), %rax        ; rax = page table base = 0x0e14b430
+1425a0865: andl $0xf, %ecx              ; from [rsi+0xac]
+1425a086b: shll $0x14, %ecx
+1425a086e: orl  %edx, %ecx              ; PTE flags: bits 20.. and 24..
+1425a0870: xorl %edx, %edx
+1425a0872: movl (%r14,%rdx,4), %r9d     ; r9d = entry from the array
+1425a0879: addl $-0x8, %r9d             ; byte offset into the table
+1425a087d: movl (%rax,%r9), %r10d       ; <-- the fault: read-modify-write of a PTE
+1425a0881: andl $0xfffff, %r10d
+1425a0887: movl %r10d, (%rax,%r9)       ; write it back
+```
+
+写回的目标正好是 `rax + r9 = 0xe14b430 + 0x689acce8 = 0x76af8118`，也就是**在改一条 GPU 页表项**。
+
+两个事实互斥，说明这里有一处语义对不上：
+
+1. `r9` 是数组 `r14` 里的第 i 项（由标题自己的 getter 用 `new count*4` + 填充调用拿到）。页表项的
+   字节偏移只有落在页表页里才有意义（页表页是 64 KiB 的物理页），不可能到 1.7 GB。
+2. 我们的 `XMemAllocatePhysicalPages` 发出的页号是 `slot * 16`，`slot < 2^21`，也就是说页号不会超过
+   `0x2000000`；而数组里的值是 `0x689accf0` 量级，比这个上限大两个数量级。
+
+所以只有两种可能：
+
+- **数组没被真正填过**（`new` 出来的堆内存），即那个"先取 4 字节计数、再取 `count*4` 字节"的 getter 在我们
+  这边拿到了非零计数但没拿到内容；
+- 或者**标题在这段代码里假定控制台地址空间可以 CPU 直接访问**：`[obj+0x10]` 是主机侧的页表基址，
+  而数组里装的是控制台侧的偏移，两套地址空间混在一起算。
+
+第二条如果成立，方向就大了：`docs/d3d12_xs_console_abi.md` §8 记着"`Map` of a unified-memory resource returns
+its console address"，即标题确实会拿控制台地址当指针用；那我们的 Map/GetGPUVA 与加载器的地址空间必须一致，
+并且控制台地址空间要在宿主上真的映射出来。这一条留给下一次接手判断，没有在本轮动手。
+
+### 9.2b 两个实验把范围缩小了
+
+**实验一：`LEONIDA_COMMIT_ON_FAULT=1`**（新增诊断：AV 落在 `MEM_RESERVE` 区域时提交那一页并重试指令，
+模拟控制台"首次触碰即背书"的语义）。同一次启动里：
+
+```text
+11.381015 commit_on_fault addr=0x76cfcc48
+11.381167 commit_on_fault addr=0x7725d179
+11.381233 commit_on_fault addr=0x782d6d23
+11.381250 commit_on_fault addr=0x7c6fd310
+11.381303 commit_on_fault addr=0x7d3752d1
+11.381365 commit_on_fault addr=0x7e0da463
+11.381393 commit_on_fault addr=0x794a53ff
+11.381502 exception 0xc0000005 addr=0x7aca9651 region=free   <- 落在一个纯空闲区，提交也不行
+```
+
+所以这**不是一个地址的问题**：那个循环每处理一个数组元素就写一条 PTE，元素一个接一个落在互不相干的地方；
+而且其中至少一个落在**从未保留过**的地址上。换句话说"只是少提交了一次"解释不了它。
+
+**实验二：给 slot 81 打出参数**（新增：超过 PC 表的设备槽位第一次调用时打印前五个参数）。boot 的调用是
+
+```text
+[rt] d3d12_xs: device slot 81 first call arguments: 0x1 0x11100 0x134f0e3cc 0x134f0e3d0 0x6475e0e88
+```
+
+反汇编调用点（`0x1424826a0` 起，`callq *0x288(%rax)` 即 vtable 槽位 81）：
+
+```asm
+1424826ef: leaq 0x2c(%rsp), %rdi        ; rdi = &kind        (输入时 kind = 6)
+1424826f4: leaq 0x30(%rsp), %rbx        ; rbx = &out         (16 字节)
+1424826f9: movl $0x11100, %r8d          ; r8  = 0x11100
+1424826ff: movl $0x6, (%rdi)
+142482705: movq %rdi, %r9               ; r9  = &kind
+14248270b: movq %rbx, 0x20(%rsp)        ; 栈参数 = &out
+142482710: callq *0x288(%rax)           ; slot 81
+142482716: testl %eax, %eax             ; 只看 hr
+142482718: movl (%rdi), %eax            ; 成功还要 kind != 0
+...
+14248272b: movl (%rbx), %ecx            ; out+0 = 页大小：0x10000 或 0x1000
+14248273d: cmpb $0x0, 0x8(%rbx)         ; out+8 = 一个标志字节
+```
+
+调用者拿到的结构按 0x38（56 字节，`sizeof(D3D12_RESOURCE_DESC)`）步长遍历，并读 `out+0x18`。
+`E_NOTIMPL` 让 `hr != 0`，调用者于是走 `0x14248276d` 的回退路径——**页表那一大块偏移就是从这里出来的**。
+
+也就是说 slot 81 是一次"查询"（1 个描述、属性字 0x11100、输入 kind=6、输出页大小 + 标志），
+它答不上来时标题退到一条没有尺寸信息的路上，随后用垃圾偏移写页表。这是下一轮最值得先实现的一条。
+
+同一条 PSO 链上还有两处不影响停点、但迟早要补的：
 
 ```text
 [rt] d3d12: multisample shader view requires a matching typed colour format: 19
@@ -216,8 +347,38 @@ tools/rdna2spirv.py ... --merge
 [rt] d3d12: no translated compute shader for FSPX kind-6 and kind-0 sha256 7b6436b0…
 ```
 
-- `slot 67` 是 PSO 创建（`0x80070057` = `E_INVALIDARG`），kind 6/7 的字节数说明描述符流里混着控制台专有块。
-- FSPX 那两个 shader 在 `amd_fidelityfx_loader_xbox.dll` 里，用第 7.1 节同一条 carve→translate 链就能补进语料。
+- `slot 67` 是 FSPX compute PSO 创建（`0x80070057` = `E_INVALIDARG`），失败原因就是下面那两个 shader 没有译文。
+- 这两个 FSPX kind-6 程序和另外 38 个程序，已经被 `LEONIDA_DUMP_SHADERS` 抓出来了（见 9.3）。
+
+### 9.3 这一轮修掉的：控制台拓扑 19，以及语料里缺的 Blit VS
+
+**拓扑 19**：`runtime/shims/d3d12_vulkan_device.cpp` 的 PSO 翻译原来只认 `POINT`/`LINE`/`TRIANGLE`，
+其余一律 `E_INVALIDARG`。用 `LEONIDA_DUMP_SHADERS` + 一次详情日志定位到请求者：
+
+```text
+[rt] d3d12: primitive topology type not supported: 19
+[rt] d3d12:   vs VS_Blit_6e5520d1_Wrapped, ps PS_BlitColour_6e5520d1_Wrapped, 1 target(s) format0 28, dsv 20, samples 1
+```
+
+一个 Blit 管线要 5 个 MRT 之外的 1 个 RGBA8 目标、没有深度状态。控制台把矩形列表画成两个三角形
+（`docs/d3d12_xs_console_abi.md` §10：`IASetPrimitiveTopology` 17 = rectangle lists），所以
+**大于 `PATCH` 的取值按 `TRIANGLE_LIST` 建**，并把取值打进日志。改完这条 PSO 就建出来了。
+
+**缺的 Blit VS**：同一时刻日志里还有
+
+```text
+[rt] d3d12: no translated vs for FSSM sha256 01ac7810dcabd62afcd904b231e90d9a031a51808a700e3349290bec5f0d426f
+```
+
+它不是 `shaders.rpf` 里的程序，语料里没有（`index.json` 里查不到这个 sha256）。这一轮的
+`LEONIDA_DUMP_SHADERS` 把它和另外 39 个程序一起写了出来，其中 24 个能干净反汇编，**1 个能直接翻译**——
+正是这个 Blit VS（`vs-01ac7810dcabd62a`，wave64 VS、无顶点输入、5 个 MRT、`topology type 3`）。
+已按 §7.1 的链翻译、`spirv-val` 通过、并进语料（26,555 → **26,556**），重跑后 `no translated vs` 归零。
+
+剩下 23 个多半是 compute：翻译器要 `COMPUTE_PGM_RSRC2` 和线程组大小，也就是 FSSM **头部** 0x138..0x144
+的四字，而我们 dump 出来的是"程序"（运行时用来算 `fssm_sha256` 的那段代码），**不含头部**，所以报
+`CS group size` / `CS thread-group-size SGPR` 而拒绝。要补它们得拿到带头的 FSSM 块（容器里那份），
+不是这条 dump 路径能给的。另外 8 个反汇编失败的是 FSPX kind-6，不是 FSSM 布局。
 
 ---
 
@@ -280,6 +441,9 @@ $env:LEONIDA_SKIP_ASSERTS='1'
 | `LEONIDA_SKIP_ASSERTS=N` | 跳过前 N 个 guest `int3`（#7204） |
 | `LEONIDA_SKIP_INT3=1` | 同上的旧开关 |
 | `LEONIDA_UNIMPLEMENTED=log\|stop\|fail` | 未实现导入的策略 |
+| `LEONIDA_DUMP_SHADERS=<dir>` | 语料里没有的 shader 写到该目录（见 7.1b） |
+| `LEONIDA_TRACE_PSO=1` | 每解析一条 pipeline state stream 就打一行 subobject 走位 |
+| `LEONIDA_COMMIT_ON_FAULT=1` | 诊断用：AV 落在 `MEM_RESERVE` 时提交那一页并重试（见 9.2b） |
 | `--trace-d3d12` | **别在长时间运行里用**，日志量会把进程拖到看门狗的 30 秒门槛 |
 
 退出码 `0x80000003`（`-2147483645`）= 撞上 guest `int3`，`0xc0000005` = 真 AV。两者要分开看。
@@ -304,19 +468,25 @@ $env:LEONIDA_SKIP_ASSERTS='1'
 
 ## 13. 下一次接手的第一梯队
 
-1. **console PSO 原语拓扑 19**（`runtime/shims/d3d12_vulkan_device.cpp` 的 PSO 翻译）→ 顺带看 `slot 67` 的
-   `E_INVALIDARG`（kind 6/7 的控制台块）。
-2. **设备槽位 81 超出 80 槽 PC vtable**：要么扩路由表，要么找到它在 PC 侧的等价槽位。
-3. **FSPX 两个缺翻译的 compute shader**（`9e132485…`、`7b6436b0…`）：第 7.1 节的 carve→translate 链补语料。
-4. **`d3d12_vulkan_device` 的 `R10G10B10` 拷贝失败**：唯一一条代码级红项，和 A8/格式规则合并有关。
-5. 音频 `AcpHal` / `xapu` / `chad` 的未实现导入（上游 A20 的 open ask）。
-6. `pipeline_cache` 里 `shard-7/9` 那两个 `indirect_diffuse_lighting_CS_ScreenProbes_*` 模块：需要先弄清是
+1. **实现设备槽位 81**（9.2b）：一次查询，形状是 `(1, 0x11100, &kind=6, &out{页大小, 标志, ...})`，
+   调用方按 56 字节结构遍历并读 `out+0x18`。答不上来时标题走回退路径，接着用垃圾偏移写页表。
+   先按"返回 64 KiB 或 4 KiB 页大小 + 标志"去试，用 `--trace` 看 PTE 偏移是否变得合理。
+2. **`+0x25a087d` 的页表写入 AV**：有了第 1 条再回看这条。若仍然散射，说明数组本身来自别处
+   （标题自己的 static），要顺着 `getter`（`0x1451d2260`）往里查。
+3. **`slot 67` 的 FSPX compute PSO**：两个 shader（`9e132485…`、`7b6436b0…`）已 dump 在
+   `tmp/missing-shaders/`，但它们是 FSPX kind-6，反汇编要按 `docs/fspx.md` 的布局来，不是 FSSM 那条链。
+4. **其余 23 个 compute 程序的语料**：需要带 FSSM 头部的块（头部 0x138..0x144 是 `COMPUTE_PGM_RSRC2` 和线程组
+   大小，dump 出来的"程序"不含它），所以要先从它们的来源（某个 DLL 或 `shaders.rpf`）取容器，再走 7.1 的链。
+5. **`d3d12_vulkan_device` 的 `R10G10B10` 拷贝失败**：唯一一条代码级红项，怀疑和 A8/格式规则合并有关。
+6. 音频 `AcpHal` / `xapu` / `chad` 的未实现导入（上游 A20 的 open ask）。
+7. `pipeline_cache` 里 `shard-7/9` 那两个 `indirect_diffuse_lighting_CS_ScreenProbes_*` 模块：需要先弄清是
    翻译器不收敛还是驱动侧的问题，再决定要不要单独跑。
 
 ---
 
 ## 14. 仓库状态
 
-- 分支 `main`，HEAD `5bf5ad4f0`，**102 个提交领先 `origin/main`，0 落后**，工作树干净（只剩未跟踪的 `.idea/`、`tmp/`）。
+- 分支 `main`，**105 个提交领先 `origin/main`**（含本文档这一笔），0 落后，工作树干净（只剩未跟踪的 `.idea/`、`tmp/`）。
+- 最新两个提交：`13d2785b0`（本文档）、`d435276bb`（拓扑 19 + 本次加的四组诊断）。
 - **从未推送**，也不打算推送（用户明确：不做 PR，改为同步上游）。
-- 本文档本身是一次独立提交，只含这一个文件。
+- 本文档与那一笔代码提交分开：改文档时只提交这一个文件。
