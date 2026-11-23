@@ -22,6 +22,7 @@
 #include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
+#include "../src/vulkan_mesh_limits.h"
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
 #include "../src/conservative_raster.h"
@@ -3419,19 +3420,9 @@ public:
                 // The SPIR-V's output arrays are sized from PSV0 (the index's max_vertices / max_primitives); Vulkan
                 // has no per-pipeline limit to set, so a mesh shader beyond the device's is refused here
                 // (docs/d3d12_vulkan.md, "Pipelines").
-                const VkPhysicalDeviceMeshShaderPropertiesEXT& limits = device_.mesh_limits();
-                const auto& n = stage.entry->local_size;
-                if (stage.entry->max_vertices > limits.maxMeshOutputVertices ||
-                    stage.entry->max_primitives > limits.maxMeshOutputPrimitives ||
-                    n[0] > limits.maxMeshWorkGroupSize[0] || n[1] > limits.maxMeshWorkGroupSize[1] ||
-                    n[2] > limits.maxMeshWorkGroupSize[2] ||
-                    std::uint64_t(n[0]) * n[1] * n[2] > limits.maxMeshWorkGroupInvocations) {
-                    std::fprintf(stderr,
-                                 "[rt] d3d12: %s needs %u vertices, %u primitives, %ux%ux%u threads; the device "
-                                 "allows %u, %u, %u invocations\n",
-                                 stage.entry->name.c_str(), stage.entry->max_vertices, stage.entry->max_primitives,
-                                 n[0], n[1], n[2], limits.maxMeshOutputVertices, limits.maxMeshOutputPrimitives,
-                                 limits.maxMeshWorkGroupInvocations);
+                if (const std::string refusal = leonida::mesh_limit_refusal(*stage.entry, device_.mesh_limits());
+                    !refusal.empty()) {
+                    std::fprintf(stderr, "[rt] d3d12: %s\n", refusal.c_str());
                     return E_NOTIMPL;
                 }
             }

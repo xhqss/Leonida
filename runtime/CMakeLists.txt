@@ -1454,6 +1454,12 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME bindless_sizing COMMAND bindless_sizing_test)
   endif()
+  # CPU-only: a mesh PSO's output, workgroup and shared-memory needs against synthetic device limits (vulkan_mesh_limits.h).
+  add_executable(vulkan_mesh_limits_test test/vulkan_mesh_limits_test.cpp)
+  target_link_libraries(vulkan_mesh_limits_test PRIVATE Vulkan::Headers)
+  if(BUILD_TESTING)
+    add_test(NAME vulkan_mesh_limits COMMAND vulkan_mesh_limits_test)
+  endif()
   # CPU-only: Vulkan 1.3 core vs 1.2 KHR/EXT feature probing and proc fallback (runtime/src/vulkan13_features.h).
   add_executable(vulkan13_features_test test/vulkan13_features_test.cpp)
   target_link_libraries(vulkan13_features_test PRIVATE Vulkan::Headers)
