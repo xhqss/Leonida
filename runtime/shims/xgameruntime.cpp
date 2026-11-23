@@ -254,6 +254,11 @@ void STDMETHODCALLTYPE error_set_callback(void*, XErrorCallback callback, void* 
 // void XErrorSetOptions(XErrorOptions, XErrorOptions), as Microsoft documents it: nothing to configure offline.
 void STDMETHODCALLTYPE error_set_options(void*, uint32_t, uint32_t) {}
 
+// HRESULT XErrorReport(HRESULT, const char*) as a named export of xgameruntime.dll. XCurl.dll reaches the interface
+// method above through QueryApiImpl, but the retail executable asks for this name with GetProcAddress during startup
+// (measured: "GetProcAddress(xgameruntime.dll, XErrorReport)" 0.97 s in), so the same handler is served by name too.
+HRESULT __stdcall XErrorReport(HRESULT hr, const char* message) { return error_report(nullptr, hr, message); }
+
 const void* const kErrorVtable[] = {
     reinterpret_cast<const void*>(&object_query_interface), reinterpret_cast<const void*>(&object_add_ref),
     reinterpret_cast<const void*>(&object_release),
@@ -1194,6 +1199,7 @@ SHIM_TABLE(xgameruntime,
     {"gameplatformservices.dll", "GetApiVersionImpl", reinterpret_cast<void*>(&GetApiVersionImpl)},
     XGR(XGameRuntimeInitialize),
     XGR(XGameRuntimeUninitialize),
+    XGR(XErrorReport),
     XGR(XSystemGetDeviceType),
     XGR(XSystemGetConsoleId),
     XGR(XSystemGetAppMemoryUsageLimit),
