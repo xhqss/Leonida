@@ -19,9 +19,13 @@
 
 #include <dxgi1_6.h>
 
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <string>
 #include <functional>
 #include <string_view>
 #include <vector>
@@ -304,6 +308,22 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
 
 int main() {
     vktest::Device d;
+    // LEONIDA_CAPTURE writes every presented frame to disk. Turn it on here so the path is exercised with the rest of
+    // the presenter, and check its files against the colour this test clears to.
+    wchar_t capture_dir[MAX_PATH]{};
+    {
+        wchar_t temp[MAX_PATH]{};
+        if (GetTempPathW(MAX_PATH, temp))
+            swprintf_s(capture_dir, L"%sleonida_present_capture_%lu", temp, GetCurrentProcessId());
+        if (capture_dir[0]) {
+            CreateDirectoryW(capture_dir, nullptr);
+            // The presenter reads these with std::getenv, so they have to go into the CRT's environment too, which
+            // SetEnvironmentVariableW alone does not update.
+            _wputenv_s(L"LEONIDA_CAPTURE", capture_dir);
+            _wputenv_s(L"LEONIDA_CAPTURE_EVERY", L"1");
+            _wputenv_s(L"LEONIDA_CAPTURE_LIMIT", L"4");
+        }
+    }
     const auto device_status = d.initialize(true);
     if (device_status == vktest::DeviceStatus::unavailable) {
         std::fprintf(stderr, "SKIP: no usable Vulkan presentation device\n");
@@ -621,6 +641,43 @@ int main() {
             }
         } else {
             std::printf("the window is not in front: on-screen colour check skipped\n");
+        }
+
+        // The capture files must hold the colour the presented images hold: the frame written is the swapchain image
+        // as the presentation engine got it, so a capture that reads the wrong buffer shows up here.
+        if (capture_dir[0]) {
+            char narrow[MAX_PATH * 3]{};
+            WideCharToMultiByte(CP_ACP, 0, capture_dir, -1, narrow, static_cast<int>(sizeof narrow), nullptr, nullptr);
+            char path[MAX_PATH * 3 + 32]{};
+            int files = 0;
+            for (int i = 1; i <= 4; ++i) {
+                std::snprintf(path, sizeof path, "%s\\frame_%05d.ppm", narrow, i);
+                if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) ++files;
+                DeleteFileA(path);
+            }
+            int lines = 0, matching = 0, black = 0;
+            std::ifstream index(std::string(narrow) + "\\index.txt");
+            for (std::string line; std::getline(index, line);) {
+                const auto at = line.find("mean rgb ");
+                double r = -1, g = -1, b = -1;
+                if (at == std::string::npos || std::sscanf(line.c_str() + at, "mean rgb %lf %lf %lf", &r, &g, &b) != 3)
+                    continue;
+                ++lines;
+                if (std::fabs(r - 51) <= 3.0 && std::fabs(g - 153) <= 3.0 && std::fabs(b - 230) <= 3.0) ++matching;
+                if (r < 8 && g < 8 && b < 8) ++black;
+            }
+            // The test resizes and injects failures on purpose, so a frame caught mid-transition is a near miss rather
+            // than a bug; half the frames with the cleared colour is the signal, and a capture reading the wrong
+            // buffer shows up as black frames, which is a hard failure.
+            EXPECT(files >= 2);
+            EXPECT(lines >= 2);
+            EXPECT(matching * 2 >= lines);
+            EXPECT(black == 0);
+            std::printf("capture: %d file(s), %d line(s), %d with the cleared colour, %d black\n", files, lines,
+                        matching, black);
+            index.close();
+            DeleteFileA((std::string(narrow) + "\\index.txt").c_str());
+            RemoveDirectoryA(narrow);
         }
 
         presenter.reset();  // before the device's queue and resources go

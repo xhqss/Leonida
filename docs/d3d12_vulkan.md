@@ -3156,6 +3156,13 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   presents a loading screen with `Token = 0`, presents again with one token, or presents from a render thread out of
   order must not freeze. So those are presented anyway and logged once per kind; only a token that was never handed
   out gives `E_INVALIDARG` (nothing presented). Skipping a token is fine.
+- *Frame capture* (`LEONIDA_CAPTURE=<dir>`, `LEONIDA_CAPTURE_EVERY=<n>`, `LEONIDA_CAPTURE_LIMIT=<n>`): writes
+  every n-th presented frame (default 30, at most 24) to `<dir>/frame_NNNNN.ppm`, a binary P6 of the swapchain image
+  converted to 8-bit RGB, and appends one line per frame to `<dir>/index.txt` with the extent and the mean RGB. Off
+  unless the variable is set, and the folder is created. This is what a check reads when it has to know what the
+  layer actually presented: the window is not readable in every setup (under Wine it is not even mapped), and the
+  mean is enough to tell a real frame from a black one. `d3d12_present_test` turns it on and checks the files against
+  the colour it clears to.
 - *`SuspendX`/`ResumeX`*: suspend drops the interval, the origin event and the frames in flight, wakes blocked waits
   with `ERROR_INVALID_STATE` and refuses presents (a `PresentX` waiting for a swapchain image polls the suspended
   state every 50 ms and gives up, so `SuspendX` never waits on it); resume allows presents again, but waits fail until

@@ -40,12 +40,18 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <system_error>
 #include <cstring>
+#include <fstream>
 #include <functional>
+#include <iomanip>
 #include <map>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -164,7 +170,32 @@ public:
                 vk.vkCreateSemaphore(device, &semaphore, nullptr, &frame.acquired) != VK_SUCCESS)
                 return;
         }
+        // LEONIDA_CAPTURE=<dir>: besides presenting, copy the swapchain image to host memory and write it out as a
+        // binary PPM, every LEONIDA_CAPTURE_EVERY presented frames (default 30), at most LEONIDA_CAPTURE_LIMIT of
+        // them (default 24). Off unless the variable is set; a capture that cannot be made shows nothing and is
+        // reported here instead of failing the presenter.
+        if (const char* dir = std::getenv("LEONIDA_CAPTURE"); dir && *dir) {
+            capture_dir_ = dir;
+            // Create the folder: a capture run names its own output folder and should not have to make it first.
+            std::error_code created;
+            std::filesystem::create_directories(capture_dir_, created);
+            capture_to_disk_ = true;
+            capture_ = true;  // the swapchain needs TRANSFER_SRC, and every frame copies into a staging buffer
+            if (const char* every = std::getenv("LEONIDA_CAPTURE_EVERY")) capture_every_ = std::max(1, std::atoi(every));
+            if (const char* limit = std::getenv("LEONIDA_CAPTURE_LIMIT")) capture_limit_ = std::max(1, std::atoi(limit));
+            std::fprintf(stderr, "[rt] present: capture on: every %d presented frame(s), at most %d, into %s\n",
+                         capture_every_, capture_limit_, capture_dir_.c_str());
+        }
         ok_ = recreate(true, false);
+        if (!ok_ && capture_to_disk_) {
+            // The surface refused a TRANSFER_SRC swapchain, or the staging buffer could not be made: present
+            // without the capture rather than not at all.
+            std::fprintf(stderr, "[rt] present: capture is unavailable on this surface; presenting without it\n");
+            capture_to_disk_ = false;
+            capture_ = false;
+            capture_dir_.clear();
+            ok_ = recreate(true, false);
+        }
     }
 
     ~VulkanPresenter() {
@@ -179,6 +210,8 @@ public:
             release(swapchain_);
         }
         swapchain_ = VK_NULL_HANDLE;
+        // A capture still pending has its copy complete once the queue is idle: write it before the buffer goes.
+        for (Frame& frame : frames_) write_pending_capture(frame);
         release_capture();
         composer_.reset();
         for (Frame& frame : frames_) {
@@ -461,6 +494,8 @@ private:
         Frame& frame = frames_[frame_index_ % frames_.size()];
         if (const VkResult waited = vkWaitForFences_(device, 1, &frame.done, VK_TRUE, UINT64_MAX); waited != VK_SUCCESS)
             return stop(waited);
+        // That fence also covers the capture copy this slot made two presents ago: its pixels are now readable.
+        write_pending_capture(frame);
 
         std::uint32_t image = 0;
         VkResult acquired = acquire(frame.acquired, &image);
@@ -589,6 +624,21 @@ private:
                 last_tore_ = true;
                 ++tear_presents_;
             }
+            // LEONIDA_CAPTURE: this frame's copy is in the staging buffer. Its fence, waited when the slot comes
+            // round again, says when the pixels are readable; write_pending_capture() then writes the file.
+            if (capture_to_disk_ && capture_ && capture_ptr_ && capture_written_ < capture_limit_ &&
+                (presented_ - 1) % std::uint64_t(capture_every_) == 0) {
+                // The buffer is shared by the two frames in flight: a capture still pending in the other slot
+                // (only with a stride of 1) is written now, after its fence, before this frame overwrites it.
+                Frame& other = frames_[frame_index_ % frames_.size()];
+                if (other.capture_serial &&
+                    vkWaitForFences_(device, 1, &other.done, VK_TRUE, UINT64_MAX) == VK_SUCCESS)
+                    write_pending_capture(other);
+                frame.capture_serial = ++capture_serial_;
+                frame.capture_number = presented_;
+                frame.capture_extent = extent_;
+                frame.capture_format = format_;
+            }
         }
         if (capture_ && capture_ptr_) {
             captured_ = true;
@@ -615,6 +665,11 @@ private:
         VkFence done = VK_NULL_HANDLE;
         VkSemaphore acquired = VK_NULL_HANDLE;
         std::array<VkImageView, 2> views{};  // the plane views of the last composed present, until the frame is reused
+        // LEONIDA_CAPTURE: the capture serial this frame's copy wrote, once that fence has been waited (0: none).
+        std::uint64_t capture_serial = 0;
+        std::uint64_t capture_number = 0;  // the present number the file is named after
+        VkExtent2D capture_extent{};
+        VkFormat capture_format = VK_FORMAT_UNDEFINED;
     };
 
     // Whether `source` is a colour texture the device knows, so present() can refuse it before acquiring an image.
@@ -997,6 +1052,108 @@ private:
         captured_ = false;
     }
 
+    // The name VkFormat has in the index; the few formats a capture can be written from, else its number.
+    static const char* capture_format_name(VkFormat format) {
+        switch (format) {
+        case VK_FORMAT_B8G8R8A8_UNORM: return "VK_FORMAT_B8G8R8A8_UNORM";
+        case VK_FORMAT_B8G8R8A8_SRGB: return "VK_FORMAT_B8G8R8A8_SRGB";
+        case VK_FORMAT_R8G8B8A8_UNORM: return "VK_FORMAT_R8G8B8A8_UNORM";
+        case VK_FORMAT_R8G8B8A8_SRGB: return "VK_FORMAT_R8G8B8A8_SRGB";
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return "VK_FORMAT_A2B10G10R10_UNORM_PACK32";
+        case VK_FORMAT_A2R10G10B10_UNORM_PACK32: return "VK_FORMAT_A2R10G10B10_UNORM_PACK32";
+        default: return "unknown";
+        }
+    }
+
+    // Writes the captured frame in `frame` as <dir>/frame_NNNNN.ppm, once the fence covering its copy has been waited
+    // and while the staging buffer is still mapped. The shared buffer holds the newest captured copy, so a frame
+    // whose serial a later capture has overtaken is dropped (only with a stride below the frames in flight).
+    void write_pending_capture(Frame& frame) {
+        const std::uint64_t serial = frame.capture_serial;
+        if (!serial) return;
+        frame.capture_serial = 0;
+        if (!capture_to_disk_ || !capture_ptr_ || serial != capture_serial_) return;
+        if (capture_written_ >= std::uint64_t(capture_limit_) || capture_dir_.empty()) return;
+        const VkExtent2D extent = frame.capture_extent;
+        const VkFormat format = frame.capture_format;
+        const std::uint64_t number = frame.capture_number;
+        const std::size_t texels = std::size_t(extent.width) * extent.height;
+        if (!texels) return;
+        std::vector<std::uint8_t> rgb(texels * 3);
+        std::uint64_t sum[3] = {0, 0, 0};
+        const std::uint8_t* src = capture_ptr_;
+        switch (format) {
+        case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_B8G8R8A8_SRGB:
+            for (std::size_t i = 0; i < texels; ++i) {
+                const std::uint8_t b = src[i * 4 + 0], g = src[i * 4 + 1], r = src[i * 4 + 2];
+                rgb[i * 3 + 0] = r;
+                rgb[i * 3 + 1] = g;
+                rgb[i * 3 + 2] = b;
+                sum[0] += r;
+                sum[1] += g;
+                sum[2] += b;
+            }
+            break;
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R8G8B8A8_SRGB:
+            for (std::size_t i = 0; i < texels; ++i) {
+                const std::uint8_t r = src[i * 4 + 0], g = src[i * 4 + 1], b = src[i * 4 + 2];
+                rgb[i * 3 + 0] = r;
+                rgb[i * 3 + 1] = g;
+                rgb[i * 3 + 2] = b;
+                sum[0] += r;
+                sum[1] += g;
+                sum[2] += b;
+            }
+            break;
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+        case VK_FORMAT_A2R10G10B10_UNORM_PACK32: {
+            const bool bgra = format == VK_FORMAT_A2R10G10B10_UNORM_PACK32;  // B in the low bits
+            for (std::size_t i = 0; i < texels; ++i) {
+                std::uint32_t word = 0;
+                std::memcpy(&word, src + i * 4, sizeof word);
+                const std::uint32_t low = word & 0x3ffu, mid = (word >> 10) & 0x3ffu, high = (word >> 20) & 0x3ffu;
+                const auto to8 = [](std::uint32_t v) { return std::uint8_t((v * 255u + 511u) / 1023u); };
+                const std::uint8_t r = to8(bgra ? high : low), g = to8(mid), b = to8(bgra ? low : high);
+                rgb[i * 3 + 0] = r;
+                rgb[i * 3 + 1] = g;
+                rgb[i * 3 + 2] = b;
+                sum[0] += r;
+                sum[1] += g;
+                sum[2] += b;
+            }
+            break;
+        }
+        default: return;  // not a format the capture can be written from (recreate() refused the others)
+        }
+        char name[64];
+        std::snprintf(name, sizeof name, "frame_%05llu.ppm", static_cast<unsigned long long>(number));
+        std::string path = capture_dir_;
+        if (path.back() != '/' && path.back() != '\\') path += '/';
+        path += name;
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        if (!file) {
+            std::fprintf(stderr, "[rt] present: cannot write %s\n", path.c_str());
+            return;
+        }
+        file << "P6\n" << extent.width << ' ' << extent.height << "\n255\n";
+        file.write(reinterpret_cast<const char*>(rgb.data()), std::streamsize(rgb.size()));
+        file.close();
+        const double scale = 1.0 / double(texels);
+        const double mean[3] = {sum[0] * scale, sum[1] * scale, sum[2] * scale};
+        path.resize(path.size() - std::strlen(name));
+        path += "index.txt";
+        std::ofstream index(path, std::ios::app);
+        if (index)
+            index << "frame " << number << " format " << int(format) << " (" << capture_format_name(format)
+                  << ") extent " << extent.width << 'x' << extent.height << " mean rgb " << std::fixed
+                  << std::setprecision(2) << mean[0] << ' ' << mean[1] << ' ' << mean[2] << '\n';
+        ++capture_written_;
+        std::fprintf(stderr, "[rt] present: capture %s (%ux%u, mean rgb %.2f %.2f %.2f)\n", name, extent.width,
+                     extent.height, mean[0], mean[1], mean[2]);
+    }
+
     // (Re)creates the swapchain for the surface's current size. A zero-sized surface (minimised) leaves no
     // swapchain and is retried on the next present. Keep the old swapchain until the surface queries succeed and
     // the replacement can be attempted. An incomplete replacement stays stale so the next present tries again.
@@ -1307,6 +1464,13 @@ private:
     bool captured_ = false;
     VkExtent2D captured_extent_{};
     VkFormat captured_format_ = VK_FORMAT_UNDEFINED;
+    // LEONIDA_CAPTURE: write the copies the staging buffer makes to <capture_dir_> (see write_pending_capture()).
+    bool capture_to_disk_ = false;
+    std::string capture_dir_;
+    int capture_every_ = 30;  // presented frames between files
+    int capture_limit_ = 24;  // files at most
+    std::uint64_t capture_serial_ = 0;   // the copy counter, so a write knows the buffer still holds its frame
+    std::uint64_t capture_written_ = 0;
 
     PFN_vkGetPhysicalDeviceSurfaceSupportKHR vkGetPhysicalDeviceSurfaceSupportKHR_ = nullptr;
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR vkGetPhysicalDeviceSurfaceCapabilitiesKHR_ = nullptr;
