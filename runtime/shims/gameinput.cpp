@@ -2667,7 +2667,11 @@ void set_hid_backend(const HidBackend* backend) { g_hid = backend ? backend : &k
 
 }  // namespace rt::gameinput
 
+// GameInputCreate is GameInput.dll's export 1, and the retail executable imports it by that ordinal, which the loader
+// looks up as "#1". Without the alias the import misses the shim and binds to the host's GameInput.dll; under Wine that
+// is the builtin stub, which fails, and the title stops on the result.
 SHIM_TABLE(gameinput,
     {"gameinput.dll", "GameInputCreate", reinterpret_cast<void*>(&GameInputCreate)},
+    {"gameinput.dll", "#1", reinterpret_cast<void*>(&GameInputCreate)},
     {"xgameruntime.dll", "GameInputCreate", reinterpret_cast<void*>(&GameInputCreate)},
 );
