@@ -564,6 +564,79 @@ zlib 之后的新停点是 `0xC0000409`（fastfail）与 `0xC0000005`（写地�
 这是本晚最好的状态：**从"15 秒必死"变成"能一直活着"**。剩下的问题是画面：全程只有一次 `PresentX ready`，
 没有第二帧，窗口是白的——所以它还停在初始化/PSO 阶段，没进渲染循环。
 
+### 9.6 那些 `slot 67` 的 FSPX 程序是什么，以及怎么补（本轮做到了 395 条）
+
+窗口活着之后唯一的"红字"就是几百条
+
+```text
+[rt] d3d12: no translated compute shader for FSPX kind-6 and kind-0 sha256 <…>
+[rt] d3d12_xs: slot 67 call 717 failed with 0x80070057 (kind 0 28 B, kind 1 20 B, kind 6 91264 B, kind 7 5528 B)
+```
+
+先把"这是谁的 shader"查清了：
+
+| 检查 | 结果 |
+| --- | --- |
+| 与 `amd_fidelityfx_upscaler_xbox.dll` 里的 29 个比 | **0 / 272 命中**——不是 FSR upscaler 那套 |
+| kind 6 的尺寸范围 | 320 B – 95 KB（DLL 里是 768 B – 41.5 KB） |
+| 在 exe / `shaders.rpf` / `data.rpf` 里搜 `FSPX` 魔数 | **0 命中**——数据是运行时才解出来的（zlib 补上之后才出现） |
+| 与语料里已有的 FSPX 键比 | 当前失败的 304 条里 **0 条已在语料**——是真缺程序，不是键对不上 |
+
+所以这是**标题自己的一大批 FSPX compute 程序**（控制台原生代码 + dispatch state），按当前的速率（首轮爆发后
+约 9 条/分钟）还在继续出现。要补它们，先得把"整个 payload"抓下来——而原来 dump 只写 kind-6 的裸程序，
+翻译器要的线程组大小 / `COMPUTE_PGM_RSRC2` / wave 大小都在 **kind 0** 里（`docs/fspx.md` §Kind 0）。
+
+本轮加的东西：
+
+1. **`slot 67` 的失败也 dump**：`dump_untranslated_fspx()` 把 `proxy_slot_67` 已经拼好的四段 payload 整体写成
+   `cs-<kind 6 的 sha256 前 16 位>.fspx`（和设备的 `cs-<…>.fssm` 同一个目录）。
+2. **一条能跑通的批量链**（都在仓库外，`tmp/` 里）：
+
+```powershell
+$env:LLVM_MC='wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'   # fspx_unpack --disasm 要它
+& .\.venv\Scripts\python.exe -I tools\fspx_unpack.py <payloads…> --out tmp\fspx-batch --disasm
+$env:PATH="E:\VulkanSDK\1.4.363.1\Bin;$env:PATH"
+& .\.venv\Scripts\python.exe -I tools\rdna2spirv.py tmp\fspx-batch\disasm --out tmp\fspx-batch-spirv
+& .\.venv\Scripts\python.exe -I tmp\merge_shaders_into_corpus.py <corpus> tmp\fspx-batch-spirv
+```
+
+第一次批量：**351 个 payload → 290 个翻译成功**且全部过 `spirv-val`，并库后重启，`slot 67` 的前 283 次调用里
+**226 次直接建成了**（之前是 0）。第二批 148 → 95，第三批 129 → 只剩 10（剩下的都撞上翻译器的边界）。
+语料因此从 26,557 涨到 **26,952**（其中 FSPX 条目 **395**）。
+
+翻译器现在挡住的几类（下一轮要补的）：
+
+| 失败原因 | 数量（第一批/第二批） |
+| --- | --- |
+| `fall-through into undecodable words` | 28 / 31 |
+| `CS thread-group-size SGPR` | 23 / 4 |
+| `ds_append` | 1 / 9 |
+| `s_bitreplicate_b64_b32 on a lane mask`、`s_flbit_i32_b64 of a lane mask` | 7 / 4 |
+| `v_fma_mix_f32 … LLVM printed … (a field the disassembler dropped)` | 4 / 1 |
+| `undecodable words (cannot re-anchor)`、`v_cmp destination`、`mask destination`、`normalized encoding` | 各 1 |
+
+注意 `v_fma_mix_f32` 那条是 **llvm-mc 丢字段**（blob 里是 `…ccff84…`，打印成 `…cc8084…`），也就是反汇编这一层
+的失真，不是翻译器的语义问题——和 `docs/shader_disasm.md` 里那类已知问题同源。
+
+**05:00 之后的第四批把瓶颈定位搬了一次家**：又抓了 315 个 payload（翻译成 146），语料到 **27,098**（FSPX 541 条）。
+但下一次启动仍然有 218 条 miss，而这 218 条里：
+
+| 分类 | 数量 |
+| --- | --- |
+| 已在语料里 | **0** |
+| **已经 unpack+反汇编过、但翻译器拒了** | **169** |
+| 这一轮才第一次出现 | 49 |
+
+也就是说：**收集已经不是瓶颈了，翻译器才是**。把这 169 条逐条单独跑 `rdna2spirv.py`，拒的理由分布和 9.6 上表一致
+（`s_flbit_i32_b64 of a lane mask`、`fall-through into undecodable words`、`CS thread-group-size SGPR`、`ds_append`）。
+所以下一轮最值钱的一件事不是再抓 payload，而是**补翻译器的那几类语义**——每补一类，一次启动就少一批 `slot 67` 失败。
+
+另外两条"看起来像 bug 其实不是"的结论，留给下一轮省时间：
+
+- 语料里 FSPX 条目的 `fspx_code_sha256` 与**kind 6 整体的 sha256** 一致（不是 prologue 之后的），运行时的键定义相同，
+  所以"键对不上"这条可以排除；
+- 同一尺寸、不同启动的 payload 常常**整段不同**，但那是不同的程序（同尺寸的程序有十几个），不是标题在打补丁。
+
 ---
 
 ## 10. 构建与测试
@@ -662,19 +735,18 @@ $env:LEONIDA_SKIP_ASSERTS='1'
 按 04:30 的状态排序。**先读这一条**：现在的停点不再是"崩"，而是"活着但不渲染"——窗口 `Americas`
 在前台、`Responding`、进程能一直活着，只有一次 `PresentX ready`、没有第二帧、画面全白。
 
-1. **FSPX compute 的语料**（当前最硬的一条）：`slot 67` 已经在几百次调用上失败，每条都是
-   `no translated compute shader for FSPX kind-6 and kind-0`。实测 270 次调用里 **270 个不同 sha256**，
-   但只有 **176 个不同的 (kind 6, kind 7) 尺寸对**——说明 `sha256` 键把 kind 0（dispatch state）也算进去了，
-   而 kind 0 每次都在变。所以先别急着翻译 270 个程序：先用 §9.4.1 的新 dump（连容器一起写）把它们抓下来，
-   看清"真正不同的 kind 6 程序有几个"。若只有几十个（`amd_fidelityfx_upscaler_xbox.dll` 里就 29 个），
-   就按 `docs/fspx.md` 的链翻译；若真是几百个，那是**查找键**的问题，不是语料的问题。
-   语料里 `fspx/<name>.json`（kind 0 的 word 3/4/6：线程组、wave32、`COMPUTE_PGM_RSRC2`）就是翻译器要的头部。
-2. **画面为什么还是白的**：只有一次 `PresentX ready`，没有第二帧。要么标题卡在初始化（它每 20 秒才建一个
-   FSPX PSO，说明中间在做重活），要么第一帧提交了但交换链没把图像拷出来。先看
-   `LEONIDA_TRACE_PSO`/`--trace` 在 8 分钟里有没有 `Present` 事件；没有就是没进渲染循环。
-3. **`xapu.dll` / `chad.dll` 的 10 个导入**：仍是未实现。`XApuConnect(&a,&b,&c)` 有三个出参
-   （`+0x43aee69` 实测），`XApuEnqueueCommand`/`XApuDequeueResult` 共享一个全局句柄；音频命令队列一旦被真正用到，
-   这三个出参就得像 §9.5 那样写出真东西。
+1. **FSPX 的翻译器缺口**（当前最硬的一条，见 9.6）：`slot 67` 每次启动还有 ~220 条失败，其中 **169 条是我们
+   已经抓下来、反汇编过、但翻译器拒掉的**（0 条是语料里没有的）。所以下一步不是抓 payload，而是补
+   `tools/rdna2spirv.py` 的这几类：`fall-through into undecodable words`（最大头，一批 100 条）、
+   `CS thread-group-size SGPR`（31）、`ds_append`（10）、`s_flbit_i32_b64` / `s_bitreplicate_b64_b32` on a lane
+   mask，以及 `v_fma_mix_f32` 的字段被 llvm-mc 丢掉（这条在反汇编层）。每补一类就用
+   `tmp/merge_shaders_into_corpus.py` 并库、再启动看失败数是否下降。
+2. **画面为什么还是白的**：只有一次 `PresentX ready`，没有第二帧；标题一直停在"建 FSPX compute PSO"这一段，
+   没有任何 draw/clear。先确认它到底在等什么（`--trace` 里 8 分钟内有没有 `Present`），再看是不是交换链没把
+   图像拷出来。
+3. **`xapu.dll` / `chad.dll` 的 10 个导入**：仍是未实现，标题现在已经在调 `XApuConnect`（三个出参）、
+   `XApuGetResultCount`、`XDspConnectWithMaximumStreamLimit`。目前不致命，但音频命令队列一旦真被用到，
+   这些出参就要像 9.5 那样写出真东西。
 4. **其余 compute 程序的语料**（若 §1 判定是真缺程序）：按 §9.4.1 的链（dump 带 `.dxbc` → 反汇编 → 翻译 → 并库）。
 5. **`d3d12_depth_resolve` 的"拒绝却改写了目标"**：`Close` 已经是 `E_INVALIDARG`、批处理也被拒
    （`list 0 is invalid; refusing batch`），但目标纹理的字节和清屏值不一致，而
