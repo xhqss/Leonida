@@ -54,7 +54,11 @@
 namespace rt::d3d12_xs {
 namespace {
 
-constexpr unsigned kMaxSlots = 128;
+// The title's highest reached slot is 133 (docs/retail_boot_chain.md §3.4), and a table shorter than that leaves a null
+// pointer where the title expects a method, which is an execute fault at 0 rather than an E_NOTIMPL. 128 covered the PC
+// device; 192 covers the console slots the boot reaches past it.
+constexpr unsigned kMaxSlots = 192;
+static_assert(kMaxSlots > 133, "the proxy table must reach the console device slot 133");
 static_assert(kMaxSlots > 83, "the proxy table must cover ID3D12Device14 (83 slots)");
 static_assert(sizeof(void*) == 8, "the Xbox-ABI proxy is x64-only");
 static_assert(sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) == 8,
@@ -2250,6 +2254,54 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                                                *riid, out);
 }
 
+// Xbox device slot 133: CreatePlacedResourceX(va, desc, state, clear, riid, out). The state is 0xFFFFFFFF, which is not a
+// PC D3D12_RESOURCE_STATES, and the virtual address belongs to a physical-page range the title just reserved. This
+// stand-in creates a committed DEFAULT-heap resource from the description instead of placing it at `va`
+// (docs/retail_boot_chain.md §3.4): the title holds a resource and a VA it can write, but the two are not the same
+// memory, so what it writes there does not reach the GPU. A real implementation needs the page mapper (#5378) or an
+// imported host allocation; this one is what gets the boot past the call.
+HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, const D3D12_RESOURCE_DESC* xbox_desc,
+                                       std::uint64_t state_word, const D3D12_CLEAR_VALUE* clear_value,
+                                       const IID* riid, void** out) {
+    note_slot(133);
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!xbox_desc) return E_POINTER;
+
+    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
+    const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
+    constexpr D3D12_RESOURCE_FLAGS kPcFlags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                              D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                                              D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE |
+                                              D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+                                              D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcFlags);
+    pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                                                                         : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    static std::atomic<bool> logged{false};
+    if (first_call(logged)) {
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 133 placed resource at VA 0x%llx: dimension=%d %llux%u state 0x%llx flags "
+                     "0x%x -> committed DEFAULT, PC flags 0x%x, state COMMON (not tied to the VA)\n",
+                     static_cast<unsigned long long>(va), static_cast<int>(pc_desc.Dimension),
+                     static_cast<unsigned long long>(pc_desc.Width), static_cast<unsigned>(pc_desc.Height),
+                     static_cast<unsigned long long>(state_word), xbox_flags,
+                     static_cast<unsigned>(pc_desc.Flags));
+    }
+
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    heap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    heap.CreationNodeMask = 1;
+    heap.VisibleNodeMask = 1;
+    // The clear value is only legal for a render-target or depth-stencil resource, which is what the title passes it for.
+    return self->real->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &pc_desc, D3D12_RESOURCE_STATE_COMMON,
+                                               clear_value, __uuidof(ID3D12Resource), out);
+}
+
 // Xbox device slot 26: GetCustomHeapProperties. MSVC's x64 ABI returns D3D12_HEAP_PROPERTIES by value, so the first
 // register holds the caller's buffer and the second the device: the console call `(output, device, node mask, heap
 // type)` is that same ABI, not the swapped order docs/retail_boot_chain.md §3.1 assumed, and the generic forward below
@@ -2331,6 +2383,11 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a4)),
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
             reinterpret_cast<void**>(a7)));
+    } else if constexpr (Slot == 133) {
+        return hr_to_u64(proxy_create_placed_resource_x(
+            self, a1, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2), a3,
+            reinterpret_cast<const D3D12_CLEAR_VALUE*>(a4), reinterpret_cast<const IID*>(a5),
+            reinterpret_cast<void**>(a6)));
     } else {
         note_slot(Slot);
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
@@ -2508,7 +2565,7 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 14 || slot == 26 || slot == 31 ||
         slot == 32 || slot == 34 || slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 ||
-        slot == 62 || slot == 67 || slot == 75 || slot == 76)
+        slot == 62 || slot == 67 || slot == 75 || slot == 76 || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
