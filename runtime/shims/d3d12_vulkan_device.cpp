@@ -3113,10 +3113,13 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
 // LEONIDA_DUMP_SHADERS=<dir>: write the program of a shader this layer has no translation for, named by its SHA-256,
 // beside a note of the stage and the pipeline shape that asked for it. The file is an FSSM (or FSPX kind-6) program as
 // the corpus holds them, so it goes straight into the carve/translate tools (tools/shader_carve.py,
-// tools/fssm_unpack.py, tools/rdna2spirv.py). A VS must match the input layout it is used with, so the note records the
-// layout and shape the pipeline asked for, to see whether a variant the corpus already has fits.
+// tools/fssm_unpack.py, tools/rdna2spirv.py). The DXBC container it was carved out of goes beside it as <name>.dxbc,
+// which is what the translator needs for signatures, PSV0 and the FSSM header (group size, COMPUTE_PGM_RSRC2). A VS must
+// match the input layout it is used with, so the note records the layout and shape the pipeline asked for, to see
+// whether a variant the corpus already has fits.
 void dump_untranslated_shader(const char* stage, const std::string& hash, const std::vector<std::uint8_t>& program,
-                              const D3D12_GRAPHICS_PIPELINE_STATE_DESC* graphics) {
+                              const D3D12_GRAPHICS_PIPELINE_STATE_DESC* graphics, const void* container = nullptr,
+                              std::size_t container_bytes = 0) {
     char dir[1024] = {};
     size_t length = 0;
     if (getenv_s(&length, dir, sizeof dir, "LEONIDA_DUMP_SHADERS") != 0 || length <= 1) return;
@@ -3129,8 +3132,20 @@ void dump_untranslated_shader(const char* stage, const std::string& hash, const 
         std::fprintf(stderr, "[rt] d3d12: could not write %s.fssm\n", base.c_str());
         return;
     }
+    // The container the program came out of, beside it: the translator reads signatures and PSV0 out of it, and the
+    // FSSM header that carries the compute group size and COMPUTE_PGM_RSRC2 (that header is not part of the program
+    // the library is keyed by). A bare program cannot be translated without them.
+    bool have_container = false;
+    if (container && container_bytes >= 4 &&
+        std::memcmp(container, "DXBC", 4) == 0) {
+        std::ofstream code(base + ".dxbc", std::ios::binary | std::ios::trunc);
+        code.write(static_cast<const char*>(container), static_cast<std::streamsize>(container_bytes));
+        code.close();
+        have_container = static_cast<bool>(code);
+    }
     std::ofstream note(base + ".txt", std::ios::trunc);
     note << "stage " << stage << "\nfssm sha256 " << hash << "\nbytes " << program.size() << "\n";
+    if (have_container) note << "container bytes " << container_bytes << "\n";
     if (graphics) {
         note << "input layout elements " << graphics->InputLayout.NumElements << "\n";
         for (UINT i = 0; i < graphics->InputLayout.NumElements; ++i) {
@@ -3373,7 +3388,8 @@ public:
             });
             if (!stage.entry) {
                 std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
-                dump_untranslated_shader(stage.name, hash, stage.fssm, &desc);
+                dump_untranslated_shader(stage.name, hash, stage.fssm, &desc, stage.code.pShaderBytecode,
+                                         static_cast<std::size_t>(stage.code.BytecodeLength));
                 return E_INVALIDARG;
             }
             if (stage.entry->binding_count) {
@@ -3863,7 +3879,9 @@ public:
                              leonida::sha256_hex(program.bytes).c_str());
             // An FSPX program is keyed by its kind-6 and kind-0 parts: the dump holds the program the corpus would
             // hold, and the note says which stage looked for it.
-            dump_untranslated_shader("cs", leonida::sha256_hex(program.bytes), program.bytes, nullptr);
+            dump_untranslated_shader("cs", leonida::sha256_hex(program.bytes), program.bytes, nullptr,
+                                     desc.CS.pShaderBytecode,
+                                     static_cast<std::size_t>(desc.CS.BytecodeLength));
             return E_INVALIDARG;
         }
         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
