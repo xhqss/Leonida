@@ -117,6 +117,30 @@ HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size,
     return fn(data, size, iid, out);
 }
 
+// Console virtual-memory policy (docs/d3d12_xs_surface.md §2.1 row 4). The PC runtime and the Vulkan allocator own
+// the address space, so there is nothing to configure; the title only reads the result. Measured at the first call
+// (game_scarlett_master.exe+0x1e1cfe5): four register arguments, the first pointing at a 32-byte block the title
+// zeroed and whose word at +4 it filled in, and `test eax, eax / jns` on the result — a success value is what lets
+// the boot path continue, and nothing is written back because the block belongs to the title. Parameter types are
+// therefore left unasserted.
+HRESULT WINAPI configure_virtual_memory(void* first, const void* second, const void* third, uintptr_t fourth) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX(%p, %p, %p, 0x%llx): console virtual-memory policy, "
+                     "the PC/Vulkan side owns it; returning S_OK without configuring anything\n",
+                     first, second, third, static_cast<unsigned long long>(fourth));
+        // The caller zeroes a 32-byte block and fills word +4 before the call; the words are printed because the
+        // library may fill the block in and the title can read it afterwards.
+        if (first) {
+            const auto* words = static_cast<const uint32_t*>(first);
+            std::fprintf(stderr, "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX block =%08x %08x %08x %08x\n", words[0],
+                         words[1], words[2], words[3]);
+        }
+    }
+    return rt::d3d12_trace::result("D3D12ConfigureVirtualMemoryX", S_OK);
+}
+
 // Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 24-word block that is only
 // logged and not used to create the device. The struct's total size is unknown, so the log reads 24 x 32-bit words
 // (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead, so 12_0 is used as the
@@ -225,4 +249,5 @@ SHIM_TABLE(d3d12_xs,
     {"d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer",
      reinterpret_cast<void*>(&create_root_signature_deserializer)},
     {"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&D3D12XboxCreateDevice)},
+    {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&configure_virtual_memory)},
 );

@@ -21,7 +21,7 @@ namespace {
 
 using XMemAllocFn = void*(__stdcall*)(size_t, uint64_t);
 using XMemFreeFn = void(__stdcall*)(void*, uint64_t);
-using XMemVirtualQueryFn = SIZE_T(__stdcall*)(HANDLE, const void*, void*);
+using XMemVirtualQueryFn = SIZE_T(__stdcall*)(HANDLE, const void*, void*, SIZE_T);
 // BOOL XMemGetWorkingSetStatistics(UINT32 kind, stats*): the FSR DLL passes kind 0x20000001 at every call site.
 using XMemGetWorkingSetStatisticsFn = BOOL(__stdcall*)(uint32_t, void*);
 using XMemVirtualAllocFn = void*(WINAPI*)(void*, SIZE_T, DWORD, ULONGLONG, DWORD);
@@ -122,7 +122,7 @@ void test_virtual_query(XMemVirtualQueryFn query) {
 
     alignas(64) uint8_t out[64];
     std::memset(out, 0xa5, sizeof(out));
-    const SIZE_T written = query(GetCurrentProcess(), local_address, out);
+    const SIZE_T written = query(GetCurrentProcess(), local_address, out, sizeof(out));
     check(written != 0, "XMemVirtualQuery(current process, stack local) returns non-zero");
 
     MEMORY_BASIC_INFORMATION info{};
@@ -143,12 +143,27 @@ void test_virtual_query(XMemVirtualQueryFn query) {
     }
     check(written != 0 && tail_zero, "XMemVirtualQuery leaves the 64-byte output tail zero");
 
+    // The fourth argument is the caller's buffer length (VirtualQueryEx's shape). A shorter guest structure must not be
+    // overrun: the bytes past it stay as the caller left them.
+    alignas(64) uint8_t short_out[64];
+    std::memset(short_out, 0xa5, sizeof(short_out));
+    const SIZE_T short_written = query(GetCurrentProcess(), local_address, short_out, 16);
+    check(short_written != 0 && short_written <= 16, "a 16-byte XMemVirtualQuery request writes at most 16 bytes");
+    bool short_tail_untouched = true;
+    for (size_t i = 16; i < sizeof(short_out); ++i) {
+        if (short_out[i] != 0xa5) {
+            short_tail_untouched = false;
+            break;
+        }
+    }
+    check(short_tail_untouched, "XMemVirtualQuery does not write past the length the caller gave");
+
     alignas(64) uint8_t bad_out[64];
     std::memset(bad_out, 0xa5, sizeof(bad_out));
     // Address 1 is queryable (it falls in the free region starting at 0), so use a non-canonical address that
     // VirtualQueryEx rejects.
     const void* const unmappable = reinterpret_cast<const void*>(~static_cast<uintptr_t>(0));
-    const SIZE_T bad = query(GetCurrentProcess(), unmappable, bad_out);
+    const SIZE_T bad = query(GetCurrentProcess(), unmappable, bad_out, sizeof(bad_out));
     check(bad == 0, "XMemVirtualQuery on an invalid address returns 0 without crashing");
 }
 
@@ -212,16 +227,54 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
 
     check(VirtualFree(base, 0, MEM_RELEASE), "release the synthetic write-watch region");
 
-    SetLastError(ERROR_SUCCESS);
-    void* const large_page = virtual_alloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT | 0x20000000, 0,
-                                           PAGE_READWRITE);
-    check(large_page == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
-          "unsupported large-page allocation is rejected before host allocation");
+    // The guest words a title passes here, measured on the first real run (game_scarlett_master.exe+0x1e1cf60, the
+    // routine that configures virtual memory before the allocator starts): (0x20402000, 0x21, 0x004) for a
+    // reserve-only 64 KiB region, (0x20402000, 0x3, 0x801) for another of the same size, and (0x20003000, 0x183,
+    // 0x22004) four times. The attribute word has no host counterpart, and the console's protection step is
+    // XMemMapPhysicalPages, which has none either: every one of them has to come back committed and writable, including
+    // the one whose protect byte is PAGE_NOACCESS.
+    struct GuestRequest {
+        DWORD allocation_type;
+        ULONGLONG attributes;
+        DWORD protect;
+        const char* what;
+        bool committed;
+    };
+    const GuestRequest guest_requests[] = {
+        {MEM_RESERVE | 0x20400000, 0x21, 0x004, "reserve-only 64 KiB region with attribute 0x21", false},
+        {MEM_RESERVE | 0x20400000, 0x3, 0x801, "reserve-only 64 KiB region with protect 0x801 (PAGE_NOACCESS + 0x800)",
+         false},
+        {MEM_RESERVE | MEM_COMMIT | 0x20000000, 0x183, 0x22004, "committed region with the guest large-page bit", true},
+    };
+    for (const GuestRequest& request : guest_requests) {
+        void* const region =
+            virtual_alloc(nullptr, page_size, request.allocation_type, request.attributes, request.protect);
+        std::string message = std::string("a ") + request.what + " is allocated here";
+        check(region != nullptr, message.c_str());
+        if (!region) continue;
+        // A reserve-only request stays a reservation: committing it here is what exhausted the host's commit limit on
+        // the game's two 24 GiB reservations (ERROR_COMMITMENT_LIMIT on the next one). The guest commits through its
+        // own mapping calls.
+        MEMORY_BASIC_INFORMATION info{};
+        const SIZE_T queried = VirtualQuery(region, &info, sizeof(info));
+        const bool committed = queried != 0 && info.State == MEM_COMMIT;
+        if (request.committed) {
+            auto* const writable = static_cast<volatile uint8_t*>(region);
+            writable[0] = 0x5a;
+            message = std::string("a ") + request.what + " is committed and writable";
+            check(writable[0] == 0x5a, message.c_str());
+        } else {
+            message = std::string("a ") + request.what + " stays reserved, not committed";
+            check(queried != 0 && !committed, message.c_str());
+        }
+        check(VirtualFree(region, 0, MEM_RELEASE), "release the measured guest region");
+    }
 
     SetLastError(ERROR_SUCCESS);
-    void* const attributed = virtual_alloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT, 1, PAGE_READWRITE);
-    check(attributed == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
-          "nonzero XMem allocation attributes are rejected before host allocation");
+    void* const unknown_type =
+        virtual_alloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT | 0x80000000, 0, PAGE_READWRITE);
+    check(unknown_type == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+          "an allocation-type bit outside the measured guest vocabulary is rejected before host allocation");
 }
 
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
