@@ -63,17 +63,15 @@ four `_l`/`_lz` forms, packed image formats (`*_pck`, `*_by2`), the 16-bit `v_pk
 `*_saveexec` / `s_nand`/`s_nor`/`s_xnor` scalar forms. `python -I tools/isa_coverage.py --list` has the full list per
 encoding.
 
-Names the translator matches that are not in the RDNA2 XML (16), each checked with
+Names the translator matches that are not in the RDNA2 XML (10), each checked with
 `llvm-mc -arch=amdgcn -mcpu=gfx1013`:
 
 | name | llvm-mc for gfx1013 | verdict |
 |---|---|---|
-| `s_and_b32_mask`, `s_or_b32_mask` | invalid instruction | dead: nothing in the repository produces them |
 | `v_add_u16`, `v_sub_u16` | other GPU only | internal: `v_add_nc_u16` / `v_sub_nc_u16` are re-dispatched under these names |
-| `v_subrev_u16`, `v_and_b16`, `v_or_b16`, `v_xor_b16` | other GPU only | dead GFX9 spellings, harmless |
 | `s_delay_alu` | other GPU only (RDNA3) | deliberate, in `NOOPS` |
 | `v_mac_f32`, `v_mac_legacy_f32`, `v_mad_f32`, `v_mad_legacy_f32`, `v_madak_f32`, `v_madmk_f32`, `s_get_waveid_in_workgroup` | valid | real gfx1013 instructions that AMD's XML omits |
 
-None is a typo that breaks translation, so there is nothing to fix in the translator; the two `_mask` names and the
-four dead 16-bit spellings are candidates for removal. No name ends in a suffix `base_op()` strips (`_e32`, `_e64`,
-`_sdwa`, `_dpp`), and every `startswith` prefix matches at least one RDNA2 instruction.
+None is a typo that breaks translation, so there is nothing to fix in the translator. No name ends in a suffix
+`base_op()` strips (`_e32`, `_e64`, `_sdwa`, `_dpp`), and every `startswith` prefix matches at least one RDNA2
+instruction.

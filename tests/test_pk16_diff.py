@@ -206,6 +206,18 @@ class Cli(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("MISMATCH", out)
 
+    def test_a_run_where_every_program_was_skipped_is_not_a_success(self):
+        def refuse(lines, *args):
+            raise d.Skip("unsupported form")
+        real = d.translated
+        try:
+            d.translated = refuse
+            rc, out = self.main("--programs", "3", "--seed", "1", "--ops", "v_pk_max_u16")
+        finally:
+            d.translated = real
+        self.assertEqual(rc, 2, out)
+        self.assertIn("no program ran: every one was skipped", out)
+
     def test_hardware_oracle_without_the_tools_exits_77(self):
         env = dict(os.environ, LEONIDA_AMD_CLANG=str(TOOL.parent / "no-such-clang.exe"))
         r = subprocess.run([sys.executable, "-I", str(TOOL), "--oracle", "hw", "--programs", "3"],

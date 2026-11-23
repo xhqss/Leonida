@@ -478,6 +478,16 @@ class ArchiveTest(unittest.TestCase):
                 with open(arc, "rb") as f:
                     self.assertEqual(f.read(), rpf_data)
 
+    def test_output_cannot_create_a_report_in_place_of_the_carve_manifest(self):
+        folder = os.path.join(self.root, "no_manifest")
+        os.mkdir(folder)
+        manifest = os.path.join(folder, "index.json")
+        p = subprocess.run([sys.executable, "-I", TOOL, folder, manifest, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("output would overwrite the carve manifest", p.stderr)
+        self.assertFalse(os.path.exists(manifest))
+
     def test_output_cannot_overwrite_carve_manifest(self):
         folder = os.path.join(self.root, "carved_manifest")
         os.makedirs(folder)

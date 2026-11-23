@@ -65,9 +65,15 @@ def _encode_rans_syms(syms, model, x):
     return x, buf
 
 
+MAX_FRAGMENT_LEN = 257 + 0xFFFF  # 65,792 bytes (3-byte header stores n - 257 in u16)
+
+
 def _make_hdr(default_w, w, q, flush, n):
     z = default_w - w
-    assert 0 <= z <= 3 and n >= 1
+    if not 0 <= z <= 3:
+        raise ValueError(f"width reduction out of range: {z}")
+    if not 1 <= n <= MAX_FRAGMENT_LEN:
+        raise ValueError(f"fragment length {n} out of range 1..{MAX_FRAGMENT_LEN}")
     if n <= 256:
         return [((z & 3) << 6) | ((1 if flush else 0) << 4) | (q & 15), n - 1]
     n2 = n - 257
@@ -388,6 +394,84 @@ class EntropyLayerTest(unittest.TestCase):
         decoded, used = bcpack.decode_lanes(raw, codec, nsym * 8)
         self.assertEqual(used, len(raw))
         self.assertEqual(decoded, lanes)
+
+    def test_fragment_length_boundaries(self):
+        # 2-byte header covers 1..256; 3-byte header stores (n - 257) in u16 -> 257..65,792.
+        self.assertEqual(len(_make_hdr(8, 8, 0, True, 1)), 2)
+        self.assertEqual(_make_hdr(8, 8, 0, True, 256), [0x10, 0xFF])
+        self.assertEqual(_make_hdr(8, 8, 0, True, 257), [0x30, 0x00, 0x00])
+        self.assertEqual(_make_hdr(8, 8, 0, True, MAX_FRAGMENT_LEN), [0x30, 0xFF, 0xFF])
+        with self.assertRaises(ValueError):
+            _make_hdr(8, 8, 0, True, 0)
+        with self.assertRaises(ValueError):
+            _make_hdr(8, 8, 0, True, MAX_FRAGMENT_LEN + 1)
+
+        # Pick the (w=8, q) model whose largest symbol has the lowest frequency so a
+        # 65,792-byte payload needs as few symbols as possible.
+        dw = 8
+        q_heavy = min(
+            (q for q in range(16) if bcpack._get_model(dw, q) is not None),
+            key=lambda q: bcpack._get_model(dw, q).freq[dw],
+        )
+        model = bcpack._get_model(dw, q_heavy)
+        s_heavy = (1 << dw) - 1
+
+        def build_exact_payload_syms(target_len):
+            x = bcpack.RANS_L
+            buf_len = 0
+            syms_rev = []
+
+            def step(x_in, s):
+                p = s.bit_length()
+                f = model.freq[p]
+                c = model.base[p] + f * (s - (0 if p == 0 else 1 << (p - 1)))
+                if c == 0:
+                    f, c = f - 1, 1
+                limit = f << 16
+                emitted = 0
+                while x_in >= limit:
+                    x_in >>= 8
+                    emitted += 1
+                q_div, r_mod = divmod(x_in, f)
+                return (q_div << 16) + c + r_mod, emitted
+
+            while 4 + buf_len < target_len:
+                need = target_len - (4 + buf_len)
+                chosen = None
+                for cand in (s_heavy, 1, 0) if need >= 2 else (0, 1, s_heavy):
+                    nx, em = step(x, cand)
+                    if em <= need:
+                        chosen = (cand, nx, em)
+                        break
+                self.assertIsNotNone(chosen, f"could not hit exact payload length {target_len}")
+                cand, x, em = chosen
+                syms_rev.append(cand)
+                buf_len += em
+            return list(reversed(syms_rev))
+
+        codec = 1
+        widths = bcpack.LANE_WIDTHS[codec]
+        for target_len, exp_hdr_len, exp_tail in (
+            (256, 2, bytes([0xFF])),
+            (257, 3, bytes([0x00, 0x00])),
+            (MAX_FRAGMENT_LEN, 3, bytes([0xFF, 0xFF])),
+        ):
+            with self.subTest(payload_len=target_len):
+                syms0 = build_exact_payload_syms(target_len)
+                nsym = len(syms0)
+                frag0, _ = _encode_fragment(syms0, dw, dw, q_heavy, flush=True, strip_zeros=False)
+                self.assertEqual(len(frag0), exp_hdr_len + target_len)
+                self.assertEqual(frag0[1:exp_hdr_len], exp_tail)
+                lanes = [syms0] + [[0] * nsym for _ in range(len(widths) - 1)]
+                streams = [frag0]
+                for w_i in widths[1:]:
+                    f_i, _ = _encode_fragment([0] * nsym, w_i, w_i, 0, flush=True)
+                    streams.append(f_i)
+                raw = interleave_lanes(streams, widths, nsym)
+                decoded, used = bcpack.decode_lanes(raw, codec, nsym * 8)
+                self.assertEqual(used, len(raw))
+                self.assertEqual(decoded[0], syms0)
+                self.assertTrue(all(decoded[k] == lanes[k] for k in range(1, len(widths))))
 
     def test_rejects_corrupt_and_trailing_data(self):
         lanes = [[0] * 8 for _ in range(12)]

@@ -182,7 +182,7 @@ class TestFormatDecoderBoundary(unittest.TestCase):
         self.gen = rdna2spirv.Gen("ps")
 
     def test_invalid_format_codes_raise_unsupported(self):
-        for code in (0, -1, 999, 255, 42, 100):
+        for code in (0, -1, 999, 255, 100, 127):   # 42 (10_11_11 SINT) is a format since #2022 and #2432
             with self.subTest(code=code):
                 with self.assertRaisesRegex(rdna2spirv.Unsupported, r"format .* \(not in FORMATS\)"):
                     self.gen.decode_format(["%w0", "%w1", "%w2", "%w3"], code)
@@ -382,6 +382,77 @@ class TestTranslateIntegrationBoundaryChecks(unittest.TestCase):
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", ResourceWarning)
                 with self.assertRaisesRegex(rdna2spirv.Unsupported, "undecodable words \\(cannot re-anchor\\)"):
+                    rdna2spirv.translate(src)
+
+    def test_fall_through_into_undecodable_words_is_refused(self):
+        # SHADER-813: llvm-mc skips words it cannot decode (e.g. some v_dot4_i32_i8 op_sel forms). When a reachable
+        # instruction runs into them the path used to end there, so the export after the gap was dropped and the
+        # module translated, valid and silent. It must be refused instead.
+        mov0 = [0xF2, 0x02, 0x00, 0x7E]
+        mov1 = [0xF2, 0x02, 0x02, 0x7E]
+        export = [0x0F, 0x18, 0x00, 0xF8, 0x00, 0x01, 0x00, 0x01]
+        endpgm = [0x00, 0x00, 0x81, 0xBF]
+        gap = [0x00, 0x50, 0x16, 0xCC, 0x01, 0x05, 0x0E, 0x0C]   # the word from the finding, as llvm-mc leaves it
+
+        def enc(words):
+            return ",".join(f"0x{b:02x}" for b in words)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            fssm = os.path.join(tmp, "fssm")
+            os.makedirs(disasm)
+            os.makedirs(fssm)
+            with open(os.path.join(tmp, "ps_gap.dxbc"), "wb") as f:
+                f.write(STUB_DXBC)
+            with open(os.path.join(fssm, "ps_gap.fssm"), "wb") as f:
+                f.write(bytes(mov0 + mov1 + gap + export + endpgm))
+            shader_text = (
+                "ps_gap.s:\n"
+                f"\tv_mov_b32_e32 v0, 1.0 ; encoding: [{enc(mov0)}]\n"
+                f"\tv_mov_b32_e32 v1, 1.0 ; encoding: [{enc(mov1)}]\n"
+                "; invalid instruction encoding at 0x8\n"
+                f"\texp mrt0 v0, v1, v0, v1 done vm ; encoding: [{enc(export)}]\n"
+                f"\ts_endpgm ; encoding: [{enc(endpgm)}]\n"
+            )
+            src = os.path.join(disasm, "ps_gap.s")
+            with open(src, "w", encoding="utf-8") as f:
+                f.write(shader_text)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                with self.assertRaisesRegex(rdna2spirv.Unsupported, "fall-through into undecodable words"):
+                    rdna2spirv.translate(src)
+
+    def test_fall_through_into_undecodable_words_at_the_end_of_the_range_is_refused(self):
+        # SHADER-813 follow-up (@Flyander): the skipped words come after the last printed instruction but inside the
+        # code range the header declares, so the path runs into them as well
+        mov0 = [0xF2, 0x02, 0x00, 0x7E]
+        mov1 = [0xF2, 0x02, 0x02, 0x7E]
+        gap = [0x00, 0x50, 0x16, 0xCC, 0x01, 0x05, 0x0E, 0x0C]
+
+        def enc(words):
+            return ",".join(f"0x{b:02x}" for b in words)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            fssm = os.path.join(tmp, "fssm")
+            os.makedirs(disasm)
+            os.makedirs(fssm)
+            with open(os.path.join(tmp, "ps_tail.dxbc"), "wb") as f:
+                f.write(STUB_DXBC)
+            with open(os.path.join(fssm, "ps_tail.fssm"), "wb") as f:
+                f.write(bytes(mov0 + mov1 + gap))
+            shader_text = (
+                "; ps_tail  code 0x0..0x10 (header), gfx1013, 2 invalid words\n"
+                f"\tv_mov_b32_e32 v0, 1.0 ; encoding: [{enc(mov0)}]\n"
+                f"\tv_mov_b32_e32 v1, 1.0 ; encoding: [{enc(mov1)}]\n"
+                "; invalid instruction encoding at 0x8\n"
+            )
+            src = os.path.join(disasm, "ps_tail.s")
+            with open(src, "w", encoding="utf-8") as f:
+                f.write(shader_text)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                with self.assertRaisesRegex(rdna2spirv.Unsupported, "fall-through into undecodable words"):
                     rdna2spirv.translate(src)
 
     def test_native_blob_mismatched_encoding_reachable_normalized(self):

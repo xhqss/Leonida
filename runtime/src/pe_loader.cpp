@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <intrin.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <array>
@@ -332,11 +333,51 @@ void release_thread_slot(size_t slot) {
     entry = ThreadTlsSlot{};
 }
 
+// A block load() put into a thread that was already running (install_on_existing_threads). Such a thread has no
+// g_thread_tls_slots record of it: the record is here, keyed by thread id, and the thread's own DLL_THREAD_DETACH or
+// the module's ~Loader takes the block out again.
+struct ExistingThreadBlock {
+    DWORD thread = 0;
+    size_t slot = 0;
+    Module* module = nullptr;
+    uint64_t generation = 0;   // the module's tls_generation: with the pointer, what identifies the module
+    uint32_t index = kNoTlsIndex;
+    void*** vector = nullptr;  // that thread's TEB->ThreadLocalStoragePointer field; the array itself can be replaced
+    void* saved = nullptr;     // what the block replaced
+    void* block = nullptr;
+};
+
+// Immortal, like the thread events that use them. `ended` holds the ids of threads whose DLL_THREAD_DETACH has run:
+// Windows frees such a thread's TLS array next, so nothing may be put into it any more.
+struct ExistingThreads {
+    SRWLOCK lock = SRWLOCK_INIT;  // a leaf: nothing is called while it is held but VirtualFree and thread queries
+    std::vector<ExistingThreadBlock> blocks;
+    std::vector<DWORD> ended;
+};
+ExistingThreads& existing_threads() {
+    static auto* state = new ExistingThreads;
+    return *state;
+}
+struct ExistingThreadsLock {
+    ExistingThreadsLock() { AcquireSRWLockExclusive(&existing_threads().lock); }
+    ~ExistingThreadsLock() { ReleaseSRWLockExclusive(&existing_threads().lock); }
+    ExistingThreadsLock(const ExistingThreadsLock&) = delete;
+    ExistingThreadsLock& operator=(const ExistingThreadsLock&) = delete;
+};
+
+bool has_existing_thread_block(DWORD thread, const Module& m) {
+    ExistingThreadsLock lock;
+    for (const auto& b : existing_threads().blocks)
+        if (b.thread == thread && b.module == &m && b.generation == m.tls_generation) return true;
+    return false;
+}
+
 void install_thread_block(Module& m) {
     if (m.tls_slot >= kMaxMappedTlsModules) return;
     const size_t slot = m.tls_slot;
     ThreadTlsSlot& entry = g_thread_tls_slots[slot];
     if (entry.module == &m && entry.generation == m.tls_generation) return;
+    if (has_existing_thread_block(GetCurrentThreadId(), m)) return;  // load() already gave this thread its copy
     if (entry.module) {
         // A copy left by a module whose Loader is gone (or from an earlier generation) is released; a live owner's is a conflict.
         if (entry.module == g_tls_slot_owners[slot].load() &&
@@ -407,6 +448,269 @@ void run_callbacks(Module& m, uint32_t reason, bool trace = false) {
     }
 }
 
+// ---- Threads that existed before load() ---------------------------------------------------------------------------
+//
+// When Windows loads a DLL with static TLS itself, every running thread gets a block for it (and no DLL_THREAD_ATTACH).
+// The helper DLL gets exactly that, so in a thread that was already running the reserved slot holds the helper's
+// one-byte block, and mapped __declspec(thread) code there would read and write past it. Such threads are not rare:
+// the workers of the process thread pool predate most loads, and the task queue runs a title's callbacks on them.
+// load() therefore gives each of them a copy of the template too, through the thread's TEB, which is ordinary memory
+// of this process.
+//
+// What makes that safe:
+//  - The slot is the helper's, and nothing reads the helper's variable, so swapping the pointer under a running
+//    thread disturbs nothing; the thread cannot be in mapped code of a module whose load() has not returned.
+//  - The swap is made with g_tls_lock held exclusively, so no thread is inside its attach or detach event meanwhile.
+//  - A thread whose detach event has run is skipped (`ended`), and so is one with no TLS array or no helper block:
+//    Windows is about to free, or never built, what the block would go into.
+//  - The block comes out again in that thread's own detach event, before Windows frees the array, or in ~Loader.
+// What is left:
+//  - A thread that ran its detach event before the helper DLL was ever loaded and has not left the process yet is
+//    not in `ended`; if Windows leaves a stale array pointer in its TEB for those last instructions, the write goes
+//    to freed heap memory.
+//  - Windows replaces a thread's TLS array (a new one, copied from the old) when some thread loads a DLL with static
+//    TLS. If that happens during the swap, the write can land in the old array; the thread then still has the
+//    helper's one-byte block, and the first mapped __declspec(thread) access on it writes past that block: heap
+//    corruption, with nothing to show for it. The swap therefore reads the array pointer again after writing and
+//    repeats on the new array (kSwapAttempts times); if the block is not in the thread's current array at the end,
+//    it is taken back and the miss is logged. A replacement after that last look is not seen.
+//  - TerminateThread frees a thread's TEB with no detach event. Every read and write of another thread's TEB or
+//    TLS array here is made right after the thread was seen running and inside __try, so a TEB that has just gone
+//    is a skipped thread, not a fault in load() or ~Loader. If the memory was already given to something else, the
+//    write is not caught.
+using QueryThreadFn = LONG(NTAPI*)(HANDLE, int, void*, ULONG, ULONG*);
+struct ThreadBasicInfo {  // THREAD_BASIC_INFORMATION (winternl.h keeps it opaque), x64
+    LONG exit_status;
+    void* teb;
+    void* process_id;
+    void* thread_id;
+    ULONG_PTR affinity;
+    LONG priority;
+    LONG base_priority;
+};
+static_assert(sizeof(ThreadBasicInfo) == 48);
+
+QueryThreadFn query_thread_fn() {
+    static const auto fn = reinterpret_cast<QueryThreadFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread")));
+    return fn;
+}
+
+// The TEB's ThreadLocalStoragePointer field of a thread that is still running; null otherwise.
+void*** running_thread_tls_vector(HANDLE thread) {
+    ThreadBasicInfo info{};
+    const QueryThreadFn query = query_thread_fn();
+    if (!query || query(thread, 0 /* ThreadBasicInformation */, &info, sizeof info, nullptr) < 0) return nullptr;
+    if (info.exit_status != STILL_ACTIVE || !info.teb) return nullptr;
+    return reinterpret_cast<void***>(static_cast<uint8_t*>(info.teb) + 0x58);
+}
+
+// Another thread's TLS array and one entry of it, read through its TEB. False when the memory is not there any more
+// (the thread was terminated). No C++ objects in these three: they are __try frames.
+bool read_thread_slot(void*** vector, uint32_t index, void**& slots, void*& value) noexcept {
+    __try {
+        slots = *vector;
+        value = slots ? slots[index] : nullptr;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        slots = nullptr;
+        value = nullptr;
+        return false;
+    }
+}
+
+bool write_thread_slot(void** slots, uint32_t index, void* value) noexcept {
+    __try {
+        slots[index] = value;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Puts `saved` back where `block` is, if it is still there.
+void restore_thread_slot(void*** vector, uint32_t index, void* block, void* saved) noexcept {
+    __try {
+        void** slots = *vector;
+        if (slots && slots[index] == block) slots[index] = saved;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// Takes a block out of its slot and frees it. The existing-threads lock is held; b.vector is null when the thread
+// is gone.
+void remove_existing_block(const ExistingThreadBlock& b) {
+    if (b.vector && b.index < kMaxModuleTlsSlots) restore_thread_slot(b.vector, b.index, b.block, b.saved);
+    VirtualFree(b.block, 0, MEM_RELEASE);
+}
+
+constexpr int kSwapAttempts = 4;
+constexpr size_t kMaxEndedThreads = 1024;
+
+// load(): every other running thread gets its own copy of m's template. Not fatal where it cannot be done.
+void install_on_existing_threads(Module& m) {
+    const uint64_t total = static_cast<uint64_t>(m.tls_raw_size) + m.tls_zero_fill;
+    if (!total || m.tls_index >= kMaxModuleTlsSlots || m.tls_slot >= kMaxMappedTlsModules) return;
+    // Stays ahead of the TLS lock: the first call resolves the function with GetModuleHandle and GetProcAddress, which
+    // take the Windows loader lock, and a thread inside its attach event holds that lock while it waits for ours.
+    if (!query_thread_fn()) return;
+
+    // Outside the TLS lock: none of this may wait for a thread that is inside its attach event.
+    // The handles are closed on every way out, also when a vector below cannot grow.
+    struct Candidate {
+        DWORD id = 0;
+        HANDLE handle = nullptr;
+    };
+    struct Candidates {
+        std::vector<Candidate> list;
+        HANDLE snapshot = INVALID_HANDLE_VALUE;
+        ~Candidates() {
+            if (snapshot != INVALID_HANDLE_VALUE) CloseHandle(snapshot);
+            for (const Candidate& c : list)
+                if (c.handle) CloseHandle(c.handle);
+        }
+    } found;
+    std::vector<Candidate>& candidates = found.list;
+    // TH32CS_SNAPTHREAD lists the threads of every process; the loop keeps this one's.
+    found.snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (found.snapshot == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof entry;
+    const DWORD process = GetCurrentProcessId(), self = GetCurrentThreadId();
+    for (BOOL more = Thread32First(found.snapshot, &entry); more; more = Thread32Next(found.snapshot, &entry)) {
+        if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) continue;
+        candidates.push_back({entry.th32ThreadID, nullptr});  // the slot first, so the handle always has an owner
+        candidates.back().handle = OpenThread(THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+    }
+
+    {
+        ExclusiveTlsLock tls_lock;
+        ExistingThreadsLock lock;
+        ExistingThreads& state = existing_threads();
+        for (const Candidate& c : candidates) {
+            if (!c.handle) continue;
+            if (std::find(state.ended.begin(), state.ended.end(), c.id) != state.ended.end()) continue;
+            void*** vector = running_thread_tls_vector(c.handle);
+            void** slots = nullptr;
+            void* saved = nullptr;
+            if (!vector || !read_thread_slot(vector, m.tls_index, slots, saved) || !slots || !saved) continue;
+            // A copy an earlier module left in this slot of this thread goes first; what it replaced is kept.
+            bool present = false;
+            for (auto it = state.blocks.begin(); it != state.blocks.end();) {
+                if (it->thread != c.id || it->slot != m.tls_slot) {
+                    ++it;
+                } else if (it->module == &m && it->generation == m.tls_generation) {
+                    present = true;
+                    break;
+                } else {
+                    if (saved == it->block) saved = it->saved;
+                    it->vector = vector;
+                    remove_existing_block(*it);
+                    it = state.blocks.erase(it);
+                }
+            }
+            if (present) continue;
+            void* block = VirtualAlloc(nullptr, static_cast<SIZE_T>(total), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (!block) continue;
+            if (m.tls_raw_size) std::memcpy(block, m.tls_template, m.tls_raw_size);
+
+            // Write, then look at the thread's array pointer again: if Windows has replaced the array meanwhile, the
+            // write went into the old one, and it is made again in the new one.
+            bool installed = false;
+            for (int attempt = 0; attempt < kSwapAttempts && !installed; ++attempt) {
+                if (!running_thread_tls_vector(c.handle) || !write_thread_slot(slots, m.tls_index, block)) break;
+                void** now = nullptr;
+                void* value = nullptr;
+                if (!read_thread_slot(vector, m.tls_index, now, value) || !now) break;
+                installed = now == slots && value == block;
+                slots = now;
+            }
+            if (!installed) {
+                restore_thread_slot(vector, m.tls_index, block, saved);
+                VirtualFree(block, 0, MEM_RELEASE);
+                static std::atomic<bool> logged{false};
+                if (!logged.exchange(true))
+                    std::fprintf(stderr, "[rt] loader: %s: a running thread did not take its TLS block (it ended, or "
+                                         "its TLS array kept changing); mapped thread-local data is not valid on it\n",
+                                 m.name.c_str());
+                continue;
+            }
+            state.blocks.push_back({c.id, m.tls_slot, &m, m.tls_generation, m.tls_index, vector, saved, block});
+        }
+    }
+}
+
+// ~Loader, with g_tls_lock held exclusively: the blocks load() put into other threads come out. A thread that has
+// ended without a detach event (TerminateThread) has no TEB to restore.
+void remove_from_existing_threads(Module& m) {
+    ExistingThreadsLock lock;
+    ExistingThreads& state = existing_threads();
+    for (auto it = state.blocks.begin(); it != state.blocks.end();) {
+        if (it->module != &m || it->generation != m.tls_generation) {
+            ++it;
+            continue;
+        }
+        ExistingThreadBlock b = *it;
+        it = state.blocks.erase(it);
+        const HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, b.thread);
+        if (!h || running_thread_tls_vector(h) != b.vector) b.vector = nullptr;
+        if (h) CloseHandle(h);
+        remove_existing_block(b);
+    }
+}
+
+// DLL_THREAD_ATTACH: a record under this thread's id is from a thread that ended without a detach event.
+void forget_ended_thread_id() {
+    const DWORD self = GetCurrentThreadId();
+    ExistingThreadsLock lock;
+    ExistingThreads& state = existing_threads();
+    state.ended.erase(std::remove(state.ended.begin(), state.ended.end(), self), state.ended.end());
+    for (auto it = state.blocks.begin(); it != state.blocks.end();) {
+        if (it->thread != self) {
+            ++it;
+            continue;
+        }
+        VirtualFree(it->block, 0, MEM_RELEASE);
+        it = state.blocks.erase(it);
+    }
+}
+
+// DLL_THREAD_DETACH, before this thread's own records are released: the blocks load() gave it come out, newest first,
+// after the module's TLS callbacks have seen the event (Windows sends DLL_THREAD_DETACH to a DLL for a thread that
+// was running before it was loaded, too).
+void release_existing_blocks_of_this_thread() {
+    const DWORD self = GetCurrentThreadId();
+    std::vector<ExistingThreadBlock> mine;
+    {
+        ExistingThreadsLock lock;
+        for (const auto& b : existing_threads().blocks)
+            if (b.thread == self) mine.push_back(b);
+    }
+    for (auto it = mine.rbegin(); it != mine.rend(); ++it) {
+        Module* m = it->module;
+        if (g_tls_slot_owners[it->slot].load() != m || g_tls_slot_generations[it->slot].load() != it->generation ||
+            !m->initialised)
+            continue;
+        try {
+            run_callbacks(*m, DLL_THREAD_DETACH);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[rt] loader: thread detach: %s\n", e.what());
+        }
+    }
+    ExistingThreadsLock lock;
+    ExistingThreads& state = existing_threads();
+    for (auto it = state.blocks.end(); it != state.blocks.begin();) {
+        --it;
+        if (it->thread != self) continue;
+        remove_existing_block(*it);
+        it = state.blocks.erase(it);
+    }
+    // Bounded: an id matters only until its thread has left the process, moments after this event, so the oldest
+    // can go. (An id also leaves the list when a new thread gets it.)
+    if (state.ended.size() >= kMaxEndedThreads) state.ended.erase(state.ended.begin(), state.ended.begin() + kMaxEndedThreads / 2);
+    state.ended.push_back(self);
+}
+
 // Runs in gta6rt_tls_host.dll's DllMain for each thread the process starts or ends once the helper is loaded, under
 // the Windows loader lock, on that thread. A new thread gets its own copy of each active TLS owner's template; an
 // ending one gives each helper's block back before the Windows loader frees it. TLS callbacks get the thread events
@@ -416,6 +720,11 @@ void __cdecl on_host_thread_event(DWORD reason) {
     // The try/catch is per slot: a throw from one module's install or callbacks must not take the thread events
     // away from the other slots. Nothing may leave DllMain.
     if (reason == DLL_THREAD_ATTACH) {
+        try {
+            forget_ended_thread_id();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[rt] loader: thread attach: %s\n", e.what());
+        }
         for (size_t slot = 0; slot < kMaxMappedTlsModules; ++slot) {
             Module* m = g_tls_slot_owners[slot].load();
             if (!m) continue;
@@ -429,6 +738,13 @@ void __cdecl on_host_thread_event(DWORD reason) {
             }
         }
     } else if (reason == DLL_THREAD_DETACH) {
+        // The blocks load() gave this thread while it was already running come out first (they can sit on top of
+        // an older module's block in the same slot).
+        try {
+            release_existing_blocks_of_this_thread();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[rt] loader: thread detach: %s\n", e.what());
+        }
         for (size_t i = kMaxMappedTlsModules; i-- > 0;) {
             Module* m = g_tls_slot_owners[i].load();
             if (m && g_thread_tls_slots[i].module == m &&
@@ -451,9 +767,15 @@ void __cdecl on_host_thread_event(DWORD reason) {
 
 // The Xbox builds of the MSVC runtime import the same CRT the desktop does, so the host's own copies are used.
 bool prefer_host_copy(const std::string& dll) {
+    // The second row is the Debug builds of the same DLLs. A Debug build of a stand-in image (tiny_game) links them,
+    // and without them here its C++ exceptions were not redirected below: a throw caught inside the image ended the
+    // run with 0xE06D7363 (run_tiny_game_eh in a Debug build).
     static const char* names[] = {"vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll",
                                   "msvcp140_2.dll", "msvcp140_atomic_wait.dll", "msvcp140_codecvt_ids.dll",
-                                  "concrt140.dll", "vccorlib140.dll", "vcomp140.dll"};
+                                  "concrt140.dll", "vccorlib140.dll", "vcomp140.dll",
+                                  "vcruntime140d.dll", "vcruntime140_1d.dll", "msvcp140d.dll", "msvcp140_1d.dll",
+                                  "msvcp140_2d.dll", "msvcp140d_atomic_wait.dll", "msvcp140d_codecvt_ids.dll",
+                                  "concrt140d.dll", "vccorlib140d.dll", "vcomp140d.dll"};
     for (auto* n : names)
         if (dll == n) return true;
     return false;
@@ -594,6 +916,7 @@ Loader::~Loader() {
                 Module* owner = m;
                 if (g_tls_slot_owners[m->tls_slot].compare_exchange_strong(owner, nullptr))
                     g_tls_slot_generations[m->tls_slot].store(0);
+                remove_from_existing_threads(*m);
             }
             uninstall_tls_for_thread(*m);
         }
@@ -864,6 +1187,8 @@ Module& Loader::map_image(const std::filesystem::path& path) {
     std::memcpy(m->base, file.data(), oh.SizeOfHeaders);
     auto* sec = IMAGE_FIRST_SECTION(nt);
     for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        if (sec->VirtualAddress < oh.SizeOfHeaders)
+            throw std::runtime_error(m->name + ": section " + std::to_string(i) + " overlaps the headers");
         uint32_t n = std::min(sec->SizeOfRawData, sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData);
         if (!n) continue;
         if (sec->PointerToRawData > file.size() || n > file.size() - sec->PointerToRawData)
@@ -889,6 +1214,9 @@ Module& Loader::map_image(const std::filesystem::path& path) {
             size_t count = (block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / 2;
             for (size_t i = 0; i < count; ++i) {
                 uint16_t type = entries[i] >> 12, off = entries[i] & 0xFFF;
+                if (type != IMAGE_REL_BASED_ABSOLUTE &&
+                    static_cast<uint64_t>(block->VirtualAddress) + off < oh.SizeOfHeaders)
+                    throw std::runtime_error(m->name + ": a relocation lands in the headers");
                 if (type == IMAGE_REL_BASED_DIR64) {
                     require_range(m->name, static_cast<uint64_t>(block->VirtualAddress) + off, sizeof(uint64_t), m->size,
                                   "a relocation");
@@ -1003,6 +1331,9 @@ void Loader::initialize_tls(Module& m) {
         m.tls_block = g_thread_tls_slots[slot].block;
         m.tls_saved_block = g_thread_tls_slots[slot].saved;
     }
+    // Threads started from here on get their copy from the helper DLL's DLL_THREAD_ATTACH; the ones already running
+    // get it now.
+    install_on_existing_threads(m);
 }
 
 void Loader::install_tls_for_thread(Module& m) { install_thread_block(m); }

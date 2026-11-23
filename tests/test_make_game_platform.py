@@ -242,6 +242,15 @@ class RuntimePackagingTest(unittest.TestCase):
                 self.assertIn("is missing", log.call_args.args[0])
                 self.assertNotIn("--dry-run", log.call_args.args[0])
 
+    def test_runtime_records_shader_work_directory(self):
+        self.write_artifact("gta6rt_tls_host.dll", b"TLS host")
+        work = os.path.join(self.root, "Shader Work \u03bb")
+        with mock.patch.object(make_game, "log"):
+            make_game.runtime(self.game, self.out, {"expected_exe": "game.exe"}, self.build, work=work)
+        with open(os.path.join(self.out, "shader_path.txt"), "rb") as f:
+            recorded = f.read()
+        self.assertEqual(recorded, os.fsencode(os.path.join(work, "shaders", "spirv")))
+
     def package(self):
         with mock.patch.object(make_game.os, "name", "nt"), \
                 mock.patch.object(make_game, "ROOT", self.root), \
@@ -269,6 +278,32 @@ class RuntimePackagingTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("gta6rt_tls_host.dll", err.getvalue())
         self.assertFalse(os.path.exists(self.out))
+
+    def test_runtime_build_starts_powershell_by_its_full_path(self):
+        # The stage started "powershell" by name. CreateProcess searches System32 but not
+        # System32\WindowsPowerShell\v1.0, so on a PC whose PATH had lost that folder the stage ended in a
+        # FileNotFoundError traceback after the earlier stages had run.
+        self.write_artifact("gta6rt_tls_host.dll", b"TLS host")
+        system_root = os.path.join(self.root, "Windows")
+        folder = os.path.join(system_root, "System32", "WindowsPowerShell", "v1.0")
+        os.makedirs(folder)
+        exe = os.path.join(folder, "powershell.exe")
+        with open(exe, "wb"):
+            pass
+        with mock.patch.object(make_game.os, "name", "nt"), \
+                mock.patch.object(make_game, "ROOT", self.root), \
+                mock.patch.dict(os.environ, {"SystemRoot": system_root, "PATH": ""}), \
+                mock.patch.object(make_game, "run") as run, \
+                mock.patch.object(make_game, "log"):
+            make_game.runtime(self.game, self.out, {"expected_exe": "game.exe"})
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], exe)
+        self.assertIn(os.path.join(self.root, "scripts", "build_runtime.ps1"), command)
+
+    def test_powershell_is_the_bare_name_where_the_file_is_not_at_its_usual_place(self):
+        with mock.patch.dict(os.environ, {"SystemRoot": os.path.join(self.root, "nowhere")}):
+            self.assertEqual(make_game.windows_powershell(), "powershell")
 
 
 class ConfiguredCrossToolsTest(unittest.TestCase):
@@ -431,9 +466,19 @@ class PipelineCheckExeTest(unittest.TestCase):
     def test_linux_prefers_the_readme_build_folder(self):
         self.assertIsNone(self.exe("posix"))
         plain = self.touch("vk_pipeline_check")
+        os.chmod(plain, 0o755)
         self.assertEqual(self.exe("posix"), plain)
         readme = self.touch("linux", "vk_pipeline_check")
+        os.chmod(readme, 0o755)
         self.assertEqual(self.exe("posix"), readme)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX execute permissions")
+    def test_non_executable_linux_checker_does_not_hide_the_fallback(self):
+        preferred = self.touch("linux", "vk_pipeline_check")
+        os.chmod(preferred, 0o644)
+        fallback = self.touch("vk_pipeline_check")
+        os.chmod(fallback, 0o755)
+        self.assertEqual(self.exe("posix"), fallback)
 
     def test_windows_finds_only_the_exe(self):
         self.touch("linux", "vk_pipeline_check")
@@ -452,6 +497,7 @@ class PipelineCheckExeTest(unittest.TestCase):
 
     def test_pipelines_off_windows_runs_the_linux_build(self):
         exe = self.touch("linux", "vk_pipeline_check")
+        os.chmod(exe, 0o755)
         self.touch("vk_pipeline_check.exe")
         work = os.path.join(self.tmp.name, "work")
         os.makedirs(os.path.join(work, "shaders", "spirv"))

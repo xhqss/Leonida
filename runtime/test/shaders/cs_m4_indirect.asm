@@ -6,6 +6,9 @@
 ; structured buffer and the image the first dispatch wrote, and writes a raw output buffer. Run:
 ; d3d12_m4_compute_test. Same root signature, user data and table as cs_m4_fill (see there):
 ;   slot 0: structured buffer (read)   slot 2: R32_UINT image (read, image_load)   slot 4: raw output (written)
+; D3D12 build: runtime/CMakeLists.txt builds this with LEONIDA_USER_DATA_SHIFT=4, so in the PSO every SGPR named
+; here is 4 higher (the console compute layout starts the root arguments at s4, D3D-448). The table pointer
+; then reads s[8:9]: s8 is the table's 32-bit VA and s9 a user dword the runtime leaves zero.
 ; g = 64 * group + lane; t = image(g & 15, g >> 4); record g = { w0, w1, w2, w3 }
 ;   out[g] = { (w0 + t) ^ w3, (w2 ^ t) + w1 } at byte offset 8 * g
 s_load_dwordx4 s[8:11], s[4:5], 0x0

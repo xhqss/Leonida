@@ -631,10 +631,12 @@ int main() {
     }
     std::string host_name = "none";
     bool compared = false;
+    std::uint32_t vendor = 0;
     {
         VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
         VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
         d.instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(d.physical, &properties);
+        vendor = properties.properties.vendorID;
         copycmp::Ptr<ID3D12Device> host;
         LUID luid{};
         std::memcpy(&luid, id.deviceLUID, sizeof(luid));
@@ -659,6 +661,33 @@ int main() {
             std::fill_n(host_bytes.begin() + test.byte_offset, UINT64(test.elements) * size, std::uint8_t(0));
             std::printf("host adapter has no typed UAV store for DXGI format %d: that case is not compared\n",
                         int(test.format));
+        }
+        // One measured host quirk, not a layer bug: Intel's D3D12 (Xe-LP, 32.0.101.7092) writes the R11G11B10_FLOAT
+        // clear (1.0, 2.0, 0.5) as 0x701e03c0, G = 1.0, as if the values were clamped to [0, 1]. Report it, don't
+        // fail, only when the host's bytes are exactly that clamped encoding. The layer and model() share
+        // uav_clear::encode, so the host stays the independent reference for every other format, adapter and value.
+        for (std::size_t c = 0; c < std::size(clear_cases); ++c) {
+            const ClearCase& test = clear_cases[c];
+            if (vendor != 0x8086 || test.format != DXGI_FORMAT_R11G11B10_FLOAT || !supported[c] ||
+                ours.size() != api_readback || host_bytes.size() != api_readback) continue;
+            std::array<std::uint32_t, 4> clamped = test.values;
+            for (auto& v : clamped) v = fb(std::clamp(std::bit_cast<float>(v), 0.0f, 1.0f));
+            uc::Element e{};
+            if (!uc::encode(test.vulkan, true, clamped, e)) continue;
+            const UINT64 begin = test.byte_offset, end = begin + UINT64(test.elements) * e.size;
+            bool host_clamped = true;
+            for (UINT64 i = begin; i < end; ++i) host_clamped = host_clamped && host_bytes[i] == e.bytes[(i - begin) % e.size];
+            const std::vector<std::uint8_t> reference = model(supported);
+            if (!host_clamped || !std::equal(ours.begin() + begin, ours.begin() + end, reference.begin() + begin) ||
+                std::equal(ours.begin() + begin, ours.begin() + end, host_bytes.begin() + begin)) continue;
+            UINT64 first = begin;
+            while (ours[first] == host_bytes[first]) ++first;
+            std::uint32_t host_word = 0;
+            std::memcpy(&host_word, host_bytes.data() + begin, 4);
+            std::printf("DXGI format %d: host quirk: %s writes 0x%08x, the clear clamped to [0, 1] (first differing "
+                        "byte %llu: layer %02x, host %02x); not compared\n", int(test.format), host_name.c_str(),
+                        host_word, static_cast<unsigned long long>(first), ours[first], host_bytes[first]);
+            std::copy(ours.begin() + begin, ours.begin() + end, host_bytes.begin() + begin);
         }
     }
     EXPECT(ours.size() == api_readback && host_bytes.size() == api_readback);

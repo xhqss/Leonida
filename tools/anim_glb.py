@@ -57,6 +57,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import anim_clips  # noqa: E402
 import anim_index  # noqa: E402
 import glb_writer  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
 import skin_streams  # noqa: E402
 
 SYSTEM = 0x50000000
@@ -461,11 +462,15 @@ def clip_channels(s, dictionary, clip, joint_by_hash, root_motion, tally):
         step = anim["duration"] / (frames - 1) if frames > 1 and anim["duration"] > 0 else 1.0 / 30
         start = entry["start"] if math.isfinite(entry["start"]) else 0.0
         end = entry["end"] if math.isfinite(entry["end"]) and entry["end"] >= start else anim["duration"]
-        keep = [k for k in range(frames) if start - 1e-4 <= k * step <= end + 1e-4]
-        fallback = not keep
-        if fallback:
-            target_time = 0.5 * (start + end) if end >= start else start
-            keep = [min(range(frames), key=lambda k: abs(k * step - target_time))] if frames else []
+        if end == start:
+            keep = [min(range(frames), key=lambda k: abs(k * step - start))] if frames else []
+            single_pose = True
+        else:
+            keep = [k for k in range(frames) if start - 1e-4 <= k * step <= end + 1e-4]
+            single_pose = not keep
+            if single_pose:
+                target_time = 0.5 * (start + end)
+                keep = [min(range(frames), key=lambda k: abs(k * step - target_time))] if frames else []
         if not keep:
             continue
         tally["animations"] += 1
@@ -491,7 +496,7 @@ def clip_channels(s, dictionary, clip, joint_by_hash, root_motion, tally):
             if (target, path) in channels:
                 tally["tracks_overridden"] += 1
             # a frame kept by the 1e-4 tolerance before `start` would get a slightly negative time
-            if fallback:
+            if single_pose:
                 channels[(target, path)] = [(0.0, tuple(tracks[t][k])) for k in keep]
             else:
                 channels[(target, path)] = [(max(0.0, (k * step - start) / rate), tuple(tracks[t][k])) for k in keep]
@@ -703,7 +708,7 @@ def coverage(args):
         groups, _unresolved, _gaps = anim_clips.group(m, rows)
     segments = [[anim_clips.segment(rows, k) for k in parts] for _root, parts in groups]
     hashes = sorted({j["hash"] for j in joints})
-    jobs = max(1, args.jobs)
+    jobs = process_workers(max(1, args.jobs))   # a pool takes at most 61 workers on Windows
     slices = [(args.anim, segments[i::jobs], hashes) for i in range(jobs)]
     total = collections.Counter()
     if jobs == 1:

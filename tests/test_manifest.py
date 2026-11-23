@@ -341,7 +341,7 @@ class ManifestCliTest(unittest.TestCase):
         self.out_manifest = os.path.join(self.tmp.name, "manifest.json")
 
     def run_cli(self, *args):
-        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True, errors="replace")
 
     def test_cli_create_and_verify(self):
         p_create = self.run_cli("create", self.pkg, "--out", self.out_manifest, "--jobs", "2")
@@ -598,7 +598,7 @@ class ManifestDigestCaseTest(unittest.TestCase):
         return subprocess.run(
             [sys.executable, "-I", "-B", TOOL, "verify", self.pkg,
              "--manifest", self.out, "--jobs", str(jobs)],
-            capture_output=True, text=True)
+            capture_output=True, text=True, errors="replace")
 
     def test_verify_accepts_hex_digest_case(self):
         for case in ("lower", "upper", "mixed"):

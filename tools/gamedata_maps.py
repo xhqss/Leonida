@@ -25,10 +25,9 @@ match the published GTA V `heightmap.dat` (`HMAP`) layout:
 `PAMH` (`HMAP` read little-endian)
     0x00  "PAMH"             (the `HMAP` magic stored little-endian)
     0x04  u8 version major, u8 version minor  (1.2 in `common.rpf`)
-    0x05  in the `levels.rpf` tiles 0x05..0x0B also hold leftover text of the
-          tile name; 0x04 stays 1 and the real fields start at 0x0C (see below)
+    0x05  start of the coordinate label in the `levels.rpf` tiles (see below)
     0x06  u16 pad
-    0x08  u32: GTA V's `compressed` word in `common.rpf`, padding in the tiles
+    0x08  u32 at GTA V's `compressed` offset. In level tiles bit 0 is set.
     0x0C  u16 width
     0x0E  u16 height
     0x10  six f32 bounds     (min xyz, max xyz)
@@ -38,13 +37,11 @@ match the published GTA V `heightmap.dat` (`HMAP`) layout:
     On the measured file the first array is a flat 110 (2.5 m) sea-surface
     layer and the second is the ground; min <= max in all 23,616 cells.
 
-In the 1,476 64 x 64 tiles of `levels.rpf`, bytes 0x05..0x0B hold leftover text,
-not a version minor and a flag: 0x04 stays 1, 0x05.. hold the tile name `n_m`
-(n = column + 1, m = row + 1), and the remaining bytes keep the right-aligned
-tail of the string `height` (`ght`, `ht`, or a zero byte when the name is
-longer). The 28 distinct 0x08..0x0B words are all text and none of them changes
-the arrays, so 0x08 is padding there. The `common.rpf` payload happens to hold
-0x1BBC8CED, which is why it was once reported as a `compressed` flag.
+In the 1,476 level tiles, derive column and row from the 512 m bounding boxes.
+Write their one-based ASCII `column_row` and NUL over the right-aligned `height`
+tail at 0x05..0x0B, then set bit 0 at 0x08. All seven bytes match on every tile.
+Only 819 match before setting the bit. The stored label can represent two
+different coordinates. The `common.rpf` payload holds 0x1BBC8CED at 0x08.
 
 Both formats scale a u8 value into the header's Z box:
 
@@ -70,7 +67,7 @@ import unicodedata
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from report_paths import same_report_path  # noqa: E402
 
-MAGIC = (b"MHIU", b"PAMH", b"SPS1Z")
+MAGIC = (b"MHIU", b"PAMH")
 HEADER = 44
 
 
@@ -249,9 +246,9 @@ def parse_pamh(blob: bytes) -> dict:
 def pamh_census(payloads: list[dict]) -> list[dict]:
     """Group decoded PAMH payloads by grid size and count what varies inside a group.
 
-    The 0x08 word is padding, so it is counted, not used as a key. Byte 0x05 is the HMAP
-    version-minor byte in the common.rpf payload but holds text in the levels.rpf tiles, so it is
-    reported as a distribution instead of a group key."""
+    The 0x08 word overlaps the coordinate label in level tiles. Byte 0x05 holds the HMAP
+    version minor in the common.rpf payload and the first digit of the column in the tiles.
+    The census counts the 0x05 values and distinct 0x08 words within each grid size."""
     groups = {}
     for p in payloads:
         if p["type"] != "PAMH":

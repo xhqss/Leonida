@@ -124,7 +124,7 @@ Measured with the per-table guess (counts only):
 |---|---:|---:|---:|---:|
 | Nested archives (all) | 41 | 436 | 48 | 18 |
 | Nested archives holding string tables | 13 | 13 | 13 | 0 |
-| Tables in them / all tables | 14,440 / 14,440 | 15,831 / 15,831 | 78 / 78 | 0 / 0 |
+| Tables in them / all tables | 14,482 / 14,482 | 15,831 / 15,831 | 78 / 78 | 0 / 0 |
 | Tables per archive | 1,109-1,113 | 1,214-1,220 | 6 | - |
 | Per-table guess equal to its archive's language | 57.7%-99.9% | 72.2%-100% | 66.7%-100% | - |
 | Tables whose language changes | 2,075 | 849 | 5 | 0 |
@@ -167,7 +167,7 @@ About 7-12% of lines have no text in a given language: the label's hash is in no
 
 `--labels` takes word lists or a `hashdict.py` JSON. Each table is then grouped by the longest `_`-prefix (up to three
 parts) that at least half of its resolved labels share, usually a mission or feature code. With about 3 million
-harvested identifiers as labels, 1,869,883 of 7,172,826 strings (26%) resolve, and 9,409 of 30,349 tables get a
+harvested identifiers as labels, 1,869,883 of 7,172,826 strings (26%) resolve, and 9,409 tables get a
 group.
 
 ## Usage

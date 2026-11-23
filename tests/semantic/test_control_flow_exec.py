@@ -446,7 +446,9 @@ class TestTranslatorSpirvEmission(unittest.TestCase):
 
         body_text = "\n".join(g.body)
         self.assertIn("OpLoad %bool %active", body_text)
-        self.assertIn("OpGroupNonUniformAny %bool %c3", body_text)
+        self.assertIn("OpGroupNonUniformBallot %v4uint_bal %c3", body_text)
+        self.assertIn("%c20", body_text)  # select the ballot word for this wave32 pixel half
+        self.assertIn("OpINotEqual %bool", body_text)
         self.assertIn(f"{cond} = OpLogicalNot %bool", body_text)
 
     def test_branch_condition_execnz_emission(self):
@@ -458,7 +460,10 @@ class TestTranslatorSpirvEmission(unittest.TestCase):
 
         body_text = "\n".join(g.body)
         self.assertIn("OpLoad %bool %active", body_text)
-        self.assertIn(f"{cond} = OpGroupNonUniformAny %bool %c3", body_text)
+        self.assertIn("OpGroupNonUniformBallot %v4uint_bal %c3", body_text)
+        self.assertIn("%c20", body_text)  # select the ballot word for this wave32 pixel half
+        self.assertIn("OpINotEqual %bool", body_text)
+        self.assertIn(f"{cond} = OpCopyObject %bool", body_text)
         self.assertNotIn("OpLogicalNot", body_text)
 
     def test_spirv_subgroup_simulation_matches_isa_reference(self):

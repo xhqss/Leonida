@@ -1487,6 +1487,11 @@ def main():
             if os.path.isfile(os.path.join(folder, config, name)):
                 args.exe = os.path.join(folder, config, name)
                 break
+    # Windows' CreateProcess searches for a relative path written with "/" that doesn't start with "./" or "../"
+    # (runtime/build/x.exe) instead of taking it from the working directory, though os.path.isfile does, so such an
+    # --exe passed the check below and the first GPU run ended in a FileNotFoundError traceback. An absolute path
+    # (abspath also turns "/" into "\" there) runs from anywhere.
+    args.exe = os.path.abspath(args.exe)
     global PERMLANE_FETCH_INACTIVE
     PERMLANE_FETCH_INACTIVE = args.permlane_fetch_inactive
     if args.translator:
@@ -1496,13 +1501,14 @@ def main():
     backends = tuple(dict.fromkeys(t.strip() for t in args.oracle.split(",")))
     if not backends or any(t not in ("translator", "hw") for t in backends):
         ap.error("--oracle takes translator, hw or translator,hw")
-    if args.wave == "32" and "emulate" in args.modes:
+    if args.wave == "32" and "native" not in args.modes:
         # emulate runs a wave64 program as two 32-lane halves, so a wave32-only selection has nothing to run: the run
         # used to end after a bare `summary:` with exit 0, the same false pass #1452 fixed for a count below 1.
+        # Only when emulate is the sole mode: with the default (native,emulate) native runs every wave32 program.
         ap.error("--modes emulate needs wave64 programs: with --wave 32 nothing runs (use --wave 64 or both)")
-    if args.wave == "64" and "native" in args.modes and not args.w64_native:
+    if args.wave == "64" and "emulate" not in args.modes and not args.w64_native:
         # A wave64 program only runs natively when --w64-native asks for the documented cross-half approximation, so
-        # this combination was empty in the same silent way.
+        # this combination was empty in the same silent way. With the default modes emulate runs them.
         ap.error("--wave 64 --modes native runs nothing without --w64-native; pass it to run the documented "
                  "cross-half approximation, or use --modes emulate")
     if "translator" in backends and not os.path.isfile(args.exe):   # before any program is generated or run

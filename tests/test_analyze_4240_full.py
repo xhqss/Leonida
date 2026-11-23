@@ -51,7 +51,7 @@ class Analyze4240Test(unittest.TestCase):
 
     def run_tool(self, *args, timeout=30):
         return subprocess.run([sys.executable, "-I", TOOL, *args], cwd=ROOT,
-                              capture_output=True, text=True, timeout=timeout)
+                              capture_output=True, text=True, errors="replace", timeout=timeout)
 
     def truncated_archive(self):
         path = os.path.join(self.root, "truncated.rpf")

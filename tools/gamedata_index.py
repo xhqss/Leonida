@@ -20,6 +20,7 @@ The tool is standard library only and never writes outside the requested output 
 from __future__ import annotations
 
 import argparse
+import codecs
 import csv
 import json
 import mmap
@@ -43,7 +44,7 @@ XML_OPEN = re.compile(rb"<([A-Za-z_][\w.:-]*)")
 XML_CLOSE_TAIL = re.compile(rb"</([A-Za-z_][\w.:-]*)>\s*$")
 # Tag-like text inside these cannot open or close an element.
 XML_NON_TAG = re.compile(rb"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>", re.S)
-MAGIC = {b"MHIU": "MHIU", b"PAMH": "PAMH", b"SPS1Z": "SPS1Z", b"RBF0": "RBF0", b"PSIN": "PSIN"}
+MAGIC = {b"MHIU": "MHIU", b"PAMH": "PAMH", b"SPS1": "SPS1", b"RBF0": "RBF0", b"PSIN": "PSIN"}
 # A resource whose page directory starts the stream carries "0DRP" at +16 (docs/animation.md, "0DRP page marker").
 # Its first 4 KiB can be over 95% printable, so without this check such a stream reads as text, and as XML when it
 # holds a "<": data.rpf has 337 of them and no XML at all (docs/gamedata.md, "Relationship to data.rpf").
@@ -56,6 +57,27 @@ def printable(data: bytes) -> float:
         return 0.0
     good = sum(1 for c in sample if c in (9, 10, 13) or 32 <= c < 127)
     return good / len(sample)
+
+
+def _utf8_text(data: bytes) -> bool:
+    """True when the leading 4 KiB decodes as printable UTF-8 text (tolerating a split multibyte boundary)."""
+    sample = data[:4096]
+    if not sample or b"\x00" in sample:
+        return False
+    start = 0
+    while start < min(3, len(sample)) and 0x80 <= sample[start] <= 0xBF:
+        start += 1
+    sample = sample[start:]
+    if not sample:
+        return False
+    try:
+        text = codecs.getincrementaldecoder("utf-8")("strict").decode(sample, final=False)
+    except UnicodeDecodeError:
+        return False
+    if not text:
+        return False
+    good = sum(1 for ch in text if ch in "\t\r\n" or (ord(ch) >= 0x20 and ord(ch) != 0x7F and ch.isprintable()))
+    return good / len(text) >= 0.95
 
 
 def has_xml_decl(data: bytes) -> bool:
@@ -112,10 +134,17 @@ def xml_complete(root: str, data: bytes) -> bool:
     return bool(closes or self_closed)
 
 
+def _self_closing_root(root: str, data: bytes) -> bool:
+    text = data[3:] if data.startswith(BOM) else data
+    text = XML_NON_TAG.sub(b"", text).strip()
+    name = re.escape(root.encode("ascii", "replace"))
+    return bool(re.fullmatch(rb"<" + name + rb"(?=[\s/])(?:\"[^\"]*\"|'[^']*'|[^'\">])*/>", text))
+
+
 def standalone_xml(data: bytes) -> bool:
     """A complete document in one stream, with or without a declaration."""
     root = xml_root(data)
-    return bool(root) and tail_root(data) == root and xml_complete(root, data)
+    return bool(root) and xml_complete(root, data) and (tail_root(data) == root or _self_closing_root(root, data))
 
 
 def stream_kind(data: bytes, row: dict) -> str:
@@ -258,20 +287,27 @@ def build_rows(rows: list, source) -> list:
         if kind in ("rbf0", "psin", "text", "binary"):
             group = [i]
             chunks = [data] if kind == "text" and b"<" in data else None
+            start_root = xml_root(data) if chunks is not None else ""
             j = i + 1
-            while j < n and rows[j - 1]["size"] == 65536:
-                nxt = source.read(rows[j])
-                if standalone_xml(nxt):
-                    break
-                nk = stream_kind(nxt, rows[j])
-                if nk in ("decl", "bink2", "rbf0", "psin", "other"):
-                    break
-                if chunks is not None:
-                    chunks.append(nxt)
-                group.append(j)
-                j += 1
+            if not (chunks is not None and standalone_xml(data)):
+                while j < n and rows[j - 1]["size"] == 65536:
+                    nxt = source.read(rows[j])
+                    if standalone_xml(nxt):
+                        break
+                    nk = stream_kind(nxt, rows[j])
+                    if nk in ("decl", "bink2", "rbf0", "psin", "other") or (
+                        chunks is not None and nk == "binary" and not _utf8_text(nxt)
+                    ):
+                        break
+                    if chunks is not None:
+                        chunks.append(nxt)
+                    group.append(j)
+                    j += 1
+                    if chunks is not None and start_root and tail_root(nxt) == start_root and xml_complete(start_root, b"".join(chunks)):
+                        break
             if chunks is not None:
-                root = tail_root(b"".join(chunks))
+                blob = b"".join(chunks)
+                root = tail_root(blob) or (xml_root(blob) if standalone_xml(blob) else "")
                 out.append(row_for("xml", rows, group, root=root, header=False, complete=bool(root)))
             else:
                 out.append(row_for(kind, rows, group))

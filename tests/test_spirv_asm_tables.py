@@ -136,6 +136,106 @@ class EnumsTableTests(unittest.TestCase):
         self.assertLess(img_ops["Offset"][0], img_ops["MinLod"][0])
 
 
+# Every instruction alias in SPIRV-Headers' spirv.core.grammar.json (each instruction's "aliases"), alias -> opname.
+# spirv-as accepts either spelling and writes the same words for both.
+INSTRUCTION_ALIASES = {
+        "OpArbitraryFloatAddINTEL": "OpArbitraryFloatAddALTERA",
+        "OpArbitraryFloatCastFromIntINTEL": "OpArbitraryFloatCastFromIntALTERA",
+        "OpArbitraryFloatCastINTEL": "OpArbitraryFloatCastALTERA",
+        "OpArbitraryFloatCastToIntINTEL": "OpArbitraryFloatCastToIntALTERA",
+        "OpArbitraryFloatCbrtINTEL": "OpArbitraryFloatCbrtALTERA",
+        "OpArbitraryFloatDivINTEL": "OpArbitraryFloatDivALTERA", "OpArbitraryFloatEQINTEL": "OpArbitraryFloatEQALTERA",
+        "OpArbitraryFloatGEINTEL": "OpArbitraryFloatGEALTERA", "OpArbitraryFloatGTINTEL": "OpArbitraryFloatGTALTERA",
+        "OpArbitraryFloatHypotINTEL": "OpArbitraryFloatHypotALTERA",
+        "OpArbitraryFloatLEINTEL": "OpArbitraryFloatLEALTERA", "OpArbitraryFloatLTINTEL": "OpArbitraryFloatLTALTERA",
+        "OpArbitraryFloatMulINTEL": "OpArbitraryFloatMulALTERA",
+        "OpArbitraryFloatRSqrtINTEL": "OpArbitraryFloatRSqrtALTERA",
+        "OpArbitraryFloatRecipINTEL": "OpArbitraryFloatRecipALTERA",
+        "OpArbitraryFloatSinCosPiINTEL": "OpArbitraryFloatSinCosPiALTERA",
+        "OpArbitraryFloatSqrtINTEL": "OpArbitraryFloatSqrtALTERA",
+        "OpArbitraryFloatSubINTEL": "OpArbitraryFloatSubALTERA",
+        "OpControlBarrierArriveINTEL": "OpControlBarrierArriveEXT",
+        "OpControlBarrierWaitINTEL": "OpControlBarrierWaitEXT",
+        "OpCooperativeMatrixConvertNV": "OpCooperativeMatrixConvertUseEXT",
+        "OpCooperativeMatrixPerElementOpNV": "OpCooperativeMatrixPerElementOpEXT",
+        "OpCooperativeMatrixReduceNV": "OpCooperativeMatrixReduceEXT",
+        "OpCrossWorkgroupCastToPtrINTEL": "OpCrossWorkgroupCastToPtrALTERA",
+        "OpDecorateStringGOOGLE": "OpDecorateString", "OpDemoteToHelperInvocationEXT": "OpDemoteToHelperInvocation",
+        "OpFPGARegINTEL": "OpFPGARegALTERA", "OpFixedCosINTEL": "OpFixedCosALTERA",
+        "OpFixedCosPiINTEL": "OpFixedCosPiALTERA", "OpFixedExpINTEL": "OpFixedExpALTERA",
+        "OpFixedLogINTEL": "OpFixedLogALTERA", "OpFixedRecipINTEL": "OpFixedRecipALTERA",
+        "OpFixedRsqrtINTEL": "OpFixedRsqrtALTERA", "OpFixedSinCosINTEL": "OpFixedSinCosALTERA",
+        "OpFixedSinCosPiINTEL": "OpFixedSinCosPiALTERA", "OpFixedSinINTEL": "OpFixedSinALTERA",
+        "OpFixedSinPiINTEL": "OpFixedSinPiALTERA", "OpFixedSqrtINTEL": "OpFixedSqrtALTERA",
+        "OpGroupNonUniformPartitionNV": "OpGroupNonUniformPartitionEXT",
+        "OpMemberDecorateStringGOOGLE": "OpMemberDecorateString",
+        "OpPtrCastToCrossWorkgroupINTEL": "OpPtrCastToCrossWorkgroupALTERA",
+        "OpRayQueryGetClusterIdNV": "OpRayQueryGetIntersectionClusterIdNV",
+        "OpReadPipeBlockingINTEL": "OpReadPipeBlockingALTERA", "OpReportIntersectionNV": "OpReportIntersectionKHR",
+        "OpSDotAccSatKHR": "OpSDotAccSat", "OpSDotKHR": "OpSDot", "OpSUDotAccSatKHR": "OpSUDotAccSat",
+        "OpSUDotKHR": "OpSUDot", "OpTaskSequenceAsyncINTEL": "OpTaskSequenceAsyncALTERA",
+        "OpTaskSequenceCreateINTEL": "OpTaskSequenceCreateALTERA", "OpTaskSequenceGetINTEL": "OpTaskSequenceGetALTERA",
+        "OpTaskSequenceReleaseINTEL": "OpTaskSequenceReleaseALTERA",
+        "OpTypeAccelerationStructureNV": "OpTypeAccelerationStructureKHR",
+        "OpTypeCooperativeVectorNV": "OpTypeVectorIdEXT", "OpTypeTaskSequenceINTEL": "OpTypeTaskSequenceALTERA",
+        "OpUDotAccSatKHR": "OpUDotAccSat", "OpUDotKHR": "OpUDot",
+        "OpWritePipeBlockingINTEL": "OpWritePipeBlockingALTERA",
+}
+
+ALIAS_MODULE = """
+OpCapability Shader
+OpCapability DemoteToHelperInvocation
+OpCapability DotProduct
+OpCapability DotProductInput4x8BitPacked
+OpExtension "SPV_GOOGLE_hlsl_functionality1"
+OpExtension "SPV_GOOGLE_user_type"
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %target
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %target Location 0
+OpDecorateStringGOOGLE %target UserSemantic "SV_Target0"
+OpMemberDecorateStringGOOGLE %pair 0 UserSemantic "PAIR0"
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%int = OpTypeInt 32 1
+%uint = OpTypeInt 32 0
+%pair = OpTypeStruct %int
+%out_int = OpTypePointer Output %int
+%target = OpVariable %out_int Output
+%a = OpConstant %uint 16909060
+%b = OpConstant %uint 84281096
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%dot = OpSDotKHR %int %a %b PackedVectorFormat4x8Bit
+OpStore %target %dot
+OpDemoteToHelperInvocationEXT
+OpReturn
+OpFunctionEnd
+"""
+
+
+class InstructionAliasTests(unittest.TestCase):
+    def test_every_alias_has_its_canonical_entry(self):
+        for alias, canonical in INSTRUCTION_ALIASES.items():
+            with self.subTest(alias=alias):
+                self.assertIn(alias, INSTRUCTIONS)
+                self.assertEqual(INSTRUCTIONS[alias], INSTRUCTIONS[canonical])
+
+    def test_alias_spellings_assemble_like_canonical_ones(self):
+        # The same module with each alias opname replaced by the instruction it names.
+        canonical = "\n".join(" ".join(INSTRUCTION_ALIASES.get(token, token) for token in line.split(" "))
+                              for line in ALIAS_MODULE.splitlines())
+        for alias, opname in (("OpDecorateStringGOOGLE", "OpDecorateString"),
+                              ("OpMemberDecorateStringGOOGLE", "OpMemberDecorateString"),
+                              ("OpSDotKHR", "OpSDot"),
+                              ("OpDemoteToHelperInvocationEXT", "OpDemoteToHelperInvocation")):
+            self.assertIn(alias, ALIAS_MODULE.split())
+            self.assertNotIn(alias, canonical.split())
+            self.assertIn(opname, canonical.split())
+        self.assertEqual(spirv_asm.assemble(ALIAS_MODULE, target_env="vulkan1.3"),
+                         spirv_asm.assemble(canonical, target_env="vulkan1.3"))
+
+
 class AssembleRoundTripTests(unittest.TestCase):
     def test_assemble_module_matches_table_opcodes(self):
         asm = "\n".join(

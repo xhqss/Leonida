@@ -18,6 +18,7 @@ from collections import Counter
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 
@@ -81,6 +82,7 @@ def main() -> int:
             staged = os.path.join(staging, "rpf_probe.json")
             with open(staged, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(rows, f, indent=1)
+            os.chmod(staged, published_mode(a.out))
             os.replace(staged, a.out)
     except OSError as error:
         reason = error.strerror or str(error)

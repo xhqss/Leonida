@@ -1,6 +1,6 @@
 // Subgroup size control in PSOs, end to end through the Xbox-ABI proxy over the Vulkan device (src/subgroup_size.h):
 // three translated compute shaders from runtime/test/shaders, each dispatched through a D3D12 PSO found by the
-// SHA-256 of its FSSM program, writing eight words through the V# in s[0:3] (four root constants), read back:
+// SHA-256 of its FSSM program, writing eight words through the V# in s[4:7] (four root constants in the console compute layout), read back:
 //   w64 native    cs_w64x_readlane translated natively: v_readlane across both halves of a wave64. Exact only in a
 //                 64-wide subgroup, so the PSO must ask for 64 (and full subgroups) on a device that can give it.
 //                 On a device that cannot (NVIDIA: 32 only) the PSO reports it, and the result is not judged.
@@ -98,9 +98,11 @@ std::vector<std::uint8_t> shader_container(const std::vector<std::uint8_t>& fssm
 
 // runtime/test/shaders/compute_fixture.py's header for a compute shader without "; group:" or "; rsrc2:" lines:
 // 0x148 bytes, COMPUTE_PGM_RSRC2 0x8088 (four user SGPRs, TGID_X, 512 bytes of LDS) at 0x138 and a 64x1x1 group.
+// The synthetic header build.py gives these fixtures: compute_fixture.py's default RSRC2 0x8088 (four user SGPRs,
+// TGID_X) with USER_SGPR raised by LEONIDA_USER_DATA_SHIFT=4, so 0x8090 (eight: the V# moves to s[4:7], D3D-448).
 std::vector<std::uint8_t> fixture_fssm() {
     std::vector<std::uint8_t> fssm(0x138, 0);
-    for (const std::uint32_t v : {0x8088u, 64u, 1u, 1u}) put32(fssm, v);
+    for (const std::uint32_t v : {0x8090u, 64u, 1u, 1u}) put32(fssm, v);
     return fssm;
 }
 
@@ -186,7 +188,8 @@ Result run(vktest::Device& d, const std::filesystem::path& library, const leonid
                                                             reinterpret_cast<void**>(&device.p))));
     rt::d3d12::set_device_outer(inner, device.p);
 
-    // Root signature: [0] four constants (s0..s3), the V# the shaders store through.
+    // Root signature: [0] four constants (s4..s7 in the console compute layout, D3D-448), the V# the shaders store
+    // through. The asm fixtures are built with LEONIDA_USER_DATA_SHIFT=4 to read it there (runtime/CMakeLists.txt).
     D3D12_ROOT_PARAMETER param{};
     param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     param.Constants = {0, 0, 4};
@@ -235,7 +238,7 @@ Result run(vktest::Device& d, const std::filesystem::path& library, const leonid
                                                     IID_PPV_ARGS(&list.p))));
     CASE_EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
-    // The V# the shaders read from s[0:3]: base = the buffer's console VA (the shader adds the heap base), stride 0,
+    // The V# the shaders read from s[4:7]: base = the buffer's console VA (the shader adds the heap base), stride 0,
     // num_records unlimited, OOB_SELECT 3 (raw: a stride of 0 is a bounds check in the other modes).
     list->SetComputeRootSignature(root.p);
     const std::uint32_t vsharp[4] = {std::uint32_t(va), std::uint32_t(va >> 32) & 0xffff, 0xffffffffu, 0x31016FACu};

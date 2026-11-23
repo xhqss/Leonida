@@ -115,12 +115,26 @@ _MODE_FIELDS_GONE_ON_GFX1170 = ("ieee", "dx10_clamp")
 _MODE_FIXED = ("ieee", "dx10_clamp")
 
 
+def is_gfx1170_or_later(arch):
+    """True for GFX11.7 and GFX12 (gfx1170 and later), which RDNA2 and RDNA3 code does not assemble for as is."""
+    fam = family(arch)
+    return fam == "gfx12" or (fam == "gfx11" and int(arch[5], 16) >= 7)
+
+
+def rdna23_skip_reason(arch):
+    """Why a fuzzer or test written for RDNA2 and RDNA3 cannot run on this GPU, or None. AMD clang (rocm-sdk-core 10.0.0)
+    rejects s_barrier and some 16-bit and memory operands for gfx1201 (TEST-873, found by @PeterGrieffindor in #3918),
+    which fails every program of a chunk; on gfx1170+ the caller reports a skip instead."""
+    if not is_gfx1170_or_later(arch):
+        return None
+    return f"{arch} (GFX11.7 or GFX12) is not RDNA2 or RDNA3: the kernels here do not assemble for it"
+
+
 def mode_skip_reason(mode, arch):
     """Why a kernel's starting MODE cannot be set on this architecture, or None. A kernel that asks for one of
     _MODE_FIXED on gfx1170+ (GFX11.7 and GFX12) is reported as not runnable there, rather than reaching the assembler,
     which rejects the directive and, when every kernel of a chunk sets it, the whole chunk."""
-    fam = family(arch)
-    if not (fam == "gfx12" or (fam == "gfx11" and int(arch[5], 16) >= 7)):
+    if not is_gfx1170_or_later(arch):
         return None
     fixed = sorted(k for k in (mode or {}) if k in _MODE_FIXED)
     if not fixed:
@@ -200,10 +214,11 @@ def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32, sgpr
 """
 
 
-def kernel_text(name, lines, arch, wave=32, vgprs=16, sgprs=32):
-    """Assembly for one kernel. The descriptor takes the wave size and the register counts (raised to the registers
-    the lines name, register_counts). It used to be fixed at wave32, 16 VGPRs and 32 SGPRs: on gfx1036 v16 and up
-    read back 0 and a Kernel(wave=64) ran as wave32 (the lane ids of a full EXEC had 32 lanes)."""
+def kernel_text(name, lines, arch, wave=32, vgprs=16, sgprs=32, lds=0):
+    """Assembly for one kernel. The descriptor takes the wave size, the register counts (raised to the registers
+    the lines name, register_counts) and the LDS size (the group segment: without it a Linux launcher has nothing
+    to program COMPUTE_PGM_RSRC2.LDS_SIZE from). It used to be fixed at wave32, 16 VGPRs and 32 SGPRs: on gfx1036
+    v16 and up read back 0 and a Kernel(wave=64) ran as wave32 (the lane ids of a full EXEC had 32 lanes)."""
     fam = family(arch)
     vgprs, sgprs = register_counts(lines, vgprs, sgprs)
     load = "s_load_dwordx2" if fam == "gfx10" else "s_load_b64"
@@ -226,6 +241,7 @@ def kernel_text(name, lines, arch, wave=32, vgprs=16, sgprs=32):
   .amdhsa_user_sgpr_kernarg_segment_ptr 1
   .amdhsa_next_free_vgpr {vgprs}
   .amdhsa_next_free_sgpr {sgprs}
+  .amdhsa_group_segment_fixed_size {lds}
   .amdhsa_wavefront_size32 {1 if wave == 32 else 0}
   .amdhsa_system_vgpr_workitem_id 0
 .end_amdhsa_kernel
@@ -258,7 +274,7 @@ def module_text(programs, arch, prefix="k", wave=32):
         if isinstance(prog, Kernel):
             vg, sg = register_counts(prog.lines, prog.vgprs, prog.sgprs)
             text = (raw_kernel_text(name, prog.lines, arch, prog.wave, prog.mode, prog.lds, vg, sg) if prog.raw
-                    else kernel_text(name, prog.lines, arch, prog.wave, vg, sg))
+                    else kernel_text(name, prog.lines, arch, prog.wave, vg, sg, prog.lds))
         else:
             vg, sg = register_counts(prog, 16, 32)
             text = kernel_text(name, prog, arch, wave, vg, sg)
@@ -298,7 +314,7 @@ GFX11_VALU_RENAMED = {
 # the GFX10 spelling of all of them on gfx1150 except ds_cmpst_rtn_b32 ("instruction not supported on this GPU"), and
 # takes the GFX11 spelling on gfx1030 for none. The new spelling is used on GFX11/GFX12 so the program text is what
 # the target names, not what an alias happens to accept. ds_cmpstore_rtn_b32 also takes its two data operands in the
-# other order (ds_line).
+# other order (ds_line), and GFX12 spells the barrier and the LDS wait differently (sync_lines).
 DS_RENAMED_GFX11 = {
     "ds_wrxchg_rtn_b32": "ds_storexchg_rtn_b32",
     "ds_cmpst_rtn_b32": "ds_cmpstore_rtn_b32",
@@ -321,30 +337,46 @@ def ds_mnemonic(op, arch):
 
 
 def ds_line(line, arch):
-    """A whole instruction line (GFX10 spelling and operand order in) respelled for the architecture. On GFX11
-    (measured on gfx1150; GFX12 is not measured, lds_fuzz skips it) ds_cmpstore_rtn_b32 takes the value to store first and the compare value second, the reverse of GFX10's
+    """A whole instruction line (GFX10 spelling and operand order in) respelled for the architecture. On GFX11 and
+    GFX12 ds_cmpstore_rtn_b32 takes the value to store first and the compare value second, the reverse of GFX10's
     ds_cmpst_rtn_b32 vdst, vaddr, cmp, store (measured on gfx1150: tools/lds_fuzz.py --oracle hw, and it is what LLVM's
-    cmpxchg selection does for GFX11); llvm-mc encodes both spellings of the same text identically, so only the
+    cmpxchg selection does for GFX11; measured on gfx1201, an RX 9070 XT: with M = 7 at the address, data v1 = 9 and
+    v2 = 7 the dword becomes 9 and with v1 = 7, v2 = 9 it stays 7, for the rtn and the non-returning form, while
+    gfx1036's ds_cmpst does the opposite); llvm-mc encodes both spellings of the same text identically, so only the
     operand order tells them apart."""
     op, sep, rest = line.partition(" ")
-    if op == "ds_cmpst_rtn_b32" and family(arch) == "gfx11":
+    if op == "ds_cmpst_rtn_b32" and family(arch) in ("gfx11", "gfx12"):
         m = re.fullmatch(r"(v\d+),\s*(v\d+),\s*(v\d+),\s*(v\d+)(.*)", rest)
         if not m:
             raise ValueError(f"cannot swap the operands of {line!r}")
         dst, addr, cmp_, store, tail = m.groups()
         rest = f"{dst}, {addr}, {store}, {cmp_}{tail}"
-    elif op == "ds_cmpst_b32" and family(arch) == "gfx11":
+    elif op == "ds_cmpst_b32" and family(arch) in ("gfx11", "gfx12"):
         # The non-returning form is renamed as well, and its two data operands swap the same way: GFX10's
         # ds_cmpst_b32 vaddr, cmp, store is GFX11's ds_cmpstore_b32 vaddr, store, cmp (measured on gfx1100: with
-        # M = 7, vaddr = 0 and data v1 = 9, v2 = 7 the dword becomes 9, so the store operand is v1). The rename is
-        # done here rather than in DS_RENAMED_GFX11 because the swap is only measured on GFX11, and renaming
-        # without swapping on GFX12 would silently compare and store the wrong way round.
+        # M = 7, vaddr = 0 and data v1 = 9, v2 = 7 the dword becomes 9, so the store operand is v1; the same on
+        # gfx1201). The rename is done here rather than in DS_RENAMED_GFX11 so that it never happens without the
+        # swap, which would silently compare and store the wrong way round.
         m = re.fullmatch(r"(v\d+),\s*(v\d+),\s*(v\d+)(.*)", rest)
         if not m:
             raise ValueError(f"cannot swap the operands of {line!r}")
         addr, cmp_, store, tail = m.groups()
         return f"ds_cmpstore_b32 {addr}, {store}, {cmp_}{tail}"
     return ds_mnemonic(op, arch) + sep + rest
+
+
+def sync_lines(line, arch):
+    """A wait or barrier line (GFX10/GFX11 spelling in) as the instructions that do it on this architecture. GFX12 has
+    no s_barrier (AMD LLVM 23: "instruction not supported on this GPU (gfx1201)"); a workgroup barrier there is
+    s_barrier_signal -1 then s_barrier_wait -1. It also split lgkmcnt into dscnt (LDS) and kmcnt (scalar memory), so
+    a wait for the LDS is s_wait_dscnt 0 rather than the legacy s_waitcnt encoding the assembler still takes."""
+    if family(arch) == "gfx12":
+        text = line.strip()
+        if text == "s_barrier":
+            return ["s_barrier_signal -1", "s_barrier_wait -1"]
+        if text == "s_waitcnt lgkmcnt(0)":
+            return ["s_wait_dscnt 0"]
+    return [line]
 
 
 def valu_skip_reason(op, arch):
@@ -360,12 +392,64 @@ _F16_UNARY = "|".join(f"v_{op}_f16" for op in ("exp", "log", "rcp", "rsq", "sqrt
 _F16_DST = re.compile(rf"^([ \t]*(?:v_cvt_f16_f32|{_F16_UNARY})(?:_e32|_e64)?[ \t]+v\d+)(?=[ \t]*,)", re.M)
 _F16_SRC = re.compile(rf"^([ \t]*(?:v_cvt_f32_f16|{_F16_UNARY})(?:_e32|_e64)?[ \t]+v\d+(?:\.[lh])?[ \t]*,"
                       r"[-| \ta-z(]*\bv\d+)\b(?!\.[lh])", re.M)
+# These binary instructions use 16-bit VGPRs for all three operands. Packed operations and the VOP3 instructions the
+# fuzzers emit with op_sel keep their existing operand spelling.
+_TRUE16_BINARY = re.compile(
+    r"^([ \t]*v_(?:(?:add|sub|mul|max|min)_f16|mul_lo_u16|lshlrev_b16|lshrrev_b16|ashrrev_i16|"
+    r"(?:max|min)_[ui]16)(?:_e32|_e64)?[ \t]+)([^/;\r\n]+)", re.M)
+_BARE_VGPR = re.compile(r"\bv\d+\b(?!\.[lh])")
 
 
 def true16_spelling(text):
-    """The f16 operands of those ops written as the low half, which is what a bare register means there on GFX10
+    """The 16-bit operands of those ops written as the low half, which is what a bare register means there on GFX10
     and to older assemblers. Line numbers don't change, so error lines still map to kernels."""
-    return _F16_SRC.sub(r"\1.l", _F16_DST.sub(r"\1.l", text))
+    def binary(match):
+        prefix, operands = match.groups()
+        if re.search(r"\bop_sel\s*:", operands):
+            return match[0]
+        return prefix + _BARE_VGPR.sub(r"\g<0>.l", operands)
+
+    text = _F16_SRC.sub(r"\1.l", _F16_DST.sub(r"\1.l", text))
+    return _TRUE16_BINARY.sub(binary, text)
+
+
+def needs_true16(assembles):
+    """Probe fixed input so a failed generated instruction never changes the chosen spelling."""
+    bare = "v_cvt_f16_f32 v8, v1\n"
+    return not assembles(bare) and assembles(true16_spelling(bare))
+
+
+# ---- op_sel on GFX11+: the two-source 16-bit integer VOP3 ops want it on the registers too ----
+# This is separate from true16_spelling: AMD LLVM 23 (rocm-sdk-core 10.0.0) still takes a bare `v_cvt_f16_f32 v8, v1`
+# on gfx1100, gfx1150 and gfx1201, so the runner's true16 probe says no, yet it rejects
+# `v_max_u16_e64 v14, s12, v5 op_sel:[1,0,0]` on all three ("operands are not valid for this GPU or mode") and takes
+# `v_max_u16_e64 v14.l, s12, v5.l op_sel:[1,0,0]`, which encodes to the same op_sel bits and operands as gfx1036's
+# bare form. v_add_nc/v_sub_nc_*16 and the three-source 16-bit ops still take the bare form there.
+_OPSEL16_OPS = ("v_ashrrev_i16", "v_lshlrev_b16", "v_lshrrev_b16", "v_max_i16", "v_max_u16", "v_min_i16",
+                "v_min_u16", "v_mul_lo_u16")
+_OPSEL16 = re.compile(rf"^([ \t]*(?:{'|'.join(_OPSEL16_OPS)})(?:_e64)?[ \t]+)([^\n]*?)([ \t]+op_sel:\[([01,]+)\])"
+                      r"([^\n]*)$", re.M)
+
+
+def _opsel16_halves(m):
+    """One _OPSEL16 line with each bare VGPR operand named by the half its op_sel bit picks: bit i for source i,
+    the last bit for the destination. The op_sel list itself is kept, since SGPR and constant sources still
+    take their half from it."""
+    head, operands, opsel, bits, tail = m.groups()
+    ops = [o.strip() for o in operands.split(",")]
+    bits = [b == "1" for b in bits.split(",")]
+    if len(bits) != len(ops):     # not the dst + sources shape this respells; leave it to the assembler to judge
+        return m.group(0)
+    for i, o in enumerate(ops):
+        if re.fullmatch(r"v\d+", o):
+            ops[i] = o + (".h" if bits[i - 1] else ".l")    # i - 1: the destination (operand 0) is the last bit
+    return head + ", ".join(ops) + opsel + tail
+
+
+def opsel16_spelling(text):
+    """The VGPRs of the _OPSEL16_OPS lines that have op_sel, written as the half it selects, for GFX11 and later.
+    Lines without op_sel and every other op are left as they are. Line numbers don't change."""
+    return _OPSEL16.sub(_opsel16_halves, text)
 
 
 def failing_kernels(stderr, starts):

@@ -1013,6 +1013,53 @@ class PngTests(unittest.TestCase):
                 self.assertEqual(struct.unpack(">II", chunks[0][1][:8]), (1, 1))
                 self.assertEqual(zlib.decompress(chunks[1][1]), bytes((0, *expected)))
 
+    def test_png_downscale_filters_tagged_srgb_in_linear_light(self):
+        rgba = bytes((0, 32, 0, 255, 255, 160, 10, 255))
+        # BC1 indices 1 and 0 select black and white in the first two texels.
+        bc1 = bc1_block(0xFFFF, 0, [1, 0, 0, 0])
+        for dxgi, payload, expected in (
+            (29, rgba, (188, 119, 5, 255)),
+            (28, rgba, (128, 96, 5, 255)),
+            (72, bc1, (188, 188, 188, 255)),
+            (71, bc1, (128, 128, 128, 255)),
+        ):
+            with self.subTest(dxgi=dxgi):
+                data = dds_buffer(2, 1, payload, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=dxgi)
+                chunks = png_chunks(dds.dds_to_png_bytes(data, max_size=1))
+                self.assertEqual(zlib.decompress(chunks[1][1]), bytes((0, *expected)))
+
+        data = dds_buffer(2, 1, rgba, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=29)
+        for max_size in (0, 2):
+            chunks = png_chunks(dds.dds_to_png_bytes(data, max_size=max_size))
+            self.assertEqual(zlib.decompress(chunks[1][1]), b"\0" + rgba)
+
+    def test_srgb_downscale_weights_linear_color_by_alpha(self):
+        # Opaque red, half-covered green and invisible blue. Alpha is linear.
+        rgba = bytes((255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0))
+        data = dds_buffer(3, 1, rgba, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=29)
+        chunks = png_chunks(dds.dds_to_png_bytes(data, max_size=1))
+        self.assertEqual(zlib.decompress(chunks[1][1]), bytes((0, 213, 156, 0, 128)))
+
+    def test_srgb_linear_segment_rounds_half_bytes_up(self):
+        # All channels lie on the linear segment. Their means are 5.5, 5.5 and 3.5.
+        for alpha in (128, 255):
+            left = bytes((2, 5, 6, alpha))
+            right = bytes((9, 6, 1, alpha))
+            for rgba in (left + right, right + left):
+                with self.subTest(rgba=rgba):
+                    data = dds_buffer(2, 1, rgba, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=29)
+                    chunks = png_chunks(dds.dds_to_png_bytes(data, max_size=1))
+                    self.assertEqual(zlib.decompress(chunks[1][1]), bytes((0, 6, 6, 4, alpha)))
+
+    def test_srgb_downscale_across_two_levels(self):
+        # An opaque white first row and three black rows give 25% linear light.
+        for width in (1, 4):
+            with self.subTest(width=width):
+                rgba = b"\xff" * (4 * width) + bytes((0, 0, 0, 255)) * (3 * width)
+                data = dds_buffer(width, 4, rgba, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=29)
+                chunks = png_chunks(dds.dds_to_png_bytes(data, max_size=1))
+                self.assertEqual(zlib.decompress(chunks[1][1]), bytes((0, 137, 137, 137, 255)))
+
     def test_dds_to_png_rejects_negative_max_size(self):
         payload = bc1_block(0xFFFF, 0x0000, [0, 0, 0, 0]) * 4
         data = dds_buffer(8, 8, payload, flags=DDPF_FOURCC, fourcc=b"DXT1")

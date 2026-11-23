@@ -347,6 +347,36 @@ class SoundnessRegressions(unittest.TestCase):
             ], contains=["unsafe-vote-branch"])
 
     # -- Clean controls (no false positives)
+    # SHADER-820 (@shdann): a vote's SCC tag survived a new value in the voted mask register. v_cmp into the pair
+    # or VCC and s_mov_b64 don't write SCC, so s_cbranch_scc0 votes on the old mask while the run side narrows
+    # EXEC to the new one: one 64-lane wave writes v6 in lanes 20..63, two 32-lane waves skip the upper half.
+    STALE_VOTE_HEAD = ["v_cmp_gt_u32_e32 vcc, 20, v0", "s_and_b64 s[20:21], exec, vcc", "s_cmp_lg_u64 s[20:21], 0"]
+    STALE_VOTE_TAIL = ["s_cbranch_scc0 3", "s_and_b64 exec, exec, s[20:21]", "v_add_nc_u32_e32 v6, 3, v0",
+                       "s_mov_b64 exec, s[10:11]"]
+
+    def test_vote_on_a_rewritten_pair_is_unsafe(self):
+        self.assert_tier_c_and_diverges("vs_stale_vote_vcmp", self.STALE_VOTE_HEAD + [
+            "v_cmp_gt_u32_e64 s[20:21], 64, v0"] + self.STALE_VOTE_TAIL)
+        self.assert_tier_c_and_diverges("vs_stale_vote_mov", self.STALE_VOTE_HEAD + [
+            "s_mov_b64 s[20:21], exec"] + self.STALE_VOTE_TAIL)
+
+    def test_vote_on_a_rewritten_vcc_is_unsafe(self):
+        self.assert_tier_c_and_diverges("vs_stale_vote_vcc", [
+            "v_cmp_gt_u32_e32 vcc, 20, v0", "s_and_b64 vcc, exec, vcc", "v_cmp_gt_u32_e32 vcc, 64, v0",
+            "s_cbranch_scc0 3", "s_and_saveexec_b64 s[18:19], vcc", "v_add_nc_u32_e32 v6, 3, v0",
+            "s_mov_b64 exec, s[18:19]"])
+
+    def test_vote_on_an_unchanged_or_revoted_mask_stays_a(self):
+        for name, body in (
+                ("vs_vote_unchanged", self.STALE_VOTE_HEAD + self.STALE_VOTE_TAIL),
+                # the second s_and_b64 writes s[20:21] and votes on it (SCC = new mask != 0): its tag is the new one
+                ("vs_vote_revoted", self.STALE_VOTE_HEAD + ["v_cmp_gt_u32_e32 vcc, 40, v0",
+                                                            "s_and_b64 s[20:21], exec, vcc"] + self.STALE_VOTE_TAIL)):
+            with self.subTest(name=name):
+                (tier, reasons, _), asm = meta_of(name, vs(body))
+                self.assertEqual(tier, "A", f"{name}: got {tier}, reasons={reasons}")
+                self.assertEqual(out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32)), name)
+
     def test_clean_controls_stay_invariant(self):
         for name, body in (
                 ("vs_clean_spack", ["s_pack_ll_b32_b16 s5, s4, 7", "v_mov_b32_e32 v6, s5"]),

@@ -16,7 +16,7 @@ if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 
 import mode_round_probe as probe  # noqa: E402
-from hw_oracle import runner  # noqa: E402
+from hw_oracle import asm as hw_asm, runner  # noqa: E402
 
 
 class ModeRoundProbeTests(unittest.TestCase):
@@ -106,6 +106,59 @@ class ModeRoundProbeTests(unittest.TestCase):
                 rc = probe.main(["--waves", "32", "--json", str(out_json)])
             self.assertEqual(rc, 1)
             self.assertIn("denied", err.getvalue())
+
+
+class FakeModeOracle:
+    """Answers the probe's kernels from the tables in tools/mode_round_probe.py, like a GFX10 GPU that matches them,
+    except that `bad_op` gets `diffs` nonzero RNE/RTZ XOR words in its first 1024-input chunk."""
+    arch = "gfx1030"
+
+    def __init__(self, bad_op=None, diffs=0):
+        self.bad_op, self.diffs = bad_op, diffs
+
+    def run(self, programs, words=4):
+        out = []
+        for k in programs:
+            if k.words == 1024:
+                op = next(t[0] for t in probe.TRANSCENDENTALS if f"{t[0]} v2, v1" in k.lines)
+                chunk = [0] * 1024
+                if op == self.bad_op and k.lines[0] == "v_add_nc_u32 v1, 0x0, v0":
+                    chunk[:self.diffs] = [1] * self.diffs
+                out.append(chunk)
+                continue
+            rtz = probe.RTZ in k.lines
+            case = next((c for c in probe.CASES
+                         if k.lines[:len(c[1]) + 3] == [*c[1], probe.RTZ if rtz else probe.RNE, "s_nop 0", c[2]]), None)
+            if case is not None:
+                want = case[5] if rtz else case[4]
+                out.append(list(want) if case[3] else [want, 0])
+                continue
+            spot = next(t for t in probe.TRANSCENDENTALS if f"{t[0]} v3, v1" in k.lines)
+            out.append([spot[2], 0])
+        return out
+
+
+class SummaryLineTests(unittest.TestCase):
+    """The per-wave summary line reports what the oracle returned, not a fixed '7/7 ... 0/65536'."""
+
+    def run_main(self, oracle):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(runner, "open_oracle", return_value=oracle),              mock.patch.object(hw_asm, "family", return_value="gfx10"),              mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err):
+            rc = probe.main(["--waves", "32"])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_all_matching_reports_every_transcendental(self):
+        rc, out, err = self.run_main(FakeModeOracle())
+        self.assertEqual(rc, 0, err)
+        self.assertIn(f"{len(probe.CASES)}/{len(probe.CASES)} f16/f64 RNE/RTZ cases exact", out)
+        self.assertIn("7/7 f16 transcendentals 0/65536 RNE/RTZ diffs", out)
+
+    def test_mode_dependent_transcendental_is_reported(self):
+        rc, out, err = self.run_main(FakeModeOracle(bad_op="v_sin_f16_e32", diffs=3))
+        self.assertEqual(rc, 1, err)
+        self.assertNotIn("7/7 f16 transcendentals", out)
+        self.assertIn("6/7 f16 transcendentals 0/65536 RNE/RTZ diffs", out)
+        self.assertIn("v_sin_f16_e32: 3/65536 RNE/RTZ diffs", out)
 
 
 if __name__ == "__main__":

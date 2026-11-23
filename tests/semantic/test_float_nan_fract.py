@@ -349,8 +349,8 @@ class FractNearOne(unittest.TestCase):
         self.assertTrue(is_nan16(got & 0xFFFF) and got >> 16 == 0, hex(got))
 
     def test_v_fract_f16_mul2_keeps_a_true_one(self):
-        # fract(0.5) * 2 = 1.0 exactly: the 0x3c00 -> 0x3bff fix-up is only for Fract's own rounding.
-        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:2", (0x3800,)), 0x3C00)
+        # On RDNA2 with denorms kept, mul:2 is ignored on f16: fract(0.5) remains 0.5 (0x3800).
+        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:2", (0x3800,)), 0x3800)
 
     def test_fract_alone_rounds_to_one(self):
         # Without the select, fract(-1e-10) is exactly 1.0: the select is what gives 0x3f7fffff.
@@ -358,7 +358,7 @@ class FractNearOne(unittest.TestCase):
 
 
 class GpuFixtures(unittest.TestCase):
-    """The two GPU fixtures with the heap words check.py seeds (the same words the .asm headers give)."""
+    """The GPU fixtures with the heap words check.py seeds (the same words the .asm headers give)."""
 
     def test_ps_fnan_med3(self):
         heap = (NAN_A, P70, P50, NAN_A, P35, M25)
@@ -373,6 +373,22 @@ class GpuFixtures(unittest.TestCase):
         words = support.mrt0_words(spv, push_constants=[0x1000, 0, 16, 0] + [0] * 28,
                                    memory={0x1000 + 4 * i: w for i, w in enumerate(heap)})
         self.assertEqual(words, [0x3F7FFFFF, 0x00003BFF, M25, M25])
+
+    def test_ps_fnan_med3_s2(self):
+        # med3(5, 7, NaN), med3(NaN, NaN, 5), med3(NaN, -2.5, NaN), med3(7, NaN, NaN): min3 with the NaNs ignored
+        heap = (P50, P70, NAN_A, M25)
+        spv = support.translate_fixture("ps_fnan_med3_s2")
+        words = support.mrt0_words(spv, push_constants=[0x1000, 0, 16, 0] + [0] * 28,
+                                   memory={0x1000 + 4 * i: w for i, w in enumerate(heap)})
+        self.assertEqual(words, [P50, P50, M25, P70])
+
+    def test_ps_f16_fnan_med3(self):
+        # the same four rows as f16 (5.0, 7.0, NaN, -2.5); the high half of each destination is kept
+        heap = (0x00004500, 0x00004700, 0x00007E01, 0x0000C100)
+        spv = support.translate_fixture("ps_f16_fnan_med3")
+        words = support.mrt0_words(spv, push_constants=[0x1000, 0, 16, 0] + [0] * 28,
+                                   memory={0x1000 + 4 * i: w for i, w in enumerate(heap)})
+        self.assertEqual(words, [0xAAAA4500, 0xAAAA4500, 0xAAAAC100, 0xAAAA4700])
 
 
 class InterpreterOps(unittest.TestCase):

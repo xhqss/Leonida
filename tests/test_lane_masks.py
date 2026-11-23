@@ -269,6 +269,55 @@ def test_writelane_sdwa_dpp_swaps_stores_and_div_scale():
         assert got_ds == {6: L.MASK_LO, 7: L.MASK_HI}, ds_op
 
 
+
+def test_v_and_or_xnor_bfi_track_vector_masks():
+    use = ins("s_and_b32", s(12), s(7), s(8))
+    and_or = ins("v_and_or_b32", v(2), sp("vcc_lo"), sp("exec_lo"), imm(0))
+    xnor = ins("v_xnor_b32", v(3), sp("vcc_lo"), sp("exec_lo"))
+    bfi = ins("v_bfi_b32", v(4), sp("vcc_lo"), sp("exec_lo"), imm(-1))
+    mixed = ins("v_bfi_b32", v(5), sp("exec_lo"), sp("exec_hi"), imm(0))
+    blocks = [[
+        ins("v_cmp_eq_u32_e32", sp("vcc_lo"), v(0), v(1)),
+        and_or,
+        xnor,
+        bfi,
+        mixed,
+        ins("v_readfirstlane_b32", s(7), v(2)),
+        ins("v_readfirstlane_b32", s(8), v(3)),
+        ins("v_readfirstlane_b32", s(9), v(4)),
+        ins("v_readfirstlane_b32", s(10), v(5)),
+        use,
+    ]]
+    out, writes = L.analyse(blocks, [[]])
+    for w in (and_or, xnor, bfi, mixed):
+        assert id(w) in writes, w["op"]
+    masks = out[id(use)]
+    assert masks.get(("v", 2)) == L.MASK_LO
+    assert masks.get(("v", 3)) == L.MASK_LO
+    assert masks.get(("v", 4)) == L.MASK_LO
+    assert masks.get(("v", 5)) == L.MASK
+    assert masks.get(7) == L.MASK_LO
+    assert masks.get(8) == L.MASK_LO
+    assert masks.get(9) == L.MASK_LO
+    assert masks.get(10) == L.MASK
+    # Negative controls: any non-mask or non-0/-1 constant operand keeps dst as plain data.
+    for bad in (
+        ins("v_and_or_b32", v(6), sp("vcc_lo"), v(9), imm(0)),
+        ins("v_and_or_b32", v(6), sp("vcc_lo"), sp("exec_lo"), imm(5)),
+        ins("v_xnor_b32", v(6), sp("vcc_lo"), v(9)),
+        ins("v_bfi_b32", v(6), v(9), sp("exec_lo"), imm(0)),
+        ins("v_bfi_b32", v(6), sp("vcc_lo"), sp("exec_lo"), imm(3)),
+    ):
+        bad_use = ins("s_and_b32", s(12), s(7), sp("exec_lo"))
+        out, writes = L.analyse([[
+            ins("v_cmp_eq_u32_e32", sp("vcc_lo"), v(0), v(1)),
+            bad,
+            ins("v_readfirstlane_b32", s(7), v(6)),
+            bad_use,
+        ]], [[]])
+        assert id(bad) not in writes, bad["op"]
+        assert 7 not in out[id(bad_use)] and ("v", 6) not in out[id(bad_use)], bad["op"]
+
 if __name__ == "__main__":
     test_straight_line()
     test_joins()
@@ -278,4 +327,5 @@ if __name__ == "__main__":
     test_bfm64_and_half_kinds()
     test_b64_mask_imm_and_include_either()
     test_writelane_sdwa_dpp_swaps_stores_and_div_scale()
+    test_v_and_or_xnor_bfi_track_vector_masks()
     print("ok")

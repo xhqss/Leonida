@@ -54,6 +54,8 @@ class GlobalBodyEvaluator:
             self._step(line.split())
 
     def _value(self, name):
+        if name == "%heap_base":          # built once in the entry block, outside the body run here
+            return self.heap_base
         if name == "%c64_32":
             return 32
         if name in self.ids:
@@ -105,10 +107,6 @@ class GlobalBodyEvaluator:
             value = ("mem", self._value(args[0]))
         elif op == "OpLoad" and ty == "%bool" and args == ["%active"]:
             value = self.active
-        elif op == "OpLoad" and ty == "%uint" and args[0] == "%ud_base_lo_p":
-            value = self.heap_base & MASK32
-        elif op == "OpLoad" and ty == "%uint" and args[0] == "%ud_base_hi_p":
-            value = (self.heap_base >> 32) & MASK32
         elif op == "OpLoad" and ty == "%uint":
             kind, where = self._value(args[0])
             if kind in ("%sgpr", "%vgpr") and len(args) == 1:
@@ -135,8 +133,14 @@ class GlobalBodyEvaluator:
             value = (self._value(args[0]) << self._value(args[1])) & MASK64
         elif op == "OpShiftLeftLogical" and ty == "%uint":
             value = (self._value(args[0]) << self._value(args[1])) & MASK32
+        elif op == "OpShiftRightLogical" and ty == "%uint":
+            value = (self._value(args[0]) >> self._value(args[1])) & MASK32
         elif op == "OpBitwiseOr" and ty == "%ulong":
             value = self._value(args[0]) | self._value(args[1])
+        elif op == "OpBitwiseOr" and ty == "%uint":
+            value = (self._value(args[0]) | self._value(args[1])) & MASK32
+        elif op == "OpIEqual" and ty == "%bool":
+            value = self._value(args[0]) == self._value(args[1])
         elif op == "OpBitwiseAnd" and ty == "%uint":
             value = self._value(args[0]) & self._value(args[1])
         elif op == "OpIAdd" and ty == "%ulong":
@@ -145,6 +149,8 @@ class GlobalBodyEvaluator:
             value = (self._value(args[0]) - self._value(args[1])) & MASK64
         elif op in ("OpBitFieldUExtract", "OpBitFieldSExtract") and ty == "%uint":
             v, off, count = (self._value(x) for x in args)
+            if off + count > 32:
+                raise AssertionError(f"bit-field extract beyond 32 bits: off={off}, count={count}")
             value = (v >> off) & ((1 << count) - 1)
             if op == "OpBitFieldSExtract" and value >> (count - 1):
                 value -= 1 << count
@@ -226,6 +232,25 @@ class GlobalOffsetTests(unittest.TestCase):
         # One spelled-out case: sshort at offset -2046 from 0x...4800 is bytes 0x4002..0x4003 of the dword at 0x4000.
         ev, _ = self.run_line("global_load_sshort v10, v[4:5], off offset:-2046", memory={self.BASE - 2048: 0x8BAD1800})
         self.assertEqual(ev.regs["%vgpr"][10], 0xFFFF8BAD)
+
+    def test_short_loads_crossing_dword_boundary(self):
+        # At (addr & 3) == 3, 16-bit global loads read byte 3 of (addr & ~3) and byte 0 of (addr & ~3) + 4.
+        for mode in ("v1, s[20:21]", "v[4:5], off"):
+            for op, signed in (("global_load_ushort", False), ("global_load_sshort", True)):
+                for off, hi_byte, want_hi in ((-1, 0x3F, 0x3F), (-2045, 0x80, 0x80), (2047, 0xFE, 0xFE)):
+                    addr = self.BASE + off
+                    lo_dw, hi_dw = addr & ~3, (addr & ~3) + 4
+                    mem = {lo_dw: 0x99000000, hi_dw: 0xAABBCC00 | hi_byte}
+                    expected = (want_hi << 8) | 0x99
+                    if signed and (expected & 0x8000):
+                        expected |= 0xFFFF0000
+                    line = f"{op} v10, {mode} offset:{off}"
+                    with self.subTest(line=line, hi_byte=hex(hi_byte)):
+                        ev, _ = self.run_line(line, memory=mem)
+                        self.assertEqual(ev.reads, [lo_dw, hi_dw])
+                        self.assertEqual(ev.regs["%vgpr"][10], expected)
+                        ev_off, _ = self.run_line(line, memory=mem, active=False)
+                        self.assertEqual((ev_off.reads, ev_off.regs["%vgpr"][10]), ([], 0xEEEEEEEE))
 
     def test_store_both_modes(self):
         for mode in ("v1, v6, s[20:21]", "v[4:5], v6, off"):

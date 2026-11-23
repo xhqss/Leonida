@@ -167,6 +167,25 @@ class Cli(unittest.TestCase):
         self.assertEqual(len(stderr.splitlines()), 1)
         self.assertIn("spirv-as not found on PATH", stderr)
 
+    def test_invalid_index_leaves_existing_assembly_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = os.path.join(tmp, "index.json")
+            asm = os.path.join(tmp, "ms_a.mesh_vs.spvasm")
+            for payload, message in ((b"{", "invalid JSON"), (b"[]", "expected a shader index object"),
+                                     (b'{"ms_a": {"mesh_compute": {"params": {}}}}', "layout for 'ms_a'")):
+                with self.subTest(payload=payload):
+                    with open(asm, "wb") as f:
+                        f.write(b"previous assembly")
+                    with open(index, "wb") as f:
+                        f.write(payload)
+                    with mock.patch.object(vs, "tool_path", side_effect=lambda name: name):
+                        rc, stdout, stderr = self.run_main(["mesh_compute_vs.py", tmp])
+                    self.assertEqual((rc, stdout), (1, ""))
+                    self.assertIn(index, stderr)
+                    self.assertIn(message, stderr)
+                    with open(asm, "rb") as f:
+                        self.assertEqual(f.read(), b"previous assembly")
+
     def test_a_wrong_argument_count_is_a_usage_error(self):
         rc, stdout, stderr = self.run_main(["mesh_compute_vs.py"])
         self.assertEqual(rc, 2)

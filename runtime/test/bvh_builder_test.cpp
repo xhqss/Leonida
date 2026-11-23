@@ -9,7 +9,9 @@
 //   LEONIDA_BVH_WARP=1                (optional: use the WARP adapter; the default on an NVIDIA adapter, RT-54)
 //   LEONIDA_BVH_HARDWARE=1            (optional: keep an NVIDIA adapter instead of switching to WARP)
 //   LEONIDA_BVH_RECORD62=1            (optional: print each CreateComputePipelineState's container shape, its ILDN
-//                                     module name and digest)
+//                                      module name and digest, the call site (stack frames as offsets from the DLL's
+//                                      image base with the enclosing function's start) and the name the builder
+//                                      gives the returned PSO through SetName / SetPrivateData, RT-266)
 //   LEONIDA_BVH_DXIL=1                (optional, with RECORD62: dx.op counts and validator error kinds, needs
 //                                      dxcompiler.dll and dxil.dll on PATH)
 //   LEONIDA_BVH_DEVICE=vulkan         (optional: the Vulkan-backed ID3D12Device from #119 instead of a PC device)
@@ -32,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -496,6 +499,163 @@ std::string dxil_usage(const void* bytecode, size_t length) {
     return out;
 }
 
+// RT-266: where each creation comes from and which name the builder attaches to the PSO it gets back. The call
+// site is the stack of the hook as offsets from the DLL's image base, each with the start of its function from the
+// x64 unwind tables (RtlLookupFunctionEntry); the name is whatever the builder passes to the returned object's
+// SetName (ID3D12Object slot 6) or SetPrivateData (slot 4) with the D3D debug-name GUIDs. The returned object gets a
+// copy of its vtable with those two slots redirected (the creation number is looked up by object pointer).
+uint64_t g_bvh_base = 0, g_bvh_size = 0;
+
+std::string module_offset(uint64_t addr) {
+    if (!g_bvh_base || addr < g_bvh_base || addr >= g_bvh_base + g_bvh_size) {
+        char b[40];
+        std::snprintf(b, sizeof b, "outside the DLL (%#llx)", (unsigned long long)addr);
+        return b;
+    }
+    char b[96];
+    DWORD64 image = 0;
+    const RUNTIME_FUNCTION* rf = RtlLookupFunctionEntry(addr, &image, nullptr);
+    if (rf)
+        std::snprintf(b, sizeof b, "+%#llx (function +%#lx)", (unsigned long long)(addr - g_bvh_base),
+                      (unsigned long)rf->BeginAddress);
+    else
+        std::snprintf(b, sizeof b, "+%#llx (no unwind entry)", (unsigned long long)(addr - g_bvh_base));
+    return b;
+}
+
+void print_call_site(int number) {
+    // Unwound by hand with the x64 tables: RtlCaptureStackBackTrace stops after the first DLL frame here.
+    CONTEXT ctx;
+    RtlCaptureContext(&ctx);
+    unsigned printed = 0;
+    for (int step = 0; step < 12 && printed < 6; ++step) {
+        DWORD64 image = 0;
+        const RUNTIME_FUNCTION* rf = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
+        if (!rf) break;
+        void* handler_data = nullptr;
+        DWORD64 frame = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, const_cast<RUNTIME_FUNCTION*>(rf), &ctx, &handler_data,
+                         &frame, nullptr);
+        if (!ctx.Rip) break;
+        const auto addr = static_cast<uint64_t>(ctx.Rip);
+        if (addr < g_bvh_base || addr >= g_bvh_base + g_bvh_size) continue;  // this test's own frames
+        std::printf("  slot62 #%d call site frame %u: %s\n", number, printed++, module_offset(addr).c_str());
+    }
+}
+
+struct PsoName {
+    int number;
+    void* object;
+    void** original_vtable;
+    bool restored;
+    void** vtable_copy;  // the hooked copy installed on the object; freed once the original is back
+};
+std::vector<PsoName> g_pso_names;
+std::set<int> g_named;  // creation numbers that got a name
+thread_local bool g_in_set_name = false;
+
+// The newest live entry for the address (an address can be reused after a PSO is released).
+PsoName* find_pso(void* object) {
+    for (auto it = g_pso_names.rbegin(); it != g_pso_names.rend(); ++it)
+        if (!it->restored && it->object == object) return &*it;
+    return nullptr;
+}
+
+// Puts the object's own vtable back, so its destructor and every virtual call past the 9 copied slots see the
+// original. Done as soon as the name is logged, and for the rest after the constructor returns.
+void restore_pso_vtable(PsoName& p) {
+    if (p.restored) return;
+    p.restored = true;
+    __try {
+        *static_cast<void***>(p.object) = p.original_vtable;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    // The thunks that call this have already been dispatched through the copy and read only the original vtable
+    // afterwards; find_pso skips restored entries, so nothing reads the copy past this point.
+    delete[] p.vtable_copy;
+    p.vtable_copy = nullptr;
+    // Drops the reference hook_pso_names took; the builder still holds its own here, so this cannot free the object.
+    using ReleaseFn = ULONG(STDMETHODCALLTYPE*)(void*);
+    reinterpret_cast<ReleaseFn>(p.original_vtable[2])(p.object);
+}
+
+void restore_all_pso_vtables() {
+    for (auto& p : g_pso_names) restore_pso_vtable(p);
+}
+
+std::string narrow(const wchar_t* w) {
+    std::string s;
+    for (; w && *w && s.size() < 200; ++w) s += *w < 0x80 ? char(*w) : '?';
+    return s;
+}
+
+constexpr GUID kDebugNameW = {0x4cca5fd8, 0x921f, 0x42c8, {0x85, 0x66, 0x70, 0xca, 0xf2, 0xa9, 0xb7, 0x41}};
+constexpr GUID kDebugNameA = {0x429b8c22, 0x9188, 0x4b0c, {0x87, 0x42, 0xac, 0xb0, 0xbf, 0x85, 0xc2, 0x00}};
+
+HRESULT STDMETHODCALLTYPE pso_set_name(void* self, const wchar_t* name) {
+    if (auto* p = find_pso(self)) {
+        std::printf("  slot62 #%d name via SetName: \"%s\"\n", p->number, narrow(name).c_str());
+        g_named.insert(p->number);
+        using Fn = HRESULT(STDMETHODCALLTYPE*)(void*, const wchar_t*);
+        g_in_set_name = true;  // the runtime's SetName may call SetPrivateData through the vtable
+        const HRESULT hr = reinterpret_cast<Fn>(p->original_vtable[6])(self, name);
+        g_in_set_name = false;
+        restore_pso_vtable(*p);
+        return hr;
+    }
+    return E_FAIL;
+}
+
+HRESULT STDMETHODCALLTYPE pso_set_private_data(void* self, const GUID& guid, UINT size, const void* data) {
+    if (auto* p = find_pso(self)) {
+        if (g_in_set_name) {
+            using Fn = HRESULT(STDMETHODCALLTYPE*)(void*, const GUID&, UINT, const void*);
+            return reinterpret_cast<Fn>(p->original_vtable[4])(self, guid, size, data);
+        }
+        char g[48];
+        std::snprintf(g, sizeof g, "%08lx-%04x-%04x", guid.Data1, guid.Data2, guid.Data3);
+        std::string value;
+        if (data && size) {
+            if (!std::memcmp(&guid, &kDebugNameW, sizeof(GUID)))
+                value = narrow(std::wstring(static_cast<const wchar_t*>(data), size / 2).c_str());
+            else if (!std::memcmp(&guid, &kDebugNameA, sizeof(GUID)))
+                value = std::string(static_cast<const char*>(data), size);
+        }
+        std::printf("  slot62 #%d SetPrivateData guid %s size %u%s%s%s\n", p->number, g, size,
+                    value.empty() ? "" : " name \"", value.c_str(), value.empty() ? "" : "\"");
+        if (!value.empty()) g_named.insert(p->number);
+        using Fn = HRESULT(STDMETHODCALLTYPE*)(void*, const GUID&, UINT, const void*);
+        const HRESULT hr = reinterpret_cast<Fn>(p->original_vtable[4])(self, guid, size, data);
+        if (!value.empty()) restore_pso_vtable(*p);
+        return hr;
+    }
+    return E_FAIL;
+}
+
+void hook_pso_names(uint64_t out_ptr, int number) {
+    void* object = nullptr;
+    __try {
+        if (out_ptr) object = *reinterpret_cast<void**>(out_ptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        object = nullptr;
+    }
+    if (!object) {
+        std::printf("  slot62 #%d: no object at a5\n", number);
+        return;
+    }
+    constexpr unsigned kSlots = 9;  // IUnknown, ID3D12Object, GetDevice, GetCachedBlob
+    void** orig = *static_cast<void***>(object);
+    auto** copy = new void*[kSlots];
+    std::memcpy(copy, orig, kSlots * sizeof(void*));
+    copy[4] = reinterpret_cast<void*>(&pso_set_private_data);
+    copy[6] = reinterpret_cast<void*>(&pso_set_name);
+    // Hold a reference until the vtable is restored, so the later write-back never lands in freed memory.
+    using AddRefFn = ULONG(STDMETHODCALLTYPE*)(void*);
+    reinterpret_cast<AddRefFn>(orig[1])(object);
+    g_pso_names.push_back({number, object, orig, false, copy});
+    *static_cast<void***>(object) = copy;
+}
+
 uint64_t WINAPI record_slot62(void* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
     const int n = g_slot62_logged++;
     if (n < 1) {
@@ -536,9 +696,12 @@ uint64_t WINAPI record_slot62(void* self, uint64_t a1, uint64_t a2, uint64_t a3,
         if (env("LEONIDA_BVH_DXIL") == "1")
             std::printf("  slot62 #%d uses: %s\n", n + 1, dxil_usage(desc->CS.pShaderBytecode, desc->CS.BytecodeLength).c_str());
     }
+    print_call_site(n + 1);
     const uint64_t r = g_slot62(self, a1, a2, a3, a4, a5, a6);
     const auto hr = static_cast<HRESULT>(static_cast<uint32_t>(r));
     (SUCCEEDED(hr) ? g_slot62_ok : g_slot62_failed)++;
+    // The output slot is a5 (desc, two words, riid, out); the object it receives is the one the builder names.
+    if (SUCCEEDED(hr)) hook_pso_names(a5, n + 1);
     std::printf("  slot62 #%d: CS bytecode %llu bytes, root signature %s, node mask %u, flags %#x -> hr %#010lx\n", n + 1,
                 desc ? (unsigned long long)desc->CS.BytecodeLength : 0ull, desc && desc->pRootSignature ? "set" : "null",
                 desc ? desc->NodeMask : 0u, desc ? (unsigned)desc->Flags : 0u, static_cast<unsigned long>(hr));
@@ -590,6 +753,8 @@ int main() {
         rt::Module& bvh = loader.load(dll);
         std::printf("mapped %s at %p, size %u, entry +%#x%s\n", bvh.name.c_str(), bvh.base, bvh.size,
                     bvh.entry_rva, bvh.relocated ? " (relocated)" : "");
+        g_bvh_base = reinterpret_cast<uint64_t>(bvh.base);
+        g_bvh_size = bvh.size;
         int shim = 0, host = 0, unimplemented = 0;
         for (auto& r : bvh.imports) {
             if (r.binding == rt::Binding::Shim) ++shim;
@@ -685,6 +850,7 @@ int main() {
         std::vector<uint8_t> object(kObjectBuffer, kSentinel);
         const ULONGLONG t0 = GetTickCount64();
         Call c = guarded_ctor(ctor, object.data(), proxy, flag);
+        restore_all_pso_vtables();  // PSOs never named keep the copy until here (RT-266)
         const ULONGLONG ms = GetTickCount64() - t0;
         size_t last = 0, changed = 0;
         for (size_t i = 0; i < object.size(); ++i)
@@ -702,6 +868,8 @@ int main() {
              (g_slot62_logged ? ", succeeded " + std::to_string(g_slot62_ok) + ", failed " + std::to_string(g_slot62_failed)
                               : std::string()));
         if (g_slot62_logged) {
+            note("slot 62 creations given a name by the builder: " + std::to_string(g_named.size()) + " of " +
+                 std::to_string(g_slot62_logged));
             note("slot 62 creations: " + std::to_string(g_slot62_logged) + ", distinct containers: " +
                  std::to_string(g_slot62_logged - g_repeats) + ", repeated creations: " + std::to_string(g_repeats));
             if (g_repeats) {

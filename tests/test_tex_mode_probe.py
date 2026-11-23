@@ -24,6 +24,7 @@ try:
     import numpy as np
     HAVE_NUMPY = True
 except ImportError:
+    np = None
     HAVE_NUMPY = False
 
 try:
@@ -31,7 +32,16 @@ try:
 except ImportError:
     pytest = None
 
-import tex_mode_probe
+if pytest is not None:
+    pytestmark = pytest.mark.skipif(not HAVE_NUMPY, reason="numpy required for tex_mode_probe tests")
+
+if HAVE_NUMPY:
+    import tex_mode_probe
+else:
+    tex_mode_probe = None
+
+    def setUpModule():
+        raise unittest.SkipTest("numpy required for tex_mode_probe tests")
 
 # Synthetic 4K and 64K equations providing exact bijections within tiles:
 # 4K, bpe=8: elems=512, bw=32 (5 bits x), bh=16 (4 bits y), 3 bits intra-element

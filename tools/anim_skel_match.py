@@ -34,6 +34,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import anim_index  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 DEFAULT_STREAMS = (0x101A32160, 0x101C379A0, 0x101C41D50, 0x101EA66C0)
 
@@ -145,6 +146,11 @@ def main(argv=None):
     ap.add_argument("--stream", type=parse_offset, action="append", help="bone-table stream offset in anim.rpf")
     ap.add_argument("--json", help="write the report here")
     a = ap.parse_args(argv)
+    if a.json:
+        for source in (a.anim, a.packs):
+            if same_report_path(a.json, source):
+                print(f"anim_skel_match: --json must not overwrite input {source}", file=sys.stderr)
+                return 2
     try:
         names = stream_names(a.anim, a.stream or DEFAULT_STREAMS)
         skeletons = read_skeletons(a.packs, lambda t: print(t, file=sys.stderr, flush=True))

@@ -7,8 +7,8 @@ support.translate_lines) and tests/semantic/spirv_mini_interp.py:
     values checked against a Python struct("<e", ...) reference.
   - IEEE-754 binary16 special cases: +inf (0x7C00 -> 0x7C00), NaNs (0x7E00,
     0x7E01, 0x7C01 -> NaN), and negative inputs (-1.0 = 0xBC00, -inf = 0xFC00),
-    which raise spirv_mini_interp.UnsupportedConstruct because GLSL.std.450
-    leaves Sqrt(x < 0) undefined.
+    which give 0xFE00 (a negative quiet NaN, the hardware's result; the
+    translator keeps the undefined GLSL.std.450 Sqrt(x < 0) out of it).
   - Preservation of the untouched 16-bit half of the destination VGPR and
     independence from the unused 16-bit half of the source VGPR.
   - _e32, _e64, and bare mnemonics, op_sel:[src,dst] ([0,0], [1,0], [0,1],
@@ -186,17 +186,16 @@ class SqrtF16SpecialCasesTests(unittest.TestCase):
                     self.assertEqual(got_nan & 0xFFFF0000, OLD & 0xFFFF0000)
                     self.assertTrue(is_f16_nan(got_nan & 0xFFFF), f"expected NaN, got {got_nan:#010x}")
 
-    def test_negative_inputs_raise_unsupported_construct(self):
-        # GLSL.std.450 leaves Sqrt(x < 0) undefined; spirv_mini_interp raises UnsupportedConstruct.
-        for line, v1_word in (
-            ("v_sqrt_f16_e32 v0, v1", (H_1P0 << 16) | H_NEG_1P0),
-            ("v_sqrt_f16_e32 v0, v1", (H_1P0 << 16) | H_NEG_INF),
-            ("v_sqrt_f16_e64 v0, v1 op_sel:[1,0]", (H_NEG_1P0 << 16) | H_1P0),
-            ("v_sqrt_f16_e64 v0, v1 op_sel:[1,1]", (H_NEG_INF << 16) | H_1P0),
+    def test_negative_inputs_give_negative_quiet_nan(self):
+        # GLSL.std.450 leaves Sqrt(x < 0) undefined, so the translator selects the hardware's 0xFE00 itself.
+        for line, v1_word, dst_hi in (
+            ("v_sqrt_f16_e32 v0, v1", (H_1P0 << 16) | H_NEG_1P0, 0),
+            ("v_sqrt_f16_e32 v0, v1", (H_1P0 << 16) | H_NEG_INF, 0),
+            ("v_sqrt_f16_e64 v0, v1 op_sel:[1,0]", (H_NEG_1P0 << 16) | H_1P0, 0),
+            ("v_sqrt_f16_e64 v0, v1 op_sel:[1,1]", (H_NEG_INF << 16) | H_1P0, 1),
         ):
             with self.subTest(line=line, v1=hex(v1_word)):
-                with self.assertRaises(si.UnsupportedConstruct):
-                    run_op(line, v1_word)
+                self.assertEqual(run_op(line, v1_word), merge_half(OLD, 0xFE00, dst_hi))
 
 
 class SqrtF16ModifiersAndOperandsTests(unittest.TestCase):
@@ -215,14 +214,13 @@ class SqrtF16ModifiersAndOperandsTests(unittest.TestCase):
         self.assertEqual(run_op("v_sqrt_f16_e64 v0, |v1| op_sel:[1,1]", v1), merge_half(OLD, H_2P0, 1))
         # -v1 on a negative value turns it positive before sqrt.
         self.assertEqual(run_op("v_sqrt_f16_e64 v0, -v1 op_sel:[1,0]", v1), merge_half(OLD, H_2P0, 0))
-        # -|v1| is negative, so GLSL.std.450 Sqrt raises UnsupportedConstruct.
-        with self.assertRaises(si.UnsupportedConstruct):
-            run_op("v_sqrt_f16_e64 v0, -|v1| op_sel:[0,0]", v1)
+        # -|v1| is negative: 0xFE00.
+        self.assertEqual(run_op("v_sqrt_f16_e64 v0, -|v1| op_sel:[0,0]", v1), merge_half(OLD, 0xFE00, 0))
 
-        # Output modifiers: mul:2, div:2, clamp.
+        # Output modifiers: mul:2 and div:2 ignored on RDNA2 with denorms kept; clamp applies.
         v1_pos = (H_9P0 << 16) | H_4P0
-        self.assertEqual(run_op("v_sqrt_f16_e64 v0, v1 mul:2", v1_pos), merge_half(OLD, H_4P0, 0))
-        self.assertEqual(run_op("v_sqrt_f16_e64 v0, v1 div:2", v1_pos), merge_half(OLD, H_1P0, 0))
+        self.assertEqual(run_op("v_sqrt_f16_e64 v0, v1 mul:2", v1_pos), merge_half(OLD, H_2P0, 0))
+        self.assertEqual(run_op("v_sqrt_f16_e64 v0, v1 div:2", v1_pos), merge_half(OLD, H_2P0, 0))
         self.assertEqual(run_op("v_sqrt_f16_e64 v0, v1 clamp", v1_pos), merge_half(OLD, H_1P0, 0))
         self.assertEqual(run_op("v_sqrt_f16_e64 v0, v1 op_sel:[1,1] clamp", v1_pos), merge_half(OLD, H_1P0, 1))
 

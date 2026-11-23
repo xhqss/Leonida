@@ -352,9 +352,12 @@ def decode_facial_curves(virt, anim, anim_desc, stats=None):
     A packed block is one sequence of tools/anim_clips.py (0x20-byte header, version 2, 11 channel
     types) and the track directory is its 12-byte `{id hash, track-type hash, value format}` list, so
     the block and track decoders are that tool's. `tracks` is the directory as stored. Raises
-    `anim_clips.DecodeError` when a block does not decode.
+    `anim_clips.DecodeError` when a block does not decode. A contiguous view is decoded in place,
+    without copying the resource.
     """
-    system = anim_clips.System(bytes(virt))
+    if isinstance(virt, memoryview):
+        virt = virt.cast("B") if virt.c_contiguous else bytes(virt)
+    system = anim_clips.System(virt)
     at, count = anim_desc["track_ptr"] or 0, anim_desc["track_count"] or 0
     if count and at + 12 * count > len(system.d):
         raise anim_clips.DecodeError("track directory runs past the resource")
@@ -366,6 +369,16 @@ def decode_facial_curves(virt, anim, anim_desc, stats=None):
         kind = type(e).__name__ if type(e).__module__ == "builtins" else f"{type(e).__module__}.{type(e).__name__}"
         raise anim_clips.DecodeError(f"malformed block: {kind}") from e
     return values, frames, tracks
+
+
+def _extents_overlap(anim, anim_desc):
+    """True when two packed blocks, or a block and the track directory, share a byte."""
+    spans = [(b["voff"], b["voff"] + b["anim_size"]) for b in anim["blocks"]]
+    count = anim_desc["track_count"] or 0
+    if count:
+        spans.append((anim_desc["track_ptr"], anim_desc["track_ptr"] + 12 * count))
+    spans.sort()
+    return any(spans[i][0] < spans[i - 1][1] for i in range(1, len(spans)))
 
 
 def facial_curve_summary(virt, anim, anim_desc):
@@ -722,14 +735,6 @@ def decode_rsc8(data, *, stream_id=None, deep=True, curves=False):
         "tracks_in_bounds",
         "no_embedded_audio_container",
     ]
-    if (
-        curves
-        and out["anim"]
-        and out["anim_desc"]
-        and checks["anim_blocks_in_bounds"]
-        and checks["tracks_in_bounds"]
-    ):
-        out["curves"] = facial_curve_summary(virt, out["anim"], out["anim_desc"])
     if deep:
         core_checks.extend(("clip_duration_matches_frames", "tracks_sorted", "tracks_schema_ok"))
     else:
@@ -737,6 +742,15 @@ def decode_rsc8(data, *, stream_id=None, deep=True, curves=False):
         checks.pop("tracks_sorted", None)
         checks.pop("tracks_schema_ok", None)
     out["valid"] = all(checks[k] for k in core_checks)
+    if curves:
+        # Keyframes are decoded only from a clip whose structure checks out, so a block whose sizes disagree
+        # or that runs into another block or the track directory is counted as an error, never decoded.
+        if not out["valid"] or not out["anim"] or not out["anim_desc"]:
+            out["curves"] = {"decoded": False, "error": "structural checks failed"}
+        elif _extents_overlap(out["anim"], out["anim_desc"]):
+            out["curves"] = {"decoded": False, "error": "block or track extents overlap"}
+        else:
+            out["curves"] = facial_curve_summary(virt, out["anim"], out["anim_desc"])
     return out
 
 

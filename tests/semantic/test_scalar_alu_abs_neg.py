@@ -841,7 +841,8 @@ class TestSpirvTranslatorIntegration(unittest.TestCase):
         body_exec = "\n".join(gen_exec.body)
 
         self.assertIn("OpNot %uint", body_exec)
-        self.assertIn("OpGroupNonUniformAny", body_exec)
+        self.assertIn("OpGroupNonUniformBallot", body_exec)
+        self.assertIn("%c20", body_exec)
         self.assertIn("OpStore %scc", body_exec)
 
     def test_spirv_math_model_equivalence(self):

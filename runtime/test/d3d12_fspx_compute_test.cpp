@@ -37,7 +37,20 @@ namespace {
 using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);  // heap slots 9/10: handle in RAX
 using XboxComputePipelineFn = HRESULT(WINAPI*)(void* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, std::uint64_t,
                                                std::uint64_t, const IID*, void**);
-using SerializeFn = HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
+// Device slot 67 as the FidelityFX DLL calls it: (desc, riid, out), the description as docs/fspx.md lays it out.
+struct XboxNativeDesc {
+    ID3D12RootSignature* root_signature;
+    const void* kind0;
+    std::uint64_t kind0_size;
+    const void* kind1;
+    std::uint64_t kind1_size;
+    const void* kind6;
+    std::uint64_t kind6_size;
+    const void* kind7;
+    std::uint64_t kind7_size;
+};
+using XboxNativeComputePipelineFn = HRESULT(WINAPI*)(void* device, const XboxNativeDesc*, const IID*, void**);
+using SerializeFn =HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
 
 template<class T>
 struct Ref {
@@ -108,6 +121,58 @@ std::vector<std::uint8_t> container(const std::vector<std::uint8_t>& accc) {
     out.insert(out.end(), {'A', 'C', 'C', 'C'});
     put32(out, std::uint32_t(accc.size()));
     out.insert(out.end(), accc.begin(), accc.end());
+    return out;
+}
+
+// The slot-67 description built the way amd_fidelityfx_upscaler_xbox.dll builds it (docs/fspx.md, "How the DLL reads
+// it", pinned from its code):
+//   - its FSPX reader (RVA 0x1a20, and the same loop inline for a container) zeroes four (pointer, size) pairs, walks
+//     the directory with the reader's bounds rules and stores kind 0 in pair 0, kind 1 in pair 1, kind 6 in pair 2 and
+//     kind 7 in pair 3, the last entry of a kind winning; the pointers point into the payload itself;
+//   - it copies kind 6 into an allocation rounded up to 256 bytes (here filled with 0xcc past the program, so a size
+//     taken from the allocation would show) and passes that copy with kind 6's own size;
+//   - it copies the pairs into the description in that order: pair 0 at +0x08, pair 1 at +0x18, the copy at +0x28,
+//     pair 3 at +0x38.
+// So the test does not reuse the layout the proxy reads: it follows the DLL's reader over the payload's own directory.
+struct DllSlot67 {
+    XboxNativeDesc desc{};
+    std::vector<std::uint8_t> copy;  // the kind-6 copy (the DLL's XMemAlloc block)
+};
+
+DllSlot67 dll_slot67(ID3D12RootSignature* root, const std::vector<std::uint8_t>& container_bytes) {
+    DllSlot67 out;
+    out.desc.root_signature = root;
+    const std::span<const std::uint8_t> payload = leonida::dxbc_part(container_bytes, "ACCC");
+    const auto u32 = [&](std::size_t at) {
+        std::uint32_t v;
+        std::memcpy(&v, payload.data() + at, 4);
+        return v;
+    };
+    if (payload.size() < 16 || std::memcmp(payload.data(), "FSPX", 4) != 0) return out;
+    const std::uint64_t total = std::min<std::uint64_t>(u32(12), payload.size());
+    const std::uint64_t end_dir = 16 + 16 * std::uint64_t(u32(8));
+    if (end_dir > total) return out;
+    const void* pointer[4] = {};
+    std::uint64_t size[4] = {};
+    for (std::uint64_t at = 16; at < end_dir; at += 16) {
+        const std::uint32_t kind = u32(std::size_t(at)), offset = u32(std::size_t(at) + 4),
+                            length = u32(std::size_t(at) + 8);
+        if (offset < end_dir || std::uint64_t(offset) + length > total) continue;
+        const int pair = kind == 0 ? 0 : kind == 1 ? 1 : kind == 6 ? 2 : kind == 7 ? 3 : -1;
+        if (pair < 0) continue;
+        pointer[pair] = payload.data() + offset;
+        size[pair] = length;
+    }
+    out.copy.assign((size[2] + 255) & ~std::uint64_t(255), 0xcc);
+    if (size[2]) std::memcpy(out.copy.data(), pointer[2], std::size_t(size[2]));
+    out.desc.kind0 = pointer[0];
+    out.desc.kind0_size = size[0];
+    out.desc.kind1 = pointer[1];
+    out.desc.kind1_size = size[1];
+    out.desc.kind6 = out.copy.data();
+    out.desc.kind6_size = size[2];
+    out.desc.kind7 = pointer[3];
+    out.desc.kind7_size = size[3];
     return out;
 }
 
@@ -195,7 +260,8 @@ int main() {
                    "\"uses_code_base\": true, \"wave64\": false}";
         };
         sub << "{\"cs_user_data\": " << entry(code_a, 0x11) << ",\n \"cs_user_data_b\": " << entry(code_b, 0x11)
-            << ",\n \"cs_c_state1\": " << entry(code_c, 0x31) << ",\n \"cs_c_state2\": " << entry(code_c, 0x32) << "}";
+            << ",\n \"cs_c_state1\": " << entry(code_c, 0x31) << ",\n \"cs_c_state2\": " << entry(code_c, 0x32)
+            << ",\n \"cs_c_state3\": " << entry(code_c, 0x33) << "}";  // no cs_c_state3.spv: see the slot-67 block
     }
 
     constexpr UINT elements = 64, bytes = elements * 4;
@@ -223,7 +289,8 @@ int main() {
             return 77;
         }
 
-        // Root signature: [0] two constants (s0, s1), [1] a root UAV (s2:s3), [2] a one-CBV table (s4:s5).
+        // Root signature: [0] two constants (s4, s5), [1] a root UAV (s6:s7), [2] a one-CBV table (s8, its 32-bit VA):
+        // the console compute layout (rt::rootsig::pack_stage, D3D-448).
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, 0};
         D3D12_ROOT_PARAMETER params[3] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -278,6 +345,94 @@ int main() {
             pso_desc.CS = {code_c.data(), code_c.size()};
             EXPECT(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&none_bare.p)) == E_INVALIDARG &&
                    !none_bare.p);
+        }
+
+        // Slot 67 with all four pairs (RT-99): the proxy passes kind 0 on, so program C resolves by its state there
+        // too. State 0x31 finds cs_c_state1 (S_OK); state 0x33 finds cs_c_state3, whose module is missing on purpose
+        // (E_FAIL, not the E_INVALIDARG of an unknown program), so a lookup that ignored kind 0 would show. The
+        // pipeline's console slot 11 answers with a blob holding 0, and every object is released again.
+        {
+            const std::vector<std::uint8_t> state31(28, 0x31), state33(28, 0x33), kind1(20, 0x22), kind7(8, 0x77);
+            XboxNativeDesc native{};
+            native.root_signature = root.p;
+            native.kind0 = state31.data();
+            native.kind0_size = state31.size();
+            native.kind1 = kind1.data();
+            native.kind1_size = kind1.size();
+            native.kind6 = code_c.data();
+            native.kind6_size = code_c.size();
+            native.kind7 = kind7.data();
+            native.kind7_size = kind7.size();
+            const auto slot67 = reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67));
+            Ref<ID3D12PipelineState> pso67, missing67;
+            EXPECT(SUCCEEDED(slot67(device.p, &native, &pso_iid, reinterpret_cast<void**>(&pso67.p))) && pso67.p);
+            native.kind0 = state33.data();
+            EXPECT(slot67(device.p, &native, &pso_iid, reinterpret_cast<void**>(&missing67.p)) == E_FAIL &&
+                   !missing67.p);
+            native.kind0 = state31.data();
+
+            // Inconsistent pairs are refused before anything is read (the wild pointer is never dereferenced).
+            const void* wild = reinterpret_cast<const void*>(std::uintptr_t(0x10));
+            const auto refused67 = [&](XboxNativeDesc bad) {
+                Ref<ID3D12PipelineState> none;
+                return slot67(device.p, &bad, &pso_iid, reinterpret_cast<void**>(&none.p)) == E_INVALIDARG && !none.p;
+            };
+            XboxNativeDesc bad = native;
+            bad.kind1_size = 0;  // a pointer without a size
+            EXPECT(refused67(bad));
+            bad = native;
+            bad.kind7 = nullptr;  // a size without a pointer
+            EXPECT(refused67(bad));
+            bad = native;
+            bad.kind0 = nullptr;  // kind 0's size without its pointer
+            EXPECT(refused67(bad));
+            bad = native;
+            bad.kind6 = wild;
+            bad.kind6_size = std::uint64_t(1) << 40;  // far over the limit
+            EXPECT(refused67(bad));
+
+            // Slot 11 as the DLL calls it: (0, 0, &obj); obj's slot 3 gives a pointer to the dword it multiplies by
+            // 1024, slot 2 releases it. The pipeline's own count is unchanged by the call.
+            using Slot11Fn = HRESULT(WINAPI*)(void*, std::uint64_t, std::uint64_t, void**);
+            using BufferPointerFn = void*(WINAPI*)(void*);
+            using SizeFn = SIZE_T(WINAPI*)(void*);
+            using ReleaseFn = ULONG(WINAPI*)(void*);
+            for (ID3D12PipelineState* pipeline : {pso67.p, pso_a.p}) {
+                const ULONG before = pipeline->AddRef() - 1;
+                pipeline->Release();
+                void* obj = nullptr;
+                EXPECT(reinterpret_cast<Slot11Fn>(slot(pipeline, 11))(pipeline, 0, 0, &obj) == S_OK && obj);
+                const auto* value = static_cast<const std::uint32_t*>(reinterpret_cast<BufferPointerFn>(slot(obj, 3))(obj));
+                EXPECT(value && *value == 0);
+                EXPECT(reinterpret_cast<SizeFn>(slot(obj, 4))(obj) == 4);
+                EXPECT(reinterpret_cast<ReleaseFn>(slot(obj, 2))(obj) == 0);
+                EXPECT(reinterpret_cast<Slot11Fn>(slot(pipeline, 11))(pipeline, 0, 0, nullptr) == E_POINTER);
+                const ULONG after = pipeline->AddRef() - 1;
+                pipeline->Release();
+                EXPECT(after == before);
+            }
+        }
+
+        // Slot 67 with the description built the way the DLL builds it (dll_slot67): each program resolves to its
+        // own translation with its own state. Program A (state 0x11) and program C with states 0x31 and 0x32 create a
+        // pipeline; C with 0x33 finds its own entry, whose module is missing (E_FAIL, not E_INVALIDARG); C with 0x11,
+        // a state nothing was translated for, is refused like any unknown program.
+        {
+            const auto slot67 = reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67));
+            const auto create = [&](const std::vector<std::uint8_t>& box) {
+                const DllSlot67 call = dll_slot67(root.p, box);
+                Ref<ID3D12PipelineState> made;
+                const HRESULT hr = slot67(device.p, &call.desc, &pso_iid, reinterpret_cast<void**>(&made.p));
+                if (FAILED(hr) && made.p) return E_UNEXPECTED;  // a failure must leave no object
+                return hr;
+            };
+            EXPECT(dll_slot67(root.p, container_a).desc.kind0_size == 28);       // the builder found the entries
+            EXPECT(dll_slot67(root.p, container_a).copy.size() % 256 == 0);
+            EXPECT(create(container_a) == S_OK);
+            EXPECT(create(container(payload(code_c, 128, -1, 0x31))) == S_OK);
+            EXPECT(create(container(payload(code_c, 128, -1, 0x32))) == S_OK);
+            EXPECT(create(container(payload(code_c, 128, -1, 0x33))) == E_FAIL);
+            EXPECT(create(container(payload(code_c, 128, -1, 0x11))) == E_INVALIDARG);
         }
 
         // Refused with E_INVALIDARG, and no object: an untranslated program, bare and in a container; directories

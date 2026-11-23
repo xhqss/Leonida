@@ -687,6 +687,12 @@ def same_output_path(first, second):
         return False
 
 
+def _walk_error(exc: OSError):
+    # os.walk skips a directory it cannot list unless onerror raises; a scan must not report an
+    # incomplete directory as complete. main() turns the OSError into one error line and exit 2.
+    raise exc
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("inputs", nargs="+", help=".rpf archives or folders of them")
@@ -703,9 +709,13 @@ def main(argv=None):
             print(f"error: {p} does not exist", file=sys.stderr)
             return 2
         if os.path.isdir(p):
-            for root, directories, files in os.walk(p):
-                directories.sort()
-                archives += [os.path.join(root, f) for f in sorted(files) if f.lower().endswith(".rpf")]
+            try:
+                for root, directories, files in os.walk(p, onerror=_walk_error):
+                    directories.sort()
+                    archives += [os.path.join(root, f) for f in sorted(files) if f.lower().endswith(".rpf")]
+            except OSError as exc:
+                print(f"error: {exc.filename or p}: {exc.strerror or exc}", file=sys.stderr)
+                return 2
         else:
             archives.append(p)
     # The report is written after the whole scan, so check its path first: an archive given as --json used to be

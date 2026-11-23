@@ -174,6 +174,18 @@ class ShaderStats(unittest.TestCase):
         self.assertIn("stats.csv: line 1:", r.stderr)
         self.assertIn("duplicated required header column(s): name", r.stderr)
 
+    def test_broken_quoted_record_does_not_report_partial_statistics(self):
+        result = self.run_stats([
+            "ps_flat,ps,Instructions,16",
+            'ps_flat,ps,VGPRs,"8',
+            "ps_flat,ps,Spilled VGPRs,2",
+        ])
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("stats.csv:", result.stderr)
+        self.assertIn("unexpected end of data", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_short_row_missing_a_cell_is_rejected_with_its_line(self):
         r = self.run_stats(["ps_flat,ps,Instructions"])
         self.assertNotEqual(r.returncode, 0)
@@ -187,6 +199,13 @@ class ShaderStats(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         d = self.detail(r)
         self.assertEqual((d[3], d[6]), ("-", "8"))
+
+    def test_row_wider_than_the_header_is_rejected_with_its_line(self):
+        r = self.run_stats(["ps_flat,ps,Instructions,16", "ps_flat,ps,VGPRs,8,unheaded"])
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("stats.csv: line 3: row has more fields than the header", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
 
     def run_args(self, *args):
         return subprocess.run([sys.executable, "-I", SCRIPT, *args], capture_output=True, text=True)

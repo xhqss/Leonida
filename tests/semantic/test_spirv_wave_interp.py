@@ -248,11 +248,19 @@ class WideIntegers(unittest.TestCase):
         self.assertEqual(self.lane0("%m1 = OpISub %uint %c0 %c1\n%res = OpExtInst %uint %glsl SAbs %m1\n"), 1)
         self.assertEqual(self.lane0("%res = OpExtInst %uint %glsl FindUMsb %c8\n"), 3)
 
+    def test_glsl_integer_operations_reject_mixed_component_widths(self):
+        for inst in ("SAbs %cl_1", "SMin %c0 %cl_1", "SMax %cl_1 %c0",
+                     "SClamp %c0 %c0 %cl_1", "FindILsb %cl_1", "FindSMsb %cl_1", "FindUMsb %cl_1"):
+            with self.subTest(inst=inst):
+                body = f"%res = OpExtInst %uint %glsl {inst}\n"
+                with self.assertRaisesRegex(UnsupportedConstruct, "64-bit.*32-bit"):
+                    self.lane0(body)
+
     def test_find_bit_of_a_64bit_operand_is_rejected(self):
         # GLSL.std.450 limits FindILsb, FindSMsb and FindUMsb to 32-bit components.
         for name in ("FindILsb", "FindSMsb", "FindUMsb"):
             with self.subTest(name=name):
-                with self.assertRaises(UnsupportedConstruct):
+                with self.assertRaisesRegex(UnsupportedConstruct, "64-bit"):
                     self.lane0(f"%r = OpExtInst %ulong %glsl {name} %cl_2p32\n%res = OpUConvert %uint %r\n")
 
 

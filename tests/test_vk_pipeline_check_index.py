@@ -15,6 +15,23 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+class ModuleFeatureGateTest(unittest.TestCase):
+    def test_dynamic_image_indexing_is_gated_before_module_creation(self):
+        # Check the worker's ordering without sending a module to an unsupported Vulkan device.
+        source = (ROOT / "runtime" / "test" / "vk_pipeline_check.cpp").read_text(encoding="utf-8")
+        before_worker, _, worker = source.partition("auto worker = [&] {")
+        self.assertIn("auto check_missing_module_feature", before_worker)
+        module_check = before_worker.split("auto check_missing_module_feature", 1)[1].split("};", 1)[0]
+        for feature in ("shaderSampledImageArrayDynamicIndexing", "shaderStorageImageArrayDynamicIndexing"):
+            with self.subTest(feature=feature):
+                self.assertIn(f'feat == "{feature}" && !f2.features.{feature}', module_check)
+        before_create, create, _ = worker.partition("mod_ok = vkCreateShaderModule(")
+        self.assertTrue(create, "expected the worker's Vulkan module creation call")
+        self.assertRegex(before_create,
+                         r"check_missing_module_feature\(meta\); !miss\.empty\(\)\) \{\s*"
+                         r"(?://[^\n]*\s+)?record_skip\(name, stage, miss\);\s*\+\+done;\s*continue;")
+
+
 def find_binary():
     env = os.environ.get("LEONIDA_VK_PIPELINE_CHECK")
     if env:
@@ -66,6 +83,16 @@ class IndexTest(unittest.TestCase):
         r = self.run_tool("{}\n\n \t")
         self.assertNotIn("malformed JSON", r.stderr)
         self.assertIn("0 shaders in index", r.stderr)
+
+    def test_leading_utf8_bom_is_accepted(self):
+        r = self.run_tool('\ufeff{"example":{"stage":"cs"}}')
+        self.assertIn("1 shaders in index", r.stderr)
+
+    def test_utf8_bom_keeps_error_offsets_relative_to_the_file(self):
+        self.assert_index_error(self.run_tool("\ufeffnot JSON"), "expected '{' at byte 3")
+
+    def test_trailing_utf8_bom_is_still_an_error(self):
+        self.assert_index_error(self.run_tool("{}\ufeff"), "unexpected data after the top-level object")
 
     def test_valid_empty_object_is_an_empty_corpus(self):
         r = self.run_tool("{}")

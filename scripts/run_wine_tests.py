@@ -25,6 +25,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -80,15 +81,26 @@ class DriveMap:
         if not os.path.isdir(dosdevices):
             self.note = f"no Wine prefix at {self.prefix}: drive {drive}: not mapped"
             return self
+        already_set = f"drive {drive}: is already set in {dosdevices}: left as it is"
         if os.path.lexists(link):
-            self.note = f"drive {drive}: is already set in {dosdevices}: left as it is"
+            self.note = already_set
             return self
         self.scratch = tempfile.mkdtemp(prefix="wine-drive-")
-        parent = os.path.join(self.scratch, *rest[:-1])
-        os.makedirs(parent, exist_ok=True)
-        os.symlink(self.root, os.path.join(parent, rest[-1]))
-        os.symlink(self.scratch, link)
-        self.link = link
+        try:
+            parent = os.path.join(self.scratch, *rest[:-1])
+            os.makedirs(parent, exist_ok=True)
+            os.symlink(self.root, os.path.join(parent, rest[-1]))
+            try:
+                os.symlink(self.scratch, link)
+            except FileExistsError:
+                self.note = already_set
+                return self
+            self.link = link
+        finally:
+            # __exit__ only runs after a successful __enter__.
+            if self.link is None:
+                shutil.rmtree(self.scratch, ignore_errors=True)
+                self.scratch = None
         self.note = f"drive {drive}: maps {self.windows_root} to {self.root} for this run"
         return self
 
@@ -157,9 +169,11 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
     for a in command[1:]:
         mapped = map_path(a, args.windows_root, args.root)
         argv.append(wine_path(mapped) if mapped is not None else a)
-    cwd = props.get("WORKING_DIRECTORY")
-    cwd = map_path(cwd, args.windows_root, args.root) if cwd else os.path.dirname(exe)
-    if not cwd or not os.path.isdir(cwd):
+    listed_cwd = props.get("WORKING_DIRECTORY")
+    cwd = map_path(listed_cwd, args.windows_root, args.root) if listed_cwd else None
+    if cwd is not None and not os.path.isdir(cwd):
+        return "fail", f"CTest working directory is not a directory: {listed_cwd} (mapped to {cwd})"
+    if cwd is None:
         cwd = os.path.dirname(exe)
     assignments = props.get("ENVIRONMENT", [])
     if not isinstance(assignments, list):
@@ -182,10 +196,18 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
             return "fail", "invalid CTest TIMEOUT"
         if ctest_timeout > 0:
             timeout = min(timeout, ctest_timeout)
+    skip_code = props.get("SKIP_RETURN_CODE")
+    if skip_code is not None:
+        error = "invalid CTest SKIP_RETURN_CODE: expected an integer from 0 to 255"
+        try:
+            skip_code = int(str(skip_code))
+        except ValueError:
+            return "fail", error
+        if not 0 <= skip_code <= 255:
+            return "fail", error
     start = time.monotonic()
     try:
-        proc = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              timeout=timeout)
+        proc = run_test_process(argv, cwd=cwd, env=env, timeout=timeout)
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode("utf-8", "replace")
         return "fail", f"timed out after {timeout} s\n{out}"
@@ -198,8 +220,7 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
         # A negative return code is a host-signal termination (e.g. SIGSEGV), not a process exit code:
         # report it as a failure before SKIP_RETURN_CODE or WILL_FAIL can reinterpret it.
         return "fail", f"killed by signal {-code} in {elapsed:.1f} s\n{out}"
-    skip_code = props.get("SKIP_RETURN_CODE")
-    if skip_code is not None and code == int(skip_code):
+    if code == skip_code:
         return "skip", f"exit {code} (skip) in {elapsed:.1f} s\n{out}"
     detail = f"exit {code} in {elapsed:.1f} s\n{out}"
     skip_patterns = regex_list(props.get("SKIP_REGULAR_EXPRESSION", []))
@@ -217,6 +238,27 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
     if truthy(props.get("WILL_FAIL")):
         passed = not passed
     return ("pass" if passed else "fail"), detail
+
+
+def run_test_process(argv: list[str], *, cwd: str, env: dict[str, str],
+                     timeout: float) -> subprocess.CompletedProcess:
+    options = dict(cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if os.name != "posix":
+        return subprocess.run(argv, **options, timeout=timeout)
+
+    # Wine's Windows children and launcher wrappers can outlive the immediate child.
+    with subprocess.Popen(argv, **options, start_new_session=True) as proc:
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            # The launcher may have exited while a helper still holds the output pipe.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+            raise
+        return subprocess.CompletedProcess(argv, proc.returncode, out)
 
 
 def positive_seconds(text: str) -> float:
@@ -243,6 +285,17 @@ def wine_command(text: str) -> list[str]:
     return parts
 
 
+def valid_test_property(entry) -> bool:
+    if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or "value" not in entry:
+        return False
+    name, value = entry["name"], entry["value"]
+    if name == "WORKING_DIRECTORY":
+        return isinstance(value, str) and "\0" not in value
+    if name in ("PASS_REGULAR_EXPRESSION", "FAIL_REGULAR_EXPRESSION", "SKIP_REGULAR_EXPRESSION"):
+        return isinstance(value, str) or (isinstance(value, list) and all(isinstance(p, str) for p in value))
+    return True
+
+
 def valid_test_row(test) -> bool:
     if not isinstance(test, dict) or not isinstance(test.get("name"), str):
         return False
@@ -251,10 +304,7 @@ def valid_test_row(test) -> bool:
     if not isinstance(command, list) or not all(isinstance(arg, str) and "\0" not in arg for arg in command):
         return False
     entries = test.get("properties", [])
-    return isinstance(entries, list) and all(
-        isinstance(entry, dict) and isinstance(entry.get("name"), str) and "value" in entry
-        for entry in entries
-    )
+    return isinstance(entries, list) and all(valid_test_property(entry) for entry in entries)
 
 
 def read_tests(path: str) -> list[dict] | None:
@@ -276,7 +326,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tests", required=True, help="ctest --show-only=json-v1 output from the Windows build")
     ap.add_argument("--windows-root", required=True, help="the Windows checkout the tests were listed in")
-    ap.add_argument("--root", default=ROOT, help="the Linux checkout (default: this repository)")
+    ap.add_argument("--root", type=os.path.abspath, default=ROOT, help="the Linux checkout (default: this repository)")
     ap.add_argument("--wine", type=wine_command, default=os.environ.get("WINE", "wine"),
                     help="Wine command (default: $WINE or wine)")
     ap.add_argument("--require", action="append", default=[], help="a test that must pass (repeatable)")
@@ -289,22 +339,29 @@ def main() -> int:
     tests = read_tests(args.tests)
     if tests is None:
         return 2
-    dependencies = fixture_dependencies(tests)
+    names = [test.get("name", "?") for test in tests]
+    indices = {name: index for index, name in enumerate(names)}
+    setups = fixture_dependencies(tests)
+    sorter = TopologicalSorter(setups)
+    for index, test in enumerate(tests):
+        # DEPENDS controls order. Only failed fixture setups block a consumer.
+        sorter.add(index, *(indices[name] for name in properties(test).get("DEPENDS", []) if name in indices))
     try:
-        order = list(TopologicalSorter(dependencies).static_order())
+        order = list(sorter.static_order())
     except CycleError:
-        print("ERROR: CTest fixture setup dependencies form a cycle", file=sys.stderr)
+        print("ERROR: CTest test dependencies form a cycle", file=sys.stderr)
         return 2
     wine = args.wine
     results = {}
+    results_by_index: dict[int, str] = {}
     prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
-    names = [test.get("name", "?") for test in tests]
     with DriveMap(args.windows_root, args.root, prefix) as drive:
         print(drive.note, flush=True)
         for index in order:
             name = names[index]
-            failed_setups = tuple(names[setup] for setup in dependencies[index] if results[names[setup]] == "fail")
+            failed_setups = tuple(names[setup] for setup in setups[index] if results_by_index[setup] == "fail")
             status, detail = run_test(tests[index], args, wine, failed_setups=failed_setups)
+            results_by_index[index] = status
             results[name] = status
             print(f"[{status.upper()}] {name}", flush=True)
             if status != "pass":

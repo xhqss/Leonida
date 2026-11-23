@@ -33,6 +33,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import psin_data  # noqa: E402
 import psin_index  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 from world_names import joaat, murmur3_x64_128  # noqa: E402
 
 CONTROL_SALT = "#zq"
@@ -217,6 +218,9 @@ def main():
                 except ValueError:
                     inside_src = False
                 if inside_src:
+                    ap.error("--refs must not overwrite an input")
+                if os.path.isfile(a.refs) and any(same_report_path(path, a.refs)
+                                                   for path in psin_index.input_paths(a.src)):
                     ap.error("--refs must not overwrite an input")
         names = load_names(a.names)
         if a.refs:

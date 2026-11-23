@@ -134,9 +134,10 @@ Current limits, by design:
   `gta6rt_tls_host.dll`'s `DLL_THREAD_ATTACH`, and gives it back at `DLL_THREAD_DETACH`, also when the
   thread outlives its `Loader`. From `initialise()` until `~Loader` starts the process detach, those
   events also run the module's TLS callbacks, with the thread's copy already in place. A thread that
-  existed before `load()` gets nothing:
-  call `install_tls_for_thread()` before mapped code runs on it and `uninstall_tls_for_thread()` before it
-  exits. Mapped DLLs' `DllMain` is not called with thread events. Destroy the `Loader` on the thread that
+  was already running when `load()` ran, such as a worker of the process thread pool that the task queue later runs a
+  title's callback on, gets its copy from `load()` itself, the way Windows gives one to running threads for a DLL it
+  loads: a block, no `DLL_THREAD_ATTACH`, `DLL_THREAD_DETACH` when it ends, and `~Loader` takes the block back.
+  `install_tls_for_thread()` and `uninstall_tls_for_thread()` are no-ops on such a thread. Mapped DLLs' `DllMain` is not called with thread events. Destroy the `Loader` on the thread that
   called `load()`.
 - The TOC of the game's RPF archives is encrypted and is not read here. The loader works on the PE
   files and on any images the caller passes it.
@@ -226,7 +227,8 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
 - `d3d12_fspx_compute_test` — compute PSOs from synthetic FSPX programs (`docs/fspx.md`): an `ACCC` container
   through slot 62 and a bare kind-6 program, found by `fspx_code_sha256` in `<shaders>/fspx/index.json`, one
   dispatch each that reads its kind-6 program as the code base; malformed directories and untranslated programs
-  are refused with `E_INVALIDARG`.
+  are refused with `E_INVALIDARG`. Also slot 67 with all four pairs (picked by kind 0), refused pairs, and the
+  pipeline's console slot 11.
 - `d3d12_set0_compute_test` — set 0 from the compute bind point: a compute PSO whose index entry lists set-0
   bindings, and four dispatches that sample two SRVs, bytes no view was made for and a clamping sampler through
   the bindless set the layer binds.
@@ -245,8 +247,8 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
 
 `gameinput_test` (only with SDL3; otherwise CTest lists `gameinput` as not run) drives the GameInput shim on SDL virtual joysticks (no controller needed): enumeration, readings
 and the button/axis mapping, rumble and trigger rumble, DualSense effect bytes, a dispatcher, and hot-plug.
-`gameinput_probe [--seconds N] [--rumble]` is the manual check on a real pad: it prints live readings and plays each
-motor and trigger.
+`gameinput_probe [--seconds N] [--rumble] [--force-feedback]` is the manual check on a real pad: it prints live
+readings, plays each motor and trigger, and holds a constant force on a pad that reports a force-feedback motor.
 
 `unimplemented_policy_test` builds a small image whose two imports bind to nothing and checks `log`, `fail` and
 `stop` on it: return values, untouched out parameter, xmm0 = 0, environment parsing, and (in a child process) the
@@ -290,15 +292,16 @@ The game does not boot yet, and none of this has been measured against the real 
 blocks the import-driven work:
 
 - The device entry point: `D3D12XboxCreateDevice` exists and wraps the PC or the Vulkan-backed device in the
-  measured-slot proxy, but its parameter and flag layout is unmeasured and so is the Xbox device vtable beyond
-  slots 62, 67 and 76.
+  measured-slot proxy, but its parameter and flag layout is unmeasured, and the Xbox device vtable is only partly
+  measured: the FSR DLL's calls confirm device slots 14, 15, 16, 18, 19, 27, 38, 62 and 76, slot 67 is a
+  console-only pipeline call, and the rest is open (`docs/d3d12_vulkan.md`, question 2).
 - The command-queue and fence extensions: the proxies forward the public slots, and the console's own methods past
   them (`PresentX`, `SuspendX`, `ResumeX`) have unknown slots, so they are refused with a log.
   `PresentX` and the frame events themselves are implemented (`shims/xbox_present.*`, `xbox_present_test`) but
   nothing reaches them yet: their queue and device slots are unmeasured.
 - Most of the `xgameruntime` surface: an offline shim covers `XGameRuntimeInitialize`, device/console queries,
-  `XTaskQueue` and `XAsync`, and `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl` and
-  `XSystemImpl` (see `xgameruntime_test`); any other class is refused with a log.
+  `XTaskQueue` and `XAsync`, and `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`,
+  `XPersistentLocalStorageImpl` and `XSystemImpl` (see `xgameruntime_test`); any other class is refused with a log.
 
 The D3D12-to-Vulkan design and the measured console ABI are in
 [docs/d3d12_vulkan.md](../docs/d3d12_vulkan.md); the shader translator and its GPU checks are described
@@ -383,9 +386,9 @@ $env:VK_VALIDATION_VALIDATE_SYNC = '1'
 
 `typeless_rtv_test` checks typed-view recording and replay without a GPU. It is registered in CTest.
 `d3d12_typeless_rtv_test` compares synthetic full and rectangular clears with Windows WARP through explicit
-UNORM/SRGB/UINT RTVs on a one-mip, one-layer, single-sample 2D RGBA8 typeless resource. It checks descriptor
+UNORM/SRGB/UINT RTVs on 2D RGBA8 typeless resources, including mip slices, array-layer ranges and 4x MSAA.
+SINT/SNORM clears are compared where both Vulkan and WARP report render-target support. It checks descriptor
 snapshots, alternating view formats, SRGB with UAV resource usage, and invalid view rejection.
-Other typeless families, typed-resource casts, SINT/SNORM, mip/array expansion, MSAA and 3D views are not added.
 
 ```powershell
 ctest --test-dir runtime/build -C RelWithDebInfo -R '^typeless_rtv$' --output-on-failure
@@ -408,14 +411,18 @@ $env:VK_VALIDATION_VALIDATE_SYNC = '1'
 .\runtime\build\RelWithDebInfo\d3d12_rgb96_test.exe
 ```
 
-RGBA8 typeless RTV clears support explicit UNORM/SRGB/UINT views of 2D mip slices and contiguous array-layer ranges, with sample count 1. Other format families, typed-resource casts, MSAA and 3D views are not expanded.
+RGBA8 typeless RTV clears support explicit UNORM/SRGB/UINT/SINT/SNORM views of 2D mip slices and contiguous
+array-layer ranges, and MSAA. Other typeless color families also accept same-family typed RTVs, subject to Vulkan
+color-attachment support. Typed-resource RTV casts are limited to R8G8B8A8_UNORM resources whose castable-format
+list allows the view. A 1D texture cannot be created as a render target or depth buffer (`CreateCommittedResource`
+refuses `ALLOW_RENDER_TARGET`/`ALLOW_DEPTH_STENCIL` on it), and 3D typeless view reinterpretation remains refused.
 
 ### Resource descriptions
 
 `d3d12_resource_desc_test` creates the same committed and reserved resources on the Vulkan-backed device and on
 Windows D3D12 (the default adapter and WARP, whichever exist) and compares every field of `ID3D12Resource::GetDesc`:
 the `Alignment` and `MipLevels` a description left at 0 must read back as the host fills them in. A description the
-host refuses is skipped, and one only the layer refuses (1D textures today) is listed and not compared. It needs a
+host refuses is skipped, and one only the layer refuses is listed and not compared. It needs a
 Vulkan GPU and runs explicitly.
 
 ```powershell
@@ -432,6 +439,18 @@ dimension outside the enum must be refused alike. It also copies a pattern throu
 ```powershell
 $env:LEONIDA_VK_VALIDATION = '1'
 .\runtime\build\RelWithDebInfo\d3d12_placed_dimensions_test.exe
+### 1D render targets and depth buffers
+
+`d3d12_texture1d_target_test` creates `TEXTURE1D` textures with `ALLOW_RENDER_TARGET` (10 color formats) or
+`ALLOW_DEPTH_STENCIL` (4 depth formats), one texture and a 6-layer array each, on the Vulkan-backed device, the
+hardware adapter and WARP. Where every reference creates one and the Vulkan device can make that 1D attachment image,
+the layer must create it and `GetResourceAllocationInfo` must answer a size. It then clears through `TEXTURE1D` and
+`TEXTURE1DARRAY` RTVs and DSVs (whole and with rectangles, on mips and slice ranges) and through a 1D UAV with a
+rectangle, and compares every subresource's bytes with WARP. It is registered in CTest (`d3d12_texture1d_target`).
+
+```powershell
+$env:LEONIDA_VK_VALIDATION = '1'
+.\runtime\build\RelWithDebInfo\d3d12_texture1d_target_test.exe
 ```
 
 ### Depth and stencil resolves
@@ -450,3 +469,55 @@ $env:LEONIDA_VK_VALIDATION = '1'
 ### Predicate capture lifetime
 
 `vk_predicate_capture_test` checks full-width predicate snapshots, offset rebinding and reset with 32 gated submissions, then reuses completed command-buffer slots. Run explicitly on a Vulkan GPU with conditional rendering; it uses only synthetic data.
+
+### A synthetic guest draws its first offscreen frame
+
+On a Windows Vulkan build, configure CMake with `-DLEONIDA_TEST_GUEST_DRAW=ON` and build the
+`tiny_guest_draw` and `gta6rt` targets. With llvm-mc, spirv-as and spirv-val available at configure
+time, run `ctest --test-dir runtime/build -C Release -R "^d3d12_translated_draw_guest$" -V`.
+The loader maps the test executable. It imports the Xbox device factory, submits three draws using two
+handwritten shaders, reads back a 64×64 offscreen texture and checks every pixel.
+
+The guest also builds independently of the shader tools. To produce the same synthetic fixture on
+another machine, run `python -I runtime/test/shaders/build.py m15_shaders vs_m15 ps_m15` from the
+checkout with llvm-mc, spirv-as and spirv-val available. Copy the whole resulting folder to the test
+machine. For Wine, make the runtime executable, its runtime DLLs, the guest executable and the fixture
+accessible in the same Wine prefix. For example, from their containing directory with the guest and
+fixture beside the loader:
+
+```sh
+fixture=$(winepath -w "$PWD/m15_shaders")
+shaders=$(winepath -w "$PWD/m15_shaders/spirv")
+guest=$(winepath -w "$PWD/tiny_guest_draw.exe")
+LEONIDA_D3D12=vulkan LEONIDA_SHADERS="$shaders" wine ./gta6rt.exe --run "$guest" -- "$fixture"
+```
+
+A passing run exits zero and prints `M1.5 guest: PASS, 4064 of 4096 pixels exact, 32 edge pixels the clear colour`.
+The 32 diagonal pixels must all match the clear colour exactly. The fixture does not create a window.
+
+### A 600-frame headless guest scene
+
+Configure a Windows Vulkan build with `-DLEONIDA_GUEST_SCENE=ON` and static SDL3
+(`SDL3_DIR` or `-DLEONIDA_SDL3_FETCH=ON`). Build `gta6rt` and `tiny_guest_draw`.
+With the shader tools and Python available at configure time, CTest runs the existing
+one-frame test and the scene with `ctest -R "^(d3d12_translated_draw_guest|d3d12_guest_scene)$" -V`.
+For an externally generated M1.5 shader fixture, use the runner directly:
+
+```sh
+python -I scripts/run_guest_scene.py --loader path/to/gta6rt.exe --guest path/to/tiny_guest_draw.exe \
+    --shaders path/to/m15_shaders --out new-scene-run --negative-controls
+```
+
+For Wine, add `--wine path/to/wine`. The runner launches the mapped guest for an
+uninterrupted 600-frame run, a 300-frame save, and a fresh process that restores the
+checkpoint. This opt-in build links a fixture input source into the loader. Scripted keyboard changes feed the SDL virtual pad. GameInput readings
+drive the position of one quad. The guest streams ten 16-byte synthetic palette pages from
+`GAME:\scene.bin` and changes its shader constants. A software reference independently
+predicts the GPU pixel digest for each frame and checks six captured images.
+
+Each run writes frame records, a state file, selected PPM readbacks, and a checkpoint
+where applicable. At the first A-button edge the guest generates a quarter-second PCM
+WAV. Playback is off by default. `--play-audio` requests playback through host WinMM
+and records its result. The runner uses a fresh output directory, or a temporary one
+when `--out` is omitted. The negative controls independently corrupt a scene byte and
+a saved-state byte and require the expected guest errors. This fixture renders offscreen.

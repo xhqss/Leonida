@@ -250,6 +250,10 @@ class OnHardware(unittest.TestCase):
             cls.oracle = runner.open_oracle()
         except runner.Unavailable as e:
             raise unittest.SkipTest(f"hardware oracle unavailable: {e}") from None
+        why = asm.rdna23_skip_reason(cls.oracle.arch)
+        if why:
+            cls.oracle.close()
+            raise unittest.SkipTest(why)
 
     @classmethod
     def tearDownClass(cls):

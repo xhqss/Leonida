@@ -34,9 +34,13 @@ def reference(code):
         elif kind == "sint":
             out.append(signed & 0xFFFFFFFF)
         elif kind == "f16":
-            # The interpreter's pinned f16 -> f32 rule (a NaN half widens to the canonical quiet NaN with its sign),
-            # not struct's '<e', whose NaN payload depends on the Python version (CPython gh-130317).
-            out.append(f32_bits(half_to_float(v)))
+            # A NaN half widens as sign | 0x7F800000 | payload << 13, quiet bit as stored: measured on gfx1036 for
+            # formats 13, 29 and 71 (#4623, tools/f16_widen_probe.py). Not struct's '<e', whose NaN payload
+            # depends on the Python version (CPython gh-130317).
+            if v & 0x7FFF > 0x7C00:
+                out.append((v & 0x8000) << 16 | 0x7F800000 | (v & 0x3FF) << 13)
+            else:
+                out.append(f32_bits(half_to_float(v)))
         elif kind == "unorm":
             out.append(f32_bits(float(Fraction(v, (1 << w) - 1))))
         elif kind == "snorm":

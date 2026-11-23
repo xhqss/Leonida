@@ -485,7 +485,10 @@ class TestSwizzleSearchCliAndRender(unittest.TestCase):
 
                     output = Path(td) / "alias.png" if hardlink else blob
                     if hardlink:
-                        os.link(blob, output)
+                        try:
+                            os.link(blob, output)
+                        except (OSError, NotImplementedError) as e:
+                            self.skipTest(f"hard links unavailable: {e}")
 
                     result = subprocess.run(
                         [

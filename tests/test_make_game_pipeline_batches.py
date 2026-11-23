@@ -54,6 +54,12 @@ if config.get("interrupt") or config.get("interrupt_probe") and count == 1 and o
         os.kill(os.getpid(), signal.SIGTERM)
 if config.get("crash_before_work"):
     sys.exit(70)
+if config.get("probe_crash_before_work") and count == 1 and option("--jobs") == "1":
+    report = config.get("probe_report", "missing")
+    if inflight and report != "missing":
+        Path(inflight).write_text("unrelated\tpipeline\n" if report == "other" else "",
+                                  encoding="utf-8", newline="\n")
+    sys.exit(70)
 crasher = config.get("crasher")
 if crasher in active or len(active) > config.get("max_batch", 1000000):
     if inflight:
@@ -185,6 +191,25 @@ class PipelineBatchesTest(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertEqual(len(self.calls()), 2)
         self.assertFalse((self.out / "pipeline_crashes.txt").exists())
+
+    def assert_inconclusive_probe_stops(self, report):
+        code, logs, err = self.invoke({"max_batch": 2, "probe_crash_before_work": True,
+                                      "probe_report": report})
+        self.assertNotEqual(code, 0)
+        self.assertEqual(len(self.calls()), 2)   # failed batch, then the first inconclusive probe
+        self.assertEqual(self.calls()[-1]["selected"], [self.names[0]])
+        self.assertFalse((self.out / "pipeline_crashes.txt").exists())
+        self.assertFalse(any("took vk_pipeline_check down" in line for line in logs), logs)
+        self.assertIn("inconclusive", err)
+
+    def test_abnormal_probe_without_a_report_does_not_blacklist_a_module(self):
+        self.assert_inconclusive_probe_stops("missing")
+
+    def test_abnormal_probe_with_an_empty_report_does_not_blacklist_a_module(self):
+        self.assert_inconclusive_probe_stops("empty")
+
+    def test_abnormal_probe_reporting_another_module_does_not_blacklist_the_selected_one(self):
+        self.assert_inconclusive_probe_stops("other")
 
     def test_a_crash_before_work_cannot_retry_forever_or_claim_success(self):
         code, _, err = self.invoke({"crash_before_work": True})

@@ -146,6 +146,27 @@ class DxbcMetaTests(unittest.TestCase):
         self.assertTrue(got["sfi0_resource_heap_directly_indexed"])
         self.assertFalse(got["sfi0_sampler_heap_directly_indexed"])
 
+    def test_invalid_isg1_table_does_not_publish_partial_signature(self):
+        fourcc, payload = isg1_chunk([("POSITION", 0, 0, 7, 7, 0, 3)])
+        for count, offset in ((2, 8), (1, 0)):
+            with self.subTest(count=count, offset=offset):
+                malformed = struct.pack("<II", count, offset) + payload[8:]
+                dxbc = make_dxbc([(fourcc, malformed), sfi0_chunk(M.SFI0_RESOURCE_DESCRIPTOR_HEAP_INDEXING)])
+                meta = M.read_dxbc_meta(dxbc)
+                self.assertNotIn("input_signature", meta)
+                self.assertTrue(meta["sfi0_resource_heap_directly_indexed"])
+
+    def test_invalid_second_name_drops_whole_signature(self):
+        tag, payload = isg1_chunk([("POSITION", 0, 0, 7, 7, 0, 3), ("TEXCOORD", 0, 1, 3, 3, 0, 3)])
+        second_name = struct.unpack_from("<I", payload, 8 + 32 + 4)[0]
+        for offset, data in ((8, payload), (len(payload), payload), (second_name, payload[:-1])):
+            with self.subTest(offset=offset):
+                malformed = bytearray(data)
+                struct.pack_into("<I", malformed, 8 + 32 + 4, offset)
+                meta = M.read_dxbc_meta(make_dxbc([(tag, malformed), sfi0_chunk(M.SFI0_RESOURCE_DESCRIPTOR_HEAP_INDEXING)]))
+                self.assertNotIn("input_signature", meta)
+                self.assertTrue(meta["sfi0_resource_heap_directly_indexed"])
+
     def test_sfi0_both_heaps_and_empty_dxbc(self):
         dxbc = make_dxbc([sfi0_chunk(M.SFI0_RESOURCE_DESCRIPTOR_HEAP_INDEXING | M.SFI0_SAMPLER_DESCRIPTOR_HEAP_INDEXING)])
         got = M.read_dxbc_meta(dxbc)
@@ -508,6 +529,39 @@ class OperandClassificationTests(unittest.TestCase):
         self.assertEqual(meta["descriptor_strides"], [32])
         self.assertEqual(meta["literal_samplers"], [[0x92, 0xFFFFFFFF, 0, 0]])
 
+    def test_s_brev_b32_constant_folding(self):
+        # A literal S# with one dword bit-reversed by s_brev_b32 from an immediate or a known SGPR.
+        lines = [
+            "s_mov_b32 s12, 0x92",
+            "s_brev_b32 s13, 1",
+            "s_mov_b32 s20, 0x3",
+            "s_brev_b32 s14, s20",
+            "s_mov_b32 s15, 0",
+            "v_mov_b32_e32 v0, 0.5",
+            "v_mov_b32_e32 v1, 0.5",
+            "image_sample v[4:7], v[0:1], s[0:7], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "exp mrt0 v4, v5, v6, v7 done vm",
+            "s_endpgm",
+        ]
+        _, meta = translate_synthetic("ps_brev_meta", lines)
+        self.assertEqual(meta["literal_samplers"], [[0x92, 0x80000000, 0xC0000000, 0]])
+
+    def test_s_brev_b32_of_unknown_source_is_not_a_literal(self):
+        # s_brev_b32 of a user SGPR leaves its destination unknown, so no literal S# is recorded.
+        lines = [
+            "s_mov_b32 s12, 0x92",
+            "s_brev_b32 s13, s2",
+            "s_mov_b32 s14, 0",
+            "s_mov_b32 s15, 0",
+            "v_mov_b32_e32 v0, 0.5",
+            "v_mov_b32_e32 v1, 0.5",
+            "image_sample v[4:7], v[0:1], s[0:7], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "exp mrt0 v4, v5, v6, v7 done vm",
+            "s_endpgm",
+        ]
+        _, meta = translate_synthetic("ps_brev_user_meta", lines)
+        self.assertNotIn("literal_samplers", meta)
+
     def test_scalar_store_pointer_and_vsharp(self):
         # s_store_dword* classifies its 2-SGPR pointer pair without marking table_loads,
         # and s_buffer_store_dword* classifies its 4-SGPR resource descriptor as vsharp.
@@ -534,6 +588,85 @@ class OperandClassificationTests(unittest.TestCase):
         ])
         self.assertFalse(got["table_loads"])
         self.assertTrue(got["truncates_high"])
+
+    @staticmethod
+    def _literal_samplers_with(build_s13):
+        # A literal S# in s[12:15]: s12 = 0x92, s14 = s15 = 0, and s13 built by the given hand-written lines.
+        # s8 = 0x80000000 and s9 = 0xf0 are known constants; s3 is a user SGPR (not a known constant).
+        import shader_ir
+        lines = ["s_mov_b32 s8, 0x80000000", "s_mov_b32 s9, 0xf0", "s_mov_b32 s12, 0x92", *build_s13,
+                 "s_mov_b32 s14, 0", "s_mov_b32 s15, 0",
+                 "image_sample v[4:7], v[0:1], s[16:23], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D", "s_endpgm"]
+        return M.analyse_instructions([[shader_ir.parse_line(ln) for ln in lines]], [[]])["literal_samplers"]
+
+    def test_inverted_scalar_logic_folds_into_literal_sampler(self):
+        # s_not_b32, s_nand_b32, s_nor_b32 and s_xnor_b32 of known constants give a known constant, so a literal
+        # S# with a dword built by one of them is reported in literal_samplers.
+        cases = [
+            (["s_not_b32 s13, 0"], 0xFFFFFFFF),
+            (["s_not_b32 s13, s9"], 0xFFFFFF0F),
+            (["s_not_b32 s13, s8"], 0x7FFFFFFF),
+            (["s_mov_b32 s13, 0xf0", "s_not_b32 s13, s13"], 0xFFFFFF0F),  # source and destination are one register
+            (["s_nand_b32 s13, s9, 0x30"], 0xFFFFFFCF),
+            (["s_nand_b32 s13, s8, s8"], 0x7FFFFFFF),
+            (["s_nor_b32 s13, s9, 0x0f"], 0xFFFFFF00),
+            (["s_nor_b32 s13, 0, 0"], 0xFFFFFFFF),
+            (["s_xnor_b32 s13, s9, 0xff"], 0xFFFFFFF0),
+            (["s_xnor_b32 s13, s9, s9"], 0xFFFFFFFF),
+            # The case found with #4289 open: the complement of 0, then a second fold of the result.
+            (["s_not_b32 s13, 0", "s_and_b32 s13, s13, 0xffff00ff"], 0xFFFF00FF),
+        ]
+        for build, want in cases:
+            with self.subTest(build=build):
+                self.assertEqual(self._literal_samplers_with(build), [[0x92, want, 0, 0]])
+
+    def test_shift_bitfield_min_max_abs_fold_into_literal_sampler(self):
+        # s_ashr_i32, s_bfm_b32, s_bfe_u32, s_min_u32, s_max_u32 and s_abs_i32 of known constants give a known
+        # constant. The expected values are the ones the translator computes for immediates (rdna2spirv.py).
+        cases = [
+            (["s_ashr_i32 s13, s8, 4"], 0xF8000000),          # the sign bit comes in from the left
+            (["s_ashr_i32 s13, s9, 4"], 0x0000000F),
+            (["s_ashr_i32 s13, s8, 36"], 0xF8000000),         # the shift count is taken modulo 32
+            (["s_bfm_b32 s13, 4, 8"], 0x00000F00),            # width 4, offset 8
+            (["s_bfm_b32 s13, 0, 8"], 0x00000000),
+            (["s_bfm_b32 s13, 31, 1"], 0xFFFFFFFE),
+            (["s_bfe_u32 s13, s9, 0x40004"], 0x0000000F),     # offset 4, width 4
+            (["s_bfe_u32 s13, s8, 0x20001f"], 0x00000001),    # offset 31, width 32: the field stops at bit 31
+            (["s_bfe_u32 s13, s9, 0x4"], 0x00000000),         # width 0
+            (["s_min_u32 s13, s9, 0x10"], 0x00000010),
+            (["s_min_u32 s13, s8, s9"], 0x000000F0),          # unsigned: 0x80000000 is the larger value
+            (["s_max_u32 s13, s9, 0x10"], 0x000000F0),
+            (["s_max_u32 s13, s8, s9"], 0x80000000),
+            (["s_abs_i32 s13, s9"], 0x000000F0),
+            (["s_abs_i32 s13, -16"], 0x00000010),
+            (["s_abs_i32 s13, s8"], 0x80000000),              # the most negative value has no positive form
+        ]
+        for build, want in cases:
+            with self.subTest(build=build):
+                self.assertEqual(self._literal_samplers_with(build), [[0x92, want, 0, 0]])
+
+    def test_shift_bitfield_min_max_abs_of_unknown_source_is_not_a_literal(self):
+        for build in (["s_ashr_i32 s13, s3, 4"],
+                      ["s_mov_b32 s13, 0", "s_ashr_i32 s13, s9, s3"],
+                      ["s_bfm_b32 s13, s3, 8"],
+                      ["s_bfe_u32 s13, s3, 0x40004"],
+                      ["s_bfe_u32 s13, s9, s3"],
+                      ["s_min_u32 s13, s9, s3"],
+                      ["s_max_u32 s13, s3, s9"],
+                      ["s_mov_b32 s13, 0", "s_abs_i32 s13, s3"]):
+            with self.subTest(build=build):
+                self.assertEqual(self._literal_samplers_with(build), [])
+
+    def test_inverted_scalar_logic_of_unknown_source_is_not_a_literal(self):
+        # A source that is not a known constant (the user SGPR s3) must not give a literal sampler, also when the
+        # destination held a known constant before the operation.
+        for build in (["s_not_b32 s13, s3"],
+                      ["s_mov_b32 s13, 0", "s_not_b32 s13, s3"],
+                      ["s_nand_b32 s13, s3, 0x30"],
+                      ["s_nor_b32 s13, s9, s3"],
+                      ["s_mov_b32 s13, 0", "s_xnor_b32 s13, s3, s9"]):
+            with self.subTest(build=build):
+                self.assertEqual(self._literal_samplers_with(build), [])
 
     def test_slist_operands_classify_pointers_and_descriptors(self):
         # LLVM VCCTuple slist syntax ([s0, s1], [s4, s5, s6, s7], ...) must be classified

@@ -26,7 +26,7 @@ Proje henüz erken aşamadadır: **oyun şu an açılmıyor**.
 
 - **Kendi Xbox Series paket kopyanız**, sürüm `1.0.2.1` (`MicrosoftGame.Config` dosyasını ve `.rpf` arşivlerini diskte
   düz dosyalar olarak barındıran klasör).
-- **Windows 10/11 x64** ve çalışma dosyaları için yaklaşık **350 GB boş disk alanı** (`--work` ile başka bir diske
+- **Windows 10/11 x64** ve çalışma dosyaları için yaklaşık **400 GB boş disk alanı** (`--work` ile başka bir diske
   yönlendirilebilir).
 - [Python 3.12+](https://www.python.org/downloads/) (kurulumda *"Add python.exe to PATH"* seçeneğini işaretleyin).
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
@@ -83,7 +83,7 @@ Aşamalar şu sırayla çalışır: `check` → `shaders` → `assets` → `runt
 - **`--wave64-emulate`**: Wave64 compute ve mesh shader'larını her subgroup genişliğinde birebir çalışacak şekilde
   çevirir. NVIDIA ve Intel GPU'lar 32 şeritli subgroup kullandığı için buna ihtiyaç duyar. Varsayılan `auto` modu
   `vulkaninfo` çıktısına bakar ve tüm GPU'lar yerel 64 şeritli subgroup bildirmediği sürece emülasyonu otomatik açar.
-- **`--work`**: En az 350 GB boş alana sahip bir sürücü seçin. En uzun adım shader çevirisidir ve varsayılan olarak
+- **`--work`**: En az 400 GB boş alana sahip bir sürücü seçin. En uzun adım shader çevirisidir ve varsayılan olarak
   CPU iş parçacıklarının yarısını kullanır (`--jobs` ile değiştirilebilir).
 - **`--wav`**: Varsayılan olarak kapalıdır; 16-bit PCM WAV dosyaları Ogg Opus'tan birkaç kat daha büyüktür.
 - **Linux ve Wine/Proton**: `make_game.py` Linux'ta da çalışır. Yükleyici (`gta6rt.exe`) bir Windows programıdır ve

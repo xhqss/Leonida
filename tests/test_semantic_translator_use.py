@@ -36,20 +36,14 @@ ALLOWLIST = {
     "test_fixtures.py": "checks fixtures/disasm/*.s against regen_fixtures.py; the listing is the subject",
     "test_alu_frexp.py": "hand-written SPIR-V run by spirv_mini_interp.py; no translator output",
     "test_alu_ldexp.py": "hand-written SPIR-V run by spirv_mini_interp.py; no translator output",
-    "test_alu_lshl_add.py": "hand-written copy of the emitted SPIR-V run by spirv_mini_interp.py",
-    "test_alu_pack_in_place.py": "hand-written SPIR-V run by spirv_mini_interp.py; no translator output",
-    "test_alu_sad_hi_u32.py": "pure oracle and hand-written SPIR-V run by spirv_mini_interp.py",
 }
 
 # Debt from before this guard: files that model the answer instead of running the translator.  They are
 # expected to be replaced, so an entry here never has to be kept in step with another PR: fixing the file,
 # or deleting it, simply removes it from the debt.  Do not move a file here to silence the guard.
 DEBT = {
-    "test_alu_dot2acc_f16.py": "private oracle; v_dot2acc_f16 is not implemented in the translator yet",
-    "test_ballot_votes.py": "private SPIR-V interpreter; should translate a hand-written listing instead",
     "test_valu_div_fixup.py": "private oracle whose rules RDNA2 disagrees with; TEST-545 replaces it",
     "test_alu_cndmask_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_alu_u16_clamp.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_int_to_float.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_interp_p1_p2_f32.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_lds_add_sub_src2_u32.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
@@ -62,7 +56,6 @@ DEBT = {
     "test_salu_add_sub_co_u32.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_salu_and_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_salu_andn2_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_salu_bitfield_ins_u32.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_salu_nand_nor_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_salu_or_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_salu_orn2_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
@@ -72,7 +65,6 @@ DEBT = {
     "test_valu_alignbyte_b32.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_cmp_class.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_cvt_f32_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_cvt_int_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_dot2_f16.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_dot4_int.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_dot8_int.py": "private oracle merged before this guard (2026-11-22); should translate a listing",

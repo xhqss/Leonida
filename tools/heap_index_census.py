@@ -41,6 +41,7 @@ from collections import Counter, defaultdict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shader_ir  # noqa: E402
 import shader_meta  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 USER_SGPRS = 32          # graphics stages: user data s0..s31 (tools/rdna2spirv.py USER_SGPRS)
 SYSTEM_SGPRS = {"ms": (3,), "gs": (3,)}   # NGG wave info in s3 (tools/rdna2spirv.py sys_sgprs)
@@ -409,11 +410,38 @@ def main(argv=None):
     if not os.path.isdir(args.disasm):
         print(f"ERROR: {args.disasm} is not a folder", file=sys.stderr)
         return 2
+    if args.json:
+        # The census is written last, after every listing has been read, so a report replacing one of
+        # them or the carve index would silently destroy what the run just used.
+        index_path = os.path.join(os.path.dirname(os.path.abspath(args.disasm)), "index.json")
+        if same_report_path(args.json, index_path):
+            print(f"ERROR: --json would overwrite the carve index: {args.json}", file=sys.stderr)
+            return 2
+        disasm = os.path.realpath(args.disasm)
+        target = os.path.realpath(os.path.abspath(args.json))
+        try:
+            inside = os.path.commonpath([disasm, target]) == disasm
+        except ValueError:  # paths on different Windows drives
+            inside = False
+        if inside:
+            print(f"ERROR: --json must not write inside the disasm folder it reads: {args.json}", file=sys.stderr)
+            return 2
     try:
         stages = stage_index(args.disasm)
     except (OSError, ValueError, KeyError, TypeError) as e:
         print(f"ERROR: cannot read the carve index next to {args.disasm}: {e}", file=sys.stderr)
         return 2
+    if args.json:
+        # Besides the listings and the carve index, the census reads each shader's DXBC container and
+        # FSSM header next to the disasm folder. A report landing on one of those (or a hard link to it)
+        # would destroy an input the run just used, so refuse those names too.
+        parent = os.path.dirname(os.path.abspath(args.disasm))
+        for name in stages:
+            for path in (os.path.join(parent, name + ".dxbc"),
+                         os.path.join(parent, "fssm", name + ".fssm")):
+                if same_report_path(args.json, path):
+                    print(f"ERROR: --json would overwrite an input the census reads: {path}", file=sys.stderr)
+                    return 2
     out = census(args.disasm, args.limit, stages=stages,
                  progress=lambda k, n: print(f"  {k}/{n}", file=sys.stderr, flush=True))
     print_report(out)

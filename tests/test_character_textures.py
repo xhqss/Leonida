@@ -4,6 +4,7 @@ Run with ``python -I tests/test_character_textures.py``. Covers a head material 
 bumptex), a garment material (speculartex only, must flag missing albedo), an unknown slot, the
 JSON/CSV reports and the report-path guard. Every fixture is hand-written; no game data is used.
 """
+import csv
 import json
 import pathlib
 import subprocess
@@ -33,13 +34,13 @@ def run_tool(*args):
                           errors="replace", timeout=60)
 
 
-HEADER = "model\tmaterial\tslot\trole\ttexture"
+HEADER = "model\tmaterial\tslot\trole\ttexture\tasset_key"
 
 
 def table(output):
     """The data rows of the tab-separated table (header and FLAG lines excluded)."""
     return [line.split("\t") for line in output.splitlines()
-            if line.count("\t") == 4 and line != HEADER]
+            if line.count("\t") == 5 and line != HEADER]
 
 
 class CharacterTextureTests(unittest.TestCase):
@@ -57,9 +58,9 @@ class CharacterTextureTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             rows = {row[3]: row for row in table(result.stdout)}
             self.assertEqual(rows["diffusetex"], [
-                "synthetic_model", "head", "0xC8E8C282", "diffusetex", "face_diffusetex"])
+                "synthetic_model", "head", "0xC8E8C282", "diffusetex", "face_diffusetex", "-"])
             self.assertEqual(rows["bumptex"], [
-                "synthetic_model", "head", "0x1E77BF4C", "bumptex", "face_bumptex"])
+                "synthetic_model", "head", "0x1E77BF4C", "bumptex", "face_bumptex", "-"])
             self.assertNotIn("FLAG", result.stdout)
 
     def test_garment_without_albedo_is_flagged(self):
@@ -73,7 +74,7 @@ class CharacterTextureTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             rows = table(result.stdout)
             self.assertEqual(len(rows), 1, result.stdout)
-            self.assertEqual(rows[0][2:], ["0xC6F46E79", "speculartex", "jacket_speculartex"])
+            self.assertEqual(rows[0][2:], ["0xC6F46E79", "speculartex", "jacket_speculartex", "-"])
             self.assertIn("FLAG garment-no-albedo", result.stdout)
             self.assertIn("d5ed50f4", result.stdout)
             self.assertIn("speculartex is not colour", result.stdout)
@@ -155,10 +156,47 @@ class CharacterTextureTests(unittest.TestCase):
             data = csv_path.read_bytes()
             self.assertNotIn(b"\r", data)
             lines = data.decode("utf-8").splitlines()
-            self.assertEqual(lines[0], "source,model,material,shader,slot,role,texture,flags")
+            self.assertEqual(lines[0], "source,model,material,shader,slot,role,texture,flags,asset_key")
             self.assertIn(",head,a1b2c3d4,0xC8E8C282,diffusetex,face_diffusetex,", lines[1])
             self.assertIn(",jacket,ea8d09d0,0xC6F46E79,speculartex,jacket_speculartex,garment-no-albedo",
                           lines[2])
+
+    def test_shared_name_hash_preserves_distinct_asset_keys_in_each_report(self):
+        name_hash = "12345678"
+        keys = ["0000000112345678", "FEDCBA9812345678"]
+        refs = [{"Param": "C8E8C282", "TextureIndex": i, "Name": name_hash, "Id64": key}
+                for i, key in enumerate(keys)]
+        refs.append({"Param": "C8E8C282", "Name": name_hash})
+        with tempfile.TemporaryDirectory() as td:
+            path = write_model(td, {"Items": [model([{"Textures": refs}, {"Textures": []}])]})
+            report_path, csv_path = pathlib.Path(td) / "report.json", pathlib.Path(td) / "report.csv"
+            result = run_tool(path, "--json", report_path, "--csv", csv_path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            self.assertEqual(result.stdout.splitlines()[0], HEADER)
+            self.assertEqual([row[4:] for row in table(result.stdout)],
+                             [[name_hash, key] for key in [*keys, "-"]] + [["-", "-"]])
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            bindings = report["models"][0]["materials"][0]["bindings"]
+            expected = [(name_hash, key) for key in [*keys, None]]
+            self.assertEqual([(b["texture"], b["asset_key"]) for b in bindings], expected)
+            self.assertEqual([(r["texture"], r["asset_key"]) for r in report["rows"]], expected + [("-", None)])
+            with csv_path.open(encoding="utf-8", newline="") as f:
+                self.assertEqual([(r["texture"], r["asset_key"]) for r in csv.DictReader(f)],
+                                 [(name_hash, key) for key in [*keys, ""]] + [("-", "")])
+
+    def test_asset_key_requires_an_explicit_64_bit_identity(self):
+        refs = [{"id64": "0xfedcba9876543210"}, {"AssetKey": 0}, {"asset_key": 2**64 - 1},
+                {"Id64": "12345678"}, {"Id64": 2**64}, {"Id64": True},
+                {"Key": "1234567800000001"}, "1234567800000002"]
+        with tempfile.TemporaryDirectory() as td:
+            path = write_model(td, model([{"Textures": refs}]))
+            report_path = pathlib.Path(td) / "report.json"
+            result = run_tool(path, "--json", report_path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = json.loads(report_path.read_text(encoding="utf-8"))["rows"]
+            self.assertEqual([r["asset_key"] for r in rows],
+                             ["FEDCBA9876543210", "0000000000000000", "FFFFFFFFFFFFFFFF"] + [None] * 5)
 
     def test_directory_is_searched_recursively(self):
         with tempfile.TemporaryDirectory() as td:
@@ -199,6 +237,28 @@ class CharacterTextureTests(unittest.TestCase):
             result = run_tool(path, "--json", out, "--csv", out)
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("must use different paths", result.stderr)
+
+    def test_unlistable_subfolder_is_an_error_not_a_silent_skip(self):
+        import io
+        from unittest import mock
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("ct_under_test", TOOL)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as td:
+            write_model(pathlib.Path(td) / "a", model([{"Name": "m", "Materials": []}]))
+            orig_walk = mod.os.walk
+            def fail_walk(top, *args, **kwargs):
+                if "onerror" in kwargs and kwargs["onerror"]:
+                    kwargs["onerror"](PermissionError(13, "Permission denied"))
+                return orig_walk(top, *args, **kwargs)
+            with mock.patch.object(mod.os, "walk", side_effect=fail_walk):
+                with mock.patch.object(sys, "argv", ["character_textures.py", td]):
+                    with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                        code = mod.main()
+                        self.assertEqual(code, 2)
+                        self.assertIn("ERROR:", err.getvalue())
+                        self.assertIn("Permission denied", err.getvalue())
 
 
 if __name__ == "__main__":

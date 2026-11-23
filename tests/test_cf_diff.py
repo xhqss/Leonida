@@ -47,6 +47,24 @@ def test_empty_program_batch_is_a_usage_error(count, capsys, monkeypatch):
     assert captured.out == ""
 
 
+def test_a_run_where_every_program_was_skipped_is_not_a_success(capsys, monkeypatch):
+    monkeypatch.setattr(cf_diff, "run_case", lambda *args, **kwargs: ("skip", "unsupported form"))
+    assert cf_diff.main(["--programs", "2", "--seed", "1"]) == 2
+    assert "no program ran: every one was skipped" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("statuses, code", [
+    (["skip", "skip"], 2),            # nothing was compared
+    (["skip", "mismatch"], 1),        # a mismatch outranks "nothing else ran"
+    (["match", "skip"], 0),           # one wave compared and matched
+])
+def test_a_single_program_run_exits_like_the_suite(statuses, code, capsys, monkeypatch):
+    results = iter(statuses)
+    monkeypatch.setattr(cf_diff, "run_case", lambda *args, **kwargs: (next(results), "detail"))
+    assert cf_diff.main(["--program", "3", "--seed", "1", "--wave", "both"]) == code
+    assert ("no program ran: every one was skipped" in capsys.readouterr().out) == (code == 2)
+
+
 def test_generation_is_deterministic():
     assert cf_diff.program_for(5, 3, 32, 3) == cf_diff.program_for(5, 3, 32, 3)
     assert cf_diff.program_for(5, 3, 32, 3) != cf_diff.program_for(5, 4, 32, 3)

@@ -117,6 +117,21 @@ class ContentTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 list(carve_documents(directory))
 
+    def test_cli_counts_unrelated_standalone_xml_separately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [os.path.join(directory, name) for name in ("setup.xml", "other.xml", "broken.xml")]
+            for path, payload in zip(paths, (SETUP, b"<Other/>", b"<Other>")):
+                with open(path, "wb") as f:
+                    f.write(payload)
+            cmd = [sys.executable, "-I", os.path.join(ROOT, "tools", "content_definitions.py")]
+            for inputs, expected in ((paths[:2], 0), (paths, 1)):
+                with self.subTest(inputs=len(inputs)):
+                    result = subprocess.run(cmd + inputs, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    counts = json.loads(result.stdout)
+                    self.assertEqual((counts["setups"], counts["other_xml"], counts["failed_inputs"]),
+                                     (1, 1, expected))
+
     def test_cli_reports_counts_only_and_failure_status(self):
         with tempfile.TemporaryDirectory() as directory:
             self.make_carve(directory, [CHANGE, CONTENT, SETUP])

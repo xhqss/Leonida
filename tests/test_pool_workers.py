@@ -4,13 +4,15 @@
 
 Above 61 workers concurrent.futures.ProcessPoolExecutor raises `ValueError: max_workers must be <= 61` on Windows
 and multiprocessing.Pool hangs (tools/pool_workers.py has the measurement). awc_opus.py, awc_shorts.py,
-world_lights_paths.py, world_build.py and anim_clips.py handed --jobs to a pool as it was.
+world_lights_paths.py, world_build.py, anim_clips.py and anim_glb.py (--coverage) handed --jobs to a pool as it was.
 
 Each tool is run through its own code three ways: with the limit patched in and the pool class replaced by one
 that records its size and runs the work in this process (so the cap is checked on every platform); the two audio
 tools from the command line with --jobs 62; and, on Windows, with 62 jobs and the real pool. Every input is built
-here: an empty folder, a file of zeros, or the synthetic archive of tests/test_anim_clips.py.
+here: an empty folder, a file of zeros, or the synthetic archives of tests/test_anim_clips.py and
+tests/test_anim_glb.py.
 """
+import argparse
 import concurrent.futures
 import multiprocessing
 import os
@@ -26,12 +28,14 @@ sys.path.insert(0, TOOLS)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import anim_clips  # noqa: E402
+import anim_glb  # noqa: E402
 import awc_opus  # noqa: E402
 import awc_shorts  # noqa: E402
 import pool_workers  # noqa: E402
 import world_build  # noqa: E402
 import world_lights_paths  # noqa: E402
 from test_anim_clips import two_sequence_dictionary, write_rpf  # noqa: E402
+from test_anim_glb import joaat32, part_resource, skeleton_resource, write_archive  # noqa: E402
 
 WINDOWS_LIMIT = 61
 SIZES = []          # the size each recording pool was created with
@@ -147,6 +151,26 @@ class ToolPoolSizeTest(unittest.TestCase):
             for jobs, size in ((2, 2), (62, 61), (200, 61)):
                 _, many = anim_clips.scan(rpf, jobs=jobs)
                 self.assertEqual(many["counts"], one["counts"])
+                self.assertEqual(SIZES.pop(), size)
+
+
+    def test_anim_glb_coverage(self):
+        packs, anim = self.path("packs.rpf"), self.path("anim.rpf")
+        skin = [[(0, 200), (1, 55)], [(1, 255)], [(0, 128), (1, 127)], [(1, 255)]]
+        palette = [joaat32("skel_c"), joaat32("skel_a")]
+        skeleton = write_archive(packs, [[skeleton_resource()], list(part_resource(palette, "u8x4", skin))])[0]
+        write_rpf(anim, [two_sequence_dictionary("first@dict"), two_sequence_dictionary("second@dict")])
+
+        def coverage(jobs):
+            args = argparse.Namespace(archive=packs, skeleton=(skeleton, None), anim=anim, jobs=jobs)
+            return anim_glb.coverage(args)["counts"]
+
+        one = coverage(1)
+        self.assertEqual((one["dictionaries"], one["bone_tracks_in_skeleton"]), (2, 6))
+        self.assertEqual(SIZES, [])
+        with mock.patch.object(concurrent.futures, "ProcessPoolExecutor", RecordingExecutor):
+            for jobs, size in ((2, 2), (61, 61), (62, 61), (200, 61)):
+                self.assertEqual(coverage(jobs), one)
                 self.assertEqual(SIZES.pop(), size)
 
 

@@ -44,6 +44,7 @@ class FirstLookExitTest(unittest.TestCase):
             # Keep Core's modules out of Windows PowerShell's search path when Python was started from pwsh.
             env["PSModulePath"] = str(Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/Modules")
             subprocess.run([*POWERSHELL, "-Command", compile_loader], cwd=build, env=env, check=True, timeout=30)
+            (build / "gta6rt_tls_host.dll").touch()
             for code in (0, 17):
                 with self.subTest(loader_exit_code=code):
                     image = root / f"fixture-{code}.exe"

@@ -239,6 +239,8 @@ def census(root, disasm=None):
             try:
                 with open(state_path, encoding="utf-8") as fh:
                     user_sgprs = json.load(fh).get("user_sgprs")
+                if user_sgprs is not None and (type(user_sgprs) is not int or user_sgprs < 0):
+                    raise ValueError(f"user_sgprs must be a non-negative integer, got {user_sgprs!r}")
             except (ValueError, AttributeError) as e:
                 errors.append(f"{state_path}: {e}")
                 continue

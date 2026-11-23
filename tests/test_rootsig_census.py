@@ -259,6 +259,18 @@ class TestCensus(unittest.TestCase):
                 self.assertEqual(len(lines), 1, r.stderr)
                 self.assertTrue(lines[0].startswith(f"error: {state}: "), lines[0])
 
+    def test_a_bad_user_sgprs_is_one_error_line(self):
+        for value in ("4", True, -1):
+            with self.subTest(value=value):
+                self.write("c1", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=value)
+                state = os.path.join(self.tmp.name, "fspx", "c1.json")
+                r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name], capture_output=True, text=True)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertNotIn("Traceback", r.stderr)
+                lines = r.stderr.splitlines()
+                self.assertEqual(len(lines), 1, r.stderr)
+                self.assertTrue(lines[0].startswith(f"error: {state}: "), lines[0])
+
 
 if __name__ == "__main__":
     unittest.main()

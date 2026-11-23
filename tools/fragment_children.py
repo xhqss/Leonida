@@ -181,7 +181,7 @@ def stray_bodies(system, array):
     if sys.byteorder != "little":
         words.byteswap()
     found, low, high = [], SYSTEM, SYSTEM + n
-    for at in range(HEADER, n - 176, 16):
+    for at in range(HEADER, n - 176 + 1, 16):
         if array[0] <= at < array[1]:
             continue
         i = at >> 3

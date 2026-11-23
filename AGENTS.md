@@ -95,7 +95,7 @@ Shard runs write `index.part*.json`; merge them into `index.json` with `--merge`
 
 - Python tools run with `python -I` and use only the standard library unless a file says otherwise; the exceptions
   are the texture and model tools that import numpy or Pillow: `bc_feature.py`, `amd_swizzle.py`, `tile_probe.py`,
-  `swizzle_search.py`, `tex_export.py`, `tex_mode_probe.py`, `calibrated_texture.py`, `tex_headers.py` and
-  `skinned_glb.py` (which fall back to the standard library when numpy is absent).
+  `swizzle_search.py`, `tex_export.py`, `tex_mode_probe.py`, `calibrated_texture.py`, `world_grid_atlas.py`,
+  `tex_headers.py` and `skinned_glb.py` (which fall back to the standard library when numpy is absent).
 - Keep `make_game.py` working on Windows first: paths through `os.path`, no bash in the build.
 - In the pull request, say that it was AI-assisted, what you tested and on which GPU and driver.

@@ -9,6 +9,8 @@ otherwise.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -123,6 +125,27 @@ class LlvmProbeTests(unittest.TestCase):
                 outcome = subprocess.CompletedProcess(["llvm-mc"], code, "", diagnostic)
                 with patch.object(ic.subprocess, "run", return_value=outcome):
                     self.assertEqual(ic.probe_llvm_mc("llvm-mc", [name]), {name: expected})
+
+
+class LlvmStallTests(unittest.TestCase):
+    def test_stalled_llvm_mc_is_one_error_not_a_traceback(self) -> None:
+        stalled = subprocess.TimeoutExpired(["llvm-mc"], 30)
+        with patch.object(ic.subprocess, "run", side_effect=stalled) as run:
+            probe = ic.probe_llvm_mc("llvm-mc", ["s_endpgm", "v_add_f32"])
+        self.assertEqual(list(probe), ["error"])
+        self.assertIn("did not answer", probe["error"])
+        self.assertEqual(run.call_count, 1)      # the remaining names are not each given the full timeout again
+
+    def test_main_reports_the_stall_next_to_each_name(self) -> None:
+        xml, src = _fixture(FIXTURE_XML, ".xml"), _fixture(FIXTURE_SRC, ".py")
+        self.addCleanup(os.unlink, xml)
+        self.addCleanup(os.unlink, src)
+        stalled = subprocess.TimeoutExpired(["llvm-mc"], 30)
+        out = io.StringIO()
+        with patch.object(ic.subprocess, "run", side_effect=stalled), contextlib.redirect_stdout(out):
+            code = ic.main(["--isa", xml, "--translator", src, "--llvm-mc", "llvm-mc"])
+        self.assertEqual(code, 0)
+        self.assertIn("did not answer", out.getvalue())
 
 
 class FixtureTests(unittest.TestCase):
@@ -278,8 +301,6 @@ class RealIsaTests(unittest.TestCase):
     # Names the translator matches that AMD's RDNA2 XML does not list. Each one was looked at (docs/isa_coverage.md);
     # a name that is not here and not in the XML is a typo or a wrong-generation name and fails the test.
     KNOWN_NOT_IN_XML = {
-        "s_and_b32_mask": "no producer anywhere, not an LLVM mnemonic: dead name",
-        "s_or_b32_mask": "no producer anywhere, not an LLVM mnemonic: dead name",
         "s_delay_alu": "RDNA3 instruction, kept in NOOPS so RDNA3 text does not trip the translator",
         "s_get_waveid_in_workgroup": "gfx1013 per llvm-mc, missing from the XML",
         "v_mac_f32": "gfx1013 per llvm-mc, missing from the XML",
@@ -294,10 +315,6 @@ class RealIsaTests(unittest.TestCase):
         "v_sub_i16": "internal: v_sub_nc_i16 is re-dispatched under this name",
         "s_atc_probe": "gfx1013 per llvm-mc, missing from the XML (a no-op in NOOPS)",
         "s_atc_probe_buffer": "gfx1013 per llvm-mc, missing from the XML (a no-op in NOOPS)",
-        "v_subrev_u16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",
-        "v_and_b16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",
-        "v_or_b16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",
-        "v_xor_b16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",
     }
 
     @classmethod

@@ -142,12 +142,56 @@ class IidScan(unittest.TestCase):
         self.assertEqual(data["iids"], 2)
         self.assertEqual(data["images"][0]["possible_iid_imports"], ["#30"])
 
+    def test_cli_unreadable_image_fails_cleanly(self):
+        good = self.image("h.dll", b"MZ")
+        report = os.path.join(self.tmp.name, "report.json")
+        for bad in (os.path.join(self.tmp.name, "missing.dll"), self.tmp.name):   # missing, and a folder
+            with self.subTest(bad=bad):
+                p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_iid_scan.py"), good, bad,
+                                    "--header", self.header, "--json", report], capture_output=True, text=True)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn(f"ERROR: cannot read {bad}", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertFalse(os.path.exists(report))
+
     def test_cli_missing_header_fails_cleanly(self):
         dll = self.image("e.dll", b"MZ")
         p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_iid_scan.py"), dll,
                             "--header", os.path.join(self.tmp.name, "missing.h")], capture_output=True, text=True)
         self.assertEqual(p.returncode, 2)
         self.assertIn("ERROR", p.stderr)
+
+    def test_cli_json_over_a_missing_directory_fails_cleanly(self):
+        dll = self.image("i.dll", b"MZ")
+        target = os.path.join(self.tmp.name, "missing_dir", "out.json")
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_iid_scan.py"), dll,
+                            "--header", self.header, "--json", target], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("ERROR: cannot write", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertFalse(os.path.exists(target))
+
+    def test_cli_json_over_an_input_image_is_refused(self):
+        dll = self.image("f.dll", pe32plus({}, QUEUE.bytes_le))
+        with open(dll, "rb") as f:
+            before = f.read()
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_iid_scan.py"), dll,
+                            "--header", self.header, "--json", dll], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("--json would overwrite", p.stderr)
+        with open(dll, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_cli_json_over_the_header_is_refused(self):
+        dll = self.image("g.dll", b"MZ")
+        with open(self.header, "rb") as f:
+            before = f.read()
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_iid_scan.py"), dll,
+                            "--header", self.header, "--json", self.header], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("--json would overwrite", p.stderr)
+        with open(self.header, "rb") as f:
+            self.assertEqual(f.read(), before)
 
 
 if __name__ == "__main__":

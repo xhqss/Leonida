@@ -179,6 +179,77 @@ class HeapIndexCensus(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertTrue(p.stderr.startswith("ERROR:"), p.stderr)
 
+    def test_cli_json_over_the_carve_index_is_refused(self):
+        self.work.add("ps_heap", "ps", SFI0_RES | SFI0_SMP, PS_HEAP)
+        index = os.path.join(self.work.root, "index.json")
+        with open(index, "rb") as f:
+            before = f.read()
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "heap_index_census.py"),
+                            self.work.disasm, "--json", index], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("--json would overwrite the carve index", p.stderr)
+        with open(index, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_cli_json_inside_the_disasm_folder_is_refused(self):
+        self.work.add("ps_heap", "ps", SFI0_RES | SFI0_SMP, PS_HEAP)
+        listing_path = os.path.join(self.work.disasm, "ps_heap.s")
+        with open(listing_path, "rb") as f:
+            before = f.read()
+        tool = os.path.join(ROOT, "tools", "heap_index_census.py")
+        p = subprocess.run([sys.executable, "-I", tool, self.work.disasm, "--json", listing_path],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("must not write inside the disasm folder", p.stderr)
+        with open(listing_path, "rb") as f:
+            self.assertEqual(f.read(), before)
+        # A name that does not exist yet is refused too: the folder itself is the input.
+        p = subprocess.run([sys.executable, "-I", tool, self.work.disasm, "--json",
+                            os.path.join(self.work.disasm, "report.json")], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertFalse(os.path.exists(os.path.join(self.work.disasm, "report.json")))
+
+    def test_cli_json_over_a_dxbc_container_is_refused(self):
+        self.work.add("ps_heap", "ps", SFI0_RES | SFI0_SMP, PS_HEAP)
+        container = os.path.join(self.work.root, "ps_heap.dxbc")
+        with open(container, "rb") as f:
+            before = f.read()
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "heap_index_census.py"),
+                            self.work.disasm, "--json", container], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("--json would overwrite an input the census reads", p.stderr)
+        with open(container, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_cli_json_over_an_fssm_header_is_refused(self):
+        self.work.add("cs_sys", "cs", SFI0_RES, [
+            ("s_load_dwordx8 s[20:27], s[2:3], 0x40", 8),
+            ("s_endpgm", 4),
+        ], rsrc2=2 << 1)
+        header = os.path.join(self.work.root, "fssm", "cs_sys.fssm")
+        with open(header, "rb") as f:
+            before = f.read()
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "heap_index_census.py"),
+                            self.work.disasm, "--json", header], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("--json would overwrite an input the census reads", p.stderr)
+        with open(header, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_cli_json_over_a_hard_link_to_a_container_is_refused(self):
+        self.work.add("ps_heap", "ps", SFI0_RES | SFI0_SMP, PS_HEAP)
+        container = os.path.join(self.work.root, "ps_heap.dxbc")
+        link = os.path.join(self.work.root, "report.json")
+        os.link(container, link)
+        with open(container, "rb") as f:
+            before = f.read()
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "heap_index_census.py"),
+                            self.work.disasm, "--json", link], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("--json would overwrite an input the census reads", p.stderr)
+        with open(container, "rb") as f:
+            self.assertEqual(f.read(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

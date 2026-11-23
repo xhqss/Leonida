@@ -829,6 +829,77 @@ class FacialCurvesTest(unittest.TestCase):
             memoryview(clip)[rsc8_audio.RSC8_VIRTUAL_BASE:], dec["anim"], dec["anim_desc"])
         self.assertEqual(values[0], [(float(f % 16),) for f in range(65)])
 
+    def test_a_clip_that_fails_its_structure_checks_is_not_decoded(self):
+        def seq(lo):
+            ints = [(lo + f) % 16 for f in range(33)]
+            return encode_sequence(33, [(4, 0, 0, (4, 1.0, 0.0, ints)), (2, 1, 0, 0.5)])
+
+        good = build_synthetic_curve_clip([seq(0), seq(32)], [33, 33], (4, 4), pad=(0, 16))
+        dec = rsc8_audio.decode_rsc8(good)
+        base = rsc8_audio.RSC8_VIRTUAL_BASE
+        first, second = dec["anim"]["blocks"][0]["voff"], dec["anim"]["blocks"][1]["voff"]
+
+        # The first block's size word cut to its header: the size checks fail, so nothing is decoded.
+        short = bytearray(good)
+        struct.pack_into("<I", short, base + first + 0x10, 32)
+        bad = rsc8_audio.decode_rsc8(bytes(short), curves=True)
+        self.assertFalse(bad["valid"])
+        self.assertEqual(bad["curves"], {"decoded": False, "error": "structural checks failed"})
+
+        # The first block grown four bytes into the second one's header, with its payload size and the
+        # descriptor's maximum kept consistent: every structure check passes, the overlap is caught.
+        grown = bytearray(good)
+        size = second - first + 4
+        struct.pack_into("<I", grown, base + first + 0x04, size - 32)
+        struct.pack_into("<I", grown, base + first + 0x10, size)
+        desc = base + dec["anim_desc"]["voff"]
+        struct.pack_into("<I", grown, desc + 0x48, max(size, dec["anim"]["blocks"][1]["anim_size"]))
+        overlap = rsc8_audio.decode_rsc8(bytes(grown), curves=True)
+        self.assertTrue(overlap["valid"], overlap["checks"])
+        self.assertEqual(overlap["curves"], {"decoded": False, "error": "block or track extents overlap"})
+
+        bank = build_synthetic_awc([
+            {"id": 0x00112233, "rsc8": good, "samples": 56000},
+            {"id": 0x00112233, "rsc8": bytes(short), "samples": 56000},
+            {"id": 0x00112233, "rsc8": bytes(grown), "samples": 56000},
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            awc = os.path.join(tmp, "bank.awc")
+            with open(awc, "wb") as f:
+                f.write(bank)
+            out_json = os.path.join(tmp, "report.json")
+            cp = subprocess.run([sys.executable, "-I", TOOL, awc, out_json, "--curves", "--quiet"],
+                                capture_output=True, text=True)
+            self.assertEqual(cp.returncode, 0, cp.stderr)
+            with open(out_json, encoding="utf-8") as f:
+                summary = json.load(f)["summary"]
+        self.assertEqual(summary["curve_clips"], 3)
+        self.assertEqual(summary["curve_clips_decoded"], 1)
+        self.assertEqual(summary["curve_errors"],
+                         {"structural checks failed": 1, "block or track extents overlap": 1})
+
+    def test_curves_decode_the_resource_in_place(self):
+        import tracemalloc
+
+        clip = self.clip()
+        dec = rsc8_audio.decode_rsc8(clip)
+        padded = clip + bytes(4 << 20)                  # the curve data is unchanged; only the buffer grows
+        view = memoryview(padded)[rsc8_audio.RSC8_VIRTUAL_BASE:]
+        want = rsc8_audio.decode_facial_curves(memoryview(clip)[rsc8_audio.RSC8_VIRTUAL_BASE:],
+                                               dec["anim"], dec["anim_desc"])
+        tracemalloc.start()
+        try:
+            got = rsc8_audio.decode_facial_curves(view, dec["anim"], dec["anim_desc"])
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(got, want)
+        self.assertLess(peak, 1 << 20)                  # a copy of the 4 MiB resource would exceed this
+        # A non-contiguous view is still accepted (it is copied).
+        stride = memoryview(bytes(b for c in clip for b in (c, 0)))[::2]
+        self.assertEqual(rsc8_audio.decode_facial_curves(stride[rsc8_audio.RSC8_VIRTUAL_BASE:],
+                                                         dec["anim"], dec["anim_desc"]), want)
+
     def test_block_that_does_not_decode_is_counted_not_raised(self):
         clip = bytearray(self.clip())
         dec = rsc8_audio.decode_rsc8(bytes(clip))

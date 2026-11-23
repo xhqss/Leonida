@@ -4,7 +4,9 @@
 
 Every byte is built by this test. No game file, asset name or payload is used.
 """
+import contextlib
 import csv
+import io
 import json
 import os
 import struct
@@ -312,6 +314,22 @@ class ArchiveTest(unittest.TestCase):
             self.assertNotIn("Traceback", proc.stderr)
         self.assertFalse(os.path.exists(os.path.join(self.root, "no_such_folder")))
 
+    def test_write_failure_after_scan_names_the_output(self):
+        for ext in (".json", ".csv"):
+            out = os.path.join(self.root, "report" + ext)
+            with self.subTest(ext=ext), \
+                    unittest.mock.patch.object(sys, "argv", [TOOL, self.rpf, out]), \
+                    unittest.mock.patch.object(restofworld_index, "write_output",
+                                               side_effect=OSError("report write denied")) as write, \
+                    contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                    contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(restofworld_index.main(), 1)
+                self.assertEqual(write.call_args.args[0], out)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+                self.assertIn(out, stderr.getvalue())
+                self.assertIn("report write denied", stderr.getvalue())
+
     def test_cli_rejects_output_aliasing_source_archive(self):
         with open(self.rpf, "rb") as f:
             original = f.read()
@@ -346,12 +364,18 @@ class ArchiveTest(unittest.TestCase):
 
         # A hard link at a JSON path naming the payload.
         link = os.path.join(self.root, "payload.json")
-        os.link(os.path.join(folder, f"{0x1000:012x}.bin"), link)
-        linked = subprocess.run(
-            [sys.executable, "-I", TOOL, folder, link],
-            capture_output=True, text=True, encoding="utf-8", errors="replace")
-        self.assertEqual(linked.returncode, 2, linked.stderr)
-        self.assertIn("output must not overwrite the source archive", linked.stderr)
+        try:
+            os.link(os.path.join(folder, f"{0x1000:012x}.bin"), link)
+        except (OSError, NotImplementedError) as e:
+            link = None
+            with self.subTest("hardlink"):
+                self.skipTest(f"hard links unavailable: {e}")
+        if link is not None:
+            linked = subprocess.run(
+                [sys.executable, "-I", TOOL, folder, link],
+                capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(linked.returncode, 2, linked.stderr)
+            self.assertIn("output must not overwrite the source archive", linked.stderr)
 
         # Overwriting index.json, part of the carve.
         idx = subprocess.run(
@@ -365,8 +389,9 @@ class ArchiveTest(unittest.TestCase):
             self.assertEqual(f.read(), original, "the carved payload was overwritten")
         with open(os.path.join(folder, "index.json"), encoding="utf-8") as f:
             self.assertEqual(f.read(), "{}", "the index was overwritten")
-        with open(link, "rb") as f:
-            self.assertEqual(f.read(), original, "the hard link target changed")
+        if link is not None:
+            with open(link, "rb") as f:
+                self.assertEqual(f.read(), original, "the hard link target changed")
 
     def test_cli(self):
         out = os.path.join(self.root, "cli.json")

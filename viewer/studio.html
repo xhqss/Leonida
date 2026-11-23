@@ -554,6 +554,7 @@ let texSearchQuery = '';
 
 let scene, camera, renderer, controls;
 let currentMesh = null;
+let modelLoadId = 0;
 let shadingMode = 'original'; // 'original' | 'clay' | 'normals'
 let wireframeActive = false;
 let autoRotateActive = false;
@@ -572,6 +573,10 @@ function formatBytes(bytes) {
   const sizes = ['B', 'KB', 'MB', 'GB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
 }
 
 function switchTab(tab) {
@@ -696,16 +701,34 @@ function applyMeshShading() {
   });
 }
 
+function disposeModel(root) {
+  root.traverse(child => {
+    if (child.geometry) child.geometry.dispose();
+    // In clay/normals mode child.material is a shared material; the model's own is origMaterial.
+    const material = child.userData.origMaterial || child.material;
+    if (!material) return;
+    Object.values(material).forEach(value => {
+      if (value && value.isTexture) value.dispose();
+    });
+    material.dispose();
+  });
+}
+
 function loadModel(url, name, category, size) {
+  const loadId = ++modelLoadId;
   const bar = document.getElementById('loading-bar');
   bar.style.transform = 'scaleX(0.4)';
 
   const loader = new THREE.GLTFLoader();
   loader.load(url, (gltf) => {
+    if (loadId !== modelLoadId) return;
     bar.style.transform = 'scaleX(1)';
     setTimeout(() => { bar.style.transform = 'scaleX(0)'; }, 250);
 
-    if (currentMesh) scene.remove(currentMesh);
+    if (currentMesh) {
+      scene.remove(currentMesh);
+      disposeModel(currentMesh);
+    }
     currentMesh = gltf.scene;
     scene.add(currentMesh);
 
@@ -741,6 +764,7 @@ function loadModel(url, name, category, size) {
     controls.target.set(0, 0, 0);
     controls.update();
   }, undefined, (err) => {
+    if (loadId !== modelLoadId) return;
     bar.style.transform = 'scaleX(0)';
     console.error('Error loading model:', err);
     alert('Не удалось загрузить 3D модель: ' + name);
@@ -831,7 +855,7 @@ function renderAccordionList() {
     const header = document.createElement('div');
     header.className = 'cat-header';
     header.innerHTML = `
-      <span>${cat} <span class="badge">${list.length}</span></span>
+      <span>${escapeHtml(cat)} <span class="badge">${list.length}</span></span>
       <span class="arrow">▼</span>
     `;
 
@@ -847,9 +871,9 @@ function renderAccordionList() {
         const item = document.createElement('div');
         item.className = 'model-item';
         item.innerHTML = `
-          <div class="m-name">${m.name}</div>
+          <div class="m-name">${escapeHtml(m.name)}</div>
           <div class="m-meta">
-            <span>${m.folder !== 'Корневая папка' ? m.folder : ''}</span>
+            <span>${m.folder !== 'Корневая папка' ? escapeHtml(m.folder) : ''}</span>
             <span>${formatBytes(m.size)}</span>
           </div>
         `;
@@ -924,10 +948,10 @@ function renderTexturesGrid() {
     card.className = 'tex-card';
     card.innerHTML = `
       <div class="tex-preview">
-        <img src="${t.preview}" alt="${t.name}" loading="lazy" onerror="this.src=''; this.alt='DDS / Pre-converted'">
+        <img src="${t.preview}" alt="${escapeHtml(t.name)}" loading="lazy" onerror="this.src=''; this.alt='DDS / Pre-converted'">
       </div>
       <div class="tex-info">
-        <div class="tex-name" title="${t.name}">${t.name}</div>
+        <div class="tex-name" title="${escapeHtml(t.name)}">${escapeHtml(t.name)}</div>
         <div class="tex-meta">
           <span>${t.format}</span>
           <span>${formatBytes(t.size)}</span>
@@ -951,10 +975,10 @@ function renderTexturesGrid() {
         card.className = 'tex-card';
         card.innerHTML = `
           <div class="tex-preview">
-            <img src="${t.preview}" alt="${t.name}" loading="lazy" onerror="this.src=''; this.alt='DDS / Pre-converted'">
+            <img src="${t.preview}" alt="${escapeHtml(t.name)}" loading="lazy" onerror="this.src=''; this.alt='DDS / Pre-converted'">
           </div>
           <div class="tex-info">
-            <div class="tex-name" title="${t.name}">${t.name}</div>
+            <div class="tex-name" title="${escapeHtml(t.name)}">${escapeHtml(t.name)}</div>
             <div class="tex-meta">
               <span>${t.format}</span>
               <span>${formatBytes(t.size)}</span>

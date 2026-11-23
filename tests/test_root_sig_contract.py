@@ -117,6 +117,18 @@ def test_cluster_groups_shapes():
     assert ranked[0][1] == 2 and ranked[1][1] == 1
 
 
+def test_cluster_ties_and_example_names_are_stable():
+    index = {
+        "z_const": {"user_sgpr_reads": [{"sgpr": 0, "kind": "const32"}]},
+        "y_ptr": {"user_sgpr_reads": [{"sgpr": 2, "kind": "ptr64_lo"}]},
+        "a_const": {"user_sgpr_reads": [{"sgpr": 0, "kind": "const32"}]},
+        "b_ptr": {"user_sgpr_reads": [{"sgpr": 2, "kind": "ptr64_lo"}]},
+    }
+    ranked = rsc.cluster(index)
+    assert ranked == rsc.cluster(dict(reversed(list(index.items()))))
+    assert [row[2] for row in ranked] == [["a_const", "z_const"], ["b_ptr", "y_ptr"]]
+
+
 def test_cli_hard_fail_on_contradiction(tmp_path):
     index = {"bad": {"user_sgpr_reads": [{"sgpr": 31, "kind": "const32"}]}}
     index_path = tmp_path / "index.json"
@@ -284,3 +296,77 @@ def test_cli_rejects_noninteger_sgprs_with_cluster(tmp_path):
     assert "invalid SGPR index" in result.stdout
     assert "read-set shapes" in result.stdout
     assert "Traceback" not in result.stderr
+
+
+# --model console: rt::rootsig::pack_stage's layout (D3D-448). The package's FidelityFX compute signatures have this
+# shape (two tables, then four root CBVs); their programs read the tables at s4/s5 as 32-bit pointers and copy each
+# root CBV's 64-bit VA as two dwords. Hand-written here: shapes and register numbers only.
+FSR_SHAPE = {"version": "1.1", "flags": 0, "params": [
+    {"type": "table", "ranges": [{"kind": "srv", "count": 1}]},
+    {"type": "table", "ranges": [{"kind": "uav", "count": 1}]},
+    {"type": "cbv"}, {"type": "cbv"}, {"type": "cbv"}, {"type": "cbv"}]}
+FSR_READS = [{"sgpr": 4, "kind": "ptr32_lo"}, {"sgpr": 5, "kind": "ptr32_lo"},
+             {"sgpr": 6, "kind": "const32"}, {"sgpr": 7, "kind": "const32"}]
+
+
+def test_console_layout_compute():
+    dwords, error = rsc.pack_layout(FSR_SHAPE, "cs")
+    assert error == ""
+    assert len(dwords) == 14  # s0..s3 driver, then 10 dwords: the programs' USER_SGPR count
+    assert [d["ptype"] for d in dwords[:4]] == ["driver"] * 4
+    assert [(d["param"], d["sub"]) for d in dwords[4:]] == [
+        (0, 0), (1, 0), (2, 0), (2, 1), (3, 0), (3, 1), (4, 0), (4, 1), (5, 0), (5, 1)]
+
+
+def test_console_layout_stage_bases():
+    for stage, base in (("ps", 8), ("vs", 8), ("gs", 8), ("ms", 16)):
+        dwords, error = rsc.pack_layout(ROOT_SIG, stage)
+        assert error == "" and len(dwords) == base + 4 + 2 + 1, stage   # constants 4, cbv 2, table 1
+    dwords, error = rsc.pack_layout(ROOT_SIG, "hs")
+    assert dwords == [] and "no console base" in error
+
+
+def test_console_layout_spill_refused():
+    sig = {"version": "1.1", "flags": 0, "params": [{"type": "table"} for _ in range(17)]}
+    assert rsc.pack_layout(sig, "ms")[1] != ""                     # 17 one-dword tables past s31
+    sig["params"].pop()
+    assert rsc.pack_layout(sig, "ms")[1] == ""                     # 16 fill s16..s31
+    dwords, error = rsc.pack_layout({"params": [{"type": "constants", "count": 29}]}, "cs")
+    assert dwords == [] and "param 0" in error and "spill" in error
+
+
+def test_console_reconcile_fsr_reads():
+    console, _ = rsc.pack_layout(FSR_SHAPE, "cs")
+    assert rsc.reconcile(FSR_READS, console) == []
+    s0, _ = rsc.pack_layout(FSR_SHAPE)
+    issues = rsc.reconcile(FSR_READS, s0)
+    assert any("s5 (ptr32_lo) reads the high half" in i for i in issues)
+
+
+def test_whole_address_copy_needs_both_halves():
+    console, _ = rsc.pack_layout(FSR_SHAPE, "cs")
+    one_half = [{"sgpr": 6, "kind": "const32"}]
+    assert any("incompatible" in i for i in rsc.reconcile(one_half, console))
+
+
+def test_driver_block_reads():
+    console, _ = rsc.pack_layout(FSR_SHAPE, "cs")
+    assert rsc.reconcile([{"sgpr": 1, "kind": "const32"}], console) == []          # a system value
+    issues = rsc.reconcile([{"sgpr": 0, "kind": "ptr64_lo"}], console)
+    assert any("driver block" in i for i in issues)                                   # a spill pointer
+
+
+def test_cli_console_model_uses_each_shaders_stage(tmp_path):
+    index = {"a.cs": {"stage": "cs", "user_sgpr_reads": FSR_READS},
+             "b.ps": {"stage": "ps", "user_sgpr_reads": [{"sgpr": 8, "kind": "ptr32_lo"}]}}
+    index_path = tmp_path / "index.json"
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+    sig_path = tmp_path / "sig.json"
+    sig_path.write_text(json.dumps(FSR_SHAPE), encoding="utf-8")
+    console = subprocess.run([sys.executable, "-I", TOOL, str(index_path), "--rootsig", str(sig_path),
+                              "--model", "console"], capture_output=True, text=True)
+    assert console.returncode == 0, console.stdout + console.stderr
+    assert "2 shaders: 2 compatible, 0 contradictory" in console.stdout
+    plain = subprocess.run([sys.executable, "-I", TOOL, str(index_path), "--rootsig", str(sig_path)],
+                           capture_output=True, text=True)
+    assert plain.returncode == 1 and "CONTRADICTION" in plain.stdout

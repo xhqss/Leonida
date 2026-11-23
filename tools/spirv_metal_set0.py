@@ -110,7 +110,7 @@ def rewrite(text, counts):
     cap_by_bind = {}    # binding -> OpConstant id (emitted once per binding)
     ptr_by_key = {}     # (binding, elem_type) -> new OpTypePointer id
     new_types = []      # inserted right after the variable's pointer type is declared
-    retype = {}         # variable -> new pointer type
+    retype = {}         # resized variable or copied pointer ID -> new pointer type
     for b, _, _, v, old_ptr, elem in sorted(candidates):
         if (b, elem) in ptr_by_key:
             retype[v] = ptr_by_key[(b, elem)]
@@ -139,6 +139,12 @@ def rewrite(text, counts):
         m = re.match(r"(\s*(%\S+) = OpVariable )(%\S+)( UniformConstant)$", ln)
         if m and m.group(2) in retype:
             ln = f"{m.group(1)}{retype[m.group(2)]}{m.group(4)}"
+        # Retype copies by source ID so arrays sharing a type in other sets are unaffected.
+        m = re.match(r"(\s*(%\S+) = OpCopyObject )%\S+ (%\S+)$", ln)
+        if m and m.group(3) in retype:
+            ptr = retype[m.group(3)]
+            retype[m.group(2)] = ptr
+            ln = f"{m.group(1)}{ptr} {m.group(3)}"
         out.append(ln)
         m = re.match(r"\s*(%\S+) = OpTypePointer", ln)
         if m:
@@ -163,7 +169,9 @@ def main(argv):
         print(__doc__.strip().splitlines()[-2], file=sys.stderr)
         return 2
     dis, asm = _tools()
-    text = _run([dis, argv[1]], capture_output=True, text=True).stdout
+    # errors="replace": on Windows text=True decodes with the ANSI code page, and a program that answers in UTF-8
+    # (a path with non-ASCII letters in its error message) would otherwise kill the reader thread and lose stderr.
+    text = _run([dis, argv[1]], capture_output=True, text=True, errors="replace").stdout
     env = re.search(r"; Version: (\d+)\.(\d+)", text)
     target = f"spv{env.group(1)}.{env.group(2)}" if env else "vulkan1.2"
     _run([asm, "--target-env", target, "-", "-o", argv[2]], input=rewrite(text, counts), text=True)

@@ -189,6 +189,23 @@ class F16AndMixConstModifierTests(unittest.TestCase):
         self.assertEqual(got[:3], [0x40003C00, 0x0000BC00, 0xBC00BC00])
 
 class F64ConstModifierStructureTests(unittest.TestCase):
+    def test_unary_f64_literals_reach_the_operation_as_high_words(self) -> None:
+        fixture = Path(HERE) / "fixtures" / "unary_f64_literals.asm"
+        unary = [line for line in fixture.read_text(encoding="ascii").splitlines() if "_e32 " in line]
+        for line in unary[:3]:
+            with self.subTest(line=line):
+                spv = translate([line])
+                literal = int(line.rsplit(" ", 1)[1], 16)
+                self.assertIn(f"OpCompositeConstruct %v2uint_d %c0 %c{literal:x}", spv)
+
+        # frexp uses integer words alone. Execute the mantissa and exponent paths and read both destination words.
+        for spelling, expected in (("0x40180000", [0, 0x3fe80000, 3]), ("2.0", [0, 0x3fe00000, 2]),
+                                   ("1", [0, 0x3fe00000, (-1073) & 0xffffffff])):  # 2^-1074 = 0.5 * 2^-1073
+            with self.subTest(spelling=spelling):
+                lines = [op.replace("0x40180000", spelling) for op in unary[3:]]
+                got = run(lines, export="v8, v9, v7, v7")
+                self.assertEqual(got[:3], expected)
+
     def test_f64_literal_and_inline_source_words(self) -> None:
         fixture = Path(HERE) / "fixtures" / "f64_literals.asm"
         instructions = [line for line in fixture.read_text(encoding="utf-8").splitlines()

@@ -36,6 +36,7 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from anim_index import aux_table  # noqa: E402
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 from zero_span import gap_split  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
@@ -343,16 +344,6 @@ def offset(text):
     return value
 
 
-def same_output_path(first, second):
-    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved .bin files")
@@ -367,17 +358,17 @@ def main(argv=None):
         ap.error(f"{a.out} is a folder, not a .csv or .json file")
     if os.path.splitext(a.out)[1].lower() not in (".json", ".csv"):
         ap.error("output must end in .json or .csv")
-    if same_output_path(a.source, a.out):
+    if same_report_path(a.source, a.out):
         ap.error("output must not overwrite the source")
     if os.path.isdir(a.source):
         manifest = os.path.join(a.source, "index.json")
-        if os.path.isfile(manifest) and same_output_path(manifest, a.out):
+        if same_report_path(manifest, a.out):
             ap.error(f"output would overwrite the carve manifest: {a.out}")
         if os.path.isfile(a.out):
             for name in os.listdir(a.source):
                 inp = os.path.join(a.source, name)
                 if os.path.isfile(inp) and not name.lower().endswith((".json", ".csv")):
-                    if same_output_path(inp, a.out):
+                    if same_report_path(inp, a.out):
                         ap.error(f"output would overwrite an input file: {a.out}")
     folder = os.path.dirname(os.path.abspath(a.out))
     if not os.path.isdir(folder):

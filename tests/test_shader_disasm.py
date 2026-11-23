@@ -46,7 +46,7 @@ class DisasmFailureTest(unittest.TestCase):
     def run_tool(self, llvm_mc: str, out: str) -> subprocess.CompletedProcess:
         env = dict(os.environ, LLVM_MC=llvm_mc)
         return subprocess.run([sys.executable, "-I", TOOL, self.fssm, "--out", out, "--jobs", "1"],
-                              capture_output=True, text=True, env=env)
+                              capture_output=True, text=True, errors="replace", env=env)
 
     def fake(self, body: str) -> str:
         path = os.path.join(self.dir, "fake_mc.py")
@@ -69,6 +69,32 @@ class DisasmFailureTest(unittest.TestCase):
         self.assertEqual(p.returncode, 1)
         self.assertIn("No available targets", p.stderr)
         self.assertIn("AMDGPU target", p.stderr)
+
+    def test_undecodable_probe_error_is_reported_without_a_traceback(self):
+        # 0x81 is invalid in both UTF-8 and cp1252 (the -I locale on Windows).
+        mc = self.fake("import sys\n"
+                       "sys.stdin.read()\n"
+                       "sys.stderr.buffer.write(b'llvm-mc: \\x81\\x8d\\x8f\\x90\\x9d\\xff\\n')\n"
+                       "sys.exit(1)\n")
+        p = self.run_tool(mc, os.path.join(self.dir, "out"))
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("did not disassemble an s_endpgm: llvm-mc: ", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_undecodable_shader_error_is_reported_without_a_traceback(self):
+        mc = self.fake("import sys\n"
+                       "if sys.stdin.read().strip() == %r:\n"
+                       "    print('\\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]')\n"
+                       "    sys.exit(0)\n"
+                       "sys.stderr.buffer.write(b'error: \\x81\\x8d\\x8f\\x90\\x9d\\xff\\n')\n"
+                       "sys.exit(1)\n" % PROBE)
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(mc, out)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("'failed': 1", p.stdout)
+        self.assertIn("produced no disassembly", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(sorted(os.listdir(out)), [])
 
     def test_empty_output_is_a_failure_and_writes_nothing(self):
         mc = self.fake("import sys\n"
@@ -147,7 +173,8 @@ class DisasmInputTest(unittest.TestCase):
 
     def run_tool(self, *args: str) -> subprocess.CompletedProcess:
         env = dict(os.environ, LLVM_MC=self.mc)
-        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True, env=env)
+        return subprocess.run([sys.executable, "-I", TOOL, *args],
+                              capture_output=True, text=True, errors="replace", env=env)
 
     def write(self, name: str, data: bytes) -> None:
         with open(os.path.join(self.src, name), "wb") as f:
@@ -296,8 +323,8 @@ class DisasmInputTest(unittest.TestCase):
         with open(os.path.join(out, "old.s"), "w", encoding="utf-8") as f:
             f.write("; usable\n")
         env = dict(os.environ, LLVM_MC="definitely-not-an-llvm-mc")
-        p = subprocess.run([sys.executable, "-I", TOOL, self.src, "--out", out], capture_output=True, text=True,
-                           env=env)
+        p = subprocess.run([sys.executable, "-I", TOOL, self.src, "--out", out],
+                           capture_output=True, text=True, errors="replace", env=env)
         self.assertEqual(p.returncode, 1, p.stderr)
         self.assertIn("could not be started", p.stderr)
         self.assertTrue(os.path.isfile(os.path.join(out, "old.s")))   # pruning waits for a successful decode
@@ -337,6 +364,110 @@ class DisasmInputTest(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
         with open(out, encoding="utf-8") as f:
             self.assertEqual(f.read(), "keep")
+
+
+class DisasmOutputCollisionTest(unittest.TestCase):
+    """A planned <out>/<stem>.s that is a folder or names an input is refused before llvm-mc is probed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.src = os.path.join(self.dir, "fssm")
+        os.makedirs(self.src)
+        self.probe_marker = os.path.join(self.dir, "probe_ran")
+        mc = os.path.join(self.dir, "fake_mc.py")
+        with open(mc, "w", encoding="utf-8", newline="\n") as f:
+            f.write("import sys\n"
+                    f"open({self.probe_marker!r}, 'w').close()\n"
+                    f"probe = sys.stdin.read().strip() == {PROBE!r}\n"
+                    f"print('\\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]' if probe else {ASM!r})\n")
+        self.mc = f'"{sys.executable}" "{mc}"'
+        case_probe = os.path.join(self.dir, "CaseProbe")
+        open(case_probe, "wb").close()
+        self.case_insensitive = os.path.exists(os.path.join(self.dir, "caseprobe"))
+        os.unlink(case_probe)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_tool(self, *args: str) -> subprocess.CompletedProcess:
+        env = dict(os.environ, LLVM_MC=self.mc)
+        return subprocess.run([sys.executable, "-I", TOOL, *args, "--jobs", "1"],
+                              capture_output=True, text=True, env=env)
+
+    def write(self, path: str) -> bytes:
+        data = fssm()
+        with open(path, "wb") as f:
+            f.write(data)
+        return data
+
+    def assert_refused(self, p: subprocess.CompletedProcess, message: str) -> None:
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn(message, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertFalse(os.path.exists(self.probe_marker), "llvm-mc was probed before the output was checked")
+
+    def assert_unchanged(self, path: str, data: bytes) -> None:
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), data)
+
+    def test_an_input_named_like_its_listing_is_not_overwritten(self):
+        inp = os.path.join(self.dir, "foo.s")
+        data = self.write(inp)
+        self.assert_refused(self.run_tool(inp, "--out", self.dir), "would overwrite input")
+        self.assert_unchanged(inp, data)
+
+    def test_the_default_out_of_a_file_in_disasm_does_not_overwrite_it(self):
+        os.makedirs(os.path.join(self.dir, "disasm"))
+        inp = os.path.join(self.dir, "disasm", "foo.s")
+        data = self.write(inp)
+        self.assert_refused(self.run_tool(inp), "would overwrite input")
+        self.assert_unchanged(inp, data)
+
+    def test_skip_existing_does_not_reuse_the_input_as_its_listing(self):
+        inp = os.path.join(self.dir, "foo.s")
+        data = self.write(inp)
+        self.assert_refused(self.run_tool(inp, "--out", self.dir, "--skip-existing"), "would overwrite input")
+        self.assert_unchanged(inp, data)
+
+    def test_a_case_variant_of_the_input_is_the_input_where_case_is_ignored(self):
+        inp = os.path.join(self.dir, "FOO.S")
+        data = self.write(inp)
+        p = self.run_tool(inp, "--out", self.dir)
+        if self.case_insensitive:
+            self.assert_refused(p, "would overwrite input")
+        else:
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertTrue(os.path.isfile(os.path.join(self.dir, "FOO.s")))
+        self.assert_unchanged(inp, data)
+
+    def test_a_listing_hard_linked_to_its_input_is_refused(self):
+        inp = os.path.join(self.src, "one.fssm")
+        data = self.write(inp)
+        out = os.path.join(self.dir, "out")
+        os.makedirs(out)
+        try:
+            os.link(inp, os.path.join(out, "one.s"))
+        except (AttributeError, OSError) as e:
+            self.skipTest(f"hard links unavailable: {e}")
+        # --skip-existing would otherwise count the linked FSSM as a finished listing.
+        self.assert_refused(self.run_tool(self.src, "--out", out, "--skip-existing"), "would overwrite input")
+        self.assert_unchanged(inp, data)
+
+    def test_a_folder_where_a_listing_goes_is_refused(self):
+        self.write(os.path.join(self.src, "one.fssm"))
+        out = os.path.join(self.dir, "out")
+        os.makedirs(os.path.join(out, "one.s"))
+        self.assert_refused(self.run_tool(self.src, "--out", out), "destination is a folder")
+        self.assertTrue(os.path.isdir(os.path.join(out, "one.s")))
+
+    def test_a_listing_next_to_a_different_input_is_written(self):
+        inp = os.path.join(self.dir, "foo.fssm")
+        data = self.write(inp)
+        p = self.run_tool(inp, "--out", self.dir)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assert_unchanged(inp, data)
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, "foo.s")))
 
 
 if __name__ == "__main__":

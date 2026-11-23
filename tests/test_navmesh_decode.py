@@ -732,6 +732,24 @@ class NavmeshDecodeTest(unittest.TestCase):
             with open(out_csv, newline="", encoding="utf-8") as f:
                 self.assertEqual(len(list(csv.DictReader(f))), 1)
 
+    def test_cli_reports_a_blocked_report_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "nav.rpf")
+            make_rpf(archive, build_0drp())
+            blocker = os.path.join(tmp, "blocked")
+            with open(blocker, "wb") as f:
+                f.write(b"keep")
+            for flag in ("--out", "--csv"):
+                with self.subTest(flag=flag):
+                    target = os.path.join(blocker, "nav" + (".json" if flag == "--out" else ".csv"))
+                    command = [sys.executable, "-I", TOOL, archive, flag, target, "--quiet"]
+                    result = subprocess.run(command, cwd=tmp, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(target, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+            with open(blocker, "rb") as f:
+                self.assertEqual(f.read(), b"keep")
+
     def test_cli_refuses_to_overwrite_its_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             archive = os.path.join(tmp, "nav.rpf")
@@ -758,7 +776,14 @@ class NavmeshDecodeTest(unittest.TestCase):
             with open(source, "wb") as f:
                 f.write(original)
             alias = os.path.join(tmp, "alias.csv")
-            os.link(source, alias)
+            targets = [("--out", source), ("--csv", source)]
+            try:
+                os.link(source, alias)
+            except (OSError, NotImplementedError) as e:
+                with self.subTest(flag="--csv", target=alias):
+                    self.skipTest(f"hard links unavailable: {e}")
+            else:
+                targets.append(("--csv", alias))
 
             out = os.path.join(carve, "report.json")
             csv_path = os.path.join(carve, "report.csv")
@@ -768,7 +793,7 @@ class NavmeshDecodeTest(unittest.TestCase):
                                         capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
-            for flag, target in (("--out", source), ("--csv", source), ("--csv", alias)):
+            for flag, target in targets:
                 with self.subTest(flag=flag, target=target):
                     with open(source, "wb") as f:
                         f.write(original)
@@ -778,6 +803,28 @@ class NavmeshDecodeTest(unittest.TestCase):
                     self.assertIn("would overwrite the input", result.stderr)
                     with open(source, "rb") as f:
                         self.assertEqual(f.read(), original)
+
+    def test_reports_do_not_replace_the_carve_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            manifest = os.path.join(carve, "index.json")
+            before = b'{"files": []}'
+            with open(manifest, "wb") as f:
+                f.write(before)
+            for tool in ("navmesh_decode.py", "navmesh_index.py"):
+                for flag in ("--out", "--csv"):
+                    with self.subTest(tool=tool, flag=flag):
+                        result = subprocess.run(
+                            [sys.executable, "-I", os.path.join(os.path.dirname(TOOL), tool),
+                             carve, flag, manifest],
+                            cwd=tmp, capture_output=True, text=True,
+                        )
+                        self.assertEqual(result.returncode, 2, result.stderr)
+                        self.assertIn("would overwrite", result.stderr)
+                        self.assertIn("index.json", result.stderr)
+                        with open(manifest, "rb") as f:
+                            self.assertEqual(f.read(), before)
 
     def test_cli_rejects_bad_arguments_and_files(self):
         with tempfile.TemporaryDirectory() as tmp:

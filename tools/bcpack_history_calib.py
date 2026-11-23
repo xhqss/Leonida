@@ -333,7 +333,8 @@ def retile_mip(linear, layout, mip):
     return bytes(out)
 
 
-def _retile_mip_into(linear: bytes, layout: dict, mip: dict, out: bytearray) -> None:
+def _retile_mip_into(linear: bytes, layout: dict, mip: dict, out: bytearray,
+                     known: bytearray | None = None) -> None:
     """Write one mip's blocks into its region, which may also hold other tail mips."""
     eb = layout["element_bytes"]
     bw, bh = mip["blocks_w"], mip["blocks_h"]
@@ -348,6 +349,8 @@ def _retile_mip_into(linear: bytes, layout: dict, mip: dict, out: bytearray) -> 
             off = tiled_offset(layout, mip, bx, by)
             src = row_at + bx * eb
             out[off:off + eb] = mv[src:src + eb]
+            if known is not None:
+                known[off:off + eb] = b"\x01" * eb
 
 
 def read_dds(path):
@@ -918,10 +921,12 @@ class BcSimpleCalibrator:
             return (ref_blocks[at], ref_blocks[at + 1])
         return (ref_blocks[at], ref_blocks[at + 1], ref_blocks[at + 8], ref_blocks[at + 9])
 
-    def add_reference_chunk(self, lanes, ref_blocks, nblocks):
+    def add_reference_chunk(self, lanes, ref_blocks, nblocks, *, valid_blocks=None):
         """Algebraically invert direct built-in references from exact BCn blocks."""
         mods = self.mods
         for i in range(min(nblocks, 256)):
+            if valid_blocks is not None and not valid_blocks[i]:
+                continue
             d, dz = self._lane_step(lanes, i)
             if d == 0 or d <= i:
                 continue
@@ -1188,12 +1193,14 @@ class Bc6hCalibrator:
         self.d_obs = {}
         self.ep_seen = [False] * 256
 
-    def add_reference_chunk(self, lanes, ref_blocks, nblocks):
+    def add_reference_chunk(self, lanes, ref_blocks, nblocks, *, valid_blocks=None):
         """Algebraically invert direct built-in BC6H history references from exact blocks."""
         l0, l1, l15 = lanes[0], lanes[1], lanes[15]
         deint0, deint1 = bcpack._DEINT
         slot_widths = (16, 10, 6, 6)
         for i in range(min(nblocks, 256)):
+            if valid_blocks is not None and not valid_blocks[i]:
+                continue
             a, b = 2 * i, 2 * i + 1
             m_sym = l15[a]
             if m_sym > 13:
@@ -1570,7 +1577,7 @@ class Bc7Calibrator:
         self.pbit_parity = {}
         self.ep_obs = {}
 
-    def add_reference_chunk(self, lanes, ref_blocks, nblocks):
+    def add_reference_chunk(self, lanes, ref_blocks, nblocks, *, valid_blocks=None):
         """Algebraically invert direct built-in BC7 history references from exact blocks."""
         cfg = self.tab["config"]
         rank_of = self.tab["rank_of"]
@@ -1580,6 +1587,8 @@ class Bc7Calibrator:
         deint0, deint1 = bcpack._DEINT
 
         for i in range(min(nblocks, 256)):
+            if valid_blocks is not None and not valid_blocks[i]:
+                continue
             aa, bb = 2 * i, 2 * i + 1
             s15a, s15b = l15[aa], l15[bb]
             rank = rank_of[s15a * 16 + s15b] if s15a < 32 and s15b < 16 else -1
@@ -2113,13 +2122,15 @@ def apply_ref_dds(pool_path, index, dds_path, calibrators):
         seen_chunks = set()
         # Build virtual-offset map of retiled DDS mip bytes.
         tiled_ranges: dict[int, bytearray] = {}
+        known_ranges: dict[int, bytearray] = {}
         for m, mip in enumerate(lay["mips"]):
             if m >= len(mips):
                 break
             start = d["base"] + mip["offset"]
             if start not in tiled_ranges:
                 tiled_ranges[start] = bytearray(mip["region"])
-            _retile_mip_into(mips[m], lay, mip, tiled_ranges[start])
+                known_ranges[start] = bytearray(mip["region"])
+            _retile_mip_into(mips[m], lay, mip, tiled_ranges[start], known_ranges[start])
         # Match every BCPack chunk touching those mips.
         for m, mip in enumerate(lay["mips"]):
             if m >= len(mips):
@@ -2134,23 +2145,27 @@ def apply_ref_dds(pool_path, index, dds_path, calibrators):
                     continue
                 # Assemble the chunk's reference tiled bytes from `tiled_ranges`.
                 ref_chunk = bytearray(csize)
-                covered = 0
+                known_chunk = bytearray(csize)
                 for mstart, mtiled in tiled_ranges.items():
                     mend = mstart + len(mtiled)
                     lo = max(virt, mstart)
                     hi = min(virt + csize, mend)
                     if lo < hi:
                         ref_chunk[lo - virt:hi - virt] = mtiled[lo - mstart:hi - mstart]
-                        covered += hi - lo
-                if covered == 0:
-                    continue
+                        known_chunk[lo - virt:hi - virt] = known_ranges[mstart][lo - mstart:hi - mstart]
                 eb = bcpack.BLOCK_BYTES[codec]
                 nblocks = csize // eb
                 max_b = min(nblocks, 256)
+                # DDS files contain visible blocks only. Tiled padding and
+                # bytes belonging to absent mips are not reference evidence.
+                valid_blocks = [all(known_chunk[i * eb:(i + 1) * eb]) for i in range(max_b)]
+                if not any(valid_blocks):
+                    continue
                 raw = pool.data[src:src + packed]
                 sym_per_blk = 1 if codec in (1, 4) else 2
                 lanes = decode_lanes_prefix(raw, codec, csize, max_b * sym_per_blk)
-                calibrators[codec].add_reference_chunk(lanes, bytes(ref_chunk), max_b)
+                calibrators[codec].add_reference_chunk(lanes, bytes(ref_chunk), max_b,
+                                                      valid_blocks=valid_blocks)
                 seen_chunks.add(key)
     finally:
         pool.close()

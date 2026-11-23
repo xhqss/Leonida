@@ -247,7 +247,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
                          emulate=unittest.mock.ANY, keep_emulated=True, fallbacks=unittest.mock.ANY),
             call.assets(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), False, unittest.mock.ANY),
             call.runtime(os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY, None,
-                         unittest.mock.ANY),
+                         unittest.mock.ANY, work=os.path.abspath(self.work_dir)),
             call.pipelines(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir), unittest.mock.ANY,
                            runtime_build=None),
         ]
@@ -615,7 +615,7 @@ class PathContainmentAndDiskSpaceTest(unittest.TestCase):
 
     @patch.object(sys, "version_info", (3, 12, 0))
     def test_preflight_space_calculation_and_failure(self):
-        # Shaders needs 30GB, Assets needs 300GB -> 330GB total
+        # Shaders needs 30GB, Assets needs 370GB -> 400GB total
         def fake_which(cmd):
             if cmd in ("dotnet", "llvm-mc", "spirv-as", "spirv-val"):
                 return f"/bin/{cmd}"
@@ -626,12 +626,12 @@ class PathContainmentAndDiskSpaceTest(unittest.TestCase):
                 with patch("make_game.ensure_submodule"):
                     with patch("os.makedirs"):
                         with patch("shutil.disk_usage") as mock_disk:
-                            mock_disk.return_value = MagicMock(free=100 * (2**30))  # 100 GB available < 330 GB
+                            mock_disk.return_value = MagicMock(free=100 * (2**30))  # 100 GB available < 400 GB
                             with patch("sys.stderr", new_callable=io.StringIO) as mock_err:
                                 with self.assertRaises(SystemExit) as ctx:
                                     make_game.preflight(["shaders", "assets"], work="C:/work")
                                 self.assertEqual(ctx.exception.code, 1)
-                                self.assertIn("about 330 GB is needed", mock_err.getvalue())
+                                self.assertIn("about 400 GB is needed", mock_err.getvalue())
 
 
 class ToolAvailableTest(unittest.TestCase):

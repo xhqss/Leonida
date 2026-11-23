@@ -270,6 +270,41 @@ shipped modules, not a claim that the game never queries for them.
 The `GraphicsCommandList` ASCII string occurs 30 times in `XboxBvhBuilder.dll` (type/debug
 names); `PresentX` does not occur in any of the 16 DLLs.
 
+
+### 3.2a No shipped module passes an unknown GUID at a call site
+
+Section 3.2's byte scan can only recognise *known* IIDs; a console-only GUID (the four list IIDs of
+[`d3d12_xs_surface.md §4`](d3d12_xs_surface.md)) would scan as anonymous data. The call-site scan closes
+that hole: `tools/d3d12_guid_sites.py` enumerates every 16-byte constant a module's code can name —
+RIP-relative `lea` targets in data sections, absolute pointers stored in data, two adjacent
+`movabs` immediates that inline a GUID without a constant pool, and `mov reg, [rip+...]` loads
+through import slots (a GUID imported as data) — and reports which are GUID-shaped. Over all 16
+modules of the 1.0.2.1 package:
+
+| Binary | GUID-shaped constants the code references |
+|---|---|
+| `XboxBvhBuilder.dll` | 2: `IID_ID3D12RootSignature`, `IID_ID3D12PipelineState` (the same pair as §3.2) |
+| `amd_fidelityfx_upscaler_xbox.dll` | 8: the §3.2 set, nothing else |
+| `amd_fidelityfx_loader_xbox.dll` | 0 |
+| the other 13 modules | 0–44 GUIDs each (six have none); where present they are HTTP, WinRT and CRT interfaces — none of these modules imports `d3d12_xs.dll`, so none can call D3D12 at all |
+
+No module loads a GUID through an import slot, and no `movabs` pair inlines one. As a control, the
+upscaler's single `IID_ID3D12Device` reference (rva `0x482f0`) is the IID of a real slot-0
+`QueryInterface` call (`(this, &IID, &out)`, decompiled at rva `0xde66`). So the only
+interfaces any shipped module can name at a `QueryInterface` or a creation call are the ten it
+already uses; a console compute/copy list IID cannot appear in the package, statically, in any
+form. The same scan looks for code-referenced static `D3D12_COMMAND_QUEUE_DESC` windows
+`{Type, Priority, Flags, NodeMask}`: 10 windows in 3 modules survive the shape filter, every one with
+`Type` 1 — a PC enum value — and all of them offset tables read by stride arithmetic, not queue
+descriptions (checked by decompiling the referencing function of the upscaler's six). None has a
+value past `VIDEO_DECODE` (4), so the DMA type's numeric value has no static source in the package
+either.
+
+Reproduce: `python -I tools/d3d12_guid_sites.py <package>/*.dll --known
+IID_ID3D12ConsDmaCommandList=30bc77b9-8379-4b25-95de-b8588c42275d` (prints GUID values and counts
+only). The four list IIDs and the DMA type remain reachable only through the running title, as
+[`d3d12_xs_surface.md §4`](d3d12_xs_surface.md) already requires for the IIDs.
+
 ### 3.3 The BVH builder's command-list call sites
 
 The exported `BuildRaytracingAccelerationStructure` (ordinal 3, RVA `0x21610`) copies the input
@@ -466,9 +501,16 @@ vtable pointer of a public object.
   at `+0x18`, a copy of the kind-6 program at `+0x28` with its exact size at `+0x30`, and kind 7 at `+0x38`
   ([fspx.md](fspx.md)). The proxy maps the console desc to `D3D12_COMPUTE_PIPELINE_STATE_DESC` and routes it to
   `CreateComputePipelineState` (PC slot 11). On a PC device that call fails (`E_FAIL`) because the code is not a PC
-  shader, so the DLL falls back to slot 62; its message for that failure calls the fallback "NewBE". The Vulkan
-  device takes the bare kind-6 program and finds its translated module by `fspx_code_sha256` ([fspx.md](fspx.md),
-  "Build and run-time lookup"), for the programs the build translated.
+  shader, so the DLL falls back to slot 62; its message for that failure calls the fallback "NewBE". With kind 0 in
+  the description (always, from this DLL) the proxy passes all four pairs on as one `FSPX` payload, checking each pair
+  before reading it. The Vulkan device then finds the translated module by `fspx_code_sha256` and `fspx_state_sha256`
+  ([fspx.md](fspx.md), "Build and run-time lookup"), for the programs the build translated.
+  - **The layout is pinned from the DLL's code:** its FSPX reader (`0x1a20`), the same loop inline for a container,
+    and the copy into the description. The kind 0 and kind 6 of one call come from the same payload. With the
+    reader run on all 29 programs, every translated program resolves to its own entry ([fspx.md](fspx.md), "How
+    the table was pinned").
+  - **A failed call is logged with its number** (`slot 67 call N failed`). The DLL creates its pipelines one after
+    another, so a miss is not necessarily the first call's.
 - **Slot 62** (call at `0x5825`) takes the measured `(D3D12_COMPUTE_PIPELINE_STATE_DESC*, 0, 0, riid, out)`. The PC
   runtime refuses the DLL's code (`E_FAIL`): it is not a PC shader. The DLL's pipeline function then returns
   `0x8000000d` (`0x4b85`), but the dispatch goes on, records the null pipeline and faults (`0x65ff`), which is where a
@@ -482,9 +524,20 @@ vtable pointer of a public object.
   the largest value (`+0x10f8`). Before a dispatch whose pipeline has a non-zero value (`0x64d3`; zero skips the
   binding), the DLL creates the scratch buffer once, `largest * 0xd0` bytes rounded up to 64 KiB, through device
   slot 27 in state `UNORDERED_ACCESS` (`0x65ab`), names it `FFX_XBox_ComputeScratch`, and binds it with list slot
-  141 `(2, GPU VA, buffer size, this pipeline's value)` (`0x65f8`). Measured: the calls and the arithmetic. Open:
-  what the slot-11 object is, the unit of its dword (the factor 1024 suggests KiB), the meaning of `0xd0`, and
-  of the leading `2`.
+  141 `(2, GPU VA, buffer size, this pipeline's value)` (`0x65f8`). Measured: the calls and the arithmetic.
+  - **Failure and zero (measured, `0x585c` to `0x58b1`).** The value at `+0x44` is set to 0 before the call. A failed
+    HRESULT or a null `obj` skips to the function's success return with the value still 0, so pipeline creation does
+    not depend on slot 11. At dispatch a value of 0 skips both the scratch buffer and list slot 141 (`0x64d6`).
+  - **The object (measured shape, hypothesis about its type).** Slot 3 is called with no arguments and its result is
+    read as a pointer to the dword; slot 2 releases it. That is the shape of `ID3DBlob::GetBufferPointer` and
+    `Release`.
+  - **No per-program size (measured on the 29 programs).** `COMPUTE_PGM_RSRC2.SCRATCH_EN` is clear in all 29, no
+    program has a `scratch_*` or `flat_scratch` instruction, and kind-0 words 0, 1 and 2 are each one value across
+    all 29.
+  - **Implemented.** The Vulkan device's pipeline answers slot 11 with a blob holding 0; console slots 9 and 10
+    return `E_NOTIMPL`. A translated module keeps its private data in SPIR-V, not in a console scratch buffer.
+  - **Open.** What the console returns there for these programs, the unit of the dword (the factor 1024 suggests
+    KiB), the meaning of `0xd0`, and of the leading `2`.
 - The DLL's 29 shaders are `DXBC` containers with `SFI0`, `ISG1`, `OSG1`, `PSV0`, `RTS0`, `HASH` and `ACCC` parts
   and no `DXIL`. The `ACCC` payload starts with the tag `FSPX` in all 29; the game's own native shaders are `FSSM`
   inside `XBCH` ([design.md](design.md)). `FSPX` is a directory around an uncompressed RDNA2 program and its
@@ -664,7 +717,8 @@ Even taking both projects at face value, the following remain **Open**:
 - the Xbox queue vtable beyond the public chain (`PresentX`, `SuspendX`, `ResumeX`);
 - the `PresentX` signature, plane struct, resource/view arrays and swapchain parameters;
 - the command-list extension slots other than the ones sections 3.3a and 3.5a measured (71, 73, 80, 85, 141, 146, 148);
-- the DMA list type's real numeric value and the compute/copy console list IIDs;
+- the DMA list type's real numeric value and the compute/copy console list IIDs, which the package
+  itself cannot supply (§3.2a): they need the running title or a vendor runtime;
 - any Xbox-specific return convention on these interfaces.
 
 ## 5. What a runtime can do without the executable
@@ -780,7 +834,8 @@ command object.
 | `SuspendX` / `ResumeX` | No slot or signature. |
 | Xbox queue/list/fence/allocator slot deviations | No runtime binary and no game executable; the package has no queue, fence or allocator client, and its only command-list client is the BVH builder. |
 | Builder's list field `+0x350` | Read once (`0x1d877`) and not explained by the inline buffer of section 3.5a, which covers `+0x18`, `+0x28`, `+0x30`, `+0x140`, `+0x141`, `+0x344` and `+0x544`. |
-| DMA list use/value | The IID is prior art; type 6 is derived; no shipped module uses it. |
+| DMA list use/value | The IID is prior art; type 6 is derived; no shipped module uses it, and no module can name any GUID at a call site beyond its known ten or holds a static queue description with a non-PC type (§3.2a). |
+| Compute/copy console list IIDs | Not exported (see #3520) and not present at any call site (§3.2a); only the running title can supply them. |
 
 ### 5.4 GCL8 (resolved in PR #164)
 

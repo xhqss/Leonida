@@ -60,6 +60,21 @@ public:
 };
 """
 
+BRANCHED_HEADER = """\
+MIDL_INTERFACE("77777777-7777-7777-7777-777777777777")
+IBranched : public IUnknown
+{
+public:
+#if defined(_MSC_VER) || !defined(_WIN32)
+    virtual THING_DESC STDMETHODCALLTYPE GetDesc(void) = 0;
+#else
+    virtual THING_DESC *STDMETHODCALLTYPE GetDesc(
+        THING_DESC * RetVal) = 0;
+#endif
+    virtual UINT STDMETHODCALLTYPE GetCount(void) = 0;
+};
+"""
+
 ORPHAN_HEADER = """\
 MIDL_INTERFACE("33333333-3333-3333-3333-333333333333")
 IOrphan : public IMissing
@@ -239,6 +254,25 @@ class CoverageTests(unittest.TestCase):
     def test_repeated_interface_is_reported_once(self):
         report = gen.coverage(IFACES, ["IChild", "IChild"], [self.source])
         self.assertEqual([row["interface"] for row in report], ["IChild"])
+
+    def test_method_declared_in_both_preprocessor_branches_counts_once(self):
+        # d3d12.h declares struct-returning methods in both branches of #if/#else; that is one method.
+        interfaces = gen.parse_interfaces(BRANCHED_HEADER)
+        self.assertEqual(gen.coverage(interfaces, ["IBranched"], []), [{
+            "interface": "IBranched",
+            "methods": 2,
+            "implemented": 0,
+            "open": ["IBranched::GetDesc", "IBranched::GetCount"],
+        }])
+        with open(self.source, "w", encoding="utf-8", newline="\n") as f:
+            f.write("THING_DESC STDMETHODCALLTYPE GetDesc() { return {}; }\n")
+        report = gen.coverage(interfaces, ["IBranched"], [self.source])
+        self.assertEqual((report[0]["methods"], report[0]["implemented"], report[0]["open"]),
+                         (2, 1, ["IBranched::GetCount"]))
+        # The stub class keeps both branches, so it compiles under either side of the condition.
+        text = gen.emit_class(interfaces, "IBranched")
+        self.assertEqual(text.count('stub("IBranched::GetDesc")'), 2)
+        self.assertIn("\n#else\n", text)
 
 
 class MainTests(unittest.TestCase):

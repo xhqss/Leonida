@@ -48,6 +48,23 @@ def floats(words):
 
 
 class ComputedIJ(unittest.TestCase):
+    def test_swap_reads_both_incoming_barycentrics(self) -> None:
+        _, words = run(["v_swap_b32 v0, v1", "exp mrt0 v0, v1, v0, v1 done vm", "s_endpgm"])
+        self.assertEqual(floats(words), (J, I, J, I))
+
+    def test_swap_overwrites_interpolation_weight_in_second_operand(self) -> None:
+        # A copy of I ceases to be pristine too when it is the second operand of the swap.
+        for weight in ("v0", "v8"):
+            with self.subTest(weight=weight):
+                setup = ["v_mov_b32 v8, v0"] if weight == "v8" else []
+                _, words = run(setup + [
+                    "v_mov_b32 v6, 0.125", f"v_swap_b32 v6, {weight}",
+                    f"v_interp_p1_f32 v2, {weight}, attr0.x", "v_interp_p2_f32 v2, v1, attr0.x",
+                    f"v_interp_p1_f32 v3, {weight}, attr0.y", "v_interp_p2_f32 v3, v1, attr0.y",
+                    "exp mrt0 v2, v3, v6, v2 done vm", "s_endpgm",
+                ])
+                self.assertEqual(floats(words), (0.25, 2 * J, I, 0.25))
+
     def test_zeroed_pair_reads_the_provoking_vertex(self):
         """Vonsek's zero-source row: I' = J' = 0 interpolate to P0 = (0, 0) on every pixel."""
         _, w = run(["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",

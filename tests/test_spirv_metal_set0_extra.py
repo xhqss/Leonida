@@ -343,7 +343,7 @@ def _make_fake_spirv_tools(dis_name="spirv-dis", asm_name="spirv-as"):
     """Return a subprocess.run replacement backed by the synthetic SPIR-V binary codec."""
     calls: list[list[str]] = []
 
-    def fake_run(cmd, check=False, capture_output=False, text=False, input=None):
+    def fake_run(cmd, check=False, capture_output=False, text=False, input=None, errors=None):
         calls.append(list(cmd))
         exe = cmd[0]
         if exe == dis_name:
@@ -903,7 +903,7 @@ class TestMainAndCli(unittest.TestCase):
                 disasm = header_text + "OpCapability Shader\n"
                 seen_cmds = []
 
-                def run_stub(cmd, check=False, capture_output=False, text=False, input=None):
+                def run_stub(cmd, check=False, capture_output=False, text=False, input=None, errors=None):
                     seen_cmds.append((list(cmd), check, capture_output, text, input))
                     if len(seen_cmds) == 1:
                         return subprocess.CompletedProcess(cmd, 0, disasm, "")

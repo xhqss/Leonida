@@ -7,11 +7,14 @@ an input or another output.
 case-insensitive macOS volume also case-folded and with composed and decomposed accents treated alike) or when both
 exist and `os.path.samefile` says they are one file (a hard link, another spelling the name rules missed). Neither
 path has to exist: two report paths that don't exist yet still collide when they differ only in case on a volume that
-ignores case. Standard library only; no game data.
+ignores case. Where the name rules cannot tell, `same_name_on_folding_volume` asks the volume itself with one
+scratch folder: a Linux mount that folds case (vfat, exFAT, CIFS) answers neither `normcase` nor `pathconf`.
+Standard library only; no game data.
 """
 import os
 import posixpath
 import sys
+import tempfile
 import unicodedata
 
 _PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
@@ -46,10 +49,34 @@ def path_key(path):
     return path
 
 
+def same_name_on_folding_volume(first, second):
+    """True when two names that differ only by case are one file on the volume that holds them.
+
+    os.path.normcase folds case only on Windows and the `pathconf` probe above answers only on macOS, so a Linux
+    mount that ignores case (vfat, exFAT, CIFS) would pass `R.json` and `r.json` as two reports and let the second
+    one overwrite the first. Ask the volume itself: create one spelling in a scratch folder beside the reports and
+    look for the other. Names that differ by more than case are never one file, so that costs nothing.
+    """
+    first, second = os.path.realpath(first), os.path.realpath(second)
+    first_dir, first_name = os.path.split(first)
+    second_dir, second_name = os.path.split(second)
+    if first_name.casefold() != second_name.casefold():
+        return False
+    try:
+        if not os.path.samefile(first_dir, second_dir):
+            return False
+        with tempfile.TemporaryDirectory(prefix=".leonida-report-", dir=first_dir) as probe:
+            with open(os.path.join(probe, first_name), "xb"):
+                return os.path.exists(os.path.join(probe, second_name))
+    except OSError:
+        return False
+
+
 def same_report_path(first, second):
     if path_key(first) == path_key(second):
         return True
     try:
         return os.path.samefile(first, second)
     except OSError:
-        return False
+        pass
+    return same_name_on_folding_volume(first, second)

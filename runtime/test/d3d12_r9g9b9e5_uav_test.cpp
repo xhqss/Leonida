@@ -17,6 +17,7 @@
 //
 // Synthetic data only; no game files. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/uav_clear.h"
@@ -581,7 +582,7 @@ int main() {
 
         // 4. Differential UAV clear comparison against Windows WARP.
         Ref<ID3D12Device> warp;
-        {
+        if (!hostwine::host_is_wine()) {
             Ref<IDXGIFactory4> factory;
             Ref<IDXGIAdapter> adapter;
             if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) &&
@@ -615,9 +616,26 @@ int main() {
                 {false, {}, {0xdeadbeefu, 0x3f800000u, 0u, 0u}, {{2, 2, 4, 4}}},
             });
         }
+        // WARP's words for each case, row by row (docs/d3d12_vulkan.md: half-up rounding, uint clears write 0).
+        const auto same = [](std::uint32_t w) {
+            std::array<std::uint32_t, 16> a{};
+            a.fill(w);
+            return a;
+        };
+        constexpr std::uint32_t A = 0x94010040u, B = 0x79010100u;
+        const std::array<std::array<std::uint32_t, 16>, 6> warp_answers = {
+            same(0x94010040u), same(0x840e0501u), same(0x80000100u), same(0xf803fe00u), same(0u),
+            std::array<std::uint32_t, 16>{A, A, A, A, A, B, B, A, A, B, 0, 0, A, A, 0, 0},
+        };
         for (std::size_t c = 0; c < clear_cases.size(); ++c) {
             std::vector<std::uint32_t> vk_words;
             EXPECT(run_uav_clear_sequence(device.p, true, clear_cases[c], vk_words));
+            for (std::size_t i = 0; i < vk_words.size(); ++i) {
+                if (vk_words[i] == warp_answers[c][i]) continue;
+                std::fprintf(stderr, "clear case %zu texel %zu: 0x%08x, WARP writes 0x%08x\n", c, i, vk_words[i],
+                             warp_answers[c][i]);
+                return 1;
+            }
             if (warp.p) {
                 std::vector<std::uint32_t> warp_words;
                 EXPECT(run_uav_clear_sequence(warp.p, false, clear_cases[c], warp_words));
@@ -629,7 +647,7 @@ int main() {
             }
         }
         std::printf("UAV clears: %zu/%zu cases %s\n", clear_cases.size(), clear_cases.size(),
-                    warp.p ? "matched WARP bit-for-bit" : "succeeded (WARP unavailable)");
+                    warp.p ? "matched WARP bit-for-bit" : "matched WARP's recorded words (WARP unavailable)");
 
         // 5. CopyResource / CopyTextureRegion between UAV (emulated R32_UINT) and plain non-UAV (E5B9G9R9) textures,
         //    plus WriteToSubresource / ReadFromSubresource on a CPU-visible custom-heap UAV texture.

@@ -174,9 +174,18 @@ adjacent-Z voxel difference:
 
 | Pool / index | Dimensions | DXGI format | B/voxel | 3D tile | `padded_d` | Span (B) | 3D Z-diff | 2D stacked control | Ratio |
 |---|---|---|---:|---|---:|---:|---:|---:|---:|
-| `ttdb_graphics.ttpf` #901 | 256×32×8 | 54 `R16_FLOAT` | 2 | 16×8×16 | 16 | 262,144 | 0.023623 | 0.124305 | 5.3× smoother |
+| `ttdb_graphics.ttpf` #901 | 256×32×8 | 54 `R16_FLOAT` | 2 | 8×16×16 | 16 | 262,144 | 0.004238 | 0.124305 | 29.3× smoother |
 | `ttdb_graphics.ttpf` #575 | 32×32×32 | 10 `R16G16B16A16_FLOAT` | 8 | 8×8×8 | 32 | 262,144 | 0.036721 | 0.565428 | 15.4× smoother |
 | `ttdb_graphics.ttpf` #200 | 32×64×32 | 10 `R16G16B16A16_FLOAT` | 8 | 8×8×8 | 32 | 524,288 | 0.016793 | 0.110316 | 6.6× smoother |
+
+The intra-tile bit order (`VOLUME_PATTERNS_4K` in `tools/ttpf_mips.py`) and the tile extents
+(`_VOLUME_4K_TILE` in `tools/tex_headers.py`) are Mesa addrlib's `GFX10_SW_4K_S3_PATINFO` (the RbPlus table is
+identical), the same as rpf9-explorer's `VolumePatterns`. Until this was corrected, the rows for 2-, 4- and
+16-byte elements matched no GFX10 pattern in addrlib, and the 2-byte tile was taken as 16×8×16 instead of
+8×16×16. Only #901 uses one of those rows. The adjacent-Z check above could not catch it (the wrong order still
+kept most Z neighbours together: 5.3× against the control), but the X/Y neighbours could: as a share of the mean
+difference between random voxel pairs, adjacent-Y differences were 0.357 with the old order and are 0.067 now, and
+adjacent-Z 0.029 and 0.007 (adjacent-X 0.007 and 0.015). The two 8-byte volumes use the unchanged row.
 
 ## 43-bit `(meta, extra)` streaming chunk-page metadata
 

@@ -113,12 +113,12 @@ inline std::optional<LUID>& layer_adapter() {
 // LEONIDA_HOST_ADAPTER names an adapter that cannot be had, the run fails: a typo must not turn the comparisons into a
 // silent pass.
 inline bool create_host(Ptr<ID3D12Device>& host, std::string& name) {
-    char want[128] = {};
-    const bool named = GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", want, sizeof(want)) && want[0];
+    const std::string needle = hostadapter::wanted();
+    const bool named = !needle.empty();
     if (!named && layer_adapter() && try_create_host(host, name, &*layer_adapter())) return true;
     if (try_create_host(host, name)) return true;
     if (named) {
-        std::fprintf(stderr, "LEONIDA_HOST_ADAPTER=%s: no such adapter, or no D3D12 device on it\n", want);
+        std::fprintf(stderr, "LEONIDA_HOST_ADAPTER=%s: no such adapter, or no D3D12 device on it\n", needle.c_str());
         std::exit(1);
     }
     return false;

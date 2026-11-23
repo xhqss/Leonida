@@ -6,7 +6,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: no-game-data-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  # Coalesce superseded pending pushes per branch without canceling an active main build.
+  group: no-game-data-${{ github.event_name }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions: {}
@@ -24,7 +25,7 @@ jobs:
           fetch-depth: 1
       - name: No game data tracked
         run: |
-          bad=$(git ls-files | grep -iE '\.(rpf|ttpf|xvd|msixvc|dxbc|fssm|spv|spvasm|dds|bk2|awc|r9modeldata|obj|glb|ogg|wav|exe|dll)$' || true)
+          bad=$(git ls-files -z | grep -ziE '\.(rpf|ttpf|xvd|msixvc|dxbc|fssm|spv|spvasm|dds|bk2|awc|r9modeldata|obj|glb|ogg|wav|exe|dll)$' | tr '\0' '\n' || true)
           if [ -n "$bad" ]; then
             echo "Game or binary files tracked:"
             echo "$bad"

@@ -177,7 +177,7 @@ class ShortsTest(unittest.TestCase):
         for jobs in ("1", "2"):
             with self.subTest(jobs=jobs):
                 result = subprocess.run([sys.executable, "-I", tool, path, self.out, "--jobs", jobs],
-                                        capture_output=True, text=True, timeout=60)
+                                        capture_output=True, text=True, errors="replace", timeout=60)
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn("blocked", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)

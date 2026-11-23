@@ -11,6 +11,9 @@
 ;   s0 = mode: 0 append, 1 consume   s[4:5] = console VA of the table's first slot (32 bytes a slot)
 ;   slot 0 (+0x00): V#, structured buffer, stride 8, 256 records; the counter V# in +0x10 (raw, 4 bytes)
 ;   slot 1 (+0x20): V#, raw buffer, 128 records of 8 bytes (written by consume)
+; D3D12 build: runtime/CMakeLists.txt builds this with LEONIDA_USER_DATA_SHIFT=4, so in the PSO every SGPR named
+; here is 4 higher (the console compute layout starts the root arguments at s4, D3D-448). The table pointer
+; then reads s[8:9]: s8 is the table's 32-bit VA and s9 a user dword the runtime leaves zero.
 ; g = 64 * group + lane
 ;   append:  i = counter++ (buffer_atomic_add, glc returns the old value); record i = { g, g * 3 + 1 }
 ;   consume: i = --counter (the old value of buffer_atomic_sub, minus one); out[g] = record i

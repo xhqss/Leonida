@@ -228,16 +228,25 @@ def write_for_index(spirv_dir):
     index_path = os.path.join(spirv_dir, "index.json")
     if not os.path.isfile(index_path):
         return []
-    with open(index_path, encoding="utf-8") as f:
-        index = json.load(f)
+    try:
+        with open(index_path, encoding="utf-8") as f:
+            index = json.load(f)
+    except (ValueError, RecursionError) as e:
+        raise RuntimeError(f"{index_path}: invalid JSON ({e})") from None
+    if not isinstance(index, dict):
+        raise RuntimeError(f"{index_path}: expected a shader index object")
     written = []
     for name, meta in sorted(index.items()):
         lay = meta.get("mesh_compute") if isinstance(meta, dict) else None
         if not lay:
             continue
+        try:
+            asm = vs_spvasm(lay)
+        except (AttributeError, KeyError, OverflowError, TypeError, ValueError) as e:
+            raise RuntimeError(f"{index_path}: invalid mesh_compute layout for {name!r}: {e}") from None
         path = os.path.join(spirv_dir, name + SUFFIX + ".spvasm")
         with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(vs_spvasm(lay))
+            f.write(asm)
         written.append(path)
     return written
 

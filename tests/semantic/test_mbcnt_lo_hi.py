@@ -488,12 +488,11 @@ class TestSpirvMiniInterpMbcnt(unittest.TestCase):
         self.assertEqual(results, list(range(64)))
 
     def test_ps_mbcnt_lo_wave32(self):
-        """v_mbcnt_lo on lanes 0..31 gives lane; lanes >= 32 clamp 32."""
+        """A wave32 pixel shader counts lanes independently in both halves of a 64-lane subgroup."""
         lines = ["v_mbcnt_lo_u32_b32 v0, -1, 0"]
-        for lane in range(32):
-            self.assertEqual(run_ps_mbcnt_lines(lines, lane), lane)
-        for lane in (32, 45, 63):
-            self.assertEqual(run_ps_mbcnt_lines(lines, lane), 32)
+        for lane in range(64):
+            with self.subTest(subgroup_lane=lane):
+                self.assertEqual(run_ps_mbcnt_lines(lines, lane), lane & 31)
 
     def test_ps_mbcnt_hi_lanes(self):
         """v_mbcnt_hi on lanes < 32 adds 0; lanes >= 32 count relative bits."""

@@ -1,6 +1,9 @@
 #include "dxgi_com.h"
 #include "d3d12_stubs.h"
 
+#include <winternl.h>  // NTSTATUS, which d3dkmthk.h needs and WIN32_LEAN_AND_MEAN leaves out
+#include <d3dkmthk.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -230,6 +233,7 @@ public:
         const std::uint32_t h = size.height;
         const bool allow_tearing = (flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
         if (!swapchain_.create(hwnd, w, h, vk_fmt, desc.BufferCount, allow_tearing)) return false;
+        source_size_ = {w, h};
         if (flags_ & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
             // DXGI: waitable swapchains default to maximum frame latency 1.
             max_frame_latency_.store(1, std::memory_order_relaxed);
@@ -371,6 +375,7 @@ public:
         const UINT next_flags = flags ? flags : flags_;
         const bool allow_tearing = (next_flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
         if (!swapchain_.resize(w, h, vk_fmt, count, allow_tearing)) return E_FAIL;
+        source_size_ = {w, h};  // host-measured: ResizeBuffers resets the source region to the new back buffers
         statistics_disjoint_.store(true, std::memory_order_relaxed);
         flags_ = next_flags;
         register_buffers();
@@ -392,7 +397,37 @@ public:
             return DXGI_ERROR_INVALID_CALL;
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput**) override { return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE; }
+    HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput** out) override {
+        if (!out) return DXGI_ERROR_INVALID_CALL;
+        *out = nullptr;
+        if (!parent_) return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+        IDXGIAdapter* adapter = nullptr;
+        if (FAILED(parent_->EnumAdapters(0, &adapter)) || !adapter) return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+
+        const HMONITOR target = hwnd_ ? MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST) : nullptr;
+        IDXGIOutput* fallback = nullptr;
+        for (UINT i = 0;; ++i) {
+            IDXGIOutput* candidate = nullptr;
+            if (adapter->EnumOutputs(i, &candidate) == DXGI_ERROR_NOT_FOUND) break;
+            if (!candidate) continue;
+            DXGI_OUTPUT_DESC desc{};
+            if (target && SUCCEEDED(candidate->GetDesc(&desc)) && desc.Monitor == target) {
+                if (fallback) fallback->Release();
+                adapter->Release();
+                *out = candidate;
+                return S_OK;
+            }
+            if (!fallback) {
+                fallback = candidate;
+            } else {
+                candidate->Release();
+            }
+        }
+        adapter->Release();
+        if (!fallback) return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+        *out = fallback;
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS* stats) override {
         if (!stats) return DXGI_ERROR_INVALID_CALL;
         std::memset(stats, 0, sizeof(*stats));
@@ -480,10 +515,18 @@ public:
     }
 
     // IDXGISwapChain2
-    HRESULT STDMETHODCALLTYPE SetSourceSize(UINT, UINT) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetSourceSize(UINT width, UINT height) override {
+        // Host-measured: a region larger than either back-buffer dimension is refused and keeps the stored one;
+        // zero is accepted. Present does not scale by it yet (documented difference).
+        const VkExtent2D extent = swapchain_.extent();
+        if (width > extent.width || height > extent.height) return DXGI_ERROR_INVALID_CALL;
+        source_size_ = {width, height};
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetSourceSize(UINT* w, UINT* h) override {
-        if (w) *w = swapchain_.extent().width;
-        if (h) *h = swapchain_.extent().height;
+        if (!w || !h) return DXGI_ERROR_INVALID_CALL;  // host-measured: both are required
+        *w = source_size_.width;
+        *h = source_size_.height;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT max_latency) override {
@@ -508,16 +551,11 @@ public:
             return nullptr;
         return dup;
     }
-    HRESULT STDMETHODCALLTYPE SetMatrixTransform(const DXGI_MATRIX_3X2_F* matrix) override {
-        if (!matrix) return E_INVALIDARG;
-        matrix_transform_ = *matrix;
-        return S_OK;
-    }
-    HRESULT STDMETHODCALLTYPE GetMatrixTransform(DXGI_MATRIX_3X2_F* matrix) override {
-        if (!matrix) return E_INVALIDARG;
-        *matrix = matrix_transform_;
-        return S_OK;
-    }
+    // A matrix transform belongs to composition swapchains only (CreateSwapChainForComposition, E_NOTIMPL here).
+    // Host DXGI answers DXGI_ERROR_INVALID_CALL to both methods on an HWND swapchain, with a matrix or with null
+    // (Windows 11, RTX 5060 Ti, driver 621.14); every swapchain the layer creates gets that answer.
+    HRESULT STDMETHODCALLTYPE SetMatrixTransform(const DXGI_MATRIX_3X2_F*) override { return DXGI_ERROR_INVALID_CALL; }
+    HRESULT STDMETHODCALLTYPE GetMatrixTransform(DXGI_MATRIX_3X2_F*) override { return DXGI_ERROR_INVALID_CALL; }
 
     // IDXGISwapChain3
     UINT STDMETHODCALLTYPE GetCurrentBackBufferIndex() override { return swapchain_.current_back_buffer_index(); }
@@ -587,8 +625,8 @@ private:
     std::atomic<LONGLONG> last_present_qpc_{0};
     std::atomic<UINT> max_frame_latency_{2};
     DXGI_RGBA background_color_{0, 0, 0, 0};
-    DXGI_MATRIX_3X2_F matrix_transform_{1, 0, 0, 1, 0, 0};
     DXGI_MODE_ROTATION rotation_ = DXGI_MODE_ROTATION_IDENTITY;
+    VkExtent2D source_size_{0, 0};
 };
 
 struct ReservationState {
@@ -628,14 +666,429 @@ std::uint32_t primary_device_local_heap(const VkPhysicalDeviceMemoryProperties& 
     return best;
 }
 
+// Snapshot of a Win32 monitor (or synthetic headless fallback) exposed through IDXGIOutput*.
+// Defaults target a 1920x1080@60 Hz primary output; Win32 enumeration must also fill desktop_coords explicitly.
+struct DisplayInfo {
+    HMONITOR monitor = nullptr;
+    WCHAR device_name[CCHDEVICENAME] = L"\\\\.\\DISPLAY1";  // matches DXGI_OUTPUT_DESC::DeviceName (32 WCHARs, NUL-terminated)
+    RECT desktop_coords{0, 0, 1920, 1080};  // Default desktop coordinates
+    DXGI_MODE_ROTATION rotation = DXGI_MODE_ROTATION_IDENTITY;
+    UINT current_width = 1920;
+    UINT current_height = 1080;
+    UINT current_refresh_hz = 60;
+    bool primary = true;
+};
+
+static_assert(sizeof(DisplayInfo{}.device_name) == sizeof(DXGI_OUTPUT_DESC{}.DeviceName));
+
+// Maps Win32 DEVMODEW::dmDisplayOrientation (valid only when DM_DISPLAYORIENTATION is set in dmFields)
+// to DXGI_MODE_ROTATION.
+constexpr DXGI_MODE_ROTATION rotation_from_dm(const DEVMODEW& dm) noexcept {
+    if ((dm.dmFields & DM_DISPLAYORIENTATION) == 0)  // dmDisplayOrientation is in a union and undefined without this flag
+        return DXGI_MODE_ROTATION_IDENTITY;
+    switch (dm.dmDisplayOrientation) {
+    case DMDO_90: return DXGI_MODE_ROTATION_ROTATE90;
+    case DMDO_180: return DXGI_MODE_ROTATION_ROTATE180;
+    case DMDO_270: return DXGI_MODE_ROTATION_ROTATE270;
+    default: return DXGI_MODE_ROTATION_IDENTITY;  // covers DMDO_DEFAULT and unexpected values
+    }
+}
+
+BOOL CALLBACK collect_monitor_cb(HMONITOR hmon, HDC, LPRECT, LPARAM lparam) {
+    auto* displays = reinterpret_cast<std::vector<DisplayInfo>*>(lparam);
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(hmon, &mi)) return TRUE;
+
+    DisplayInfo info{};
+    info.monitor = hmon;
+    info.desktop_coords = mi.rcMonitor;
+    info.primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+    // szDevice is CCHDEVICENAME (32) WCHARs; _TRUNCATE guarantees a trailing NUL even on unexpected input.
+    wcsncpy_s(info.device_name, mi.szDevice, _TRUNCATE);
+
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) {
+        if ((dm.dmFields & (DM_PELSWIDTH | DM_PELSHEIGHT)) == (DM_PELSWIDTH | DM_PELSHEIGHT) &&
+            dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0) {
+            info.current_width = dm.dmPelsWidth;
+            info.current_height = dm.dmPelsHeight;
+        }
+        // Win32 drivers may report 0 or 1 as "hardware default" rather than an actual Hz rate.
+        if ((dm.dmFields & DM_DISPLAYFREQUENCY) != 0 && dm.dmDisplayFrequency > 1)
+            info.current_refresh_hz = dm.dmDisplayFrequency;
+        info.rotation = rotation_from_dm(dm);
+    }
+
+    displays->push_back(info);
+    return TRUE;
+}
+
+// Enumerates attached Win32 displays with the primary monitor at index 0 (matching DXGI's EnumOutputs contract),
+// falling back to a single 1920x1080@60 output in headless environments with no desktop monitors.
+std::vector<DisplayInfo> enumerate_displays() {
+    std::vector<DisplayInfo> displays;
+    EnumDisplayMonitors(nullptr, nullptr, &collect_monitor_cb, reinterpret_cast<LPARAM>(&displays));
+    if (displays.empty()) {
+        displays.push_back(DisplayInfo{});
+        return displays;
+    }
+    // Keep enumeration order among secondary monitors while ensuring primary is output 0.
+    for (std::size_t i = 1; i < displays.size(); ++i) {
+        if (displays[i].primary) {
+            DisplayInfo primary_info = displays[i];
+            for (std::size_t j = i; j > 0; --j) displays[j] = displays[j - 1];
+            displays[0] = primary_info;
+            break;
+        }
+    }
+    return displays;
+}
+
+bool is_supported_display_format(DXGI_FORMAT fmt) noexcept {
+    switch (fmt) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::vector<DXGI_MODE_DESC> collect_modes(const DisplayInfo& info, DXGI_FORMAT fmt) {
+    std::vector<DXGI_MODE_DESC> modes;
+    if (!is_supported_display_format(fmt)) return modes;
+
+    std::set<std::tuple<UINT, UINT, UINT>> seen;
+    auto push_mode = [&](UINT w, UINT h, UINT hz) {
+        if (!w || !h || !hz) return;
+        if (!seen.emplace(w, h, hz).second) return;
+        DXGI_MODE_DESC m{};
+        m.Width = w;
+        m.Height = h;
+        m.RefreshRate = {hz, 1};
+        m.Format = fmt;
+        m.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_PROGRESSIVE;
+        m.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
+        modes.push_back(m);
+    };
+
+    if (info.monitor) {
+        // Bound the driver enumeration loop defensively in case a faulty driver never stops returning modes.
+        for (DWORD i = 0; i < 4096; ++i) {
+            DEVMODEW dm{};
+            dm.dmSize = sizeof(dm);
+            if (!EnumDisplaySettingsW(info.device_name, i, &dm)) break;
+            if ((dm.dmFields & (DM_PELSWIDTH | DM_PELSHEIGHT)) != (DM_PELSWIDTH | DM_PELSHEIGHT) ||
+                dm.dmPelsWidth == 0 || dm.dmPelsHeight == 0)
+                continue;
+            const UINT hz =
+                ((dm.dmFields & DM_DISPLAYFREQUENCY) != 0 && dm.dmDisplayFrequency > 1) ? dm.dmDisplayFrequency
+                                                                                        : info.current_refresh_hz;
+            push_mode(dm.dmPelsWidth, dm.dmPelsHeight, hz);
+        }
+    }
+    push_mode(info.current_width, info.current_height, info.current_refresh_hz);
+
+    std::sort(modes.begin(), modes.end(), [](const DXGI_MODE_DESC& a, const DXGI_MODE_DESC& b) {
+        return std::tie(a.Width, a.Height, a.RefreshRate.Numerator) <
+               std::tie(b.Width, b.Height, b.RefreshRate.Numerator);
+    });
+    return modes;
+}
+
+constexpr DXGI_MODE_DESC1 to_mode_desc1(const DXGI_MODE_DESC& m) noexcept {
+    return {m.Width, m.Height, m.RefreshRate, m.Format, m.ScanlineOrdering, m.Scaling, FALSE};
+}
+
+constexpr DXGI_MODE_DESC from_mode_desc1(const DXGI_MODE_DESC1& m) noexcept {
+    return {m.Width, m.Height, m.RefreshRate, m.Format, m.ScanlineOrdering, m.Scaling};
+}
+
+template <class DescT, class ConvertFn>
+HRESULT fill_mode_list(const DisplayInfo& info, DXGI_FORMAT fmt, UINT* num_modes, DescT* out, ConvertFn convert) {
+    if (!num_modes) return DXGI_ERROR_INVALID_CALL;
+    const std::vector<DXGI_MODE_DESC> modes = collect_modes(info, fmt);
+    const UINT total = static_cast<UINT>(modes.size());
+    if (!out) {
+        *num_modes = total;
+        return S_OK;
+    }
+    const UINT to_copy = std::min(*num_modes, total);
+    for (UINT i = 0; i < to_copy; ++i) out[i] = convert(modes[i]);
+    // Host DXGI writes the number of copied entries back into *pNumModes when returning MORE_DATA.
+    *num_modes = to_copy;
+    return (to_copy < total) ? DXGI_ERROR_MORE_DATA : S_OK;
+}
+
+HRESULT find_closest_mode(const DisplayInfo& info, const DXGI_MODE_DESC& req, IUnknown* concerned_device,
+                          DXGI_MODE_DESC& out) {
+    out = {};
+    if (req.Format == DXGI_FORMAT_UNKNOWN && !concerned_device) return DXGI_ERROR_INVALID_CALL;
+    const DXGI_FORMAT target_fmt = (req.Format == DXGI_FORMAT_UNKNOWN) ? DXGI_FORMAT_B8G8R8A8_UNORM : req.Format;
+    const std::vector<DXGI_MODE_DESC> modes = collect_modes(info, target_fmt);
+    if (modes.empty()) return DXGI_ERROR_NOT_FOUND;
+
+    const UINT target_w = req.Width ? req.Width : info.current_width;
+    const UINT target_h = req.Height ? req.Height : info.current_height;
+    const bool has_refresh = (req.RefreshRate.Numerator > 0 && req.RefreshRate.Denominator > 0);
+    const std::uint64_t target_mhz =
+        has_refresh ? (std::uint64_t(req.RefreshRate.Numerator) * 1000ull) / req.RefreshRate.Denominator
+                    : std::uint64_t(info.current_refresh_hz) * 1000ull;
+
+    auto abs_diff = [](std::uint64_t a, std::uint64_t b) -> std::uint64_t { return a > b ? (a - b) : (b - a); };
+    auto score = [&](const DXGI_MODE_DESC& m) {
+        const std::uint64_t area_diff = abs_diff(std::uint64_t(m.Width) * m.Height, std::uint64_t(target_w) * target_h);
+        const std::uint64_t dim_diff = abs_diff(m.Width, target_w) + abs_diff(m.Height, target_h);
+        const std::uint64_t m_mhz =
+            m.RefreshRate.Denominator ? (std::uint64_t(m.RefreshRate.Numerator) * 1000ull) / m.RefreshRate.Denominator : 0;
+        const std::uint64_t hz_diff = abs_diff(m_mhz, target_mhz);
+        return std::make_tuple(dim_diff, area_diff, hz_diff);
+    };
+
+    const DXGI_MODE_DESC* best = &modes[0];
+    auto best_score = score(*best);
+    for (std::size_t i = 1; i < modes.size(); ++i) {
+        const auto s = score(modes[i]);
+        if (s < best_score) {
+            best = &modes[i];
+            best_score = s;
+        }
+    }
+    out = *best;
+    return S_OK;
+}
+
+void wait_for_vblank() {
+    using DwmFlushFn = HRESULT(WINAPI*)();
+    static const DwmFlushFn dwm_flush = []() -> DwmFlushFn {
+        // Resolve dynamically so dxgi_com.cpp needs no extra dwmapi.lib link entry in CMakeLists.txt.
+        const HMODULE mod = LoadLibraryW(L"dwmapi.dll");
+        return mod ? reinterpret_cast<DwmFlushFn>(GetProcAddress(mod, "DwmFlush")) : nullptr;
+    }();
+    if (dwm_flush && SUCCEEDED(dwm_flush())) return;
+    Sleep(16);
+}
+
+// Win32/DXGI-backed IDXGIOutput6 reporting desktop monitor descriptors and display modes.
+class Output final : public IDXGIOutput6 {
+public:
+    Output(IDXGIAdapter* parent, DisplayInfo info) : parent_(parent), info_(info) {
+        if (parent_) parent_->AddRef();
+    }
+
+    ~Output() {
+        if (parent_) parent_->Release();
+    }
+
+    // IUnknown
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = --refs_;
+        if (!left) delete this;
+        return left;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) || riid == __uuidof(IDXGIOutput) ||
+            riid == __uuidof(IDXGIOutput1) || riid == __uuidof(IDXGIOutput2) || riid == __uuidof(IDXGIOutput3) ||
+            riid == __uuidof(IDXGIOutput4) || riid == __uuidof(IDXGIOutput5) || riid == __uuidof(IDXGIOutput6)) {
+            *out = static_cast<IDXGIOutput6*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    // IDXGIObject
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return DXGI_ERROR_NOT_FOUND; }
+    HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!parent_) return E_NOINTERFACE;
+        return parent_->QueryInterface(riid, out);
+    }
+
+    // IDXGIOutput
+    HRESULT STDMETHODCALLTYPE GetDesc(DXGI_OUTPUT_DESC* desc) override {
+        if (!desc) return E_INVALIDARG;
+        fill_base_desc(*desc);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetDisplayModeList(DXGI_FORMAT fmt, UINT, UINT* num_modes, DXGI_MODE_DESC* desc) override {
+        return fill_mode_list(info_, fmt, num_modes, desc, [](const DXGI_MODE_DESC& m) { return m; });
+    }
+    HRESULT STDMETHODCALLTYPE FindClosestMatchingMode(const DXGI_MODE_DESC* mode_to_match, DXGI_MODE_DESC* closest,
+                                                      IUnknown* concerned_device) override {
+        if (!mode_to_match || !closest) return DXGI_ERROR_INVALID_CALL;
+        return find_closest_mode(info_, *mode_to_match, concerned_device, *closest);
+    }
+    HRESULT STDMETHODCALLTYPE WaitForVBlank() override {
+        wait_for_vblank();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE TakeOwnership(IUnknown* device, BOOL) override {
+        return device ? S_OK : E_INVALIDARG;
+    }
+    void STDMETHODCALLTYPE ReleaseOwnership() override {}
+    HRESULT STDMETHODCALLTYPE GetGammaControlCapabilities(DXGI_GAMMA_CONTROL_CAPABILITIES* caps) override {
+        if (caps) std::memset(caps, 0, sizeof(*caps));
+        return DXGI_ERROR_INVALID_CALL;
+    }
+    HRESULT STDMETHODCALLTYPE SetGammaControl(const DXGI_GAMMA_CONTROL*) override { return DXGI_ERROR_INVALID_CALL; }
+    HRESULT STDMETHODCALLTYPE GetGammaControl(DXGI_GAMMA_CONTROL*) override { return DXGI_ERROR_INVALID_CALL; }
+    HRESULT STDMETHODCALLTYPE SetDisplaySurface(IDXGISurface*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetDisplaySurfaceData(IDXGISurface*) override { return DXGI_ERROR_INVALID_CALL; }
+    HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS* stats) override {
+        if (!stats) return DXGI_ERROR_INVALID_CALL;
+        std::memset(stats, 0, sizeof(*stats));
+        LARGE_INTEGER qpc{};
+        if (QueryPerformanceCounter(&qpc)) stats->SyncQPCTime = qpc;
+        return S_OK;
+    }
+
+    // IDXGIOutput1
+    HRESULT STDMETHODCALLTYPE GetDisplayModeList1(DXGI_FORMAT fmt, UINT, UINT* num_modes,
+                                                  DXGI_MODE_DESC1* desc) override {
+        return fill_mode_list(info_, fmt, num_modes, desc, to_mode_desc1);
+    }
+    HRESULT STDMETHODCALLTYPE FindClosestMatchingMode1(const DXGI_MODE_DESC1* mode_to_match, DXGI_MODE_DESC1* closest,
+                                                       IUnknown* concerned_device) override {
+        if (!mode_to_match || !closest) return DXGI_ERROR_INVALID_CALL;
+        DXGI_MODE_DESC best{};
+        const HRESULT hr = find_closest_mode(info_, from_mode_desc1(*mode_to_match), concerned_device, best);
+        *closest = SUCCEEDED(hr) ? to_mode_desc1(best) : DXGI_MODE_DESC1{};
+        return hr;
+    }
+    HRESULT STDMETHODCALLTYPE GetDisplaySurfaceData1(IDXGIResource*) override { return DXGI_ERROR_INVALID_CALL; }
+    HRESULT STDMETHODCALLTYPE DuplicateOutput(IUnknown* device, IDXGIOutputDuplication** dup) override {
+        if (dup) *dup = nullptr;
+        if (!device || !dup) return E_INVALIDARG;
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+
+    // IDXGIOutput2
+    BOOL STDMETHODCALLTYPE SupportsOverlays() override { return FALSE; }
+
+    // IDXGIOutput3
+    HRESULT STDMETHODCALLTYPE CheckOverlaySupport(DXGI_FORMAT, IUnknown* device, UINT* flags) override {
+        if (flags) *flags = 0;
+        return (device && flags) ? S_OK : E_INVALIDARG;
+    }
+
+    // IDXGIOutput4
+    HRESULT STDMETHODCALLTYPE CheckOverlayColorSpaceSupport(DXGI_FORMAT, DXGI_COLOR_SPACE_TYPE, IUnknown* device,
+                                                            UINT* flags) override {
+        if (flags) *flags = 0;
+        return (device && flags) ? S_OK : E_INVALIDARG;
+    }
+
+    // IDXGIOutput5
+    HRESULT STDMETHODCALLTYPE DuplicateOutput1(IUnknown* device, UINT, UINT, const DXGI_FORMAT*,
+                                               IDXGIOutputDuplication** dup) override {
+        if (dup) *dup = nullptr;
+        if (!device || !dup) return E_INVALIDARG;
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+
+    // IDXGIOutput6
+    HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_OUTPUT_DESC1* desc) override {
+        if (!desc) return E_INVALIDARG;
+        std::memset(desc, 0, sizeof(*desc));
+        DXGI_OUTPUT_DESC base{};
+        fill_base_desc(base);
+        std::memcpy(desc->DeviceName, base.DeviceName, sizeof(desc->DeviceName));
+        desc->DesktopCoordinates = base.DesktopCoordinates;
+        desc->AttachedToDesktop = base.AttachedToDesktop;
+        desc->Rotation = base.Rotation;
+        desc->Monitor = base.Monitor;
+        desc->BitsPerColor = 8;
+        desc->ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+        // Standard sRGB / ITU-R BT.709 primaries and baseline SDR luminance.
+        desc->RedPrimary[0] = 0.64f;
+        desc->RedPrimary[1] = 0.33f;
+        desc->GreenPrimary[0] = 0.30f;
+        desc->GreenPrimary[1] = 0.60f;
+        desc->BluePrimary[0] = 0.15f;
+        desc->BluePrimary[1] = 0.06f;
+        desc->WhitePoint[0] = 0.3127f;
+        desc->WhitePoint[1] = 0.3290f;
+        desc->MinLuminance = 0.0f;
+        desc->MaxLuminance = 80.0f;
+        desc->MaxFullFrameLuminance = 80.0f;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE CheckHardwareCompositionSupport(UINT* flags) override {
+        if (!flags) return E_INVALIDARG;
+        *flags = 0;
+        return S_OK;
+    }
+
+private:
+    void fill_base_desc(DXGI_OUTPUT_DESC& desc) const noexcept {
+        std::memset(&desc, 0, sizeof(desc));
+        std::memcpy(desc.DeviceName, info_.device_name, sizeof(desc.DeviceName));
+        desc.DesktopCoordinates = info_.desktop_coords;
+        desc.AttachedToDesktop = TRUE;
+        desc.Rotation = info_.rotation;
+        desc.Monitor = info_.monitor;
+    }
+
+    std::atomic<ULONG> refs_{1};
+    IDXGIAdapter* parent_ = nullptr;
+    DisplayInfo info_{};
+};
+
+
 // Vulkan-backed IDXGIAdapter3 reporting the physical device's name, IDs, LUID (matching
 // ID3D12Device::GetAdapterLuid), memory heap sizes, and video memory budget info.
+
+// The adapter's user-mode driver version, as DXGI's CheckInterfaceSupport(IDXGIDevice) reports it: what
+// D3DKMTQueryAdapterInfo(KMTQAITYPE_UMD_DRIVER_VERSION) gives for the adapter's LUID (measured equal to host DXGI on
+// an RTX 5060 Ti, 0x0020000000100842 for driver 621.14, and on WARP). gdi32's entry points are looked up at run
+// time and the host dxgi.dll isn't used; 0 when they are missing (Wine) or the query fails.
+LARGE_INTEGER umd_driver_version(LUID luid) {
+    LARGE_INTEGER version{};
+    if (!luid.LowPart && !luid.HighPart) return version;
+    HMODULE gdi32 = GetModuleHandleW(L"gdi32.dll");
+    if (!gdi32) gdi32 = LoadLibraryW(L"gdi32.dll");
+    if (!gdi32) return version;
+    const auto open = reinterpret_cast<decltype(&D3DKMTOpenAdapterFromLuid)>(
+        GetProcAddress(gdi32, "D3DKMTOpenAdapterFromLuid"));
+    const auto query = reinterpret_cast<decltype(&D3DKMTQueryAdapterInfo)>(
+        GetProcAddress(gdi32, "D3DKMTQueryAdapterInfo"));
+    const auto close = reinterpret_cast<decltype(&D3DKMTCloseAdapter)>(GetProcAddress(gdi32, "D3DKMTCloseAdapter"));
+    if (!open || !query || !close) return version;
+    D3DKMT_OPENADAPTERFROMLUID adapter{};
+    adapter.AdapterLuid = luid;
+    if (open(&adapter) != 0) return version;
+    D3DKMT_UMD_DRIVER_VERSION umd{};
+    D3DKMT_QUERYADAPTERINFO info{};
+    info.hAdapter = adapter.hAdapter;
+    info.Type = KMTQAITYPE_UMD_DRIVER_VERSION;
+    info.pPrivateDriverData = &umd;
+    info.PrivateDriverDataSize = sizeof(umd);
+    if (query(&info) == 0) version = umd.DriverVersion;
+    D3DKMT_CLOSEADAPTER closing{adapter.hAdapter};
+    close(&closing);
+    return version;
+}
+
 class Adapter final : public IDXGIAdapter3 {
 public:
     Adapter(IDXGIFactory4* parent, PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical)
         : parent_(parent), gipa_(gipa), instance_(instance), physical_(physical) {
         if (parent_) parent_->AddRef();
         populate_desc();
+        umd_version_ = umd_driver_version(desc_.AdapterLuid);
         reservations_ = adapter_reservation_state(desc_.AdapterLuid, physical_);
     }
 
@@ -682,9 +1135,13 @@ public:
     }
 
     // IDXGIAdapter
-    HRESULT STDMETHODCALLTYPE EnumOutputs(UINT, IDXGIOutput** out) override {
-        if (out) *out = nullptr;
-        return DXGI_ERROR_NOT_FOUND;
+    HRESULT STDMETHODCALLTYPE EnumOutputs(UINT index, IDXGIOutput** out) override {
+        if (!out) return E_INVALIDARG;
+        *out = nullptr;
+        const std::vector<DisplayInfo> displays = enumerate_displays();
+        if (index >= displays.size()) return DXGI_ERROR_NOT_FOUND;
+        *out = new Output(static_cast<IDXGIAdapter*>(this), displays[index]);
+        return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetDesc(DXGI_ADAPTER_DESC* desc) override {
         if (!desc) return E_INVALIDARG;
@@ -701,7 +1158,7 @@ public:
     }
     HRESULT STDMETHODCALLTYPE CheckInterfaceSupport(REFGUID interface_name, LARGE_INTEGER* umd_version) override {
         if (interface_name == __uuidof(IDXGIDevice)) {
-            if (umd_version) umd_version->QuadPart = 0;
+            if (umd_version) *umd_version = umd_version_;
             return S_OK;
         }
         return DXGI_ERROR_UNSUPPORTED;
@@ -871,6 +1328,7 @@ private:
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
     DXGI_ADAPTER_DESC2 desc_{};
+    LARGE_INTEGER umd_version_{};  // CheckInterfaceSupport(IDXGIDevice): the adapter's user-mode driver version
     bool has_memory_budget_ = false;
     std::shared_ptr<ReservationState> reservations_;
 };
@@ -1073,8 +1531,19 @@ public:
         return create_swap_chain(device, hwnd, desc, restrict_to_output, out);
     }
     HRESULT STDMETHODCALLTYPE GetSharedResourceAdapterLuid(HANDLE, LUID*) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE RegisterStereoStatusWindow(HWND, UINT, DWORD*) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE RegisterStereoStatusEvent(HANDLE, DWORD*) override { return E_NOTIMPL; }
+    // Microsoft documents S_OK with a cookie for UnregisterStereoStatus (E_NOTIMPL is only the answer of the
+    // Windows 7 Platform Update). Stereo is never enabled here, so the window or event is never notified.
+    HRESULT STDMETHODCALLTYPE RegisterStereoStatusWindow(HWND hwnd, UINT msg, DWORD* cookie) override {
+        (void)msg;
+        if (!hwnd || !cookie) return DXGI_ERROR_INVALID_CALL;
+        *cookie = next_stereo_cookie_.fetch_add(1, std::memory_order_relaxed);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE RegisterStereoStatusEvent(HANDLE event, DWORD* cookie) override {
+        if (!event || !cookie) return DXGI_ERROR_INVALID_CALL;
+        *cookie = next_stereo_cookie_.fetch_add(1, std::memory_order_relaxed);
+        return S_OK;
+    }
     void STDMETHODCALLTYPE UnregisterStereoStatus(DWORD) override {}
     HRESULT STDMETHODCALLTYPE RegisterOcclusionStatusWindow(HWND hwnd, UINT msg, DWORD* cookie) override {
         (void)msg;
@@ -1210,6 +1679,7 @@ private:
     std::mutex adapters_changed_mutex_;
     std::map<DWORD, HANDLE> adapters_changed_events_;
     DWORD next_adapters_changed_cookie_ = 1;
+    std::atomic<DWORD> next_stereo_cookie_{1};
 };
 
 }  // namespace

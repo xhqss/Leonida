@@ -45,7 +45,7 @@ DECLARATION_OPS = TYPE_OPS | {OP_ENTRY_POINT, OP_CONSTANT, OP_SPEC_CONSTANT, OP_
                              OP_GROUP_DECORATE, OP_GROUP_MEMBER_DECORATE}
 TYPE_OPERANDS = {OP_TYPE_INT: 3, OP_TYPE_FLOAT: 2, OP_TYPE_VECTOR: 3, OP_TYPE_MATRIX: 3,
                  OP_TYPE_ARRAY: 3, OP_TYPE_POINTER: 3}
-EXECUTION_STAGES = {0: "vs", 3: "gs", 4: "ps", 5365: "ms"}
+EXECUTION_STAGES = {0: "vs", 3: "gs", 4: "ps", 5268: "ms", 5365: "ms"}  # MeshNV and MeshEXT
 STORAGE_INPUT = 1
 STORAGE_OUTPUT = 3
 DEC_BLOCK = 2
@@ -228,6 +228,7 @@ def decode_literal_string(words):
 class Module:
     def __init__(self, data):
         words = parse_words(data)
+        self.version = words[1]
         self.bound = words[3]
         self.types = {}
         self.constants = {}
@@ -260,8 +261,10 @@ class Module:
 
     def read_instruction(self, opcode, operands, at):
         if opcode in TYPE_OPS:
-            exact = TYPE_OPERANDS.get(opcode)
-            self.require_operands(operands, at, exact or 1, exact)
+            required = TYPE_OPERANDS.get(opcode)
+            # OpTypeFloat can also carry an optional FPEncoding operand.
+            maximum = 3 if opcode == OP_TYPE_FLOAT else required
+            self.require_operands(operands, at, required or 1, maximum)
             identifier, *args = operands
             self.define(identifier)
             self.types[identifier] = (opcode, tuple(args))
@@ -285,7 +288,10 @@ class Module:
             ids = tuple(rest[words_used:])
             for identifier in ids:
                 self.require_id(identifier)
-            if len(set(ids)) != len(ids):
+            if self.version < 0x00010400:
+                # OpEntryPoint permits repeated interface IDs before SPIR-V 1.4.
+                ids = tuple(dict.fromkeys(ids))
+            elif len(set(ids)) != len(ids):
                 raise InterfaceError(f"duplicate entry-point interface ID in {name!r}")
             self.entry_points.append(EntryPoint(model, name, ids))
         elif opcode in (OP_DECORATE, OP_MEMBER_DECORATE):
@@ -351,7 +357,7 @@ class Module:
                 f"varying array length %{identifier} is not a literal OpConstant or OpSpecConstant"
             ) from None
         opcode, args = self.type_declaration(type_id)
-        if opcode != OP_TYPE_INT or args[0] not in (16, 32, 64) or args[1] not in (0, 1):
+        if opcode != OP_TYPE_INT or args[0] not in (8, 16, 32, 64) or args[1] not in (0, 1):
             raise InterfaceError("varying array length must be an integer")
         width, signed = args
         if len(literal) != (width + 31) // 32:
@@ -369,6 +375,8 @@ class Module:
         opcode, args = self.type_declaration(identifier)
         nested = (*path, identifier)
         if opcode in (OP_TYPE_INT, OP_TYPE_FLOAT):
+            if opcode == OP_TYPE_FLOAT and len(args) > 1:
+                raise InterfaceError(f"unsupported floating-point encoding {args[1]} in graphics interface")
             width = args[0]
             if width not in (16, 32, 64) or (opcode == OP_TYPE_INT and args[1] not in (0, 1)):
                 raise InterfaceError("unsupported numeric type in graphics interface")

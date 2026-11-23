@@ -12,9 +12,6 @@ No game data is reproduced here.
 - A `.#ft` fragment carries the shared 597-name humanoid skeleton and the character's bounds. The
   measured skeleton is in [character_skeleton.md](character_skeleton.md).
 
-The current exporter writes every fragment as a **25-vertex bounds cube** with `Embedded: null`
-(2,865 of 2,865). Fragment child drawables are not walked, so a part that exists only as a
-fragment child is not in the OBJ/GLB output even though its parent fragment is.
 The current exporter writes every fragment as a **flat 25-vertex / 32-triangle bounds grid** (a 5x5
 grid at z=0, `Min`/`Max` z = 0) with `Embedded: null` (2,865 of 2,865). Fragment child drawables
 are not walked, so a part that exists only as a fragment child is not in the OBJ/GLB output even
@@ -32,8 +29,8 @@ The decoded export used by the previews contains 13 parts:
 | head L2 | same | 599 | 514 | same preset |
 | eyes | `…_head_fr1_lat_000_m_eyes.#dr` | 434 | 816 | `0x429453B7A2EB9980` (sRGB + alpha) |
 | eyecap | `…_head_fr1_lat_000_m_eyecap.#dr` | 214 | 304 | `0x5CE55BAA340248BD` (sRGB + alpha) |
-| hands | `hand_fr1_000_nude_cull.#dr` | 10,440 | 13,534 | none in the package — `0x4D89F2311DBBB7A8` is in no TTPF pool (see [Hands and feet](#hands-and-feet)) |
-| feet | `feet_fr1_000_full.#dr` | 2,309 | 4,082 | none in the package — `0xA54D9F8B51CA6034` is in no TTPF pool (see [Hands and feet](#hands-and-feet)) |
+| hands | `hand_fr1_000_nude_cull.#dr` | 10,440 | 13,534 | no exact hit for `0x4D89F2311DBBB7A8` in the 57 scanned TTPF pools (see [Hands and feet](#hands-and-feet)) |
+| feet | `feet_fr1_000_full.#dr` | 2,309 | 4,082 | no exact hit for `0xA54D9F8B51CA6034` in the 57 scanned TTPF pools (see [Hands and feet](#hands-and-feet)) |
 | body (legacy) | `cs_lucia_legacypedcs_fr1_000_fullbody_ws00_full.#dr` | 874 | 908 | `0x996FDBA2DB30CC12` |
 | legacy head | `cs_lucia_legacyheadcs_fr1_001_regular_ws00_full.#dr` | 592 | 1,028 | `0x707771F769AA3542` |
 | jacket (biker) | `cs_lucia_jacketbiker_fr1_000_regular_c_hl_long_full.#dr` | 9,818 | 10,837 | none — `speculartex` only (`0xF5073AA039BB3CED`) |
@@ -130,7 +127,7 @@ the export binds the slot (1,372 of 1,372). Both keys are 512x256 `BC3_UNORM_SRG
 other textures (`0x93CB433D30220BA6` and `0x5D237CCCD91F8E4D`, 256x128 `BC7_UNORM`), where the
 jacket's and the crop tee's table keys are `BC7_UNORM` `speculartex` sheets themselves.
 
-The hands and feet bind an albedo key that is not in the package (see [Hands and feet](#hands-and-feet)).
+The hands and feet bind albedo keys with no exact hit in the scanned TTPF catalogs (see [Hands and feet](#hands-and-feet)).
 The head drawable has no material texture reference, but its face is selected by
 a **head-skin preset** keyed by the head name's `joaat32`:
 
@@ -144,22 +141,27 @@ The preset library covers 897 heads; `cs_lucia_head_fr1_lat_000_y_full` is not i
 ### Hands and feet
 
 Measured against the catalogs of all 57 TTPF pools (357,115 textures). The hands and the feet bind
-the four maps on the same two shaders (`210FBC6A`, `8D69EDAB`), and **only the normal maps are in
-the package**:
+the four maps on the same two shaders (`210FBC6A`, `8D69EDAB`); for the two examples below,
+**only the normal-map keys have exact catalog hits**. "None" means no matching full 64-bit
+`AssetKey` in these scanned catalogs, not proof that no runtime source exists:
 
 | Part | `diffusetex` | `speculartex` | `bumptex` (normal) | `speculartex2` (ORM) |
 |---|---|---|---|---|
 | hands (`hand_fr1_000_*`) | `0x4D89F2311DBBB7A8` — none | `0xA805B9A446CCE950` — none | `0x9D337DABCA636906` — `ttdb_peds_2_3`, 512×1024 BC5 | `0x09D2C98C5B40D16C` — none |
 | feet (`feet_fr1_000_*`) | `0xA54D9F8B51CA6034` — none | `0x752EA8A7A086558F` — none | `0x5091E86DE6196BC3` — `ttdb_peds_3_3`, 512×1024 BC7 | `0xD5C8D2A180326DE7` — none |
 
-Each material has ten slots; the other six bind `0x5D7A3A87CC19967D` on both shaders, which is in
-no pool either: it reads as an engine-supplied default, not a missing asset.
+Each material has ten slots; the other six bind `0x5D7A3A87CC19967D` on both shaders, with no
+exact pool hit. The [independent indexed-record check](https://github.com/ItsNotRexed/Leonida/pull/3256#pullrequestreview-6014627459)
+found this same reference in all 176 material
+rows, including the 12 positive-control rows whose four named maps all resolve. An engine-supplied
+default is a hypothesis: the repeated unresolved reference alone does not establish its runtime use.
 
-**They are not textured on their own.** The hands and feet share their maps with the body skin
-pieces in `pack/core_restofworld/core_restofworld.rpf`:
+**Shared static material references.** The hands and feet have bindings in common with body skin
+pieces in `pack/core_restofworld/core_restofworld.rpf`; these references do not establish runtime
+sheet selection:
 
 - `bodynipplesgen_fr1_000_regular_ws00_full`, the female upper body, binds **the same four keys**
-  as the hands, on the same two shaders. The hands are drawn with the upper-body skin sheet.
+  as the hands, on the same two shaders.
 - `bodygenitalsgen_f{r,b,o}1_008_regular_ws00_full`, the female lower body (and the `fr1`
   `_alt_00`–`_02` variants), binds the feet's
   `speculartex`, `bumptex` and `speculartex2`, and its own `diffusetex` `0x5B6829CFEC0F41A1`, also in
@@ -167,20 +169,22 @@ pieces in `pack/core_restofworld/core_restofworld.rpf`:
 - The male lower body, `bodygenitalsgen_mr1_000_*`, has all four maps in the pools
   (`diffusetex` `0xBCE4D91DA23689C7`).
 
-So the female body skin has no albedo, specular or ORM map in the package, for the hands and feet
-and for the body pieces that share their sheets. The skin colour has to come from data outside these
-materials, as the face comes from the head-skin preset. That data was not found: none of the keys
-above appears in another resource of `data.rpf`, `common.rpf`, `script.rpf`, `packs.rpf`,
+The unresolved female-body albedo, specular and ORM references above also have no exact hit in
+these pools. The recorded search found none of these keys in another resource of `data.rpf`,
+`common.rpf`, `script.rpf`, `packs.rpf`,
 `anim.rpf`, `core_restofworld.rpf` or `core_restofworld001.rpf` (`story000.rpf` and
-`story000_restofworld.rpf` recover no entries with this reader).
+`story000_restofworld.rpf` recover no entries with this reader). These are static lookup results;
+the source of skin colour and the runtime's sheet selection remain open.
 
-The pattern holds across the set. Of the 56 `hand_`/`feet_` drawables in `packs.rpf`, 52 bind only a
-`diffusetex` key that is in no pool; the four exceptions with all four maps shipped are
+Across 162 indexed records (176 material rows, 56 distinct `hand_`/`feet_` drawable names), all
+176 rows carry the four named references. Of the 56 names in `packs.rpf`, 52 have no exact
+diffuse-key hit in the scanned pools; the four exceptions with all four maps resolved are
 `hand_fsk1_000_nude_cull`, `feet_fsk1_000_nude_cull` and the first-person hands
 `hand_mb1_000_nude_cull_fp` and `hand_mo1_000_nude_cull_fp`. The male hands and feet
-(`hand_mr1_000_nude_cull`, `feet_mr1_000_nude_cull`) also ship only their normal maps, and male and
-female feet bind the same `diffusetex` key. Until the skin data is decoded, render these parts with
-their normal map and a flat skin tone; do not borrow another part's albedo.
+(`hand_mr1_000_nude_cull`, `feet_mr1_000_nude_cull`) also have exact hits only for their normal
+maps, and male and female feet bind the same `diffusetex` key. For previews, use the resolved normal
+map and a flat skin tone; this is a fallback, not a reconstruction of the runtime's skin colouring.
+Do not borrow another part's albedo.
 
 ## Materials
 
@@ -213,10 +217,6 @@ mesh.
 
 A raw RSC8 scan of **862,555** resources across all 13 indexed RPF9 archives (every `rageobj`
 entry, unnamed pages and the >3 MiB band included; 25.6 GB compressed / 56.3 GB inflated) found
-453 ped-skeleton resources: 342 animal bounds, 2,212 `char_bipedbounds_*` fragments, 4 mannequins
-and 73 anim clips. **0** combined a ped skeleton with the skin/flesh shader, and 0 of the 908
-resources on that shader contained a single `SKEL_*` bone name. The unnamed-resource route
-therefore does not add a body.
 2,631 ped-skeleton resources: 342 animal bounds, 2,212 `char_bipedbounds_*` fragments,
 4 mannequins and 73 anim clips. **0** combined a ped skeleton with the skin/flesh shader, and
 0 of the 908 resources that use the skin/flesh shader contained a single `SKEL_*` bone name.
@@ -245,6 +245,133 @@ and `cs_mandy` (their `FragName` is identical). It is the body the game uses; it
 clothed, so it is not a high-detail nude body. A flat-skin render of the 874-v body with its
 normal map disconnected still shows the modelled top, shorts and ankle boots, so the clothing
 silhouette is geometry, not a painted-on atlas.
+
+## Modular ped construction pipeline and body assembly
+
+RAGE 9 constructs human peds from modular streamed slots rather than monolithic rigged meshes.
+Spawning a character resolves a five-stage data graph across `packs.rpf`, `data.rpf`, `common.rpf`,
+`anim.rpf` and `data/ttdb/peds/*.ttpf`:
+
+1. **Identity and archetype table.** `packs.rpf` archetype PSO (`00011d1ff000.pso`, root
+   `0xdd77771e`, 2,714 records, 384 B/record) holds each archetype's `joaat32` hash (`+0x08`) and
+   voice/short name (`+0x174`).
+2. **Outfit slot resolution.** `packs.rpf` outfit-slot PSO (`00011cfbf000.pso`, root `0x890aca98`,
+   2,713 archetypes -> 33,621 outfit hashes) maps each archetype to valid outfit slot hashes with a
+   1:1 link to compiled `0DRP` appearance catalogues.
+3. **Compiled appearance catalogues (`0DRP`) and variation pools.** 2,709 resource-packed `0DRP`
+   catalogues (`0x8dcb4cf5`, v122), the wardrobe catalogue (`00011ccb2000.pso`, 19,827 presets) and
+   80 `0x1edee47e` variation PSOs resolve 88 B presets (`0xf795e8ba`) and 184 B wearable states
+   (`0x37e52277`) to `murmur64` drawable, albedo, normal and `cull_drawable` (`0x46e1a048`) keys.
+4. **Modular geometry, skeleton, deformation and strand grooms.** Three streamed geometry LOD tiers
+   per slot, master `crSkeletonData` in `ambient_*` fragments (454–596 named bones; see
+   [character_skeleton.md](character_skeleton.md#master-skeletons-and-standing-space)),
+   `char_bipedbounds_*` collision rigs, 6,756 quantized blend-shape delta buffers, 449 ML Deformer
+   weight models and 5,751 `smh` GPU strand grooms (20,046 LOD resources; hair drawables in
+   `packs.rpf` are 3-vertex / 1-triangle stubs).
+5. **GPU compute skinning, morphing and deferred/RT shading.** `ped_morphable_model_cs` ->
+   `ped_standard_head_cs` (blendshapes, sticky lips, per-meshlet stretch/wrinkles) ->
+   `ped_skinning_cs` -> `ped_skin_processing` / `ped_standard_skin_tattoo_bake` -> `bvh_skinning`
+   -> `meshlet_culling` (`CS_BatchCullPreSkinnedMeshlets`) -> deferred G-buffer, GPU subsurface
+   scattering and ray-tracing resolve.
+
+### Standing-space coordinate convention
+
+All human modular drawables share a single standing skeleton space anchored at
+**`SKEL_ROOT = (0, 0, +1.0 m)`** in RAGE Z-up (`(0, +1.0 m, 0)` in glTF Y-up). Vertex buffers
+store root-relative bind positions (feet sit near `Z = -1.0 m`), while drawable bounding boxes
+(`root + 0x30..0x4f`) store standing-space bounds. Translating skinned parts by `(0, 0, +1.0 m)`
+aligns `head`, `eyes`, `eyecap`, `teeth`, `hand_*_nude_cull`, `feet_*_nude_cull`,
+`bodynipplesgen_*`, `bodygenitalsgen_*` and garments to sub-millimetre precision without per-slot
+offset tables. Disabled slots use `<12 cm` at-root stub meshes at `(0, 0, -1.0 m)`.
+
+### Modular body slots, `_nude_cull` islands and watertight stitching
+
+Despite their legacy `hand_` and `feet_` prefixes, the canonical base nude body drawables cover the
+entire torso and pelvis:
+
+- **Upper body (`hand_<rig>_000_nude_cull`):** torso, chest, shoulders, arms and hands (first-person
+  arms ship separately as `hand_<rig>_000_nude_cull_fp`).
+- **Lower body (`feet_<rig>_000_nude_cull`):** pelvis, hips, buttocks, legs and feet.
+- **Female nipples (`bodynipplesgen_fr1_000_regular_ws00_full`):** separate `fr1` chest patch
+  sharing the `hand_fr1` `512×1024` UV layout (male `mr1` torsos bake nipples directly into
+  `hand_mr1_000_nude_cull`).
+- **Adult genitals (`bodygenitalsgen_fr1_008_*` and `bodygenitalsgen_mr1_000_*`):** modular `fr1`
+  and `mr1` pelvic patches with four geometry variants (`base`, `_alt_00`, `_alt_01`, `_alt_02`;
+  female depth `6.83–7.58 cm`, male resting `8.9–9.0 cm` and extended `13.4–13.5 cm`).
+
+RAGE 9 uses a two-level culling architecture to prevent skin poke-through without runtime mesh
+rebuilds:
+
+1. **Catalogue swaps (`0x46e1a048` = `"cull_drawable"`):** 385 unique drawables carry `_cull`
+   suffixes — 351 `_cull_00` garments (348/351 paired directly with a `_full` sibling) plus 28
+   `_nude_cull` / `_nude_cull_fp` base skin meshes across the 12 rigs. Wearable states in `0DRP`
+   catalogues map `0x46e1a048` to `0x3d780b74` records (`25,292` resolving to `*_cull*` drawables).
+2. **Physical `_nude_cull` cull islands and coplanar overlap bands:** Base nude drawables are
+   physically split into hundreds of disconnected island patches along garment cuts:
+
+| Drawable | Physical cull islands | Tier 0 V / T | Measured coplanar overlap |
+|---|---:|---:|---|
+| `hand_fr1_000_nude_cull` | **449** | 10,440 / 13,534 | **258** waist tris (`Z = 0.8981..1.0367 m`, 13.86 cm) + **26** nipple tris |
+| `hand_mr1_000_nude_cull` | **290** | 9,914 / 13,534 | **258** waist tris (`Z = 0.9346..1.0739 m`, 13.93 cm) |
+| `feet_fr1_000_nude_cull` | **257** | 4,103 / 4,462 | **64** female genital tris behind `bodygenitalsgen_fr1_008_*` |
+| `feet_mr1_000_nude_cull` | **264** | 4,107 / 4,462 | shares the 258-tri waist band (`<1.5 mm` apart) |
+
+At runtime, an outfit occlusion mask suppresses the overlapping waist strip on one mesh plus any
+islands hidden under garments or modular chest/pelvic patches. Rendering both `hand_*_nude_cull`
+and `feet_*_nude_cull` offline without culling causes Z-fighting on those 258 waist triangles (and
+on the 26 nipple and 64 female genital backing triangles). Culling the coplanar overlapping
+triangles stitches the body with **0 boundary-edge holes** (watertight on both `fr1` and `mr1`).
+`tools/ped_assemble.py` implements standing-space alignment, canonical vertex-key plus
+coplanar-centroid/normal overlap culling and multi-part glTF 2.0 export, verified on synthetic
+overlapping body meshes in `tests/test_ped_assemble.py`:
+
+```powershell
+python -I tools/ped_assemble.py assemble <parts...> -o <out.glb>
+python -I tools/ped_assemble.py cull-overlap --target <upper> --ref <lower> -o <out.glb>
+python -I tools/ped_assemble.py inspect-seams <parts...>
+```
+
+### 15-channel meshlet vertex layout
+
+Character geometry uses GPU meshlets (16-byte headers, up to 128 local vertices per meshlet,
+32-bit packed triangles `7b a | 7b b | 7b c | 11b meshlet_id` plus `uint16` vertex remap). The
+23-slot vertex buffer header (`0x00..0x5b`) carries 15 active streams on modern character heads:
+
+| Slot | Format | Stride | Purpose |
+|---:|---|---:|---|
+| `0` | `0x42` (`0x4042`) | 8 B | Quantized 16-bit XYZ position (`base + q * step`) |
+| `2` | `0x21` | 4 B | Packed octahedral normal + 15-bit tangent frame |
+| `18` / `19` | `0x27` | 4 B | Secondary tangent / rest-pose octahedral normal (`19` heads, `18` body skin) |
+| `6`, `7` | `0x26` | 4 + 4 B | Skinning blend weights (up to 8 influences per vertex) |
+| `8`, `9` | `0x8c` or `0x25` | 16 + 16 B or 4 + 4 B | Bone indices: extended 32 B/vert (`0x8c`, hero heads) vs 8 B/vert (`0x25`, body skin / ambient) |
+| `1`, `12`, `13` | `0x26` | 4 + 4 + 4 B | Three `RGBA8` vertex color / AO / blend-mask / skin-curvature channels |
+| `3`, `4`, `14`, `15` | `0x28` / `0x42` | 4–8 B each | Four UV channels (`UV0` albedo, `UV1` tattoo/suntan/damage, `UV2` wrinkle/micro-detail, `UV3` morphable-model) |
+| `17` | `0x84` | 16 B | Per-vertex basis / blend-shape / ML-deformer stream |
+
+### 3-tier LOD budgets and thresholds
+
+Modular ped drawables in `packs.rpf` stream three separate dictionary tiers per item name plus a
+fourth `slod_human` crowd proxy. Body skin, eyes, teeth, genitals, nipples and garments encode
+`rmcDrawable` `m_LodDist[4]` (`root + 0x70..0x7f`) as **`15.0 m` (LOD 0 -> 1), `30.0 m` (LOD 1 -> 2),
+`60.0 m` (LOD 2 -> 3/SLOD), `9998.0 m`**; heads and `slod_human` store `(9998.0, 9998.0, 9998.0,
+9998.0)` because head tier selection is driven dynamically by the ped component LOD manager.
+
+| Component | Tier 0 (High) | Tier 1 (Med) | Tier 2 (Low) | Notes |
+|---|---:|---:|---:|---|
+| Human head (canonical) | 8,983 v / 13,320 t | 2,958 v / 3,362 t | 599 v / 514 t | Shared topology across 1,600+ modern heads |
+| Eyes (`*_eyes_full`) | 434 v / 816 t | 230 v / 398–408 t | 50–55 v / 80 t | Dual eyeball + cornea |
+| Teeth (`teethmodular_*`) | 3,628 v / 5,582 t | 1,359 v / 2,144 t | 373 v / 556 t | Upper/lower arches + gums + tongue |
+| Upper body nude (`hand_fr1_000_nude_cull`) | 10,440 v / 13,534 t | 5,821 v / 5,168 t | 2,365 v / 1,392 t | `hand_mr1`: 9,914 v / 13,534 t |
+| Lower body nude (`feet_fr1_000_nude_cull`) | 4,103 v / 4,462 t | 2,794 v / 2,112 t | 1,134 v / 606 t | `feet_mr1`: 4,107 v / 4,462 t |
+| First-person arms (`hand_*_nude_cull_fp`) | 8,127 v / 12,342 t | 4,337–4,360 v / 6,000 t | 932–934 v / 1,266 t | Dedicated close-up FP arms |
+| Genitals — female (`bodygenitalsgen_fr1_008_*`) | 267 v / 356 t | 132–139 v / 153–170 t | 35 v / 38 t | Identical across `base`, `alt_00..02` |
+| Genitals — male (`bodygenitalsgen_mr1_000_*`) | 246 v / 352 t | 113–115 v / 176 t | 22 v / 35–36 t | Resting + extended `alt_00..02` |
+| Nipples — female (`bodynipplesgen_fr1_000_*`) | 106 v / 182 t | 90 v / 118 t | 3 v / 1 t | Collapses to 1-tri stub at Tier 2 |
+| SLOD far crowd proxy (`slod_human`) | 392 v / 338 t | — | — | Whole distant character (-99.1%) |
+
+Assembled nude adult budget: ~**27,300–28,000 v / 38,000–38,250 t** at Tier 0 -> ~**13,400 t** at
+Tier 1 (-65%) -> ~**3,200 t** at Tier 2 (-92%) -> **338 t** at SLOD (-99.1%). Clothed characters
+typically span ~**35,000–55,000 t** at Tier 0 excluding GPU hair strands.
 
 ## What is not decoded
 
@@ -288,15 +415,12 @@ silhouette is geometry, not a painted-on atlas.
   `ambient_female` drawable; the Lucia and Mandy hits are props (photos, frames, luggage, a
   curtain). The only human-skeleton meshes in `levels.rpf` are the generic mannequin pair in
   **Bodies**.
-- **Bind pose and skinning.** The delivered GLBs are static: they contain **0 skins, 0 `JOINTS_0`
-  and 0 `WEIGHTS_0`**, so there are no inverse-bind matrices to apply. The reference TRS is the
-  only exported pose, and the meshes are not skinned to the 596-bone ped skeleton. A rigged export
-  is still open; this is a data omission, not identity inverse-bind matrices.
-- **Bind pose and full skinning.** The `rpf9dump` GLBs use identity inverse-bind matrices and do
-  not apply the 8-influence bone-palette skinning. The inverse bind matrices are at skeleton header
-  `+0x30` (the drawable's `+0x18` points at the header) and agree with the default bone transforms;
-  `tools/anim_glb.py` exports a part with them as a glTF skin, with clips (see
-  [character_skeleton.md](character_skeleton.md#animated-gltf-export)).
+- **Bind pose and skinning in static exports.** The static preview and `rpf9dump` GLBs do not apply
+  the 8-influence bone-palette skinning (preview GLBs carry 0 skins, 0 `JOINTS_0` and 0 `WEIGHTS_0`;
+  `rpf9dump` emits identity inverse-bind matrices). The real inverse bind matrices are at skeleton
+  header `+0x30` (drawable `+0x18` points at the header) and agree with the default bone transforms;
+  `tools/anim_glb.py`, `tools/skinned_glb.py` and `tools/ped_assemble.py` export glTF skins with
+  those matrices (see [character_skeleton.md](character_skeleton.md#animated-gltf-export)).
 
 ## Reproduce
 
@@ -308,26 +432,6 @@ python -I tools/fragment_children.py <package>\levels.rpf --jobs 12 --json <work
 The second command prints the fragment and child-drawable totals quoted under "Fragment children"; it
 reads the archive in place (about 22 minutes for `levels.rpf` with 12 workers over a WSL mount of
 the dump) and writes nothing else.
-
-```python
-import json
-
-items = json.load(open(r"<outdir>/packs/models/manifest.json", encoding="utf-8"))["Items"]
-names = sorted({i["Name"] for i in items})
-print(len(items), len(names))
-print(sum(1 for i in items if i.get("IsFragment")), "fragments")
-print([n for n in names if "lucia" in n.lower()])
-```
-
-```python
-import json
-
-items = json.load(open(r"<outdir>/packs/models/manifest.json", encoding="utf-8"))["Items"]
-names = sorted({i["Name"] for i in items})
-print(len(items), len(names))
-print(sum(1 for i in items if i.get("IsFragment")), "fragments")
-print([n for n in names if "lucia" in n.lower()])
-```
 
 The material rows are in the same manifest, one per shader of a record, each with the texture
 references by slot:
@@ -346,19 +450,50 @@ A key's size and format come from the pool that holds it: the `AssetKey`, `Width
 `DxgiFormat` and `Mips` fields of the manifest `rpf9dump ttpf <pool.ttpf> <outdir>` writes.
 
 The [Hands and feet](#hands-and-feet) tables also need `core_restofworld.rpf` and the 57 pool
-catalogs (`AssetKey` in each pool's `manifest.json`):
+catalogs (`AssetKey` in each pool's `manifest.json`).
+
+`rpf9dump ttpf` writes a pool's catalog to `<output root>\<pool basename>\manifest.json`, and pool
+basenames repeat: the 57 pools in [`game/xbox-1.0.2.1.json`](../game/xbox-1.0.2.1.json) have 51
+distinct basenames (`ttdb_maps` and `ttdb_terrain_image_based` twice, `ttdb_ui` and `ttdb_vfx` three
+times). With one output root for all of them, later pools overwrite earlier catalogs. Give each pool
+its package-relative parent folder under `<outdir>\ttpf` as its output root:
 
 ```powershell
-rpf9dump models <pack\core_restofworld\core_restofworld.rpf> <outdir>
-rpf9dump ttpf <each .ttpf under data\ttdb and pack\*\data\ttdb> <outdir>\ttpf\<pool>
+$game = (Resolve-Path "<game root>").Path.TrimEnd("\")
+rpf9dump models "$game\pack\core_restofworld\core_restofworld.rpf" <outdir>
+Get-Item "$game\data\ttdb", "$game\pack\*\data\ttdb" | Get-ChildItem -Recurse -File -Filter *.ttpf | ForEach-Object {
+    rpf9dump ttpf $_.FullName "<outdir>\ttpf\$($_.DirectoryName.Substring($game.Length + 1))"
+}
 ```
 
+Each catalog records its source pool in `src`. The lookup finds catalogs at any depth under
+`<outdir>\ttpf` and stops unless their sources are exactly the 57 pools of the game root, so a
+catalog that was overwritten, exported in another layout or taken from another folder is caught
+before an absent key is read as a lookup miss:
+
 ```python
-import glob, json
+import json
+import os
+from pathlib import Path
 
 maps = {"C8E8C282": "diffusetex", "C6F46E79": "speculartex", "1E77BF4C": "bumptex", "739E3D0D": "speculartex2"}
-pooled = {t["AssetKey"] for m in glob.glob(r"<outdir>/ttpf/*/manifest.json")
-          for t in json.load(open(m, encoding="utf-8"))["Textures"]}
+game = Path(r"<game root>")
+pool_root = Path(r"<outdir>/ttpf")
+
+
+def source(path):
+    return os.path.normcase(os.path.abspath(path))
+
+
+pools = {source(p) for pattern in ("data/ttdb/**/*.ttpf", "pack/*/data/ttdb/**/*.ttpf") for p in game.glob(pattern)}
+sources, pooled = set(), set()
+for m in pool_root.rglob("manifest.json"):
+    catalog = json.loads(m.read_text(encoding="utf-8"))
+    sources.add(source(catalog.get("src", m)))
+    pooled.update(t["AssetKey"] for t in catalog.get("Textures", []))
+if len(pools) != 57 or sources != pools:
+    raise ValueError(f"{len(pools)} pools under {game} (expected 57); {len(pools - sources)} have no catalog "
+                     f"under {pool_root}, {len(sources - pools)} catalogs come from other sources")
 items = [i for m in (r"<outdir>/packs/models/manifest.json", r"<outdir>/core_restofworld/models/manifest.json")
          for i in json.load(open(m, encoding="utf-8"))["Items"]]
 for name in ("hand_fr1_000_nude_cull.#dr", "feet_fr1_000_full.#dr", "bodynipplesgen_fr1_000_regular_ws00_full.#dr",

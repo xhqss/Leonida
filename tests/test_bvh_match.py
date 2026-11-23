@@ -6,6 +6,7 @@ No game data is read.
 """
 import contextlib
 import io
+import itertools
 import json
 import os
 import struct
@@ -181,6 +182,109 @@ class TestMatching(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertIn("found no model in its window", err)
 
+    def test_json_over_the_dehydrated_input_is_refused_before_it_is_read(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        blas = os.path.join(self.dir, "blas.bin")
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [group(2)]},
+                                    ["--json", blas])
+        self.assertEqual(status, 2)
+        self.assertIn("--json would overwrite", err)
+        with open(blas, "rb") as f:
+            self.assertEqual(f.read(), src)
+
+    def test_json_over_the_manifest_is_refused(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        manifest = os.path.join(self.dir, "manifest.json")
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [group(2)]},
+                                    ["--json", manifest])
+        self.assertEqual(status, 2)
+        self.assertIn("--json would overwrite", err)
+        with open(manifest, encoding="utf-8") as f:
+            self.assertEqual(len(json.load(f)["Items"]), 1)
+
+    def test_json_over_the_descriptor_is_refused(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        descriptor = os.path.join(self.dir, "instance208.bin")
+        data = bytes(0x50) + struct.pack("<12f", *[v for row in SHIFTED for v in row]) + bytes(60)
+        with open(descriptor, "wb") as f:
+            f.write(data)
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [group(2)]},
+                                    ["--descriptor", descriptor, "--json", descriptor])
+        self.assertEqual(status, 2)
+        self.assertIn("--json would overwrite", err)
+        with open(descriptor, "rb") as f:
+            self.assertEqual(f.read(), data)
+
+    def test_json_over_the_write_export_is_refused(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        out_dir = os.path.join(self.dir, "out")
+        os.makedirs(out_dir)
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [group(2)]},
+                                    ["--write", out_dir, "--json", os.path.join(out_dir, "export.json")])
+        self.assertEqual(status, 2)
+        self.assertIn("--write's export.json", err)
+
+    def test_json_over_a_write_vertex_buffer_is_refused(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        out_dir = os.path.join(self.dir, "out")
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [group(2)]},
+                                    ["--write", out_dir, "--json", os.path.join(out_dir, "g0_f3.bin")])
+        self.assertEqual(status, 2)
+        self.assertIn("--write's g0_f3.bin", err)
+        # Refused before the export runs: no buffer and no export.json were written.
+        self.assertFalse(os.path.exists(os.path.join(out_dir, "export.json")))
+
+    def test_json_over_a_write_index_buffer_is_refused(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        out_dir = os.path.join(self.dir, "out")
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [group(2)]},
+                                    ["--write", out_dir, "--json", os.path.join(out_dir, "g0_tri.bin")])
+        self.assertEqual(status, 2)
+        self.assertIn("--write's g0_tri.bin", err)
+        self.assertFalse(os.path.exists(os.path.join(out_dir, "export.json")))
+
+    def test_json_over_a_later_geometry_buffer_is_refused(self):
+        # Two matched geometries: the report must not land on the second one's buffers either.
+        src, _, _ = build([(0, 0x81, 0, 1, 0x09), (1, 0x81, 0, 1, 0x09)], bounds=BOUNDS)
+        out_dir = os.path.join(self.dir, "out")
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [2, 2])], {"a.obj": [group(2), group(2)]},
+                                    ["--write", out_dir, "--json", os.path.join(out_dir, "g1_tri.bin")])
+        self.assertEqual(status, 2)
+        self.assertIn("--write's g1_tri.bin", err)
+        self.assertFalse(os.path.exists(os.path.join(out_dir, "export.json")))
+
+    def test_json_beside_the_write_buffers_still_works(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        out_dir = os.path.join(self.dir, "out")
+        report = os.path.join(self.dir, "report.json")
+        status, out, _ = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [group(2)]},
+                                    ["--write", out_dir, "--json", report])
+        self.assertEqual(status, 0, out)
+        with open(os.path.join(out_dir, "g0_f3.bin"), "rb") as f:
+            self.assertEqual(len(f.read()), 4 * 12)
+        with open(report, encoding="utf-8") as f:
+            self.assertTrue(json.load(f)["consistent"])
+
+    def test_json_over_an_unwritable_target_is_one_error_line(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        nested = os.path.join(self.dir, "missing_dir", "report.json")
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [5, 2, 3])],
+                                    {"a.obj": [group(5), group(2), group(3)]}, ["--json", nested])
+        self.assertEqual(status, 2)
+        self.assertIn("cannot write", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_json_to_its_own_path_still_writes_the_report(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        report = os.path.join(self.dir, "report.json")
+        status, out, _ = self.guide(src, [item(0x1000, "a.obj", [5, 2, 3])],
+                                    {"a.obj": [group(5), group(2), group(3)]}, ["--json", report])
+        self.assertEqual(status, 0, out)
+        with open(report, encoding="utf-8") as f:
+            body = json.load(f)
+        self.assertTrue(body["consistent"])
+        self.assertEqual(body["matched"]["geometry"], [1])
+
     def test_write_produces_the_buffers_bvh_rehydrate_reads(self):
         src, _, _ = build(LEAVES, bounds=BOUNDS)
         out = os.path.join(self.dir, "written")
@@ -218,6 +322,37 @@ class TestMatching(unittest.TestCase):
         self.assertEqual(status, 0, out)
         self.assertIn("shader rule not applied", out)
 
+    def test_json_in_a_missing_directory_is_one_error_line(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        nested = os.path.join(self.dir, "nodir", "r.json")
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [group(2)]},
+                                    ["--json", nested])
+        self.assertEqual(status, 2, err)
+        self.assertIn("cannot write", err)
+        self.assertNotIn("Traceback", err)
+        self.assertFalse(os.path.exists(nested))
+
+    def test_readonly_json_is_one_error_line(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        ro = os.path.join(self.dir, "ro.json")
+        with open(ro, "w", encoding="utf-8") as f:
+            f.write("{}")
+        os.chmod(ro, 0o444)
+        try:
+            try:
+                with open(ro, "a", encoding="utf-8"):
+                    pass
+                self.skipTest("the file is still writable (running as root, or Windows)")
+            except OSError:
+                pass
+            status, _, err = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [group(2)]},
+                                        ["--json", ro])
+            self.assertEqual(status, 2, err)
+            self.assertIn("cannot write", err)
+            self.assertNotIn("Traceback", err)
+        finally:
+            os.chmod(ro, 0o644)
+
 
 class TestPieces(unittest.TestCase):
     def test_leaf_signature_counts_a_paired_leaf_twice(self):
@@ -235,6 +370,43 @@ class TestPieces(unittest.TestCase):
         self.assertEqual(M.embeddings([3, 2], [2, 3, 3], 8), [])
         self.assertEqual(M.embeddings([3, 2], [2, 3, 3], 8, ordered=False), [[1, 0], [2, 0]])
         self.assertEqual(len(M.embeddings([1], [1] * 20, 5)), 5)          # the cap holds
+
+    def test_embeddings_prune_impossible_suffixes(self):
+        # Count triangle-count comparisons so the regression doesn't depend on machine speed.
+        class Count(int):
+            __hash__ = int.__hash__
+
+            def __eq__(self, other):
+                nonlocal comparisons
+                comparisons += 1
+                return int.__eq__(self, other)
+
+            def __ne__(self, other):
+                return not self == other
+
+        cases = [
+            (True, [1] * 8 + [2], [2] + [1] * 16, []),  # the only 2 comes too early
+            (False, [1] * 6 + [2, 2], [2] + [1] * 8, []),  # two distinct 2s are needed
+            (True, [1] * 8 + [2], [1] * 8 + [2] + [1] * 8, [list(range(9))]),
+        ]
+        for ordered, signature, counts, expected in cases:
+            with self.subTest(ordered=ordered, counts=counts):
+                comparisons = 0
+                self.assertEqual(M.embeddings(signature, list(map(Count, counts)), 2, ordered), expected)
+                self.assertLess(comparisons, 4096)
+
+    def test_embeddings_keep_first_matches_in_index_order(self):
+        counts = [7] * 8 + [1, 2, 1, 2, 1]
+        signature = [1, 2, 1]
+        for ordered in (True, False):
+            choices = itertools.combinations if ordered else itertools.permutations
+            expected = [list(indices) for indices in choices(range(len(counts)), len(signature))
+                        if [counts[i] for i in indices] == signature]
+            for cap in (0, 1, 3, len(expected) + 1):
+                with self.subTest(ordered=ordered, cap=cap):
+                    self.assertEqual(M.embeddings(signature, counts, cap, ordered), expected[:cap])
+            self.assertEqual(M.embeddings([], counts, 1, ordered), [[]])
+            self.assertEqual(M.embeddings([], counts, 0, ordered), [])
 
     def test_read_groups_rebases_faces_per_group(self):
         with tempfile.TemporaryDirectory() as directory:

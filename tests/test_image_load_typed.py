@@ -124,6 +124,8 @@ class Module:
             return self.value(words[self.value(p[2], word1, index)], word1, index)
         if op == "OpGroupNonUniformBroadcastFirst":   # desc_lookup makes the descriptor word uniform: one invocation
             return self.value(a[2], word1, index)      # here, so the value itself (a[1] is the Subgroup scope)
+        if op == "OpGroupNonUniformShuffle":          # the same for a wave32 pixel shader's half (SHADER-731, #4225)
+            return self.value(a[2], word1, index)
         u = [self.value(y, word1, index) for y in a[1:]]
         if op == "OpBitcast":
             return u[0]
@@ -497,12 +499,14 @@ class TypedGatherShaders(unittest.TestCase):
 
 
 class StoreAndLoad(unittest.TestCase):
-    def test_a_shader_that_also_stores_needs_only_the_write_feature(self):
+    def test_a_shader_that_also_stores_needs_write_without_format_and_both_indexing_capabilities(self):
         m = Module(translate(["v_mov_b32 v4, 1", "v_mov_b32 v5, 2",
                               "image_store v[0:3], v[4:5], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D unorm",
                               "image_load v[0:3], v[4:5], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm",
                               "s_waitcnt vmcnt(0)"]))
         self.assertIn("StorageImageWriteWithoutFormat", m.caps)
+        self.assertIn("StorageImageArrayDynamicIndexing", m.caps)
+        self.assertIn("SampledImageArrayDynamicIndexing", m.caps)
         self.assertNotIn("StorageImageReadWithoutFormat", m.caps)
         self.assertNotIn("OpImageRead", m.text)
         self.assertEqual(set(m.binding.values()), {0, 1, 2, 8, 9, 10})
@@ -559,13 +563,13 @@ class VolumeGradientSamples(unittest.TestCase):
                 self.assertEqual(len(clamp), int("_cl " in line))
 
                 def source(value: str) -> tuple[int, int | None]:
-                    op, (_, word) = module.defs[value]
-                    self.assertEqual(op, "OpBitcast")
-                    op, args = module.defs[word]
+                    # Through the bitcasts between a VGPR word and a float (a round trip is the original id).
+                    op, args = module.defs[value]
+                    while op == "OpBitcast":
+                        op, args = module.defs[args[1]]
                     half = None
-                    if op == "OpBitcast":  # f16 coord converted to f32, then kept in a VGPR word
-                        extract, (_, unpacked, selector) = module.defs[args[1]]
-                        self.assertEqual(extract, "OpCompositeExtract")
+                    if op == "OpCompositeExtract":  # f16 coord converted to f32
+                        _, unpacked, selector = args
                         unpack, (_, _, name, packed) = module.defs[unpacked]
                         self.assertEqual((unpack, name), ("OpExtInst", "UnpackHalf2x16"))
                         half = int(selector)

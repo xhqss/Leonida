@@ -135,6 +135,9 @@ unsigned long device_proxy_ref_count(const void* device);
 // Per-slot call counters and first-call flags for the device and heap proxies. Slot 0 also counts the
 // QueryInterface call made while a proxy is created, so tests reset the counters after creation.
 // reset_device_proxy_stats also resets the queue and fence counters.
+// The hit counters (device, heap, queue, fence and allocator) are for tests, and they are off at the start.
+// A test must read a counter (any *_slot_hits function) or call reset_device_proxy_stats BEFORE the calls that it
+// counts. Calls made before that are not counted (the counter stays 0); they set only the first-call flags.
 std::uint64_t device_slot_hits(unsigned slot);
 bool device_slot_first_call_seen(unsigned slot);
 std::uint64_t heap_slot_hits(unsigned slot);

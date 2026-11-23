@@ -94,6 +94,9 @@ def mount_documents(paths):
     A carve directory (``index.json`` from rpf9_carve.py) and an ``.rpf`` are read as whole XML payloads, so a list
     split over several zlib streams stays in one piece. Any other directory is searched file by file.
     """
+    def scan_failed(error):
+        raise error
+
     for path in paths:
         if os.path.isdir(path) and os.path.isfile(os.path.join(path, "index.json")):
             for doc in gamedata_xml.carve_documents(path):
@@ -101,7 +104,7 @@ def mount_documents(paths):
         elif os.path.isfile(path) and path.lower().endswith(".rpf"):
             yield from _archive_documents(path)
         elif os.path.isdir(path):
-            for root, _dirs, files in os.walk(path):
+            for root, _dirs, files in os.walk(path, onerror=scan_failed):
                 for name in sorted(files):
                     full = os.path.join(root, name)
                     if os.path.getsize(full) <= MAX_LIST_BYTES:
@@ -173,6 +176,7 @@ def load_streams(source, skip_report=None):
             raise ValueError(f"{label.format(i=start + j)} is missing or unusable: {error}") from None
         if not isinstance(out[-1]["source"], str):
             raise ValueError(f"{label.format(i=start + j)} has a non-string source")
+        out[-1]["source"] = out[-1]["source"].replace("\\", "/")  # an older Windows index wrote "\"
     # A directory of carved files sorts by file name; carves name files by archive offset.
     out.sort(key=lambda r: (r["source"], r["offset"]))
     return out
@@ -201,7 +205,7 @@ def load_pins(path):
                 offset = _int(row["offset"])
                 if offset < 0:
                     raise ValueError("offset must be non-negative")
-                key = ((row.get("source") or "").strip(), offset)
+                key = ((row.get("source") or "").strip().replace("\\", "/"), offset)  # pins from before "/" too
                 raw_path = row["path"]
                 if not isinstance(raw_path, str):
                     raise TypeError("path is missing")

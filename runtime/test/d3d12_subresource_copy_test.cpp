@@ -4,10 +4,13 @@
 // multisampled one, with whole and boxed copies, pitches too small or zero, boxes outside or empty or cutting a
 // block, subresources past the last, and null pointers. Every HRESULT is recorded, and every read records a hash of
 // its whole destination buffer (so bytes written outside the region count too). The two records must be the same,
-// step by step. A step the host runtime faults on is reported and not compared. No shaders or game data. Skips (77)
-// without a Vulkan GPU; without a host D3D12 device only the layer's own record is printed. Set
-// LEONIDA_D3D49_VERBOSE=1 to print every step.
+// step by step, and the same as Microsoft's answers recorded in d3d12_subresource_copy_answers.h, which is what
+// Wine and Proton check (their host D3D12 is vkd3d). A step the host runtime faults on is reported and not compared.
+// No shaders or game data. Skips (77) without a Vulkan GPU. Set LEONIDA_D3D49_VERBOSE=1 to print every step, and
+// LEONIDA_D3D49_DUMP=1 to print the host's record in the answers file's format (Windows only).
 #include "vk_test_device.h"
+#include "host_wine.h"
+#include "d3d12_subresource_copy_answers.h"
 #include "../shims/d3d12_com.h"
 
 #include <cstdint>
@@ -270,16 +273,60 @@ bool run(ID3D12Device* device, bool bc, Record& out) {
     };
     for (std::size_t i = 0; i < kBeforeMap; ++i) step(kSteps[i]);
     // Map with a null pointer, as D3D12 asks before a CPU copy: every texture subresource in a CPU-visible heap.
-    const struct { ID3D12Resource* res; UINT subs; } maps[] = {{r.tex, 2}, {r.vol, 1}, {r.arr, 2}, {r.bc1, 1},
-                                                             {r.wc, 1}, {r.buffer, 1}, {r.upload, 1}};
+    const struct { const char* name; ID3D12Resource* res; UINT subs; } maps[] = {
+        {"tex", r.tex, 2}, {"vol", r.vol, 1},    {"arr", r.arr, 2},      {"bc1", r.bc1, 1},
+        {"wc", r.wc, 1},   {"buffer", r.buffer, 1}, {"upload", r.upload, 1}};
     for (const auto& m : maps)
-        for (UINT s = 0; m.res && s < m.subs; ++s) out.add("Map", std::uint64_t(std::uint32_t(m.res->Map(s, nullptr, nullptr))));
+        for (UINT s = 0; m.res && s < m.subs; ++s)
+            out.add(std::string("Map ") + m.name + " " + std::to_string(s),
+                    std::uint64_t(std::uint32_t(m.res->Map(s, nullptr, nullptr))));
     for (std::size_t i = kBeforeMap; i < sizeof(kSteps) / sizeof(kSteps[0]); ++i) step(kSteps[i]);
     for (const auto& m : maps)
         for (UINT s = 0; m.res && s < m.subs; ++s) m.res->Unmap(s, nullptr);
     for (ID3D12Resource* res : {r.tex, r.vol, r.arr, r.bc1, r.wc, r.buffer, r.upload, r.gpu, r.msaa})
         if (res) res->Release();
     return true;
+}
+
+// Compares the layer's record with a reference one (the host runtime's, or Microsoft's recorded answers).
+int compare(const char* path, const char* against, const Record& ours, const Record& ref, bool verbose) {
+    if (ref.names != ours.names) {
+        std::fprintf(stderr, "CPU copies (%s): the steps differ from %s's\n", path, against);
+        return 1;
+    }
+    int mismatches = 0, skipped = 0;
+    const auto show = [&](std::size_t i, const char* note) {
+        std::printf("CPU copies (%s) %s: ours 0x%llx, %s 0x%llx%s\n", path, ours.names[i].c_str(),
+                    static_cast<unsigned long long>(ours.values[i]), against,
+                    static_cast<unsigned long long>(ref.values[i]), note);
+    };
+    for (std::size_t i = 0; i < ours.values.size(); ++i) {
+        if (ref.values[i] == kFaulted) {  // null data: the host faults
+            if (verbose) show(i, " (the host faults; not compared)");
+            ++skipped;
+            continue;
+        }
+        // A default-heap texture: the host refuses CPU copies there, the layer makes them and logs it
+        // (docs/d3d12_vulkan.md), on purpose.
+        if (ours.names[i].find("(default heap)") != std::string::npos) {
+            if (verbose) show(i, " (the layer copies on purpose; not compared)");
+            ++skipped;
+            continue;
+        }
+        // A read whose rows or slices overlap in the destination: which bytes win is the order the driver
+        // copies texels in (tiled on an RTX 3060, not row by row), so only its HRESULT is compared.
+        if (ours.names[i].find("[overlap] (bytes)") != std::string::npos) {
+            if (verbose) show(i, " (the driver's copy order; not compared)");
+            ++skipped;
+            continue;
+        }
+        const bool same = ours.values[i] == ref.values[i];
+        if (verbose || !same) show(i, same ? "" : "  MISMATCH");
+        mismatches += !same;
+    }
+    std::printf("CPU copies (%s): %zu steps compared with %s (%d more not compared), %d mismatches\n", path,
+                ours.values.size() - skipped, against, skipped, mismatches);
+    return mismatches;
 }
 
 }  // namespace
@@ -290,6 +337,7 @@ int main() {
     if (device_status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU: ctest skips
     if (device_status != vktest::DeviceStatus::ready) return 1;
     const bool verbose = GetEnvironmentVariableA("LEONIDA_D3D49_VERBOSE", nullptr, 0) > 0;
+    const bool dump = GetEnvironmentVariableA("LEONIDA_D3D49_DUMP", nullptr, 0) > 0;
 
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const auto create_host = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
@@ -297,8 +345,16 @@ int main() {
                                    : nullptr;
     Ref<ID3D12Device> host;
     Record theirs;
-    if (create_host && SUCCEEDED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))))
+    if (create_host && !hostwine::host_is_wine() &&
+        SUCCEEDED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))))
         EXPECT(run(host.p, d.bc, theirs));
+    // Without BC formats there is no BC1 texture: no "create bc1" or "Map bc1" record, and its steps are missing.
+    Record recorded;
+    for (const SubresourceCopyAnswer& a : kSubresourceCopyAnswers) {
+        const std::string name = a.name;
+        if (d.bc || !a.bc) recorded.add(name, a.value);
+        else if (name.rfind("bc1:", 0) == 0) recorded.add(name, kMissing);
+    }
 
     // Once per copy path: on the host with VK_EXT_host_image_copy where the GPU has it, and through a staging submit
     // (a second D3D12 device on the same Vulkan device, told the extension is off).
@@ -321,45 +377,19 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
         Record ours;
         EXPECT(run(device.p, d.bc, ours));
-        if (!host.p) {
-            std::printf("CPU copies (%s): no host D3D12 device to compare with; %zu steps recorded, not compared\n",
-                        path, ours.values.size());
-            continue;
+        if (dump) {
+            if (!host.p) {
+                std::fprintf(stderr, "LEONIDA_D3D49_DUMP prints Microsoft's runtime's record: run it on Windows\n");
+                return 1;
+            }
+            for (std::size_t i = 0; i < theirs.values.size(); ++i)
+                std::printf("    {\"%s\", 0x%llxull, %s},\n", theirs.names[i].c_str(),
+                            static_cast<unsigned long long>(theirs.values[i]),
+                            theirs.names[i].find("bc1") != std::string::npos ? "true" : "false");
+            return 0;
         }
-        EXPECT(theirs.names == ours.names);
-        int mismatches = 0, skipped = 0;
-        const auto show = [&](std::size_t i, const char* note) {
-            std::printf("CPU copies (%s) %s: ours 0x%llx host 0x%llx%s\n", path, ours.names[i].c_str(),
-                        static_cast<unsigned long long>(ours.values[i]),
-                        static_cast<unsigned long long>(theirs.values[i]), note);
-        };
-        for (std::size_t i = 0; i < ours.values.size(); ++i) {
-            if (theirs.values[i] == kFaulted) {  // null data: the host faults
-                show(i, " (the host faults; not compared)");
-                ++skipped;
-                continue;
-            }
-            // A default-heap texture: the host refuses CPU copies there, the layer makes them and logs it
-            // (docs/d3d12_vulkan.md), on purpose.
-            if (ours.names[i].find("(default heap)") != std::string::npos) {
-                show(i, " (the layer copies on purpose; not compared)");
-                ++skipped;
-                continue;
-            }
-            // A read whose rows or slices overlap in the destination: which bytes win is the order the driver
-            // copies texels in (tiled on an RTX 3060, not row by row), so only its HRESULT is compared.
-            if (ours.names[i].find("[overlap] (bytes)") != std::string::npos) {
-                if (verbose) show(i, " (the driver's copy order; not compared)");
-                ++skipped;
-                continue;
-            }
-            const bool same = ours.values[i] == theirs.values[i];
-            if (verbose || !same) show(i, same ? "" : "  MISMATCH");
-            mismatches += !same;
-        }
-        std::printf("CPU copies (%s): %zu steps compared with the host (%d more not compared), %d mismatches\n", path,
-                    ours.values.size() - skipped, skipped, mismatches);
-        EXPECT(mismatches == 0);
+        if (host.p) EXPECT(compare(path, "the host", ours, theirs, verbose) == 0);
+        EXPECT(compare(path, "Microsoft's recorded answers", ours, recorded, verbose) == 0);
     }
     std::printf("d3d12_subresource_copy_test: OK\n");
     return 0;

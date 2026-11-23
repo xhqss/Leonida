@@ -454,6 +454,10 @@ def main(argv=None) -> int:
             return 2
         if any(os.path.exists(o) and os.path.samefile(path, o) for o in outs):
             ap.error("an output must not overwrite an input")
+    for source in a.sources:
+        index = os.path.join(source, "index.json")
+        if os.path.isdir(source) and os.path.isfile(index) and any(_same_output_path(index, o) for o in outs):
+            ap.error(f"an output must not overwrite an input: {index}")
 
     scan = Scan()
     try:

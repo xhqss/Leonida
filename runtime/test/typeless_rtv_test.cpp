@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <tuple>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
@@ -102,7 +103,9 @@ int main() {
             } else if (format == ColorViewFormat::rgba8_sint) {
                 EXPECT(captured.int32[0] == 1 && captured.int32[1] == 2 && captured.int32[2] == 127 && captured.int32[3] == -1);
             } else {
-                EXPECT(std::memcmp(captured.float32, color.data(), sizeof(captured)) == 0);
+                // UNORM and sRGB views round and clamp like D3D (render_target_clear_color): 1.5 and 256 are 1.0, -1 is 0.
+                const VkClearColorValue converted = leonida::detail::render_target_clear_color(expected, color);
+                EXPECT(std::memcmp(captured.float32, converted.float32, sizeof(captured)) == 0);
             }
             ++checks;
         }
@@ -264,6 +267,33 @@ int main() {
     EXPECT(rejects(wrong, {1, 0, 1, 2, ColorViewFormat::rgba8_srgb}, ReplayResult::invalid_subresource));
     wrong = binding; wrong.volume = true;
     EXPECT(rejects(wrong, {1, 0, 0, 1, ColorViewFormat::rgba8_srgb}));
+    // A castable RGBA8 or BGRA8 image clears through a view in the other channel order (the device checked that the
+    // list names it); without a castable list, or for a UINT image, the other order stays refused.
+    {
+        const auto bgra8_unorm = static_cast<ColorViewFormat>(VK_FORMAT_B8G8R8A8_UNORM);
+        const auto bgra8_srgb = static_cast<ColorViewFormat>(VK_FORMAT_B8G8R8A8_SRGB);
+        auto castable = binding; castable.typeless = false; castable.castable_view_formats = true;
+        auto castable_bgra = castable; castable_bgra.format = VK_FORMAT_B8G8R8A8_UNORM;
+        const std::tuple<ResourceBinding, ColorViewFormat, VkFormat> crossings[] = {
+            {castable, bgra8_unorm, VK_FORMAT_B8G8R8A8_UNORM},
+            {castable, bgra8_srgb, VK_FORMAT_B8G8R8A8_SRGB},
+            {castable_bgra, ColorViewFormat::rgba8_unorm, VK_FORMAT_R8G8B8A8_UNORM},
+            {castable_bgra, ColorViewFormat::rgba8_srgb, VK_FORMAT_R8G8B8A8_SRGB},
+        };
+        for (const auto& [image, format, expected] : crossings) {
+            CommandList cross;
+            EXPECT(cross.clear_render_target({1, 0, 0, 1, format}, color) && cross.close());
+            EXPECT(run(cross, image, vk) == ReplayResult::success);
+            EXPECT(image_clears == 0 && attachment_clears == 1 && requested_format == expected);
+            ++checks;
+        }
+        auto typed = castable; typed.castable_view_formats = false;
+        EXPECT(rejects(typed, {1, 0, 0, 1, bgra8_unorm}));
+        EXPECT(rejects(binding, {1, 0, 0, 1, bgra8_unorm}));  // typeless RGBA8: another typeless family
+        auto uint_image = castable; uint_image.format = VK_FORMAT_R8G8B8A8_UINT;
+        EXPECT(rejects(uint_image, {1, 0, 0, 1, bgra8_unorm}));
+        checks += 3;
+    }
     {
         auto msaa = binding; msaa.samples = 4;
         for (const auto [format, expected] : formats) {

@@ -34,9 +34,14 @@ without the package. Frames are written as raw BGRA and PPM under `%TEMP%\leonid
   earlier 4K frame-200 decode.
 - No `BinkSetSoundSystem` or XAudio2 call is made. A 3840x2160 stream with one audio track and a 1920x1080
   stream with four audio tracks both open and decode video without the sound system.
+- Independent run on a second machine (Windows 11, Ryzen 7 7800X3D, own 1.0.2.1 package): a `KB2j`-revision
+  512x512 15-frame stream decodes the same way (2 shim imports, 58 host, 0 unimplemented; frames 0 and 1 differ), so `KB2j` also decodes through the loader, on a second 1.0.2.1 copy (the `KB2n`
+  numbers above are from the first). The 10 `KB2j` streams are the nine 512x512 15-frame files plus one
+  1920x1080 60-frame file ([docs/movies.md](../../docs/movies.md) section 1).
 
 ## Gaps
 
 Audio tracks are only read as header metadata; no Bink Audio packet is decoded and no audio system is opened. The
-async and GPU decode paths, subtitles and the `HBINK`/`BINKTRACK`/`BINKSUMMARY` layouts are not tested. `DllMain`/TLS
+async and GPU decode paths and subtitles are not tested; the `HBINK`/`BINKSUMMARY` fields are measured by
+[`bink_abi_test`](bink_abi_test.md). `DllMain`/TLS
 are not run by the loader by default; they were not needed for this video path.

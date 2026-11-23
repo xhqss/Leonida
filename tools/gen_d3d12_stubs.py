@@ -119,6 +119,9 @@ def coverage(interfaces, leaves, sources):
         methods = []
         for name in chain(interfaces, leaf):
             methods.extend((name, item[2]) for item in interfaces[name][1] if item[0] == "m")
+        # d3d12.h declares a struct-returning method twice, once in each branch of
+        # `#if defined(_MSC_VER) || !defined(_WIN32)` / `#else`; it is one vtable slot, so count it once.
+        methods = list(dict.fromkeys(methods))
         open_methods = [f"{owner}::{method}" for owner, method in methods if method not in implemented]
         report.append({
             "interface": leaf,

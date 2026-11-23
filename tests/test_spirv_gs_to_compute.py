@@ -236,12 +236,74 @@ def test_cli_accepts_distinct_module_and_layout_paths(tmp_path, gs_module):
     subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(output)], check=True)
 
 
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+@pytest.mark.parametrize("controls", [
+    (),
+    ("SignedZeroInfNanPreserve 32", "DenormPreserve 16"),
+    ("DenormFlushToZero 32", "RoundingModeRTE 32", "RoundingModeRTZ 16"),
+], ids=["opt-out", "translator-default", "explicit"])
+def test_capture_preserves_float_control_modes(tmp_path: Path, controls: tuple[str, ...]) -> None:
+    capabilities = "".join(f"OpCapability {control.split()[0]}\n" for control in controls)
+    modes = [f"OpExecutionMode %main {control}" for control in controls]
+    geometry = PHI_GS.replace(
+        "OpMemoryModel", capabilities + "OpMemoryModel", 1,
+    ).replace(
+        "OpDecorate %in_pos", "".join(f"{mode}\n" for mode in modes) + "OpDecorate %in_pos", 1,
+    ).replace(
+        "OpStore %out_pos %v", "%neg = OpFNegate %v4float %v\nOpStore %out_pos %neg",
+    )
+
+    def validate(name: str, assembly: str) -> None:
+        module = tmp_path / f"{name}.spv"
+        subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(module)],
+                       input=assembly, text=True, check=True)
+        subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(module)], check=True)
+
+    validate("geometry", geometry)
+    lowered, _ = gsc.rewrite(geometry)
+    validate("compute", lowered)
+    execution_modes = [line for line in lowered.splitlines() if line.startswith("OpExecutionMode ")]
+    assert execution_modes == ["OpExecutionMode %main LocalSize 64 1 1", *modes]
+
+
 def test_help_is_a_clean_exit_zero(capsys):
     for flag in ("-h", "--help"):
         assert gsc.main(["spirv_gs_to_compute.py", flag]) == 0
         out = capsys.readouterr().out
         assert "spirv_gs_to_compute.py in.spv out.spv" in out
         assert "SPIRV-Tools" in out
+
+
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+@pytest.mark.parametrize("targets,expected_targets", [
+    ("%in_pos", ""),
+    ("%out_pos", ""),
+    ("%in_pos %v %out_pos %x", "%v %x"),
+    ("%v %x", "%v %x"),
+], ids=["removed-input", "removed-output", "mixed", "live-only"])
+def test_group_decorate_keeps_only_live_capture_targets(tmp_path: Path, targets: str,
+                                                        expected_targets: str) -> None:
+    geometry = PHI_GS.replace(
+        "OpDecorate %in_pos BuiltIn Position", "OpDecorate %in_pos Location 0",
+    ).replace(
+        "%void = OpTypeVoid",
+        "OpDecorate %relaxed RelaxedPrecision\n"
+        "%relaxed = OpDecorationGroup\n"
+        f"OpGroupDecorate %relaxed {targets} ; keep only module IDs\n"
+        "%void = OpTypeVoid",
+    )
+
+    lowered, _ = gsc.rewrite(geometry)
+    for name, assembly in (("geometry", geometry), ("compute", lowered)):
+        module = tmp_path / f"{name}.spv"
+        subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(module)],
+                       input=assembly, text=True, check=True)
+        subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(module)], check=True)
+
+    group_uses = [line.partition(";")[0].strip() for line in lowered.splitlines()
+                  if line.strip().startswith("OpGroupDecorate ")]
+    expected = [f"OpGroupDecorate %relaxed {expected_targets}"] if expected_targets else []
+    assert group_uses == expected
 
 
 def test_builtin_load_and_output_store_with_memory_operands():
@@ -279,3 +341,42 @@ def test_builtin_load_and_output_store_with_memory_operands():
     bad_gs = gs.replace("%pid = OpLoad %uint %prim_id Aligned 4", "OpCopyMemory %prim_id %inv_id")
     with pytest.raises(gsc.Unsupported, match="%prim_id"):
         gsc.rewrite(bad_gs)
+
+
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+@pytest.mark.parametrize("before_first,before_second", [
+    ("", ""),
+    ("OpLine %source 1 1\n", ""),
+    ("", "OpNoLine\n"),
+    ("OpLine %source 1 1\n", "OpNoLine\n"),
+], ids=["no-debug", "line", "no-line", "mixed"])
+def test_entry_debug_lines_keep_locals_before_capture_setup(tmp_path: Path, before_first: str,
+                                                            before_second: str) -> None:
+    geometry = PHI_GS.replace(
+        "OpDecorate %in_pos", '%source = OpString "synthetic.glsl"\nOpDecorate %in_pos', 1,
+    ).replace(
+        "%out_pos = OpVariable", "%ptr_local = OpTypePointer Function %float\n%out_pos = OpVariable", 1,
+    ).replace(
+        "%entry = OpLabel",
+        f"%entry = OpLabel\n{before_first}%first = OpVariable %ptr_local Function\n"
+        f"{before_second}%second = OpVariable %ptr_local Function",
+    ).replace(
+        "OpStore %out_pos %v",
+        "%x_value = OpCompositeExtract %float %v 0\n"
+        "OpStore %first %x_value\n"
+        "%first_value = OpLoad %float %first\n"
+        "OpStore %second %first_value\n"
+        "%second_value = OpLoad %float %second\n"
+        "%position = OpCompositeInsert %v4float %second_value %v 0\n"
+        "OpStore %out_pos %position",
+    )
+
+    lowered, _ = gsc.rewrite(geometry)
+    for name, assembly in (("geometry", geometry), ("compute", lowered)):
+        module = tmp_path / f"{name}.spv"
+        subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(module)],
+                       input=assembly, text=True, check=True)
+        subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(module)], check=True)
+
+    assert lowered.index("%first = OpVariable") < lowered.index("%gsc_gidv = OpLoad")
+    assert lowered.index("%second = OpVariable") < lowered.index("%gsc_gidv = OpLoad")

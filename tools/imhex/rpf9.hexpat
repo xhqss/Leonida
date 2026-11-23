@@ -4,7 +4,7 @@
 //   0x00  "9FPR"        RPF9 stored little-endian
 //   0x04  data offset   u32, where the data area (zlib streams laid end to end) starts
 //   0x08  u32           present in every header; meaning not established
-//   0x0C  u32           present in every header; meaning not established
+//   0x0C  trailer size  u32, the size of the block that ends the file (docs/rpf.md, The trailer at EOF)
 // Everything from 0x10 to the data offset is the rest of the header and the table of contents. The TOC is
 // encrypted/packed: this pattern shows that range as opaque bytes and decodes nothing in it (no keys, no decryption).
 //
@@ -22,7 +22,7 @@ struct Rpf9Header {
     char magic[4] [[comment("\"9FPR\": RPF9 stored little-endian")]];
     u32 data_offset [[comment("start of the data area (docs/rpf.md)")]];
     u32 u32_08 [[comment("meaning not established")]];
-    u32 u32_0c [[comment("meaning not established")]];
+    u32 trailer_size [[comment("size of the block at EOF (docs/rpf.md)")]];
 };
 
 Rpf9Header header @ 0x00;

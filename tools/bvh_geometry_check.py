@@ -30,6 +30,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bvh_rehydrate as R  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 BOUNDS_TOLERANCE = 1e-4     # of the largest sceneBounds extent
 OUTSIDE_TOLERANCE = 1e-3
@@ -157,16 +158,28 @@ def main(argv=None):
     ap.add_argument("--transform")
     ap.add_argument("--json")
     a = ap.parse_args(argv)
+    geom_paths = []
+    for spec in a.geom:
+        parts = spec.split(",")
+        geom_paths.append((parts[0], parts[1] if len(parts) > 1 else ""))
+    if a.json:
+        if same_report_path(a.json, a.dehydrated):
+            print("error: --json %s must not overwrite the dehydrated input" % a.json, file=sys.stderr)
+            return 2
+        for vb_path, ib_path in geom_paths:
+            for path in (vb_path, ib_path):
+                if path and same_report_path(a.json, path):
+                    print("error: --json %s must not overwrite a geometry buffer %s" % (a.json, path), file=sys.stderr)
+                    return 2
     try:
         transform = R.parse_transform(a.transform) if a.transform else None
         geometries = []
-        for spec in a.geom:
-            parts = spec.split(",")
-            with open(parts[0], "rb") as f:
+        for vb_path, ib_path in geom_paths:
+            with open(vb_path, "rb") as f:
                 vb = f.read()
             ib = None
-            if len(parts) > 1 and parts[1]:
-                with open(parts[1], "rb") as f:
+            if ib_path:
+                with open(ib_path, "rb") as f:
                     ib = f.read()
             geometries.append(R.Geometry(vb, a.stride, ib, a.index16, transform))
         with open(a.dehydrated, "rb") as f:

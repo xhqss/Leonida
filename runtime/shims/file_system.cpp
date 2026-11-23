@@ -24,6 +24,7 @@
 // host directly.
 #include <windows.h>
 
+#include <atomic>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
@@ -31,7 +32,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "file_system.h"
@@ -52,7 +55,8 @@ constexpr wchar_t kCopyDir[] = L".gta6rt-copy";
 
 // The overlay root's own folders, which a title never sees in a listing.
 bool internal_dir(const wchar_t* name) {
-    return _wcsicmp(name, kDeletedDir) == 0 || _wcsicmp(name, kCopyDir) == 0 || _wcsicmp(name, kScratchDir) == 0;
+    return _wcsicmp(name, kDeletedDir) == 0 || _wcsicmp(name, kCopyDir) == 0 || _wcsicmp(name, kScratchDir) == 0 ||
+           _wcsicmp(name, kPersistentStorageDir) == 0;
 }
 
 std::mutex g_mutex;
@@ -140,7 +144,14 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
     const Drive drive = console_drive(path, prefix_length);
     if (drive == Drive::None) return Parsed::Host;
     parts.clear();
-    if (drive == Drive::Scratch) parts.push_back(kScratchDir);
+    if (drive == Drive::Scratch) {
+        parts.push_back(kScratchDir);
+        const std::filesystem::path overlay = roots().overlay;
+        const DWORD last_error = ::GetLastError();
+        std::error_code ec;
+        if (!overlay.empty()) std::filesystem::create_directories(overlay / kScratchDir, ec);
+        ::SetLastError(last_error);
+    }
     const size_t floor = parts.size();  // ".." may not climb out of the drive's own root
     std::wstring part;
     auto flush = [&]() -> bool {
@@ -167,13 +178,23 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
             part.push_back(c);
         }
     }
-    return flush() ? Parsed::Console : Parsed::Refused;
+    if (!flush()) return Parsed::Refused;
+    // The overlay's own folders are not part of the title's GAME: tree: hidden from its listings (internal_dir) and
+    // refused as an explicit path too, in every spelling the loop above normalises (case, slashes, "." and "..").
+    // T: still names the scratch folder: its first part is pushed above, not parsed from the title's path.
+    if (drive == Drive::Game && !parts.empty() && internal_dir(parts.front().c_str())) return Parsed::Refused;
+    return Parsed::Console;
 }
 
 std::filesystem::path join(const std::filesystem::path& root, const std::vector<std::wstring>& parts) {
     std::filesystem::path p = root;
     for (const auto& part : parts) p /= part;
     return p;
+}
+
+bool drive_root(const std::wstring& path, const std::vector<std::wstring>& parts) {
+    size_t prefix_length = 0;
+    return parts.empty() || (parts.size() == 1 && console_drive(path, prefix_length) == Drive::Scratch);
 }
 
 struct Target {
@@ -271,6 +292,14 @@ View view(const Roots& r, const std::vector<std::wstring>& parts) {
 
 bool is_folder(const Roots& r, const std::vector<std::wstring>& parts) { return view(r, parts).kind == Kind::Directory; }
 
+// Whether two console paths name the same entry: names compare without case, as the lookups do.
+bool same_entry(const std::vector<std::wstring>& a, const std::vector<std::wstring>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (!same_name(a[i].c_str(), b[i].c_str())) return false;
+    return true;
+}
+
 std::vector<std::wstring> parent_of(const std::vector<std::wstring>& parts) {
     return parts.empty() ? parts : std::vector<std::wstring>(parts.begin(), parts.end() - 1);
 }
@@ -347,6 +376,14 @@ Target write_target(const std::wstring& path, bool copy_up) {
     const Roots r = roots();
     if (r.overlay.empty()) return fail(ERROR_PATH_NOT_FOUND);
     if (parts.empty()) return fail(ERROR_INVALID_NAME);  // "GAME:" is a folder, not a file
+
+    // The folder has to exist in the title's view, as CreateDirectory, MoveFile and CopyFile require: without the
+    // check a failed open left the missing folders behind, and a create succeeded in a folder that was never made,
+    // below a package file (which then read as a folder) and inside a folder the title had removed. The overlay may
+    // still lack a folder only the package has, so it is mirrored here, which the title cannot see.
+    // T:'s scratch folder is the exception: it creates its parent folders, as merged with RT-218.
+    const bool scratch = !parts.empty() && same_name(parts.front().c_str(), kScratchDir);
+    if (!scratch && !is_folder(r, parent_of(parts))) return fail(ERROR_PATH_NOT_FOUND);
 
     Target t;
     t.path = join(r.overlay, parts);
@@ -456,6 +493,84 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         error = ERROR_PATH_NOT_FOUND;
         return false;
     }
+    // The folder being listed has to exist in the title's view. The host would still enumerate a package folder the
+    // title removed (its "." and ".."), and a folder that is missing is a missing path, not a missing file. A listing
+    // below a file is a third answer on the host, ERROR_DIRECTORY.
+    const Kind listed = view(r, dirs).kind;
+    if (listed != Kind::Directory) {
+        error = listed == Kind::File ? ERROR_DIRECTORY : ERROR_PATH_NOT_FOUND;
+        return false;
+    }
+
+    // Every deletion marker for an entry of this folder lives inside its marker folder, so that folder is read once
+    // instead of probing it twice per package entry (deleted()). An entry is deleted when its marker is a file, or a
+    // folder holding kRemovedDirMarker: the rule deleted() applies. The lookup folds ASCII letters only, which matches
+    // the file system's case-insensitive compare exactly when both names are ASCII. Any other name, a non-ASCII entry
+    // or a marker that is not plain ASCII or is a reparse point, goes through deleted() and the file system's rule.
+    auto ascii = [](const wchar_t* s) {
+        for (; *s; ++s)
+            if (*s > 0x7f) return false;
+        return true;
+    };
+    auto ascii_key = [](const wchar_t* s) {
+        std::wstring k = s;
+        for (auto& c : k)
+            if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c - L'A' + L'a');
+        return k;
+    };
+    bool has_markers = false;
+    bool markers_exact = true;
+    std::unordered_set<std::wstring> deleted_here;
+    if (!r.overlay.empty()) {
+        const std::filesystem::path marks = marker(r.overlay, dirs);
+        WIN32_FIND_DATAW m{};
+        const HANDLE mh = ::FindFirstFileW((marks / L"*").c_str(), &m);
+        if (mh != INVALID_HANDLE_VALUE) {
+            has_markers = true;
+            do {
+                if (same_name(m.cFileName, L".") || same_name(m.cFileName, L"..")) continue;
+                if (!ascii(m.cFileName) || (m.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+                    markers_exact = false;
+                    continue;
+                }
+                if (!(m.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                    deleted_here.insert(ascii_key(m.cFileName));
+                    continue;
+                }
+                // A marker folder is a removed folder only with kRemovedDirMarker in it; without one it just holds the
+                // markers of a nested delete. A missing sentinel is that ordinary answer (status() reports not_found
+                // with an error code set); any other error leaves the decision to deleted() per entry.
+                std::error_code ec;
+                const auto st = std::filesystem::status(marks / m.cFileName / kRemovedDirMarker, ec);
+                if (st.type() == std::filesystem::file_type::regular) deleted_here.insert(ascii_key(m.cFileName));
+                else if (st.type() != std::filesystem::file_type::not_found && ec) markers_exact = false;
+            } while (::FindNextFileW(mh, &m));
+            if (::GetLastError() != ERROR_NO_MORE_FILES) markers_exact = false;  // an incomplete scan
+            ::FindClose(mh);
+        } else {
+            // Only a missing marker folder means "nothing deleted here". Any other failure (a folder that cannot be
+            // listed although its markers can be queried by path, for one) leaves the decision to deleted().
+            const DWORD e = ::GetLastError();
+            if (e != ERROR_FILE_NOT_FOUND && e != ERROR_PATH_NOT_FOUND) {
+                has_markers = true;
+                markers_exact = false;
+            }
+        }
+    }
+    auto entry_deleted = [&](const wchar_t* name) {
+        if (!has_markers) return false;
+        if (markers_exact && ascii(name)) return deleted_here.count(ascii_key(name)) != 0;
+        std::vector<std::wstring> entry_parts = dirs;
+        entry_parts.push_back(name);
+        return deleted(r.overlay, entry_parts);
+    };
+    // Names already listed, ordered by _wcsicmp itself, so two names are one entry exactly when same_name says so, in
+    // whatever locale the title set (a lower-cased key is not: under .UTF-8 _wcslwr_s folds É and é, _wcsicmp not).
+    struct NoCase {
+        bool operator()(const std::wstring& a, const std::wstring& b) const { return _wcsicmp(a.c_str(), b.c_str()) < 0; }
+    };
+    std::set<std::wstring, NoCase> seen;
+    for (const auto& e : out) seen.insert(e.cFileName);
 
     auto add_root = [&](const std::filesystem::path& root, bool overlay_root) {
         if (root.empty()) return;
@@ -467,18 +582,8 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         do {
             if (overlay_root && internal_dir(found.cFileName)) continue;
             const bool dot = same_name(found.cFileName, L".") || same_name(found.cFileName, L"..");
-            if (!overlay_root && !dot) {
-                std::vector<std::wstring> entry_parts = dirs;
-                entry_parts.push_back(found.cFileName);
-                if (deleted(r.overlay, entry_parts)) continue;
-            }
-            bool duplicate = false;
-            for (const auto& e : out)
-                if (same_name(e.cFileName, found.cFileName)) {
-                    duplicate = true;
-                    break;
-                }
-            if (!duplicate) out.push_back(found);
+            if (!overlay_root && !dot && entry_deleted(found.cFileName)) continue;
+            if (seen.insert(found.cFileName).second) out.push_back(found);
         } while (::FindNextFileW(h, &found));
         ::FindClose(h);
     };
@@ -871,7 +976,7 @@ BOOL WINAPI remove_directory_w(LPCWSTR name) {
 
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
-    if (parts.empty()) return fail_bool(ERROR_ACCESS_DENIED);  // "GAME:" itself stays
+    if (drive_root(name, parts)) return fail_bool(ERROR_ACCESS_DENIED);  // "GAME:" and "T:" themselves stay
     const View v = view(r, parts);
     if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
     if (v.kind == Kind::File) return fail_bool(ERROR_DIRECTORY);
@@ -908,15 +1013,34 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
 
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
-    if (src.empty() || dst.empty()) return fail_bool(ERROR_ACCESS_DENIED);
+    if (drive_root(from, src) || drive_root(to, dst)) return fail_bool(ERROR_ACCESS_DENIED);
     const View from_view = view(r, src);
     if (from_view.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    const std::filesystem::path overlay_from = join(r.overlay, src), overlay_to = join(r.overlay, dst);
+    if (same_entry(src, dst)) {
+        // The destination is the source, so it is not "already there". The host succeeds at a move onto the same
+        // name and changes nothing, and renames when only the case differs. Here the case of a name is the overlay's
+        // when the overlay holds it, so a package file gets an overlay copy under the new spelling (no marker: the
+        // listing takes the overlay's entry and skips the package's as the same name); a package folder is left
+        // where it is, as for any other move of one.
+        if (src == dst) return TRUE;
+        if (from_view.kind == Kind::Directory && from_view.in_package) return fail_bool(ERROR_ACCESS_DENIED);
+        if (from_view.in_overlay)
+            return ::MoveFileExW(overlay_from.c_str(), overlay_to.c_str(), flags & MOVEFILE_WRITE_THROUGH);
+        std::error_code same_ec;
+        std::filesystem::create_directories(overlay_to.parent_path(), same_ec);
+        if (same_ec) return fail_bool(static_cast<DWORD>(same_ec.value()));
+        if (!::CopyFileW(join(r.game, src).c_str(), overlay_to.c_str(), TRUE)) return FALSE;
+        DWORD flush_error = 0;
+        if ((flags & MOVEFILE_WRITE_THROUGH) != 0 && !flush_file(overlay_to, flush_error)) return fail_bool(flush_error);
+        return TRUE;
+    }
+
     const View to_view = view(r, dst);
     if (to_view.kind == Kind::Directory) return fail_bool(ERROR_ACCESS_DENIED);
     if (to_view.kind == Kind::File && (flags & MOVEFILE_REPLACE_EXISTING) == 0) return fail_bool(ERROR_ALREADY_EXISTS);
     if (!is_folder(r, parent_of(dst))) return fail_bool(ERROR_PATH_NOT_FOUND);
 
-    const std::filesystem::path overlay_from = join(r.overlay, src), overlay_to = join(r.overlay, dst);
     std::error_code ec;
     std::filesystem::create_directories(overlay_to.parent_path(), ec);
     if (ec) return fail_bool(static_cast<DWORD>(ec.value()));
@@ -1053,6 +1177,8 @@ namespace {
 // it) kills a title under Wine 9 or a Proton built on it; pe_loader.cpp and loader_tls_test.cpp avoid it for the same
 // reason. GetProcAddress returns null there instead, and the fallback below runs.
 using CopyFile2Fn = HRESULT(WINAPI*)(PCWSTR, PCWSTR, COPYFILE2_EXTENDED_PARAMETERS*);
+std::atomic<bool> g_force_copy_file2_fallback{false};
+
 CopyFile2Fn host_copy_file2() {
     static const CopyFile2Fn fn = [] {
         for (const wchar_t* dll : {L"kernelbase.dll", L"kernel32.dll"}) {
@@ -1061,20 +1187,46 @@ CopyFile2Fn host_copy_file2() {
         }
         return CopyFile2Fn{};
     }();
-    return fn;
+    return g_force_copy_file2_fallback.load(std::memory_order_relaxed) ? CopyFile2Fn{} : fn;
 }
 
-// CopyFile2 through CopyFileExW, for hosts without it. The flags both calls define are passed on; the rest are
-// CopyFile2-only hints and privilege requests (no offload, compressed traffic, low-free-space mode, ...) that don't
-// change what a plain file copy produces, and CopyFileExW refuses flags it doesn't know. The cancel flag has the same
-// type in both. A COPYFILE2 progress routine has another signature and message set, so it isn't called here.
-HRESULT copy_file2_fallback(const wchar_t* source, const wchar_t* destination,
-                            const COPYFILE2_EXTENDED_PARAMETERS* parameters) {
-    constexpr DWORD kCopyFileExFlags = COPY_FILE_FAIL_IF_EXISTS | COPY_FILE_RESTARTABLE |
+// The fallback's flags, by what CopyFileExW can do with them (values from the SDK's WinBase.h, spelled out because
+// some of the names are only declared for newer NTDDI_VERSION targets):
+// - passed on: the flags both calls define, with the same meaning;
+// - dropped: CopyFile2-only requests about how the copy runs (privileges, resuming a paused copy, no offload, EDP,
+//   destination DACL, compressed SMB traffic, pre-allocation, low-free-space mode, sparse copy) that leave the
+//   destination's contents as CopyFileExW writes them;
+// - everything else changes what the copy produces (0x80 DIRECTORY, 0x8000 SKIP_ALTERNATE_STREAMS, 0x200000
+//   OPEN_AND_COPY_REPARSE_POINT, 0x800000 IGNORE_SOURCE_ENCRYPTION) or isn't defined, so the fallback refuses the
+//   call with ERROR_NOT_SUPPORTED instead of copying something else.
+constexpr DWORD kFallbackPassedFlags = COPY_FILE_FAIL_IF_EXISTS | COPY_FILE_RESTARTABLE |
                                        COPY_FILE_OPEN_SOURCE_FOR_WRITE | COPY_FILE_ALLOW_DECRYPTED_DESTINATION |
                                        COPY_FILE_COPY_SYMLINK | COPY_FILE_NO_BUFFERING;
-    const DWORD flags = parameters ? parameters->dwCopyFlags & kCopyFileExFlags : 0;
+constexpr DWORD kFallbackDroppedFlags = 0x00002000 /* REQUEST_SECURITY_PRIVILEGES */ |
+                                        0x00004000 /* RESUME_FROM_PAUSE */ | 0x00040000 /* NO_OFFLOAD */ |
+                                        0x00400000 /* IGNORE_EDP_BLOCK */ |
+                                        0x02000000 /* DONT_REQUEST_DEST_WRITE_DAC */ |
+                                        0x04000000 /* DISABLE_PRE_ALLOCATION */ |
+                                        0x08000000 /* ENABLE_LOW_FREE_SPACE_MODE */ |
+                                        0x10000000 /* REQUEST_COMPRESSED_TRAFFIC */ |
+                                        0x20000000 /* ENABLE_SPARSE_COPY */ | 0x80000000 /* DISABLE_SPARSE_COPY */;
+
+// Whether the fallback can run this call as CopyFile2 would: a COPYFILE2_EXTENDED_PARAMETERS block (the V2 block's
+// extra fields have no CopyFileExW equivalent) and no flag outside the two sets above.
+bool fallback_supports(const COPYFILE2_EXTENDED_PARAMETERS* parameters) {
+    if (!parameters) return true;
+    if (parameters->dwSize != sizeof(COPYFILE2_EXTENDED_PARAMETERS)) return false;
+    return (parameters->dwCopyFlags & ~(kFallbackPassedFlags | kFallbackDroppedFlags)) == 0;
+}
+
+// CopyFile2 through CopyFileExW, for hosts without it (only for calls fallback_supports). The cancel flag has the
+// same type in both; one already set is answered here, since Wine 9's CopyFileExW doesn't read it. A COPYFILE2
+// progress routine has another signature and message set, so it isn't called here.
+HRESULT copy_file2_fallback(const wchar_t* source, const wchar_t* destination,
+                            const COPYFILE2_EXTENDED_PARAMETERS* parameters) {
+    const DWORD flags = parameters ? parameters->dwCopyFlags & kFallbackPassedFlags : 0;
     BOOL* const cancel = parameters ? parameters->pfCancel : nullptr;
+    if (cancel && *cancel) return HRESULT_FROM_WIN32(ERROR_REQUEST_ABORTED);
     if (::CopyFileExW(source, destination, nullptr, nullptr, cancel, flags)) return S_OK;
     const DWORD error = GetLastError();
     return HRESULT_FROM_WIN32(error ? error : ERROR_GEN_FAILURE);
@@ -1082,12 +1234,21 @@ HRESULT copy_file2_fallback(const wchar_t* source, const wchar_t* destination,
 
 }  // namespace
 
+void force_copy_file2_fallback(bool force) { g_force_copy_file2_fallback.store(force, std::memory_order_relaxed); }
+
+// The parameter block is checked before the destination is prepared, so a refused call leaves nothing behind: a
+// block shorter than COPYFILE2_EXTENDED_PARAMETERS is E_INVALIDARG, as the host's CopyFile2 answers (measured on
+// Windows 11 for dwSize 0, 4 and 31, which also left no destination), and a call the fallback can't run as asked is
+// ERROR_NOT_SUPPORTED. A longer block goes to the host's CopyFile2, which checks it itself.
 HRESULT WINAPI copy_file2(PCWSTR from, PCWSTR to, COPYFILE2_EXTENDED_PARAMETERS* parameters) {
+    if (parameters && parameters->dwSize < sizeof(COPYFILE2_EXTENDED_PARAMETERS)) return E_INVALIDARG;
+    const CopyFile2Fn host = host_copy_file2();
+    if (!host && !fallback_supports(parameters)) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     const bool fail_if_exists = parameters && (parameters->dwCopyFlags & COPY_FILE_FAIL_IF_EXISTS) != 0;
     std::filesystem::path source, destination;
     DWORD error = 0;
     if (!copy_paths(from, to, fail_if_exists, source, destination, error)) return HRESULT_FROM_WIN32(error);
-    if (const CopyFile2Fn host = host_copy_file2()) return host(source.c_str(), destination.c_str(), parameters);
+    if (host) return host(source.c_str(), destination.c_str(), parameters);
     return copy_file2_fallback(source.c_str(), destination.c_str(), parameters);
 }
 

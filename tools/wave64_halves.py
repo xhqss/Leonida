@@ -9,8 +9,9 @@ there is no partner half to exchange values with (compute and mesh shaders have 
     analyse(blocks, succ, masks, stage) -> {"tier": "A" | "B" | "C", "reasons": [...], "idioms": [...],
                                             "uniform_readlane": {id(ins), ...}}
 
-    A  nothing wave-wide is consumed except votes that only skip lane-masked work, whole-quad masks and
-       per-lane arithmetic: exact as translated, on any subgroup size.
+    A  nothing wave-wide is consumed except votes that only skip lane-masked work, votes on a wave-uniform compare
+       (a v_cmp of untainted scalars and constants with EXEC the launch mask: every half votes as the wave does),
+       whole-quad masks and per-lane arithmetic: exact as translated, on any subgroup size.
     B  also uses a wave-wide idiom whose result is invariant by construction: a waterfall loop, a wave-aggregated
        atomic (ballot count, one atomic from the first lane, rank), a v_readfirstlane / v_readlane of a value that
        is the same in every lane. Exact (the aggregated atomic up to the order in which lanes get slots), with the
@@ -36,6 +37,7 @@ Standard library only.
 import argparse
 import json
 import os
+import re
 import sys
 from collections import Counter
 
@@ -96,6 +98,35 @@ MOVREL_OPS = (
 MASK_BITWISE = ("s_and_b", "s_or_b", "s_xor_b", "s_andn2_b", "s_orn2_b", "s_nand_b", "s_nor_b", "s_xnor_b", "s_not_b",
                 "s_mov_b", "s_cselect_b", "s_wqm_b")
 DPP_BAD = ("row_bcast", "wave_")
+UVOTE = ("uvote", None)  # tag of a lane mask that is all launch lanes or none in the wave and in each half (see vote)
+
+
+_TYPE16 = re.compile(r"^[biuf]16$")
+_TYPE = re.compile(r"^[biuf](8|16|24|32|64)$")
+# GFX10 VOP2 16-bit integer ops: in their VOP2 (_e32) encoding they define the whole register (design.md, "16-bit
+# results"); their _e64 forms are opsel-capable and keep the high half
+VOP2_INT16 = {"v_add_u16", "v_sub_u16", "v_subrev_u16", "v_mul_lo_u16", "v_lshlrev_b16", "v_lshrrev_b16",
+              "v_ashrrev_i16", "v_max_u16", "v_max_i16", "v_min_u16", "v_min_i16"}
+
+
+def partial_write(ins, op):
+    """Whether a VALU instruction writes only part of its 32-bit destination and keeps the rest (design.md, "16-bit
+    results" and "16-bit SDWA result"): SDWA with a byte or word dst_sel and UNUSED_PRESERVE; otherwise a 16-bit
+    result, the first type in the name (v_add_f16, v_cvt_f16_f32, v_mad_u16, v_add_u16_e64), except the VOP2 16-bit
+    integer ops in _e32 form, which define the whole register. Packed and 32-bit results are whole: v_pk_*,
+    v_cvt_pk*, v_sad_*, v_cvt_f32_f16, v_mad_u32_u16. When unsure it says partial, which only costs tier A."""
+    mods = ins.get("mods") or []
+    op = ins.get("op", op)   # the printed name: base_op drops _e32/_e64/_sdwa, which decide it here
+    if "_sdwa" in op or any(m.startswith("dst_sel:") for m in mods):
+        return "dst_unused:UNUSED_PRESERVE" in mods and any(m.startswith(("dst_sel:BYTE_", "dst_sel:WORD_"))
+                                                             for m in mods)
+    name = op.split("_e32")[0].split("_e64")[0].split("_dpp")[0]
+    if name.startswith(("v_pk_", "v_cvt_pk", "v_sad_")):
+        return False
+    first = next((p for p in name.split("_")[1:] if _TYPE.match(p)), None)
+    if not (first and _TYPE16.match(first)):
+        return False
+    return not (name in VOP2_INT16 and "_e64" not in op)
 
 
 def base_op(op):
@@ -114,6 +145,20 @@ def _regs(a):
         return [("v", a["r"] + i) for i in range(a.get("n", 1))]
     if k == "vlist":
         return [("v", r) for r in a["r"]]
+    if k == "slist":
+        regs = []
+        for r in a["r"]:
+            if isinstance(r, int):
+                key = ("s", r)
+            elif isinstance(r, str) and r.startswith("vcc"):
+                key = "vcc"
+            elif isinstance(r, str) and r.startswith("exec"):
+                key = "exec"
+            else:
+                continue
+            if key not in regs:
+                regs.append(key)
+        return regs
     if k == "special":
         t = a.get("t", "")
         if t.startswith("vcc"):
@@ -160,7 +205,7 @@ def operands(ins):
     op, a = base_op(ins["op"]), ins["args"]
     mods = ins.get("mods") or []
     defs, uses = [], []
-    if op.startswith(NO_DEST) and not op.startswith(("s_cmp", "s_bitcmp")) or op in ("s_endpgm", "s_barrier"):
+    if op.startswith(NO_DEST) and not op.startswith(("s_cmp", "s_bitcmp", "v_cmpx")) or op in ("s_endpgm", "s_barrier"):
         dests, srcs = [], list(a)
     elif op.startswith(("s_cmp", "s_bitcmp")):
         dests, srcs = [], list(a)
@@ -190,7 +235,7 @@ def operands(ins):
             dests, srcs = [a[0]], list(a[1:])
         if op.startswith("v_") and len(a) > 2 and (
                 "_co_" in op or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64")) \
-                and a[1].get("k") in ("sgpr", "special"):
+                and a[1].get("k") in ("sgpr", "special", "slist"):
             dests, srcs = [a[0], a[1]], list(a[2:])
     else:
         dests, srcs = [], []
@@ -416,6 +461,81 @@ class Analysis:
                     else:
                         st[key].pop(r, None)
 
+    def operand_literal(self, n, i, x):
+        """The literal value of a scalar source before instruction `i` of block `n`, else None."""
+        if x.get("abs") or x.get("neg"):
+            return None
+        if x.get("k") == "imm":
+            return x["v"] & 0xFFFFFFFF
+        if x.get("k") == "special" and x.get("t") == "null":
+            return 0
+        if x.get("k") == "sgpr" and x.get("n", 1) == 1:
+            return self.literal_sgpr(n, i, x["r"])
+        return None
+
+    def literal_sgpr(self, n, i, r):
+        """The 32-bit literal SGPR `r` holds before instruction `i` of block `n`, as rdna2spirv's `sgpr_imm` knows
+        it: the value the last writer in this basic block gave it, when that writer is one of the scalar ops below
+        and its sources are literals too. None for any other writer, or none in the block (a run-time value).
+
+        MIRROR of rdna2spirv's `sgpr_imm` folding (it cannot be imported here: this analysis runs before the
+        translator emits a block, so its `sgpr_imm` is empty): s_mov_b32, s_movk_i32, s_mov_b64 (an immediate or an
+        SGPR pair), s_pack_ll/lh/hh_b32_b16, s_bfm_b32, s_not_b32, and the S2 folds s_and_b32, s_lshl_b32,
+        s_lshr_b32, s_mul_i32 (not s_or_b32: rdna2spirv does not record it). Not mirrored, so treated as run-time:
+        s_abs, s_sext, s_min/max, s_add/sub, s_xor/andn2 family, s_bfe, s_absdiff, s_lshlN_add. Keep the two lists
+        in step when rdna2spirv folds another op."""
+        for j in range(i - 1, -1, -1):
+            ins = self.blocks[n][j]
+            if ("s", r) not in [x for d in operands(ins)[0] for x in _regs(d)]:
+                continue
+            op, a = base_op(ins["op"]), ins["args"]
+            if op == "s_mov_b64" and len(a) == 2 and a[0].get("k") == "sgpr" and a[0].get("n") == 2:
+                half = r - a[0]["r"]
+                if a[1].get("k") == "imm":
+                    return (a[1]["v"] & 0xFFFFFFFFFFFFFFFF) >> (32 * half) & 0xFFFFFFFF
+                if a[1].get("k") == "sgpr" and a[1].get("n") == 2:
+                    return self.literal_sgpr(n, j, a[1]["r"] + half)
+                return None
+            if not (a and a[0].get("k") == "sgpr" and a[0].get("n", 1) == 1):
+                return None
+            x = self.operand_literal(n, j, a[1]) if len(a) > 1 else None
+            y = self.operand_literal(n, j, a[2]) if len(a) > 2 else None
+            if op == "s_mov_b32" and len(a) == 2:
+                return x
+            if op == "s_movk_i32" and len(a) == 2 and a[1].get("k") == "imm":
+                v = a[1]["v"] & 0xFFFF
+                return (v - 0x10000 if v & 0x8000 else v) & 0xFFFFFFFF
+            if op == "s_not_b32" and x is not None:
+                return ~x & 0xFFFFFFFF
+            if x is None or y is None or len(a) != 3:
+                return None
+            if op in ("s_pack_ll_b32_b16", "s_pack_lh_b32_b16", "s_pack_hh_b32_b16"):
+                lo = x >> 16 if op == "s_pack_hh_b32_b16" else x & 0xFFFF
+                hi = (y & 0xFFFF) << 16 if op == "s_pack_ll_b32_b16" else y & 0xFFFF0000
+                return lo | hi
+            if op == "s_bfm_b32":
+                return (((1 << (x & 31)) - 1) << (y & 31)) & 0xFFFFFFFF
+            folds = {"s_and_b32": x & y, "s_lshl_b32": x << (y & 31), "s_lshr_b32": x >> (y & 31), "s_mul_i32": x * y}
+            return folds[op] & 0xFFFFFFFF if op in folds else None
+        return None
+
+    def add_tid_lane(self, n, i, a, mods):
+        """LANE when a MUBUF/MTBUF access (vdata, vaddr, V#, ...) has no idxen and its V# word3 is a literal with
+        ADD_TID_ENABLE (bit 23) set: the effective index is then the wave lane (idxen ignores the bit), so the
+        result or the address is the lane id. A run-time V# cannot be judged here: tiers A and B assume the bit is
+        0 there (docs/design.md, SHADER-10)."""
+        if "idxen" in mods or len(a) < 3:
+            return 0
+        rsrc = a[2]
+        if rsrc.get("k") == "sgpr" and rsrc.get("n") == 4:
+            w3 = rsrc["r"] + 3
+        elif rsrc.get("k") == "slist" and len(rsrc["r"]) == 4 and isinstance(rsrc["r"][3], int):
+            w3 = rsrc["r"][3]
+        else:
+            return 0
+        lit = self.literal_sgpr(n, i, w3)
+        return LANE if lit is not None and lit >> 23 & 1 else 0
+
     def transfer(self, n, i, ins, st, ev):
         op, a = base_op(ins["op"]), ins["args"]
         mods = ins.get("mods") or []
@@ -444,6 +564,14 @@ class Analysis:
                     continue
                 T[r] = t
                 st["g"].pop(r, None)
+                # SHADER-820: a vote's SCC names the mask register it tested (its first SGPR for a pair). A new
+                # value in that register (v_cmp into the pair or VCC, s_mov_b64, s_cselect_b64: none of them
+                # writes SCC) leaves SCC a vote on the old mask, while a run side narrows EXEC to the new one, so
+                # the tag goes. Ops that vote on their own destination set the new tag after this put().
+                vote = st["g"].get("scc")
+                if vote and vote[0] == "vote" and r != "scc" and (
+                        r == vote[1] or (isinstance(vote[1], tuple) and r == (vote[1][0], vote[1][1] + 1))):
+                    del st["g"]["scc"]
                 if tag is not None:
                     st["g"][r] = tag
                 if isinstance(r, tuple) and r[0] == "v":
@@ -502,6 +630,8 @@ class Analysis:
             at = 0
             for x in addr:
                 at |= self.rd(st, ins, x)
+            if op.startswith(("buffer_store", "tbuffer_store")):
+                at |= self.add_tid_lane(n, i, a, mods)
             bits_violation(dt)
             bits_violation(at, BASE | RNK)
             if at & RNK and at & BASE:
@@ -541,6 +671,8 @@ class Analysis:
             addr_t = 0
             for x in addr_ops:
                 addr_t |= self.rd(st, ins, x)
+            if op.startswith("buffer_atomic"):
+                addr_t |= self.add_tid_lane(n, i, a, mods)
             elected = bool(st["xg"] and st["xg"][0] == "elect")
             bits_violation(addr_t, ELECT if elected else 0)
             if data_t & CNT:
@@ -575,6 +707,8 @@ class Analysis:
                         x.get("k") == "special" and x.get("t") in ("vcc", "exec") and self.is_mask(ins, x)):
                     md |= MASKD | X
         t_src |= md
+        if op.startswith(("buffer_load", "tbuffer_load")):
+            t_src |= self.add_tid_lane(n, i, a, mods)
 
         # --- lane masks and counts
         if op in ("s_bcnt1_i32_b64", "s_ff1_i32_b64") and len(a) == 2 and self.is_mask(ins, a[1]):
@@ -660,7 +794,9 @@ class Analysis:
         if op == "v_readlane_b32" and len(a) == 3:
             vr = a[1]["r"] if a[1].get("k") == "vgpr" else None
             tl = self.rd(st, ins, a[2])
-            if vr is not None and vr in st["u"] and not tl:
+            if vr is not None and vr in st["u"]:
+                # Every lane holds the same value in v[vr], so the selected lane index (even if derived from
+                # first-lane, lane-count, or lane-id) cannot change the result across 32-lane halves.
                 idiom("readlane-uniform")
                 if ev is not None:
                     ev["uniform_readlane"].add(id(ins))
@@ -713,6 +849,8 @@ class Analysis:
         if op.startswith("v_cmp") and not op.startswith("v_cmpx"):
             d = dests[0] if dests else {"k": "special", "t": "vcc"}
             tag, tj = self.cmp_tag(st, ins, op, srcs, t_src, idiom)
+            if tag is None and self.uniform_cmp(st, ins, srcs, uses, tj):
+                tag = UVOTE
             put(d, tj, tag)
             if len(dests) > 1:
                 put(dests[1], t_src)
@@ -755,8 +893,13 @@ class Analysis:
                 r = _regs(srcs[0])
                 if srcs[0].get("k") == "special" and srcs[0].get("t") == "exec":
                     tag = ("mask", st["x"])
-                elif r and r[0] in st["g"] and st["g"][r[0]][0] in ("mask", "elect", "wfmask"):
+                elif r and r[0] in st["g"] and st["g"][r[0]][0] in ("mask", "elect", "wfmask", "uvote"):
                     tag = st["g"][r[0]]
+            elif op == "s_and_b64" and not t_src and all(
+                    (_regs(x) == ["exec"] and st["f"]) or (_regs(x) and all(st["g"].get(r) == UVOTE for r in _regs(x)))
+                    for x in srcs) and any(_regs(x) != ["exec"] for x in srcs):
+                # a uniform compare ANDed with EXEC while EXEC is the launch mask (LLVM: s_and_b64 vcc, exec, s[..])
+                tag = UVOTE
             put(dests[0], t_src, tag)
             if not op.startswith(("s_mov", "s_cselect")):     # those leave SCC as it was: no vote on their dest
                 T["scc"] = X
@@ -889,6 +1032,13 @@ class Analysis:
                 uniform_active = not (st["xg"] and st["xg"][0] == "elect") and all(
                     x.get("k") in ("imm", "fimm") or (x.get("k") == "sgpr" and not self.is_mask(ins, x)) or
                     (x.get("k") == "vgpr" and all(r[1] in st["ua"] for r in _regs(x))) for x in srcs) and not uses
+                # a write of part of the VGPR (SDWA byte/word with UNUSED_PRESERVE, a 16-bit result) keeps the rest
+                # of it: uniform only if the whole register already was
+                if partial_write(ins, op):
+                    if uniform:
+                        uniform = all(r[1] in st["u"] for d in dests for r in _regs(d) if isinstance(r, tuple))
+                    if uniform_active:
+                        uniform_active = all(r[1] in st["ua"] for d in dests for r in _regs(d) if isinstance(r, tuple))
             # a waterfall scalar used by a lane whose v equals it is that lane's own value
             if tj & WFS:
                 ok = st["xg"] and st["xg"][0] == "wf"
@@ -972,6 +1122,24 @@ class Analysis:
         if g and g[0] == "elect" and len(g) > 2:
             return g[2]
         return None
+
+    def uniform_cmp(self, st, ins, srcs, uses, tj):
+        """Whether a v_cmp writes a wave-uniform lane mask: EXEC is the launch mask and every source is the same in
+        every lane (an immediate, a scalar that is no lane mask, a VGPR written from those with EXEC the launch mask)
+        and carries no taint, so the mask is every launch lane or none, in the wave and in each half alike. A value
+        read with v_readfirstlane from a varying VGPR is tainted (waterfall-scalar), so it is not one."""
+        if tj or uses or not st["f"] or not srcs:
+            return False
+        for x in srcs:
+            k = x.get("k")
+            if k in ("imm", "fimm"):
+                continue
+            if self.rd(st, ins, x) or self.is_mask(ins, x):
+                return False
+            if k == "sgpr" or (k == "vgpr" and all(r[1] in st["u"] for r in _regs(x))):
+                continue
+            return False
+        return True
 
     def cmp_tag(self, st, ins, op, srcs, t_src, idiom):
         """(tag, taint) of the lane mask a v_cmp / v_cmpx writes. The two recognised comparisons: a waterfall
@@ -1101,14 +1269,14 @@ class Analysis:
                 return
             if g and g[0] == "vote":
                 # the vote is yes (some lane in the mask) when SCC = 1, or SCC = 0 for an "empty" test
-                self.vote(n, ins, op, g[1], (op == "s_cbranch_scc1") != (g[2:] == ("empty",)), ev)
+                self.vote(n, ins, op, g[1], (op == "s_cbranch_scc1") != (g[2:] == ("empty",)), ev, None)
             return
         reg = "vcc" if "vcc" in op else "exec"
         t = (T.get(reg, 0) | (CTRL if (id(ins), "vcc") in self.stale else 0)) if reg == "vcc" else 0
         if t & ~ELECT:
             self.bad_branch(ev, ins, op, t)
             return
-        self.vote(n, ins, op, reg, op.endswith("nz"), ev)
+        self.vote(n, ins, op, reg, op.endswith("nz"), ev, st)
 
     def bad_branch(self, ev, ins, op, t):
         if ev is not None:
@@ -1118,10 +1286,20 @@ class Analysis:
                     return
             ev["viol"].append(("tainted-branch", ins.get("pc"), op))
 
-    def vote(self, n, ins, op, reg, on_taken, ev):
+    def vote(self, n, ins, op, reg, on_taken, ev, st):
         """A wave-wide vote on mask register `reg` decides the branch. EXEC's own vote is always a skip of
         lane-masked work; for any other mask the side that runs when the vote is yes must start by narrowing EXEC
-        to that mask, so lanes that voted no are inert there."""
+        to that mask, so lanes that voted no are inert there.
+
+        A VCC that is a wave-uniform compare (UVOTE: every launch lane or none) is no lane vote: each half votes as
+        the wave does, so either side may have code of its own and scalars it defines are not stale. EXEC must have
+        been the launch mask at the compare: under a narrowed EXEC a half with no active lane votes no while the
+        wave votes yes."""
+        # st only for s_cbranch_vccz/vccnz: an SCC vote was taken on the mask as it was then, and VCC may since hold
+        # another value (a later v_cmp writes no SCC)
+        if reg == "vcc" and st is not None and st["g"].get("vcc") == UVOTE and not st["t"].get("vcc", 0) \
+                and (id(ins), "vcc") not in self.stale:
+            return
         self.voted[n] = reg
         if n + 1 > self.n:
             return

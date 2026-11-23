@@ -154,6 +154,50 @@ class CmpClassF16Tests(unittest.TestCase):
         validate_spirv(spv)
         self.assertEqual(si.run_fragment(spv)["%out_mrt0"][0], 0x3F800000)
 
+    def test_f16_float_const_mask_uses_src_h(self):
+        # Float inline constants on v_cmp(x)_class_f16's mask encode as binary16 over a zero high half
+        # (e.g. 0.5=0x3800, 1.0=0x3C00, -2.0=0xC000, 0.15915494=0x3118), not binary32.
+        # _sdwa: BYTE_3(0.5)=0 (no match), BYTE_1(0.5)=0x38 (bit 3=-normal matches -1.0), WORD_1(1.0)=0, BYTE_3(-2.0)=0.
+        for mask, sel, val, want in (
+            ("0.5", "BYTE_3", 0xBC00, 0x3F800000),
+            ("0.5", "BYTE_1", 0xBC00, 0x40000000),
+            ("1.0", "WORD_1", 0x4000, 0x3F800000),
+            ("-2.0", "BYTE_3", 0x0001, 0x3F800000),
+        ):
+            with self.subTest(mask=mask, sel=sel, val=hex(val)):
+                got = run_v0([
+                    f"v_mov_b32 v1, {val:#x}",
+                    f"v_cmp_class_f16_sdwa vcc_lo, v1, {mask} src0_sel:WORD_0 src1_sel:{sel}",
+                    "v_cndmask_b32_e32 v0, 0x3f800000, 0x40000000, vcc_lo",
+                ])
+                self.assertEqual(got, want)
+
+        # _e64 with 0.15915494 (1/(2*pi)): f16=0x3118 (mask & 0x3FF = 0x118 -> bits 3,4,8; bit 0 sNaN clear),
+        # whereas f32=0x3E22F983 has mask & 0x3FF = 0x183 (would falsely match sNaN bit 0).
+        got_snan = run_v0([
+            "v_mov_b32 v1, 0x7c01",
+            "v_cmp_class_f16_e64 s0, v1, 0.15915494",
+            "v_cndmask_b32_e64 v0, 0x3f800000, 0x40000000, s0",
+        ])
+        self.assertEqual(got_snan, 0x3F800000)
+        got_norm = run_v0([
+            "v_mov_b32 v1, 0xbc00",
+            "v_cmp_class_f16_e64 s0, v1, 0.15915494",
+            "v_cndmask_b32_e64 v0, 0x3f800000, 0x40000000, s0",
+        ])
+        self.assertEqual(got_norm, 0x40000000)
+
+        # v_cmpx_class_f16_e64 with 0.15915494 kills sNaN lane (bit 0 clear in 0x3118).
+        spv_cmpx = translate_lines([
+            "v_mov_b32 v0, 0x3f800000",
+            "v_mov_b32 v1, 0x7c01",
+            "v_cmpx_class_f16_e64 v1, 0.15915494",
+            "v_mov_b32 v0, 0x40000000",
+            "s_mov_b32 exec_lo, -1",
+        ])
+        validate_spirv(spv_cmpx)
+        self.assertEqual(si.run_fragment(spv_cmpx)["%out_mrt0"][0], 0x3F800000)
+
 
 class CmpClassF64Tests(unittest.TestCase):
     def test_all_10_classes_and_no_float64(self):

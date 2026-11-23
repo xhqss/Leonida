@@ -27,7 +27,7 @@ RDNA2 GPU プログラムは Vulkan 向けの SPIR-V に翻訳され、モデル
 
 - **自分用の Xbox Series パッケージ**（バージョン `1.0.2.1`）。`MicrosoftGame.Config` と `.rpf` アーカイブが
   プレーンなファイルとして置かれているフォルダーが、ゲームフォルダーです。
-- **Windows 10/11 x64** と、作業ファイル用に約 **350 GB** の空き容量（`--work` で別ドライブに置けます）。
+- **Windows 10/11 x64** と、作業ファイル用に約 **400 GB** の空き容量（`--work` で別ドライブに置けます）。
 - [Python 3.12+](https://www.python.org/downloads/)（インストール時に "Add python.exe to PATH" を有効に）。
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)。
 - [Vulkan SDK](https://vulkan.lunarg.com/)（`spirv-as` / `spirv-val` 用）。
@@ -95,7 +95,7 @@ python -I make_game.py --wave64-emulate off            # auto（既定）、on�
   ネイティブに実行できる RDNA2 のカードや iGPU の場合は、そのドライバーのシェーダーコンパイラーが
   エミュレーションされた LDS コードでクラッシュするため（#857）、オフのままにします。設定は翻訳済みシェーダーの
   隣に保存され、変更すると翻訳し直しになります。
-- **`--work`**: 中間ファイル用のフォルダーです。最低でも 350 GB 空いているドライブを指定してください。
+- **`--work`**: 中間ファイル用のフォルダーです。最低でも 400 GB 空いているドライブを指定してください。
 - **`--wav`**: 既定では無効です。16-bit PCM WAV は Ogg Opus より数倍大きいためです。
 - **Linux と Wine/Proton**: `make_game.py` は Linux でも動作します。ローダーは Windows プログラムなので
   Wine または Proton で動きます。`runtime` ステージは Linux 上で clang-cl と lld-link（LLVM 19 以降）を使い、

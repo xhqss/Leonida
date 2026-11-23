@@ -7,12 +7,17 @@
 // Cases: one triangle; five (two levels); 1000 random triangles; an indexed R16 grid with a 16-byte vertex stride;
 // R32 indices with R32G32 vertices; a geometry transform; two geometries with an inactive (NaN) triangle; no
 // triangles; 5000 triangles (many radix-sort tiles); updates (refits) in place and into another buffer; clones and a
-// compaction (CopyRaytracingAccelerationStructure) with the postbuild size; a TLAS of four instances (rotated and scaled, one with mask 0, one with no BLAS).
+// compaction (CopyRaytracingAccelerationStructure) with the postbuild size; a TLAS of four instances (rotated and scaled, one with mask 0, one with no BLAS);
+// BOX16 builds (blas_box16_*: half boxes, which check-build compares bit for bit with tools/xdxr_bvh.py encode_box16),
+// including coordinates past the half range and below its smallest normal, and a refit; TRI1 pairing (blas_paired_*:
+// sibling triangles that share an edge in one leaf), on grids, BOX16, a transform, inactive triangles, triangles that
+// share an edge in the same direction or across geometries (never paired), and the radix-sort path.
 // Exit 77 when there is no Vulkan device with bufferDeviceAddress.
 // `vk_xdxr_build_test <out dir> <triangles>` instead times BLAS builds of that many random triangles (wall clock of
 // one submission each, after one warm-up; result and scratch in device-local memory), then in-place updates
 // (refits) of the same structure, and writes nothing.
 #include "vk_test_device.h"
+#include "xdxr_build_output.h"
 #include "../src/xdxr_build.h"
 
 #include <algorithm>
@@ -21,7 +26,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <filesystem>
 #include <fstream>
 #include <random>
 #include <string>
@@ -72,6 +76,14 @@ bool write_file(const std::string& path, const void* data, std::size_t bytes) {
     return bool(f);
 }
 
+// The size a structure's header gives (totalSizeIn64BNodes does not count the header): the nodes the build wrote,
+// at most the layout's size, which leaves room for the most a tree of that many elements can have.
+std::size_t header_size(const void* structure) {
+    std::uint32_t units = 0;
+    std::memcpy(&units, static_cast<const char*>(structure) + 4, 4);
+    return (std::size_t(units) + 1) * 64;
+}
+
 std::string tris_json(const std::vector<Tri>& tris) {
     std::string s = "[";
     for (std::size_t i = 0; i < tris.size(); ++i) {
@@ -116,14 +128,18 @@ void expand(const Geometry& g, std::uint32_t geometry, std::vector<Tri>& out) {
 
 struct Built {
     std::uint64_t address = 0;
+    std::size_t size = 0;              // as the header gives it
     std::vector<Tri> tris;
 };
 
 // With `moved` (the same geometries with new vertex positions) the BLAS is then updated: refitted in place, or with
 // `into_other` into a second buffer, in which case the untouched source is written too, as <name>_source.
+// `box16`: BOX16 inner nodes. `pair`: TRI1 pairing; the case's JSON then asks check-build for at least one TRI1
+// node, or with `expect_no_pairs` for none.
 int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir, const std::string& name,
                const std::vector<Geometry>& geometries, Built& built, unsigned rays = 0,
-               const std::vector<Geometry>* moved = nullptr, bool into_other = false) {
+               const std::vector<Geometry>* moved = nullptr, bool into_other = false, bool box16 = false,
+               bool pair = false, bool expect_no_pairs = false) {
     std::vector<Buffer> keep, vertex_buffers;
     std::vector<XdxrTriangles> descs;
     std::uint32_t total = 0;
@@ -165,23 +181,30 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
         total += geo.triangle_count;
     }
     XdxrLayout layout;
-    EXPECT(layout.compute(total, false));
+    EXPECT(layout.compute(total, false, box16));
     Buffer dst = make(gpu, layout.size + 256), scratch = make(gpu, std::size_t(layout.scratch));
     EXPECT(dst.buffer && scratch.buffer);
     const std::uint64_t base = (dst.address + 255) & ~std::uint64_t(255);   // 256-byte aligned, as D3D12 requires
     bool recorded = false;
     EXPECT(gpu.run([&](VkCommandBuffer cb) {
-        recorded = builder.record_blas(cb, layout, descs, base, scratch.address);
+        recorded = builder.record_blas(cb, layout, descs, base, scratch.address, 0, pair);
         barrier_to_host(gpu, cb);
         return recorded;
     }));
     built.address = base;
+    built.size = header_size(static_cast<const char*>(dst.map) + (base - dst.address));
     auto dump = [&](const std::string& case_name, const Buffer& buffer, std::uint64_t at, const std::vector<Tri>& tris) {
         const auto* bytes = static_cast<const char*>(buffer.map) + (at - buffer.address);
         const std::string json = "{\"kind\": \"blas\", \"address\": " + std::to_string(at) +
                                  (rays ? ", \"rays\": " + std::to_string(rays) : std::string()) +
+                                 (pair && !moved ? (expect_no_pairs ? ", \"pairs\": false" : ", \"pairs\": true")
+                                                 : "") +
+                                 (box16 ? ", \"box16\": true" : ", \"box16\": false") +
+                                 (name == "blas_paired_rotations" ? ", \"all_rotations\": true" : "") +
                                  ", \"triangles\": " + tris_json(tris) + "}\n";
-        return write_file(dir + "/" + case_name + ".bin", bytes, layout.size) &&
+        const std::size_t size = header_size(bytes);
+        if (size > layout.size) return false;
+        return write_file(dir + "/" + case_name + ".bin", bytes, size) &&
                write_file(dir + "/" + case_name + ".json", json.data(), json.size());
     };
     if (!moved) {
@@ -222,13 +245,9 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::string dir = argv[1];
-    // A failed run must not leave the previous run's cases for the checker to pass.
-    if (argc == 2) {
-        std::error_code ec;
-        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-            const auto ext = entry.path().extension();
-            if (ext == ".bin" || ext == ".json") std::filesystem::remove(entry.path(), ec);
-        }
+    if (const auto ec = prepare_xdxr_build_output(dir, argc > 2)) {
+        std::fprintf(stderr, "cannot create output directory %s: %s\n", dir.c_str(), ec.message().c_str());
+        return 1;
     }
     vktest::Device gpu;
     gpu.request_buffer_device_address = true;
@@ -357,6 +376,100 @@ int main(int argc, char** argv) {
         if (build_blas(gpu, builder, dir, "blas_refit_into_other", {g}, copied, 0, &after_grid, true)) return 1;
     }
 
+    // BOX16 inner nodes: the same tree with half boxes rounded outward (64-byte nodes instead of 128).
+    {
+        Built h0, h1, h2, h3, h4;                          // build_blas appends to a Built's triangles
+        if (build_blas(gpu, builder, dir, "blas_box16_random", {soup(1000)}, h0, 0, nullptr, false, true)) return 1;
+        if (build_blas(gpu, builder, dir, "blas_box16_sort_tiles", {soup(5000)}, h1, 200, nullptr, false, true)) return 1;
+        Geometry a16 = soup(40), b16 = soup(25);
+        b16.vertex_data[3 * 3 * 3] = std::nanf("");                // an inactive triangle: an empty box
+        if (build_blas(gpu, builder, dir, "blas_box16_two_geometries", {a16, b16}, h2, 0, nullptr, false, true)) return 1;
+        // Coordinates the half format cannot hold: past 65504 (inf outward, HALF_MAX inward), between 2^-14 and
+        // 2^-24 and below (no denormal halves: 0 or +-2^-14), exact halves, and ordinary triangles the rays hit.
+        Geometry x = soup(24);
+        const float odd[][9] = {
+            {70000.0f, 1.0f, 2.0f, 70001.0f, 3.0f, 2.5f, 69999.0f, 2.0f, 1.5f},
+            {-65520.0f, -65504.0f, 65504.0f, -65519.0f, -65500.0f, 65505.0f, -65000.0f, -65503.0f, 65490.0f},
+            {3.0e-5f, -2.0e-6f, 1.0e-7f, 6.0e-5f, 4.0e-5f, -1.0e-9f, -3.0e-5f, 6.103515625e-5f, 0.0f},
+            {-0.0f, 1.0e-30f, -1.0e-30f, 2.0f, 0.5f, 0.25f, 1.0f, -0.125f, 0.0f},
+            {1e30f, -1e30f, 5.0f, 1e30f, -1e30f, 6.0f, -1e30f, 1e30f, 5.5f},
+            {1.0009766f, -2.0019531f, 3.0f, 1.0f, -2.0f, 3.0029297f, 1.0004883f, -2.0f, 3.0f},
+        };
+        for (const auto& t : odd) x.vertex_data.insert(x.vertex_data.end(), t, t + 9);
+        x.triangle_count += sizeof odd / sizeof odd[0];
+        if (build_blas(gpu, builder, dir, "blas_box16_extremes", {x}, h3, 0, nullptr, false, true)) return 1;
+        const Geometry big = soup(3000);
+        const std::vector<Geometry> after = {move(big, 1.5f)};
+        if (build_blas(gpu, builder, dir, "blas_box16_refit_in_place", {big}, h4, 300, &after, false, true)) return 1;
+    }
+
+    // TRI1 pairing: the same tree, with sibling triangles that share an edge in one leaf.
+    {
+        Built p0, p1, p2, p3, p4;
+        Geometry pg = grid(12, 4, false);
+        pg.u16 = true;
+        if (build_blas(gpu, builder, dir, "blas_paired_grid", {pg}, p0, 0, nullptr, false, false, true)) return 1;
+        if (build_blas(gpu, builder, dir, "blas_paired_grid_box16", {grid(9, 2, true)}, p1, 0, nullptr, false, true,
+                       true))
+            return 1;
+        Geometry ptf = grid(6, 3, false);
+        ptf.transform = true;
+        std::memcpy(ptf.m, m, sizeof m);
+        if (build_blas(gpu, builder, dir, "blas_paired_transform", {ptf}, p2, 0, nullptr, false, false, true)) return 1;
+        // A grid with a NaN vertex (its triangles are inactive); quads split across two geometries (each edge shared
+        // the right way, but a leaf holds one geometry, so a pair would report the wrong one); and triangle pairs that
+        // share an edge in the same direction (mirrored winding: not a valid pair).
+        Geometry holed = grid(8, 3, false);
+        holed.vertex_data[3 * 40] = std::nanf("");
+        // Each pair is small and the pairs are spread through the volume, so a pair's two triangles have nearly the
+        // same Morton key and end up siblings: the rules, not the sort, must keep them apart.
+        Geometry cross_a, cross_b, same_dir;
+        for (int i = 0; i < 32; ++i) {
+            const float cx = spread(rng), cy = spread(rng), cz = spread(rng);
+            const float a[3] = {cx - 0.2f, cy, cz}, b[3] = {cx + 0.2f, cy, cz};
+            const float up[3] = {cx, cy + 0.3f, cz + 0.05f}, down[3] = {cx, cy - 0.3f, cz - 0.05f};
+            const float ta[9] = {a[0], a[1], a[2], b[0], b[1], b[2], up[0], up[1], up[2]};        // A -> B
+            const float tb[9] = {b[0], b[1], b[2], a[0], a[1], a[2], down[0], down[1], down[2]};  // B -> A
+            const float td[9] = {a[0], a[1], a[2], b[0], b[1], b[2], down[0], down[1], down[2]};  // A -> B again
+            if (i < 16) {                                    // across two geometries, the reverse edge
+                cross_a.vertex_data.insert(cross_a.vertex_data.end(), ta, ta + 9);
+                cross_b.vertex_data.insert(cross_b.vertex_data.end(), tb, tb + 9);
+            } else {                                         // one geometry, the same direction
+                same_dir.vertex_data.insert(same_dir.vertex_data.end(), ta, ta + 9);
+                same_dir.vertex_data.insert(same_dir.vertex_data.end(), td, td + 9);
+            }
+        }
+        cross_a.triangle_count = cross_b.triangle_count = 16;
+        same_dir.triangle_count = 32;
+        if (build_blas(gpu, builder, dir, "blas_paired_mixed", {holed, cross_a, cross_b, same_dir}, p3, 0, nullptr,
+                       false, false, true))
+            return 1;
+        // on their own, so that the triangles that must not pair are siblings: no TRI1 at all
+        Built q0, q1;
+        if (build_blas(gpu, builder, dir, "blas_unpaired_geometries", {cross_a, cross_b}, q0, 0, nullptr, false, false,
+                       true, true))
+            return 1;
+        if (build_blas(gpu, builder, dir, "blas_unpaired_same_direction", {same_dir}, q1, 0, nullptr, false, false,
+                       true, true))
+            return 1;
+        // Every triangle of a grid starts at another of its vertices (the same winding), so pairs come in all nine
+        // combinations of the first triangle's rotation k and the sibling's kd (check-build asserts it).
+        Geometry rotated = grid(16, 3, false);
+        for (std::size_t t = 0; t + 2 < rotated.indices.size(); t += 3) {
+            const std::uint32_t r = std::uint32_t((t / 3) * 7 / 3 % 3), i0 = rotated.indices[t],
+                                i1 = rotated.indices[t + 1], i2 = rotated.indices[t + 2];
+            const std::uint32_t v[3] = {i0, i1, i2};
+            for (std::uint32_t k = 0; k < 3; ++k) rotated.indices[t + k] = v[(k + r) % 3];
+        }
+        Built p5;
+        if (build_blas(gpu, builder, dir, "blas_paired_rotations", {rotated}, p5, 0, nullptr, false, false, true))
+            return 1;
+        // 7,200 triangles: the radix-sort path
+        if (build_blas(gpu, builder, dir, "blas_paired_sort_tiles", {grid(60, 3, false)}, p4, 200, nullptr, false,
+                       false, true))
+            return 1;
+    }
+
     // TLAS: instances over blas_random and blas_grid_u16_stride16. An instance names its BLAS by a 40-bit address
     // (256-byte units in 32 bits), as on the console; device addresses can be wider (llvmpipe's are host pointers).
     // The instances hold application-style addresses, device address - bias, as the layer's address window does.
@@ -392,7 +505,9 @@ int main(int argc, char** argv) {
         barrier_to_host(gpu, cb);
         return recorded;
     }));
-    EXPECT(write_file(dir + "/tlas.bin", static_cast<const char*>(dst.map) + (base - dst.address), layout.size));
+    const char* tlas_bytes = static_cast<const char*>(dst.map) + (base - dst.address);
+    EXPECT(header_size(tlas_bytes) <= layout.size);
+    EXPECT(write_file(dir + "/tlas.bin", tlas_bytes, header_size(tlas_bytes)));
     std::string json = "{\"kind\": \"tlas\", \"address\": " + std::to_string(base) + ", \"bias\": " +
                        std::to_string(bias) + ", \"blas\": [\"blas_random\", " +
                        "\"blas_grid_u16_stride16\"], \"instances\": [";
@@ -420,7 +535,7 @@ int main(int argc, char** argv) {
         barrier_to_host(gpu, cb);
         return recorded;
     }));
-    EXPECT(write_file(dir + "/tlas_refit.bin", static_cast<const char*>(dst.map) + (base - dst.address), layout.size));
+    EXPECT(write_file(dir + "/tlas_refit.bin", tlas_bytes, header_size(tlas_bytes)));
     std::string json2 = "{\"kind\": \"tlas\", \"address\": " + std::to_string(base) + ", \"bias\": " +
                         std::to_string(bias) + ", \"blas\": [\"blas_random\", \"blas_grid_u16_stride16\"], \"instances\": [";
     for (std::uint32_t i = 0; i < count; ++i) {
@@ -452,7 +567,8 @@ int main(int argc, char** argv) {
         std::uint64_t compacted = 0, clone_size = 0;
         std::memcpy(&compacted, info.map, 8);
         std::memcpy(&clone_size, static_cast<char*>(info.map) + 8, 8);
-        EXPECT(compacted == blas_layout.size);          // a build is exactly its layout's size
+        // a build is already as small as it gets: the size its header gives, within the layout's room
+        EXPECT(compacted == random.size && compacted <= blas_layout.size);
         EXPECT(clone_size == compacted);
         auto dump_blas = [&](const std::string& name, const Buffer& b, std::uint64_t at, std::size_t bytes) {
             const std::string j = "{\"kind\": \"blas\", \"address\": " + std::to_string(at) +
@@ -460,7 +576,7 @@ int main(int argc, char** argv) {
             return write_file(dir + "/" + name + ".bin", static_cast<const char*>(b.map) + (at - b.address), bytes) &&
                    write_file(dir + "/" + name + ".json", j.data(), j.size());
         };
-        EXPECT(dump_blas("blas_clone", clone, clone_at, blas_layout.size));
+        EXPECT(dump_blas("blas_clone", clone, clone_at, std::size_t(compacted)));
         // COMPACT into exactly the compacted size; a guard word after it must survive
         Buffer packed = make(gpu, std::size_t(compacted) + 256 + 4);
         EXPECT(packed.buffer);
@@ -486,7 +602,7 @@ int main(int argc, char** argv) {
             return ok;
         }));
         EXPECT(write_file(dir + "/tlas_refit_clone.bin", static_cast<const char*>(tclone.map) + (tclone_at - tclone.address),
-                          layout.size));
+                          header_size(tlas_bytes)));
         std::string json3 = json2;
         json3.replace(json3.find(std::to_string(base)), std::to_string(base).size(), std::to_string(tclone_at));
         EXPECT(write_file(dir + "/tlas_refit_clone.json", json3.data(), json3.size()));

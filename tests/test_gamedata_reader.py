@@ -349,6 +349,18 @@ class Run(unittest.TestCase):
                 with open(os.path.join(out, name), encoding="utf-8") as f:
                     values.append(json.load(f)["x"])
             self.assertEqual(sorted(values), [1, 2, 3])
+    def test_cli_fails_when_no_document_can_be_read(self):
+        # A corpus with a truncated tail still reads its other documents and exits 0 (the test above); a run that
+        # read nothing because every document was broken must not look like an empty read.
+        with tempfile.TemporaryDirectory() as d:
+            bad = os.path.join(d, "bad.xml")
+            with open(bad, "wb") as f:
+                f.write(b'<COther><x value="1"/>')              # truncated, and the only document
+            r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "gamedata_reader.py"), bad],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertIn("no document could be read", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
 
     def test_cli_missing_target(self):
         r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "gamedata_reader.py"),

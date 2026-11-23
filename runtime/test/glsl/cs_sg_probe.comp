@@ -1,6 +1,7 @@
 #version 460
 // A compute shader written to the translator's runtime contract that stores the subgroup size the driver ran it
-// with (gl_SubgroupSize) in out[0], for d3d12_subgroup_test. s0:s1 is a root UAV: the console VA of the output.
+// with (gl_SubgroupSize) in out[0], for d3d12_subgroup_test. s4:s5 (the first two of the four root constants, in the console
+// compute layout from s4) hold the console VA of the output.
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
 #extension GL_KHR_shader_subgroup_basic : require
@@ -24,6 +25,6 @@ uvec2 add64(uvec2 a, uvec2 b) {
 }
 
 void main() {
-    Words out_words = Words(add64(pc.heap_base, uvec2(pc.s[0], pc.s[1])));
+    Words out_words = Words(add64(pc.heap_base, uvec2(pc.s[4], pc.s[5])));
     if (gl_LocalInvocationIndex == 0u) out_words.w[0] = gl_SubgroupSize;
 }

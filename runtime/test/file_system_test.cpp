@@ -5,8 +5,13 @@
 // folder that stands in for the game install, an overlay folder, and a "GAME:" path in each variant.
 #include <windows.h>
 
+#include <aclapi.h>
+
+#include <algorithm>
+#include <clocale>
 #include <cstdio>
 #include <filesystem>
+#include <initializer_list>
 #include <string>
 #include <thread>
 #include <vector>
@@ -178,8 +183,10 @@ int main() {
         if (r != INVALID_HANDLE_VALUE) ::CloseHandle(r);
     }
 
-    // A new file, in folders the package does not have.
+    // A new file, in a folder the package does not have: the title makes the folder first, as it must on the host.
     {
+        const auto make_folder = resolve<CreateDirectoryWFn>("kernel32.dll", "CreateDirectoryW");
+        check(make_folder && make_folder(L"GAME:\\save", nullptr) != FALSE, "CreateDirectoryW makes GAME:\\save");
         const HANDLE h = create_w(L"GAME:\\save\\slot1.bin", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
         check(h != INVALID_HANDLE_VALUE, "CREATE_ALWAYS makes a new console file");
         DWORD written = 0;
@@ -216,8 +223,113 @@ int main() {
         SetLastError(0);
         WIN32_FIND_DATAW none{};
         const HANDLE missing = first_w(L"GAME:\\missing\\*", &none);
-        check(missing == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND,
-              "a pattern with no match reports ERROR_FILE_NOT_FOUND");
+        check(missing == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "a listing inside a folder that does not exist reports ERROR_PATH_NOT_FOUND, as the host does");
+    }
+
+    // Names that differ only in case are one entry, as on the host, and the overlay's spelling is the one listed.
+    {
+        write_path(overlay / "data" / "Mixed.TXT", "overlay");
+        write_path(package / "data" / "mixed.txt", "package");
+        const std::vector<std::wstring> names = list(first_w, next_w, find_close, L"GAME:\\data\\*");
+        check(count(names, L"mixed.txt") == 1, "names that differ only in case are listed once");
+        check(std::find(names.begin(), names.end(), std::wstring(L"Mixed.TXT")) != names.end(),
+              "and the overlay's spelling wins");
+    }
+
+    // A folder with no deletion markers at all (its marker folder does not exist) lists every package entry once.
+    {
+        for (int i = 0; i < 300; ++i) write_path(package / "many" / ("f" + std::to_string(i) + ".bin"), "x");
+        write_path(overlay / "many" / "F7.BIN", "overlay");
+        check(!std::filesystem::exists(overlay / ".gta6rt-deleted" / "many"), "GAME:\\many has no marker folder");
+        const std::vector<std::wstring> names = list(first_w, next_w, find_close, L"GAME:\\many\\*");
+        int files = 0;
+        for (const auto& n : names)
+            if (n != L"." && n != L"..") ++files;
+        check(files == 300 && count(names, L"f7.bin") == 1 && count(names, L"f299.bin") == 1,
+              "a folder without markers lists all 300 files, with the overlay's copy once");
+
+        // Once the folder has a marker folder, the listing reads it once: a delete under another ASCII case hides
+        // exactly that file and every other file stays.
+        check(delete_w(L"GAME:\\many\\F3.BIN") != FALSE, "DeleteFileW hides f3.bin under another case");
+        const std::vector<std::wstring> after = list(first_w, next_w, find_close, L"GAME:\\many\\*");
+        int left = 0;
+        for (const auto& n : after)
+            if (n != L"." && n != L"..") ++left;
+        check(left == 299 && !contains(after, L"f3.bin") && count(after, L"f30.bin") == 1,
+              "with a marker folder the listing hides only the deleted file");
+    }
+
+    // Names with non-ASCII letters keep the file system's case rule: deleting U+00E9 hides the package's U+00C9.
+    {
+        write_path(package / "names" / L"Éclair.txt", "package");
+        write_path(package / "names" / "plain.txt", "package");
+        check(delete_w(L"GAME:\\names\\éclair.txt") != FALSE, "DeleteFileW takes a name that differs in a non-ASCII case");
+        const std::vector<std::wstring> names = list(first_w, next_w, find_close, L"GAME:\\names\\*");
+        check(std::find(names.begin(), names.end(), std::wstring(L"Éclair.txt")) == names.end() &&
+                  contains(names, L"plain.txt"),
+              "and the listing hides it, as the file system's compare does");
+    }
+
+    // Duplicates are decided by _wcsicmp (same_name) in the title's locale, not by a lower-cased key: under .UTF-8,
+    // _wcslwr_s folds U+00C9 and U+00E9 while _wcsicmp keeps them apart.
+    {
+        write_path(overlay / "loc" / L"Éclair.txt", "overlay");
+        write_path(package / "loc" / L"éclair.txt", "package");
+        const char* old = std::setlocale(LC_CTYPE, nullptr);
+        const std::string saved = old ? old : "C";
+        if (std::setlocale(LC_CTYPE, ".UTF-8")) {
+            const int expected = _wcsicmp(L"Éclair.txt", L"éclair.txt") == 0 ? 1 : 2;
+            const std::vector<std::wstring> names = list(first_w, next_w, find_close, L"GAME:\\loc\\*");
+            int files = 0;
+            for (const auto& n : names)
+                if (n != L"." && n != L"..") ++files;
+            check(files == expected, "under .UTF-8 the merged listing keeps exactly the names _wcsicmp tells apart");
+        }
+        std::setlocale(LC_CTYPE, saved.c_str());
+    }
+
+    // A marker folder that cannot be listed (listing denied, lookups by path still allowed) is not "no markers":
+    // the deleted file stays hidden, as GetFileAttributesW already reports it.
+    {
+        write_path(package / "acl" / "a.txt", "package");
+        write_path(package / "acl" / "b.txt", "package");
+        check(delete_w(L"GAME:\\acl\\a.txt") != FALSE, "DeleteFileW hides a.txt");
+        const std::wstring marks = (overlay / ".gta6rt-deleted" / "acl").wstring();
+        PACL old_dacl = nullptr;
+        PSECURITY_DESCRIPTOR sd = nullptr;
+        bool denied = false;
+        if (GetNamedSecurityInfoW(marks.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr,
+                                  &old_dacl, nullptr, &sd) == ERROR_SUCCESS) {
+            EXPLICIT_ACCESS_W deny{};
+            deny.grfAccessPermissions = FILE_LIST_DIRECTORY;
+            deny.grfAccessMode = DENY_ACCESS;
+            deny.grfInheritance = NO_INHERITANCE;
+            BuildTrusteeWithNameW(&deny.Trustee, const_cast<LPWSTR>(L"CURRENT_USER"));
+            PACL new_dacl = nullptr;
+            if (SetEntriesInAclW(1, &deny, old_dacl, &new_dacl) == ERROR_SUCCESS) {
+                denied = SetNamedSecurityInfoW(const_cast<LPWSTR>(marks.c_str()), SE_FILE_OBJECT,
+                                               DACL_SECURITY_INFORMATION, nullptr, nullptr, new_dacl,
+                                               nullptr) == ERROR_SUCCESS;
+                LocalFree(new_dacl);
+            }
+        }
+        WIN32_FIND_DATAW probe{};
+        const HANDLE ph = ::FindFirstFileW((marks + L"\\*").c_str(), &probe);
+        const bool listing_denied = ph == INVALID_HANDLE_VALUE && GetLastError() == ERROR_ACCESS_DENIED;
+        if (ph != INVALID_HANDLE_VALUE) ::FindClose(ph);
+        if (denied && listing_denied) {
+            check(attributes_w(L"GAME:\\acl\\a.txt") == INVALID_FILE_ATTRIBUTES, "a.txt is still missing by path");
+            const std::vector<std::wstring> names = list(first_w, next_w, find_close, L"GAME:\\acl\\*");
+            check(!contains(names, L"a.txt") && contains(names, L"b.txt"),
+                  "a marker folder that cannot be listed still hides its deleted files");
+        } else {
+            std::printf("SKIP could not deny listing the marker folder\n");
+        }
+        if (denied)
+            SetNamedSecurityInfoW(const_cast<LPWSTR>(marks.c_str()), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                  nullptr, nullptr, old_dacl, nullptr);
+        if (sd) LocalFree(sd);
     }
 
     // A delete hides the package file without removing it.
@@ -471,6 +583,67 @@ int main() {
               "CopyFile2 copies too");
         check(copy2(L"GAME:\\misc\\keep.txt", L"GAME:\\misc\\two.txt", &params) == HRESULT_FROM_WIN32(ERROR_FILE_EXISTS),
               "and returns its HRESULT for an existing name");
+
+        // CopyFile2 again, through the host's CopyFile2 (where it has one) and through the CopyFileExW fallback the
+        // shim uses where it has none (Wine 9), so both are checked wherever the test runs.
+        for (const bool fallback : {false, true}) {
+            rt::fs::force_copy_file2_fallback(fallback);
+            const std::string mode = fallback ? " (fallback)" : " (host CopyFile2, or the fallback without one)";
+            const std::wstring dir = fallback ? L"GAME:\\copy2_fallback" : L"GAME:\\copy2_host";
+            const std::filesystem::path out = overlay / (fallback ? "copy2_fallback" : "copy2_host");
+            const auto to = [&](const wchar_t* name) { return dir + L"\\" + name; };
+            check(mkdir_w(dir.c_str(), nullptr) != FALSE, ("a folder for the CopyFile2 checks" + mode).c_str());
+
+            check(copy2(L"GAME:\\misc\\keep.txt", to(L"null.txt").c_str(), nullptr) == S_OK &&
+                      read_path(out / "null.txt") == "keep",
+                  ("CopyFile2 without a parameter block copies" + mode).c_str());
+            for (const DWORD size : {DWORD{0}, DWORD{4}, DWORD{sizeof(COPYFILE2_EXTENDED_PARAMETERS) - 1}}) {
+                COPYFILE2_EXTENDED_PARAMETERS short_block{};
+                short_block.dwSize = size;
+                check(copy2(L"GAME:\\misc\\keep.txt", to(L"short.txt").c_str(), &short_block) == E_INVALIDARG &&
+                          !std::filesystem::exists(out / "short.txt"),
+                      ("a parameter block of " + std::to_string(size) +
+                       " bytes is E_INVALIDARG and writes nothing" + mode)
+                          .c_str());
+            }
+            COPYFILE2_EXTENDED_PARAMETERS block{};
+            block.dwSize = sizeof(block);
+            block.dwCopyFlags = COPY_FILE_FAIL_IF_EXISTS | 0x00040000 /* NO_OFFLOAD, a hint */;
+            check(copy2(L"GAME:\\misc\\keep.txt", to(L"hint.txt").c_str(), &block) == S_OK &&
+                      read_path(out / "hint.txt") == "keep",
+                  ("fail-if-exists with a hint flag copies" + mode).c_str());
+            check(copy2(L"GAME:\\misc\\keep.txt", to(L"hint.txt").c_str(), &block) ==
+                      HRESULT_FROM_WIN32(ERROR_FILE_EXISTS),
+                  ("and refuses an existing name" + mode).c_str());
+            BOOL cancel = TRUE;
+            block.dwCopyFlags = 0;
+            block.pfCancel = &cancel;
+            check(copy2(L"GAME:\\misc\\keep.txt", to(L"cancelled.txt").c_str(), &block) ==
+                          HRESULT_FROM_WIN32(ERROR_REQUEST_ABORTED) &&
+                      !std::filesystem::exists(out / "cancelled.txt"),
+                  ("a cancel flag set before the copy cancels it" + mode).c_str());
+            block.pfCancel = nullptr;
+            if (fallback) {
+                // A flag that changes what the copy produces, and which CopyFileExW can't do, is refused before
+                // anything is written: the fallback doesn't copy the alternate streams it was told to skip.
+                block.dwCopyFlags = 0x00008000 /* COPY_FILE_SKIP_ALTERNATE_STREAMS */;
+                check(copy2(L"GAME:\\misc\\keep.txt", to(L"streams.txt").c_str(), &block) ==
+                              HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) &&
+                          !std::filesystem::exists(out / "streams.txt"),
+                      "the fallback refuses SKIP_ALTERNATE_STREAMS and writes nothing");
+                block.dwCopyFlags = 0x00000080 /* COPY_FILE_DIRECTORY */;
+                check(copy2(L"GAME:\\misc\\keep.txt", to(L"directory.txt").c_str(), &block) ==
+                              HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED),
+                      "and COPY_FILE_DIRECTORY");
+                block.dwCopyFlags = 0;
+                block.dwSize = sizeof(block) + 8;  // a longer (V2-sized) block: its extra fields have no equivalent
+                check(copy2(L"GAME:\\misc\\keep.txt", to(L"v2.txt").c_str(), &block) ==
+                              HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) &&
+                          !std::filesystem::exists(out / "v2.txt"),
+                      "and a block longer than COPYFILE2_EXTENDED_PARAMETERS");
+            }
+        }
+        rt::fs::force_copy_file2_fallback(false);
         SetLastError(0);
         check(copy_w(L"GAME:\\misc\\one.txt", L"GAME:\\cache\\one.txt", FALSE) == FALSE && GetLastError() == ERROR_FILE_NOT_FOUND,
               "a deleted name cannot be copied");
@@ -706,6 +879,47 @@ int main() {
                   GetLastError() == ERROR_INVALID_NAME,
               "G:\\.. is refused with ERROR_INVALID_NAME");
 
+        int fresh_count = 0;
+        auto fresh_overlay = [&] {
+            const std::filesystem::path dir = root / ("fresh_overlay" + std::to_string(++fresh_count));
+            rt::fs::configure(package, dir);
+            return dir;
+        };
+        fresh_overlay();
+        SetLastError(0);
+        const DWORD t_root = attributes_w(L"T:\\");
+        check(t_root != INVALID_FILE_ATTRIBUTES && (t_root & FILE_ATTRIBUTE_DIRECTORY) != 0 && GetLastError() == 0,
+              "on a fresh overlay GetFileAttributesW(T:\\) is a folder, and making it leaves the last error alone");
+        fresh_overlay();
+        const std::vector<std::wstring> t_names = list(first_w, next_w, find_close, L"T:\\*");
+        check(t_names.size() == 2 && count(t_names, L".") == 1 && count(t_names, L"..") == 1,
+              "on a fresh overlay FindFirstFileW(T:\\*) lists the empty root as . and ..");
+        fresh_overlay();
+        check(mkdir_w(L"T:\\shadercache", nullptr) != FALSE,
+              "on a fresh overlay CreateDirectoryW(T:\\shadercache) succeeds");
+        std::filesystem::path fresh = fresh_overlay();
+        check(copy_w(L"GAME:\\data\\hello.txt", L"T:\\hello.tmp", FALSE) != FALSE &&
+                  read_path(fresh / ".gta6rt-temp" / "hello.tmp") == "package",
+              "on a fresh overlay CopyFileW(GAME:\\data\\hello.txt, T:\\hello.tmp) succeeds");
+        fresh = fresh_overlay();
+        SetLastError(0);
+        check(rmdir_w(L"T:\\") == FALSE && GetLastError() == ERROR_ACCESS_DENIED &&
+                  std::filesystem::is_directory(fresh / ".gta6rt-temp"),
+              "T:\\ cannot be removed, like GAME:\\");
+        fresh = fresh_overlay();
+        SetLastError(0);
+        check(move_w(L"T:\\", L"GAME:\\moved") == FALSE && GetLastError() == ERROR_ACCESS_DENIED &&
+                  attributes_w(L"GAME:\\moved") == INVALID_FILE_ATTRIBUTES &&
+                  std::filesystem::is_directory(fresh / ".gta6rt-temp"),
+              "T:\\ cannot be moved");
+        fresh_overlay();
+        attributes_w(L"T:\\");
+        SetLastError(0);
+        const BOOL removed_by_game_path = rmdir_w(L"GAME:\\.gta6rt-temp");
+        check(removed_by_game_path != FALSE || GetLastError() != ERROR_ACCESS_DENIED,
+              "only a T: path names the T:\\ root: GAME:\\.gta6rt-temp is not refused as a drive root");
+        rt::fs::configure(package, overlay);
+
         h = create_w(L"T:\\cache\\scratch.bin", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
         check(h != INVALID_HANDLE_VALUE, "CreateFileW creates a file on T: (parent folders and all)");
         if (h != INVALID_HANDLE_VALUE) {
@@ -730,6 +944,49 @@ int main() {
                   GetLastError() == ERROR_INVALID_NAME,
               "T:\\.. cannot climb out of the scratch folder into the package");
 
+        // The overlay's own folders (.gta6rt-deleted, .gta6rt-temp, .gta6rt-copy) are hidden from GAME:\ listings and,
+        // as an explicit GAME: or G: path, refused like any other invalid name, in every spelling parse_console()
+        // normalises (RT-294). T:\ still names the scratch folder, and an ordinary dotted name is not reserved.
+        write_path(overlay / ".gta6rt-temp" / "runtime.tmp", "runtime");
+        write_path(overlay / ".gta6rt-deleted" / "data" / "gone.txt", "");
+        write_path(overlay / ".gta6rt-other" / "ok.txt", "ok");
+        for (const wchar_t* reserved : {L"GAME:\\.gta6rt-temp\\runtime.tmp", L"GAME:\\.GTA6RT-TEMP\\runtime.tmp",
+                                        L"game:/.gta6rt-temp/runtime.tmp", L"GAME:\\.\\.gta6rt-temp\\runtime.tmp",
+                                        L"GAME:\\data\\..\\.gta6rt-temp\\runtime.tmp", L"G:\\.gta6rt-temp\\runtime.tmp",
+                                        L"GAME:\\.gta6rt-deleted\\data\\gone.txt", L"GAME:\\.gta6rt-copy\\x.bin",
+                                        L"GAME:\\.gta6rt-temp"}) {
+            SetLastError(0);
+            const HANDLE h = create_w(reserved, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_NAME,
+                  "an explicit GAME: path into a reserved overlay folder is refused (CreateFileW)");
+            if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+            SetLastError(0);
+            check(attributes_w(reserved) == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_INVALID_NAME,
+                  "and has no attributes (GetFileAttributesW)");
+        }
+        WIN32_FIND_DATAW marker_data{};
+        SetLastError(0);
+        const HANDLE markers = first_w(L"GAME:\\.gta6rt-deleted\\data\\*", &marker_data);
+        check(markers == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_NAME,
+              "deletion markers cannot be listed through GAME:\\.gta6rt-deleted");
+        if (markers != INVALID_HANDLE_VALUE) find_close(markers);
+        SetLastError(0);
+        const HANDLE probe = create_w(L"GAME:\\.gta6rt-temp\\probe.txt", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(probe == INVALID_HANDLE_VALUE && !std::filesystem::exists(overlay / ".gta6rt-temp" / "probe.txt"),
+              "a write through GAME:\\.gta6rt-temp creates nothing in the scratch folder");
+        if (probe != INVALID_HANDLE_VALUE) ::CloseHandle(probe);
+        check(mkdir_w(L"GAME:\\.gta6rt-copy\\sub", nullptr) == FALSE && !std::filesystem::exists(overlay / ".gta6rt-copy" / "sub"),
+              "CreateDirectoryW refuses a reserved folder");
+        check(delete_w(L"GAME:\\.gta6rt-deleted\\data\\gone.txt") == FALSE &&
+                  std::filesystem::exists(overlay / ".gta6rt-deleted" / "data" / "gone.txt"),
+              "DeleteFileW cannot remove a deletion marker through GAME:");
+        HANDLE through = create_w(L"T:\\runtime.tmp", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(through != INVALID_HANDLE_VALUE && read_handle(through) == "runtime", "T:\\ still reaches the scratch folder");
+        if (through != INVALID_HANDLE_VALUE) ::CloseHandle(through);
+        through = create_w(L"GAME:\\.gta6rt-other\\ok.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(through != INVALID_HANDLE_VALUE && read_handle(through) == "ok", "an ordinary dotted name under GAME: is not reserved");
+        if (through != INVALID_HANDLE_VALUE) ::CloseHandle(through);
+
         // A package that itself sits on drive G: is reached by host paths, which must stay host paths.
         rt::fs::configure(L"G:\\leonida_missing_package", L"G:\\leonida_missing_overlay");
         SetLastError(0);
@@ -742,6 +999,161 @@ int main() {
         check(attributes_w(L"T:\\x") == INVALID_FILE_ATTRIBUTES && GetLastError() != ERROR_INVALID_NAME,
               "without configured folders G: and T: stay host drives");
         rt::fs::configure(package, overlay);
+    }
+
+    // An open that writes needs its folder to exist in the title's view, and a failed open changes nothing.
+    {
+        const auto overlay_has = [&](const wchar_t* name) { return std::filesystem::exists(overlay / name); };
+        write_path(package / "rules" / "file.txt", "package");
+        write_path(package / "rules" / "gone" / "only.txt", "package");
+
+        SetLastError(0);
+        HANDLE h = create_w(L"GAME:\\nodir\\sub\\x.dat", GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0,
+                            nullptr);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "a write-open of an existing file in a missing folder fails with ERROR_PATH_NOT_FOUND");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(attributes_w(L"GAME:\\nodir") == INVALID_FILE_ATTRIBUTES && !overlay_has(L"nodir"),
+              "the failed open did not create the missing folders");
+
+        SetLastError(0);
+        h = create_w(L"GAME:\\nodir2\\x.dat", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "CREATE_ALWAYS in a missing folder fails with ERROR_PATH_NOT_FOUND, as on the host");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(attributes_w(L"GAME:\\nodir2") == INVALID_FILE_ATTRIBUTES && !overlay_has(L"nodir2"),
+              "and creates neither the folder nor the file");
+
+        SetLastError(0);
+        h = create_w(L"GAME:\\rules\\file.txt\\x.dat", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "CREATE_ALWAYS below a package file fails with ERROR_PATH_NOT_FOUND");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        const DWORD file_attributes = attributes_w(L"GAME:\\rules\\file.txt");
+        check(file_attributes != INVALID_FILE_ATTRIBUTES && (file_attributes & FILE_ATTRIBUTE_DIRECTORY) == 0,
+              "and the package file is still a file in the title's view");
+
+        check(delete_w(L"GAME:\\rules\\gone\\only.txt") != FALSE && rmdir_w(L"GAME:\\rules\\gone") != FALSE,
+              "a package folder is emptied and removed");
+        SetLastError(0);
+        h = create_w(L"GAME:\\rules\\gone\\new.dat", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "CREATE_ALWAYS inside a removed folder fails with ERROR_PATH_NOT_FOUND");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(attributes_w(L"GAME:\\rules\\gone") == INVALID_FILE_ATTRIBUTES,
+              "and does not bring the removed folder back");
+
+        // The folders that do exist still work: one only the package has, and one the title made.
+        h = create_w(L"GAME:\\rules\\new.dat", GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "CREATE_NEW in a folder only the package has still succeeds");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(overlay_has(L"rules\\new.dat") && !std::filesystem::exists(package / "rules" / "new.dat"),
+              "and the file is in the overlay");
+        check(mkdir_w(L"GAME:\\rules\\made", nullptr) != FALSE, "a folder the title makes");
+        h = create_w(L"GAME:\\rules\\made\\x.dat", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "takes a new file");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+    }
+
+    // A listing needs its folder to exist in the title's view: a removed or missing folder is a missing path, not an
+    // empty folder and not a missing file.
+    {
+        write_path(package / "listing" / "old" / "a.txt", "package");
+        WIN32_FIND_DATAW found{};
+        check(delete_w(L"GAME:\\listing\\old\\a.txt") != FALSE && rmdir_w(L"GAME:\\listing\\old") != FALSE,
+              "a package folder is emptied and removed (listing)");
+        SetLastError(0);
+        HANDLE h = first_w(L"GAME:\\listing\\old\\*", &found);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "FindFirstFileW inside a removed package folder fails with ERROR_PATH_NOT_FOUND");
+        if (h != INVALID_HANDLE_VALUE) find_close(h);
+        SetLastError(0);
+        h = first_w(L"GAME:\\listing\\never\\*", &found);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "FindFirstFileW inside a folder that never existed fails with ERROR_PATH_NOT_FOUND");
+        if (h != INVALID_HANDLE_VALUE) find_close(h);
+        SetLastError(0);
+        h = first_w(L"GAME:\\listing\\old", &found);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND,
+              "FindFirstFileW of the removed folder's own name is ERROR_FILE_NOT_FOUND: its parent exists");
+        if (h != INVALID_HANDLE_VALUE) find_close(h);
+        SetLastError(0);
+        h = first_w(L"GAME:\\listing\\nothing*.bin", &found);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND,
+              "a pattern that matches nothing in an existing folder is still ERROR_FILE_NOT_FOUND");
+        if (h != INVALID_HANDLE_VALUE) find_close(h);
+        check(list(first_w, next_w, find_close, L"GAME:\\listing\\*").size() == 2,
+              "and the emptied parent lists only . and ..");
+
+        // A listing whose folder is a file is neither: the host answers ERROR_DIRECTORY. One level further down the
+        // path is simply missing again. (Case measured on the host and reported in review by shdann.)
+        write_path(package / "listing" / "file.txt", "package");
+        for (const wchar_t* pattern : {L"GAME:\\listing\\file.txt\\*", L"GAME:\\listing\\file.txt\\x"}) {
+            SetLastError(0);
+            h = first_w(pattern, &found);
+            check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_DIRECTORY,
+                  "FindFirstFileW below a file fails with ERROR_DIRECTORY, as the host does");
+            if (h != INVALID_HANDLE_VALUE) find_close(h);
+        }
+        SetLastError(0);
+        h = first_w(L"GAME:\\listing\\file.txt\\sub\\*", &found);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "and two levels below a file with ERROR_PATH_NOT_FOUND");
+        if (h != INVALID_HANDLE_VALUE) find_close(h);
+    }
+
+    // A move onto the same name succeeds and changes nothing; a rename that changes only the case renames.
+    {
+        const auto names_in = [&](const wchar_t* pattern) { return list(first_w, next_w, find_close, pattern); };
+        const auto has_exact = [](const std::vector<std::wstring>& names, const wchar_t* name) {
+            for (const std::wstring& n : names)
+                if (n == name) return true;
+            return false;
+        };
+        write_path(package / "moves" / "pkg.dat", "package");
+        write_path(package / "moves" / "same.dat", "package");
+        check(mkdir_w(L"GAME:\\moves\\dir", nullptr) != FALSE, "an overlay folder for the case rename");
+        HANDLE h = create_w(L"GAME:\\moves\\save.dat", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        DWORD written = 0;
+        if (h != INVALID_HANDLE_VALUE) {
+            ::WriteFile(h, "save", 4, &written, nullptr);
+            ::CloseHandle(h);
+        }
+
+        check(move_w(L"GAME:\\moves\\save.dat", L"GAME:\\moves\\save.dat") != FALSE,
+              "MoveFileW of an overlay file onto itself succeeds");
+        check(move_w(L"GAME:\\moves\\same.dat", L"GAME:\\moves\\same.dat") != FALSE,
+              "MoveFileW of a package file onto itself succeeds");
+        check(read_path(package / "moves" / "same.dat") == "package" && !std::filesystem::exists(overlay / "moves" / "same.dat"),
+              "and a package file moved onto itself is neither copied nor hidden");
+        HANDLE r = create_w(L"GAME:\\moves\\same.dat", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(r != INVALID_HANDLE_VALUE && read_handle(r) == "package", "it still reads");
+        if (r != INVALID_HANDLE_VALUE) ::CloseHandle(r);
+
+        check(move_w(L"GAME:\\moves\\save.dat", L"GAME:\\moves\\SAVE.DAT") != FALSE,
+              "MoveFileW renames an overlay file to the same name in another case");
+        std::vector<std::wstring> names = names_in(L"GAME:\\moves\\*");
+        check(has_exact(names, L"SAVE.DAT") && !has_exact(names, L"save.dat") && count(names, L"save.dat") == 1,
+              "the listing shows the new case, once");
+        check(read_path(overlay / "moves" / "SAVE.DAT") == "save", "and the bytes are the same");
+
+        check(move_w(L"GAME:\\moves\\pkg.dat", L"GAME:\\moves\\PKG.DAT") != FALSE,
+              "MoveFileW renames a package file to the same name in another case");
+        names = names_in(L"GAME:\\moves\\*");
+        check(has_exact(names, L"PKG.DAT") && !has_exact(names, L"pkg.dat") && count(names, L"pkg.dat") == 1,
+              "the listing shows the package file under its new case, once");
+        r = create_w(L"GAME:\\moves\\pkg.dat", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(r != INVALID_HANDLE_VALUE && read_handle(r) == "package", "and it opens under either case");
+        if (r != INVALID_HANDLE_VALUE) ::CloseHandle(r);
+        check(read_path(package / "moves" / "pkg.dat") == "package", "the package file is untouched");
+
+        check(move_w(L"GAME:\\moves\\dir", L"GAME:\\moves\\DIR") != FALSE,
+              "MoveFileW renames an overlay folder to the same name in another case");
+        check(has_exact(names_in(L"GAME:\\moves\\*"), L"DIR"), "the listing shows the folder's new case");
+        check(move_w(L"GAME:\\moves", L"GAME:\\moves") != FALSE, "MoveFileW of a package folder onto itself succeeds");
+        SetLastError(0);
+        check(move_w(L"GAME:\\moves", L"GAME:\\MOVES") == FALSE && GetLastError() == ERROR_ACCESS_DENIED,
+              "a case rename of a package folder is refused like any other move of one");
     }
 
     std::filesystem::remove_all(root);

@@ -11,13 +11,15 @@ Usage:
 
 ``--game-dir`` defaults to ``LEONIDA_GAME_DIR``. Naming the streams takes about half a minute, so the name table
 (names, offsets and frame sizes only, no movie data) is kept in ``%LOCALAPPDATA%\\Leonida\\bink_names.csv`` and rebuilt
-when the archive changes; ``--no-cache`` skips it. The names are a local work product: don't commit or post them.
+when the archive or the mount source changes; ``--no-cache`` skips it. The names are a local work product: don't
+commit or post them.
 """
 import argparse
 import csv
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -39,30 +41,35 @@ def stamp(archive):
 def load_names(archive, mount, use_cache=True):
     """[(path, offset, width, height, frames)] for the streams of ``archive``, named from ``mount``."""
     cache = cache_path()
-    key = stamp(archive)
+    key = stamp(archive) + "|" + stamp(mount)  # the names come from the mount lists too
     if use_cache and cache.is_file():
         with cache.open(encoding="utf-8", newline="") as f:
             first = f.readline().rstrip("\r\n")
             if first == "# " + key:
                 return [(r["path"], int(r["offset"]), r["width"], r["height"], r["frames"]) for r in csv.DictReader(f)]
-    tmp = cache.with_suffix(".tmp.csv")
-    tmp.parent.mkdir(parents=True, exist_ok=True)
-    print(f"naming the movies in {archive.name} (about half a minute, once)...", file=sys.stderr)
-    rc = bink_names.main([str(archive), "--mount", str(mount), "--out", str(tmp)])
-    if rc not in (0, None) or not tmp.is_file():
-        raise SystemExit(f"bink_names.py failed on {archive}")
-    with tmp.open(encoding="utf-8", newline="") as f:
-        rows = [r for r in csv.DictReader(f) if r.get("path")]
-    tmp.unlink()
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    # Each lookup gets its own report and staging file: two runs at once must not remove or replace each other's.
+    fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".tmp.csv", dir=cache.parent)
+    os.close(fd)
+    tmp = Path(name)
+    try:
+        print(f"naming the movies in {archive.name} (about half a minute, once)...", file=sys.stderr)
+        rc = bink_names.main([str(archive), "--mount", str(mount), "--out", str(tmp)])
+        if rc not in (0, None) or not tmp.is_file() or tmp.stat().st_size == 0:
+            raise SystemExit(f"bink_names.py failed on {archive}")
+        with tmp.open(encoding="utf-8", newline="") as f:
+            rows = [r for r in csv.DictReader(f) if r.get("path")]
+    finally:
+        tmp.unlink(missing_ok=True)
     if use_cache:
-        part = cache.with_suffix(".part")
-        with part.open("w", encoding="utf-8", newline="") as f:
+        fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".part", dir=cache.parent)
+        with open(fd, "w", encoding="utf-8", newline="") as f:
             f.write("# " + key + "\n")
             w = csv.writer(f, lineterminator="\n")
             w.writerow(["path", "offset", "width", "height", "frames"])
             for r in rows:
                 w.writerow([r["path"], r["offset"], r["width"], r["height"], r["frames"]])
-        os.replace(part, cache)
+        os.replace(name, cache)
     return [(r["path"], int(r["offset"]), r["width"], r["height"], r["frames"]) for r in rows]
 
 
@@ -114,7 +121,7 @@ def main(argv=None):
     names = load_names(archive, mount, use_cache=not a.no_cache)
 
     if a.list:
-        w = (a.name or "").lower()
+        w = (a.name or "").replace("\\", "/").lower()
         for path, _, width, height, frames in names:
             if w in path.lower():
                 print(f"{path}  {width}x{height}, {frames} frames")

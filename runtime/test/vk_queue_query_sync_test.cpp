@@ -29,10 +29,14 @@ namespace {
 namespace driver {
 PFN_vkGetDeviceProcAddr real_get_device = nullptr;
 PFN_vkQueueSubmit real_submit = nullptr;
+PFN_vkGetSemaphoreCounterValue real_counter = nullptr;
 PFN_vkCmdCopyQueryPoolResults real_copy_queries = nullptr;
 PFN_vkCmdFillBuffer real_fill_buffer = nullptr;
 
 std::atomic<VkResult> fail_next_submit{VK_SUCCESS};
+std::atomic<VkResult> fail_next_counter{VK_SUCCESS};
+std::atomic<unsigned> injected_counter_errors{0};
+std::thread::id counter_test_thread;
 std::atomic<bool> capture_next_waits{false};
 std::atomic<std::uint32_t> captured_wait_count{0};
 std::atomic<std::uintptr_t> captured_wait_sem{0};
@@ -70,6 +74,18 @@ VKAPI_ATTR VkResult VKAPI_CALL queue_submit(VkQueue queue, std::uint32_t count, 
     return real_submit(queue, count, submits, fence);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL get_counter(VkDevice device, VkSemaphore semaphore, std::uint64_t* value) {
+    if (std::this_thread::get_id() == counter_test_thread) {
+        const VkResult result = fail_next_counter.exchange(VK_SUCCESS);
+        if (result != VK_SUCCESS) {
+            *value = 999;  // failure output is undefined, so make accidental reuse detectable
+            injected_counter_errors.fetch_add(1);
+            return result;
+        }
+    }
+    return real_counter(device, semaphore, value);
+}
+
 VKAPI_ATTR void VKAPI_CALL cmd_copy_query_pool_results(VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
                                                        std::uint32_t count, VkBuffer dst, VkDeviceSize offset,
                                                        VkDeviceSize stride, VkQueryResultFlags flags) {
@@ -86,6 +102,7 @@ VKAPI_ATTR void VKAPI_CALL cmd_fill_buffer(VkCommandBuffer cb, VkBuffer dst, VkD
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char* name) {
     const std::string_view n = name;
     if (n == "vkQueueSubmit") return reinterpret_cast<PFN_vkVoidFunction>(queue_submit);
+    if (n == "vkGetSemaphoreCounterValue") return reinterpret_cast<PFN_vkVoidFunction>(get_counter);
     if (n == "vkCmdCopyQueryPoolResults") return reinterpret_cast<PFN_vkVoidFunction>(cmd_copy_query_pool_results);
     if (n == "vkCmdFillBuffer") return reinterpret_cast<PFN_vkVoidFunction>(cmd_fill_buffer);
     return real_get_device(device, name);
@@ -94,6 +111,8 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char*
 void install(PFN_vkGetDeviceProcAddr device_proc, VkDevice device) {
     real_get_device = device_proc;
     real_submit = reinterpret_cast<PFN_vkQueueSubmit>(device_proc(device, "vkQueueSubmit"));
+    real_counter = reinterpret_cast<PFN_vkGetSemaphoreCounterValue>(
+        device_proc(device, "vkGetSemaphoreCounterValue"));
     real_copy_queries =
         reinterpret_cast<PFN_vkCmdCopyQueryPoolResults>(device_proc(device, "vkCmdCopyQueryPoolResults"));
     real_fill_buffer = reinterpret_cast<PFN_vkCmdFillBuffer>(device_proc(device, "vkCmdFillBuffer"));
@@ -111,6 +130,7 @@ int main() {
         return 77;
     }
     driver::install(d.device_proc, d.device);
+    driver::counter_test_thread = std::this_thread::get_id();
 
     const auto create_query_pool = d.fn<PFN_vkCreateQueryPool>("vkCreateQueryPool");
     const auto destroy_query_pool = d.fn<PFN_vkDestroyQueryPool>("vkDestroyQueryPool");
@@ -129,6 +149,7 @@ int main() {
     const VkQueryPool pool_race = make_occlusion_pool(2);
     const VkQueryPool pool_stress = make_occlusion_pool(32);
     EXPECT(pool_uaf && pool_race && pool_stress);
+    bool progress_loss_ok = true;  // deferred verdict: release Vulkan query pools even when main is expected-red
 
     {
         VulkanContext context(driver::get_device, d.device, true);
@@ -291,6 +312,73 @@ int main() {
             std::printf("queue/query sync: pending Wait() preserved across failed vkQueueSubmit ok\n");
         }
 
+        // 3b. The same for a batch held behind a Wait with no submitted Signal (queue_holds.h): its submission
+        //     fails when the CPU Signal releases it, the failure is reported through take_held_failure(), and its
+        //     waits stay for the next submission, as when the call is not held. A Signal queued behind the failed
+        //     batch still runs.
+        {
+            VulkanFence gate(context, 0), after(context, 0);
+            EXPECT(gate.semaphore() != VK_NULL_HANDLE && after.semaphore() != VK_NULL_HANDLE);
+            const std::uint64_t pattern = 0x0badf00dcafe1234ULL;
+            std::memcpy(src_ptr, &pattern, sizeof(pattern));
+            std::memset(dst_ptr, 0, sizeof(pattern));
+            CommandList copy_list;
+            EXPECT(copy_list.copy_buffer({2, 0, 1, 0, sizeof(pattern)}));
+            EXPECT(copy_list.close());
+            const CommandList* ptr = &copy_list;
+
+            queue_a.wait(gate.semaphore(), 1);
+            EXPECT(queue_a.execute({&ptr, 1}) == ReplayResult::success);   // held: the Signal is not submitted yet
+            EXPECT(queue_a.signal(after.semaphore(), 1));                  // held behind it
+            EXPECT(after.completed() == 0 && queue_a.take_held_failure() == ReplayResult::success);
+            driver::fail_next_submit.store(VK_ERROR_OUT_OF_HOST_MEMORY);
+            EXPECT(gate.signal(1));                                        // releases the batch on this thread
+            EXPECT(queue_a.take_held_failure() == ReplayResult::unsupported);
+            EXPECT(queue_a.take_held_failure() == ReplayResult::success);  // reported once
+            EXPECT(queue_a.idle() && after.completed() == 1);              // the Signal behind it still signaled
+
+            driver::captured_wait_count.store(0);
+            driver::captured_wait_sem.store(0);
+            driver::captured_wait_val.store(0);
+            driver::capture_next_waits.store(true);
+            EXPECT(queue_a.execute({&ptr, 1}) == ReplayResult::success);
+            EXPECT(queue_a.idle());
+            EXPECT(driver::captured_wait_count.load() == 1);   // the failed batch's wait on (gate, 1) came along
+            EXPECT(driver::captured_wait_sem.load() == reinterpret_cast<std::uintptr_t>(gate.semaphore()));
+            EXPECT(driver::captured_wait_val.load() == 1);
+            std::uint64_t got = 0;
+            std::memcpy(&got, dst_ptr, sizeof(got));
+            EXPECT(got == pattern);
+            std::printf("queue/query sync: failed held batch reported, its wait kept for the retry, Signal behind it ran\n");
+        }
+
+        // 3c. A Signal whose vkQueueSubmit fails signals nothing: a queue waiting for it stays held (the value is not
+        //     counted as submitted), and the application's retry of the Signal goes through and releases it.
+        {
+            VulkanFence fence(context, 0);
+            EXPECT(fence.semaphore() != VK_NULL_HANDLE);
+            const std::uint64_t pattern = 0x5ca1ab1e0ddba11ULL;
+            std::memcpy(src_ptr, &pattern, sizeof(pattern));
+            std::memset(dst_ptr, 0, sizeof(pattern));
+            CommandList copy_list;
+            EXPECT(copy_list.copy_buffer({2, 0, 1, 0, sizeof(pattern)}));
+            EXPECT(copy_list.close());
+            const CommandList* ptr = &copy_list;
+            queue_b.wait(fence.semaphore(), 1);
+            EXPECT(queue_b.execute({&ptr, 1}) == ReplayResult::success);  // held for the Signal
+            driver::fail_next_submit.store(VK_ERROR_OUT_OF_HOST_MEMORY);
+            EXPECT(!queue_a.signal(fence.semaphore(), 1));                     // the submit fails
+            EXPECT(queue_b.idle() && fence.completed() == 0);
+            std::uint64_t got = 1;
+            std::memcpy(&got, dst_ptr, sizeof(got));
+            EXPECT(got == 0);                                                  // the waiter did not run
+            EXPECT(queue_a.signal(fence.semaphore(), 1));                      // the retry signals, and releases it
+            EXPECT(queue_b.idle() && queue_a.idle() && fence.completed() == 1);
+            std::memcpy(&got, dst_ptr, sizeof(got));
+            EXPECT(got == pattern);
+            std::printf("queue/query sync: a failed Signal does not release its waiters; the retry does\n");
+        }
+
         // 4. Concurrent multi-queue EndQuery + ResolveQueries + temporary query pool add/remove stress.
         //    Each iteration uses a distinct query slot so no slot is reset while another submission resolves it.
         {
@@ -341,6 +429,35 @@ int main() {
             context.remove_query_pool(main_heap);
             std::printf("queue/query sync: concurrent multi-queue query stress ok\n");
         }
+
+        // 5. A progress-semaphore query in acquire() can be the first Vulkan operation to discover
+        // device loss. A transient query failure must not poison a healthy queue, while DEVICE_LOST
+        // must prevent acquiring/recycling and submitting new command buffers.
+        {
+            EXPECT(!context.is_device_lost());
+            CommandList empty;
+            EXPECT(empty.close());
+            const CommandList* ptr = &empty;
+            EXPECT(queue_a.idle() && queue_b.idle());
+            (void)context.completed_retire_ticket();  // drain old submits before faulting queue's own progress query
+            driver::fail_next_counter.store(VK_ERROR_OUT_OF_HOST_MEMORY);
+            const ReplayResult transient = queue_a.execute({&ptr, 1});
+            const bool transient_ok = transient == ReplayResult::success && !context.is_device_lost() &&
+                                      driver::injected_counter_errors.load() == 1;
+
+            EXPECT(queue_a.idle());
+            (void)context.completed_retire_ticket();
+            driver::fail_next_counter.store(VK_ERROR_DEVICE_LOST);
+            const ReplayResult after_loss = queue_a.execute({&ptr, 1});
+            const bool lost = context.is_device_lost();
+            std::printf("queue/query sync: injected nonfatal execute=%d, device-loss execute=%d, "
+                        "context_lost=%d, interceptions=%u\n", int(transient), int(after_loss), int(lost),
+                        driver::injected_counter_errors.load());
+            progress_loss_ok = transient_ok && after_loss == ReplayResult::unsupported && lost &&
+                               driver::injected_counter_errors.load() == 2;
+            std::printf("queue/query sync: progress counter device loss %s\n",
+                        progress_loss_ok ? "marks context and rejects work" : "NOT propagated");
+        }
     }
 
     destroy_query_pool(d.device, pool_uaf, nullptr);
@@ -348,6 +465,7 @@ int main() {
     destroy_query_pool(d.device, pool_stress, nullptr);
 
     EXPECT(d.validation_errors() == 0);
+    EXPECT(progress_loss_ok);
     std::printf("vk_queue_query_sync_test: ok\n");
     return 0;
 }

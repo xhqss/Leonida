@@ -50,7 +50,14 @@ def lds_dwords(line, units=0, size=(32, 1, 1)):
 
 
 def bounds_checked(line, units=0):
-    return "OpULessThan %bool" in translate(line, units)
+    """True when an `OpULessThan %bool %idx <limit>` guards an access chain into %lds at the same %idx. An unrelated
+    OpULessThan (a v_cmp_lt_u32, an EXEC path) does not satisfy it. (With nothing declared the array is padded to
+    one dword and the limit is 0, so the limit is not compared with the array length.)"""
+    spv = translate(line, units)
+    for c in re.finditer(r"OpULessThan %bool (%\S+) %\S+\s", spv):
+        if re.search(r"OpAccessChain %_ptr_WG_uint %lds " + re.escape(c.group(1)) + r"\s", spv):
+            return True
+    return False
 
 
 READ = "ds_read_b32 v2, v1"
@@ -124,6 +131,9 @@ class TestRefusals(unittest.TestCase):
 
 
 class TestWrap(unittest.TestCase):
+    # These pin the translator's current approximation of a dynamic address (dword (A / 4) mod array size). Real
+    # RDNA2 LDS does not wrap (ISA 3.6.1/3.6.6), so whoever fixes the wrap should update these, not treat the
+    # failure as a regression.
     def wrap_case(self, units, write_addr, read_addr):
         """Lane i writes 0x900 + i at write_addr + 4 i, then reads read_addr + 4 i (addresses held in VGPRs)."""
         body = ["v_lshlrev_b32_e32 v3, 2, v0", "v_add_nc_u32_e32 v1, %#x, v3" % write_addr,

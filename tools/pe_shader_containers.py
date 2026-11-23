@@ -229,13 +229,18 @@ def main(argv=None) -> int:
 
     if a.extract and os.path.exists(a.extract) and not os.path.isdir(a.extract):
         ap.error(f"--extract {a.extract} is not a folder")
+    if a.extract:
+        index_path = os.path.join(a.extract, "index.json")
+        for image in a.images:
+            if same_report_path(index_path, image):
+                ap.error(f"--extract index {index_path} would overwrite the input image {image}")
     if a.json:
         if os.path.isdir(a.json):
             ap.error(f"--json {a.json} is a folder, not a file")
         for image in a.images:
             if same_report_path(a.json, image):
                 ap.error(f"--json {a.json} would overwrite the input image {image}")
-        if a.extract and same_report_path(a.json, os.path.join(a.extract, "index.json")):
+        if a.extract and same_report_path(a.json, index_path):
             ap.error(f"--json {a.json} would overwrite the extract index")
 
     all_records, status, index = [], 0, []
@@ -276,7 +281,6 @@ def main(argv=None) -> int:
                 return 2
 
     if a.extract:
-        index_path = os.path.join(a.extract, "index.json")
         try:
             with open(index_path, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(index, f, indent=0)

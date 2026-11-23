@@ -6,6 +6,9 @@
 ; translated `RWBuffer<T>` shader reads and writes them. Run: d3d12_buffer_uav_test (a compute PSO found by the
 ; SHA-256 of its synthetic FSSM header, as for the other cs_ shaders).
 ; User data, from the root signature: [0] four 32-bit constants, [1] a descriptor table of six UAVs. RSRC2 0x808c =
+; D3D12 build: runtime/CMakeLists.txt builds this with LEONIDA_USER_DATA_SHIFT=4, so in the PSO every SGPR named
+; here is 4 higher (the console compute layout starts the root arguments at s4, D3D-448). The table pointer
+; then reads s[8:9]: s8 is the table's 32-bit VA and s9 a user dword the runtime leaves zero.
 ; six user SGPRs and TGID_X, so the group index is s6:
 ;   s0 = seed   s1 = multiplier   s[4:5] = console VA of the table's first slot (a slot is 32 bytes, a V# in its first 16)
 ;   slot 0 (+0x00): V#, typed R32_UINT, 240 elements of a 256-element buffer (written, then atomically added to)

@@ -7,6 +7,8 @@ file in this tool's format (see --example), never game data.
 Usage:
     python -I tools/root_sig_contract.py <index.json> --rootsig <sig.json>
     python -I tools/root_sig_contract.py <index.json> --rootsig <sig.json> --cluster
+    python -I tools/root_sig_contract.py <index.json> --rootsig <sig.json> --model console
+        (rt::rootsig::pack_stage: each shader's stage base, one dword per table; D3D-448)
     python -I tools/root_sig_contract.py --example
 
 Exit code is 0 when every read is compatible, 1 on the first contradiction
@@ -18,7 +20,10 @@ import sys
 
 # Packing order mirrors runtime/src/root_signature.{h,cpp}: constants take
 # NumValues dwords, root descriptors and tables take 2 (VA lo/hi), static
-# samplers take none.
+# samplers take none. With a stage (--model console) it mirrors pack_stage():
+# from the stage's base, a table takes ONE dword (its 32-bit VA), and the
+# SGPRs below the base are the driver's (D3D-448).
+STAGE_BASE = {"ps": 8, "vs": 8, "gs": 8, "cs": 4, "ms": 16}
 KIND_TO_TYPES = {
     "const32": {"constants"},
     "ptr64_lo": {"descriptor", "table"},
@@ -30,14 +35,20 @@ KIND_TO_TYPES = {
 }
 
 
-def pack_layout(sig):
+def pack_layout(sig, stage=None):
     """Lay out root params into 32 dwords. Returns (dwords, error).
 
-    dwords[i] = {"param": index, "sub": sub-dword, "ptype": ptype}.
+    dwords[i] = {"param": index, "sub": sub-dword, "ptype": ptype}, indexed by SGPR.
+    stage None: rt::rootsig::pack (from s0, two dwords per table). A stage from
+    STAGE_BASE: rt::rootsig::pack_stage (from the stage base, one dword per table;
+    dwords below the base are {"param": None, "sub": 0, "ptype": "driver"}).
     error is set (and dwords empty) on spill, cost overflow or bad input:
     refuse, never truncate.
     """
-    dwords = []
+    if stage is not None and stage not in STAGE_BASE:
+        return [], f"no console base for stage {stage!r}"
+    base = STAGE_BASE[stage] if stage is not None else 0
+    dwords = [{"param": None, "sub": 0, "ptype": "driver"} for _ in range(base)]
     cost = 0
     params = [dict(p) for p in sig.get("params", [])]  # normalized copy; input untouched
     if len(params) > 64:
@@ -53,17 +64,36 @@ def pack_layout(sig):
             width, cost_add = 2, 2
             ptype = "descriptor"
         elif ptype == "table":
-            width, cost_add = 2, 1
+            width, cost_add = (1 if stage is not None else 2), 1
         else:
             return [], f"param {index}: unknown type {ptype!r}"
         cost += cost_add
         if cost > 64:
             return [], "exceeds the 64-dword D3D12 cost limit"
         if len(dwords) + width > 32:
+            if stage is not None:
+                return [], (f"param {index} does not fit in the user SGPRs from s{base} "
+                            "(spill array not modelled)")
             return [], "needs more than 32 user SGPRs (spill unsupported)"
         for sub in range(width):
             dwords.append({"param": index, "sub": sub, "ptype": ptype})
     return dwords, ""
+
+
+def _whole_address_copy(sgpr, slot, by_sgpr, dwords):
+    """True when `sgpr` is one half of a two-dword address slot and the shader reads both halves as const32.
+
+    A shader that builds a buffer descriptor from a root CBV copies its 64-bit VA as two plain dwords; the read
+    classifier calls those const32 (the FidelityFX programs copy their root CBVs this way at s6..s13,
+    tools/rootsig_census.py --disasm "whole pairs"). One half alone stays a contradiction."""
+    if slot["ptype"] not in ("descriptor", "table") or slot["param"] is None:
+        return False
+    other = sgpr + 1 if slot["sub"] == 0 else sgpr - 1
+    if not 0 <= other < len(dwords):
+        return False
+    pair = dwords[other]
+    return (pair["param"] == slot["param"] and pair["sub"] == 1 - slot["sub"]
+            and "const32" in by_sgpr.get(other, []))
 
 
 def reconcile(shader_reads, dwords):
@@ -85,10 +115,20 @@ def reconcile(shader_reads, dwords):
             issues.append(f"s{sgpr} read but layout has {len(dwords)} dwords")
             continue
         slot = dwords[sgpr]
+        if slot["ptype"] == "driver":
+            # Below the stage base: the driver's block, not a root argument. Constants there are system values
+            # (the corpus reads s1/s3 that way); an address there would be the spill pointer (section 7).
+            for kind in kinds:
+                if kind != "const32":
+                    issues.append(f"s{sgpr} ({kind}) reads the driver block below the stage base as an address "
+                                  "(a spill pointer?)")
+            continue
         for kind in kinds:
             allowed = KIND_TO_TYPES.get(kind)
             if allowed is None:
                 issues.append(f"s{sgpr}: unknown read kind {kind!r}")
+            elif kind == "const32" and _whole_address_copy(sgpr, slot, by_sgpr, dwords):
+                pass  # both halves of a root view's 64-bit VA copied as data (into a V#), not loaded through
             elif slot["ptype"] not in allowed:
                 issues.append(
                     f"s{sgpr} ({kind}) incompatible with param "
@@ -104,10 +144,10 @@ def reconcile(shader_reads, dwords):
 
 
 def cluster(shaders):
-    """Group shaders by read-set shape. Returns [(shape, count, names)]."""
+    """Group by read-set shape, using the first shader name to break size ties."""
     groups = {}
-    for name, entry in shaders.items():
-        reads = entry.get("user_sgpr_reads", [])
+    for name in sorted(shaders):
+        reads = shaders[name].get("user_sgpr_reads", [])
         shape = tuple(sorted(
             ((r["sgpr"], r["kind"]) if type(r["sgpr"]) is int
              else (f"invalid:{r['sgpr']!r}", r["kind"]) for r in reads),
@@ -132,6 +172,9 @@ def main():
     ap.add_argument("--rootsig", default=None, help="hand-written root-signature JSON")
     ap.add_argument("--cluster", action="store_true", help="print read-set shape clustering")
     ap.add_argument("--example", action="store_true", help="print an empty hand-written sig template")
+    ap.add_argument("--model", choices=("s0", "console"), default="s0",
+                    help="s0: rt::rootsig::pack (default); console: rt::rootsig::pack_stage with each shader's "
+                         "own stage base, one dword per table (D3D-448)")
     a = ap.parse_args()
     if a.example:
         print(json.dumps({"version": "1.1", "flags": 0, "params": [
@@ -179,15 +222,26 @@ def main():
                 print(f"ERROR: {a.index}: {name}: each read kind must be a string",
                       file=sys.stderr)
                 return 2
-    dwords, error = pack_layout(sig)
-    if error:
-        print(f"root signature refused: {error}")
-        return 1
-    print(f"packed {len(dwords)} dwords from {len(sig.get('params', []))} params")
+    if a.model == "console":
+        layouts = {}
+        for stage in sorted({str(entry.get("stage")) for entry in index.values()}):
+            dwords, error = pack_layout(sig, stage)
+            if error:
+                print(f"root signature refused for {stage}: {error}")
+                return 1
+            layouts[stage] = dwords
+            print(f"{stage}: packed {len(dwords) - STAGE_BASE[stage]} dwords from s{STAGE_BASE[stage]} "
+                  f"({len(sig.get('params', []))} params)")
+    else:
+        dwords, error = pack_layout(sig)
+        if error:
+            print(f"root signature refused: {error}")
+            return 1
+        print(f"packed {len(dwords)} dwords from {len(sig.get('params', []))} params")
     bad = 0
     for name in sorted(index):
         reads = index[name].get("user_sgpr_reads", [])
-        issues = reconcile(reads, dwords)
+        issues = reconcile(reads, layouts[str(index[name].get("stage"))] if a.model == "console" else dwords)
         if issues:
             bad += 1
             print(f"CONTRADICTION {name}:")

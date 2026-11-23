@@ -591,28 +591,24 @@ def main() -> int:
     parser.add_argument("--json", help="write the aggregate graph summary to this JSON")
     args = parser.parse_args()
 
-    if args.json:
-        if os.path.isdir(args.json):
-            parser.error(f"--json is a directory: {args.json}")
-        for target in args.targets:
-            if (os.path.isdir(target) and os.path.isfile(args.json)
-                    and not os.path.isfile(os.path.join(target, "index.json"))):
-                # Directory mode without index.json reads every nested *.xml; none may be the
-                # report we are about to open for writing.
-                for source in gx.xml_files(target):
-                    if gx.same_report_path(args.json, source):
-                        parser.error(f"--json would overwrite the input {source}")
-            source = os.path.join(target, "index.json") if os.path.isdir(target) else target
-            if gx.same_report_path(args.json, source):
-                parser.error(f"--json would overwrite the input {source}")
-            if os.path.isdir(target) and os.path.isfile(args.json):
-                root = os.path.normcase(os.path.abspath(target))
-                dest = os.path.normcase(os.path.abspath(args.json))
-                if os.path.dirname(dest) == root or dest.startswith(root + os.sep):
-                    if dest.endswith(".bin"):
-                        parser.error(f"--json would overwrite an input file: {args.json}")
-
     try:
+        if args.json:
+            if os.path.isdir(args.json):
+                parser.error(f"--json is a directory: {args.json}")
+            for target in args.targets:
+                is_dir = os.path.isdir(target)
+                source = os.path.join(target, "index.json") if is_dir else target
+                if gx.same_report_path(args.json, source):
+                    parser.error(f"--json would overwrite the input {source}")
+                if is_dir and os.path.isfile(args.json):
+                    root = os.path.normcase(os.path.abspath(target))
+                    dest = os.path.normcase(os.path.abspath(args.json))
+                    if dest.endswith(".bin") and dest.startswith(root + os.sep):
+                        parser.error(f"--json would overwrite an input file: {args.json}")
+                    for path in gx.input_files([target]):
+                        if gx.same_report_path(args.json, path):
+                            parser.error(f"--json would overwrite the input {path}")
+
         documents = list(gx.load_documents(args.targets))
     except FileNotFoundError as exc:
         print(f"not found: {exc}", file=sys.stderr)

@@ -618,6 +618,18 @@ def main() -> int:
     if a.max_report < 1:
         print("--max-report must be at least 1", file=sys.stderr)
         return 2
+    if a.work:
+        # Reject a --work that is a file, or sits under one, before any fuzz work: os.makedirs would raise a
+        # FileExistsError traceback after the cases were built, and nothing here is retryable anyway.
+        probe = os.path.abspath(a.work)
+        while not os.path.lexists(probe):
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                break
+            probe = parent
+        if os.path.lexists(probe) and not os.path.isdir(probe):
+            print(f"ERROR: --work is not a folder: {a.work}", file=sys.stderr)
+            return 2
     hw_oracle = None
     if "hw" in backends:
         from hw_oracle import runner

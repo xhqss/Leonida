@@ -799,5 +799,162 @@ class ShortHeaderTest(unittest.TestCase):
         self.check_rejected("bad_sig.bin", bytes(data), "no PE signature")
 
 
+class SectionBoundaryReadTest(unittest.TestCase):
+    """Strings and multi-byte directory entries must not cross section/header boundaries or alias 64-bit thunks."""
+
+    @staticmethod
+    def two_section_bytes(is64: bool = True, a_vsize: int = 0x200, a_raw: int = 0x200) -> tuple[bytearray, int]:
+        """Build raw bytes for a two-section image with `.a` at 0x1000 and `.b` immediately after it."""
+        b_raw = 0x200 + a_raw
+        image = bytearray(build_image(is64=is64, with_directories=False)[:0x200]) + bytearray(a_raw + 0x200)
+        struct.pack_into("<H", image, 0x46, 2)
+        table = OPT + (240 if is64 else 224)
+        struct.pack_into("<IIII", image, table + 8, a_vsize, 0x1000, a_raw, 0x200)
+        image[table + 40:table + 48] = b".b\0\0\0\0\0\0"
+        struct.pack_into("<IIII", image, table + 48, 0x200, 0x2000, 0x200, b_raw)
+        struct.pack_into("<I", image, table + 76, 0x40000040)
+        struct.pack_into("<I", image, OPT + 56, 0x3000)
+        return image, b_raw
+
+    def test_string_at_does_not_cross_section_or_header_boundary(self):
+        # `.a` (0x200..0x400) immediately followed by `.b` (0x400..0x600)
+        image, b_raw = self.two_section_bytes(a_vsize=0x200, a_raw=0x200)
+        image[0x3FA:0x400] = b"UNTERM"
+        image[b_raw:b_raw + 7] = b"LEAKED\0"
+        img = pe_inspect.PeImage(bytes(image))
+        self.assertIsNone(img.string_at(0x11FA))
+
+        # `.a` virtual span (0x200) shorter than its raw size (0x400), followed by unmapped raw tail
+        tail_image, _ = self.two_section_bytes(a_vsize=0x200, a_raw=0x400)
+        tail_image[0x3FA:0x400] = b"UNTERM"
+        tail_image[0x400:0x405] = b"TAIL\0"
+        self.assertIsNone(pe_inspect.PeImage(bytes(tail_image)).string_at(0x11FA))
+
+        # Unterminated string in headers stops at SizeOfHeaders (0x200) before `.a`
+        hdr_image, _ = self.two_section_bytes(a_vsize=0x200, a_raw=0x200)
+        hdr_image[0x1FD:0x200] = b"HDR"
+        hdr_image[0x200:0x206] = b"SEC_A\0"
+        self.assertIsNone(pe_inspect.PeImage(bytes(hdr_image)).string_at(0x1FD))
+
+        # Positive control: a NUL byte on the very last mapped byte of `.a` is read cleanly
+        good_image, b_raw = self.two_section_bytes(a_vsize=0x200, a_raw=0x200)
+        good_image[0x3FA:0x400] = b"EXACT\0"
+        good_image[b_raw:b_raw + 7] = b"LEAKED\0"
+        self.assertEqual(pe_inspect.PeImage(bytes(good_image)).string_at(0x11FA), "EXACT")
+
+    def test_thunk_entry_straddling_section_boundary_stops_cleanly(self):
+        for is64 in (True, False):
+            with self.subTest(is64=is64):
+                width = 8 if is64 else 4
+                ordinal_flag = 1 << (63 if is64 else 31)
+                image, b_raw = self.two_section_bytes(is64=is64, a_vsize=0x200, a_raw=0x200)
+                # Place one valid Hint/Name at RVA 0x1010 (raw 0x210)
+                image[0x210:0x21A] = b"\x00\x00GoodSym\0"
+                # Place thunk table so entry 0 fits in `.a` and entry 1 starts 2 bytes before `.a` ends
+                lookup_rva = 0x1200 - width - 2
+                entry0_off = 0x200 + (lookup_rva - 0x1000)
+                fmt = "<Q" if is64 else "<I"
+                struct.pack_into(fmt, image, entry0_off, 0x1010)
+                entry1 = struct.pack(fmt, ordinal_flag | 9)
+                image[0x3FE:0x400] = entry1[:2]
+                image[b_raw:b_raw + width - 2] = entry1[2:]
+                img = pe_inspect.PeImage(bytes(image))
+                self.assertEqual(img.thunk_names(lookup_rva), ["GoodSym"])
+
+    def test_pe64_non_ordinal_thunk_high_bits_are_not_masked(self):
+        image = bytearray(build_image(is64=True))
+        place(image, 0x1B00, b"\x00\x00AliasedSym\0")
+        place(image, 0x1200, struct.pack("<QQQ", 0x100001B00, 0x80001B00, 0))
+        img = pe_inspect.PeImage(bytes(image))
+        self.assertEqual(img.thunk_names(0x1200), ["?", "?"])
+
+    def test_export_directory_and_tables_straddling_section_boundary_do_not_cross(self):
+        # Straddling export directory itself (starts 20 bytes before `.a` ends)
+        image, b_raw = self.two_section_bytes(is64=True, a_vsize=0x200, a_raw=0x200)
+        dirs_at = OPT + 112
+        struct.pack_into("<II", image, dirs_at + pe_inspect.DIR_EXPORT * 8, 0x11EC, 40)
+        image[0x210:0x21A] = b"leaked.dll"
+        image[0x21A] = 0
+        struct.pack_into("<IIII", image, 0x220, 0x1080, 0, 0, 0)
+        image[0x240:0x247] = b"ExpSym\0"
+        struct.pack_into("<I", image, 0x250, 0x1040)
+        struct.pack_into("<H", image, 0x254, 0)
+        struct.pack_into("<IIHHIIIIIII", image, 0x3EC, 0, 0, 0, 0, 0x1010, 1, 1, 1, 0x1020, 0x1050, 0x1054)
+        img = pe_inspect.PeImage(bytes(image))
+        self.assertEqual(pe_inspect._exports(img), [])
+        self.assertEqual(pe_inspect._export_module_name(img), "")
+
+        # Straddling export table entries (functions / names / ordinals)
+        image2, b_raw2 = self.two_section_bytes(is64=True, a_vsize=0x200, a_raw=0x200)
+        struct.pack_into("<II", image2, dirs_at + pe_inspect.DIR_EXPORT * 8, 0x1020, 40)
+        image2[0x250:0x256] = b"First\0"
+        image2[b_raw2:b_raw2 + 16] = b"LeakedSym\0\0\0\0\0\0\0"
+        # AddressOfFunctions at 0x11FA (slot 0 in `.a`, slot 1 straddles 2 bytes in `.a` + 2 bytes in `.b`)
+        struct.pack_into("<I", image2, 0x3FA, 0x1080)
+        image2[0x3FE:0x400] = b"\x00\x00"
+        image2[b_raw2:b_raw2 + 2] = b"\x10\x00"
+        # AddressOfNames at 0x1100 (1 valid entry pointing to 0x1050), AddressOfNameOrdinals at 0x1110 ([0])
+        struct.pack_into("<I", image2, 0x300, 0x1050)
+        struct.pack_into("<H", image2, 0x310, 0)
+        struct.pack_into("<IIHHIIIIIII", image2, 0x220, 0, 0, 0, 0, 0, 1, 2, 1, 0x11FA, 0x1100, 0x1110)
+        self.assertEqual(pe_inspect._exports(pe_inspect.PeImage(bytes(image2))), ["First"])
+
+        # Straddling AddressOfNames and AddressOfNameOrdinals
+        image3, b_raw3 = self.two_section_bytes(is64=True, a_vsize=0x200, a_raw=0x200)
+        struct.pack_into("<II", image3, dirs_at + pe_inspect.DIR_EXPORT * 8, 0x1020, 40)
+        image3[0x250:0x256] = b"First\0"
+        image3[0x260:0x26A] = b"SecondSym\0"
+        struct.pack_into("<II", image3, 0x280, 0x1080, 0x1090)
+        struct.pack_into("<I", image3, 0x3FA, 0x1050)
+        straddle_name = struct.pack("<I", 0x1060)
+        image3[0x3FE:0x400] = straddle_name[:2]
+        image3[b_raw3:b_raw3 + 2] = straddle_name[2:]
+        struct.pack_into("<HH", image3, 0x300, 0, 1)
+        struct.pack_into("<IIHHIIIIIII", image3, 0x220, 0, 0, 0, 0, 0, 1, 2, 2, 0x1080, 0x11FA, 0x1100)
+        self.assertEqual(pe_inspect._exports(pe_inspect.PeImage(bytes(image3))), ["First", "#2"])
+
+        image4, b_raw4 = self.two_section_bytes(is64=True, a_vsize=0x200, a_raw=0x200)
+        struct.pack_into("<II", image4, dirs_at + pe_inspect.DIR_EXPORT * 8, 0x1020, 40)
+        image4[0x250:0x256] = b"First\0"
+        image4[0x260:0x26A] = b"SecondSym\0"
+        struct.pack_into("<II", image4, 0x280, 0x1080, 0x1090)
+        struct.pack_into("<II", image4, 0x300, 0x1050, 0x1060)
+        struct.pack_into("<H", image4, 0x3FD, 0)
+        straddle_ord = struct.pack("<H", 1)
+        image4[0x3FF:0x400] = straddle_ord[:1]
+        image4[b_raw4:b_raw4 + 1] = straddle_ord[1:]
+        struct.pack_into("<IIHHIIIIIII", image4, 0x220, 0, 0, 0, 0, 0, 1, 2, 2, 0x1080, 0x1100, 0x11FD)
+        self.assertEqual(pe_inspect._exports(pe_inspect.PeImage(bytes(image4))), ["First", "#2"])
+
+    def test_tls_directory_and_callbacks_straddling_section_boundary_do_not_cross(self):
+        for is64 in (True, False):
+            with self.subTest(is64=is64):
+                width = 8 if is64 else 4
+                base = IMAGE_BASE if is64 else BASE32
+                dirs_at = OPT + (112 if is64 else 96)
+                tls_size = 40 if is64 else 24
+                cb_field = 24 if is64 else 12
+                fmt = "<Q" if is64 else "<I"
+
+                # TLS directory itself straddling `.a`/`.b`
+                image, _ = self.two_section_bytes(is64=is64, a_vsize=0x200, a_raw=0x200)
+                struct.pack_into("<II", image, dirs_at + pe_inspect.DIR_TLS * 8, 0x11F0, tls_size)
+                struct.pack_into(fmt, image, 0x220, base + 0x1080)
+                struct.pack_into(fmt, image, 0x220 + width, 0)
+                struct.pack_into(fmt, image, 0x3F0 + cb_field, base + 0x1020)
+                self.assertEqual(pe_inspect._tls_callbacks(pe_inspect.PeImage(bytes(image))), 0)
+
+                # TLS callback array entry straddling `.a`/`.b`
+                image2, b_raw2 = self.two_section_bytes(is64=is64, a_vsize=0x200, a_raw=0x200)
+                struct.pack_into("<II", image2, dirs_at + pe_inspect.DIR_TLS * 8, 0x1020, tls_size)
+                cb_rva = 0x1200 - width - 2
+                struct.pack_into(fmt, image2, 0x220 + cb_field, base + cb_rva)
+                struct.pack_into(fmt, image2, 0x200 + (cb_rva - 0x1000), base + 0x1080)
+                straddle = struct.pack(fmt, base + 0x1090)
+                image2[0x3FE:0x400] = straddle[:2]
+                image2[b_raw2:b_raw2 + width - 2] = straddle[2:]
+                self.assertEqual(pe_inspect._tls_callbacks(pe_inspect.PeImage(bytes(image2))), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

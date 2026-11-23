@@ -6,7 +6,8 @@ picks the one for the platform.
 
 Tools are located through environment variables first, then by looking in the usual places:
     LEONIDA_AMD_CLANG   AMD clang (its folder must also hold ld.lld); default: amdclang / clang on PATH that lists
-                        the amdgcn target, %HIP_PATH% / %ROCM_PATH%, a .venv holding the `rocm-sdk-core` wheel
+                        the amdgcn target (a launcher without ld.lld beside it is followed to the clang it is
+                        installed as), %HIP_PATH% / %ROCM_PATH%, a .venv holding the `rocm-sdk-core` wheel
     LEONIDA_HIP_DLL     the HIP runtime (amdhip64_7.dll); default: the one in System32 (it ships with the driver)
     LEONIDA_HOST_CC     a C compiler for hw_oracle.c (MinGW gcc, or cl.exe from a Developer shell); default: gcc on
                         PATH, C:\\msys64\\ucrt64\\bin, then on Windows a cl on PATH or Visual Studio's (vswhere)
@@ -47,6 +48,24 @@ def _has_amdgcn(clang):
     return "amdgcn" in out
 
 
+def _installed_clang(clang):
+    """The clang a launcher stands for. The rocm-sdk wheels put `amdclang` in the Python environment's Scripts (bin)
+    folder: it has the amdgcn target, but ld.lld and amdgpu-arch sit beside the real clang, in the folder `--version`
+    names as InstalledDir. A clang with its ld.lld beside it, or one that names no such folder, is returned as it is."""
+    if os.path.isfile(os.path.join(os.path.dirname(clang), _exe("ld.lld"))):
+        return clang
+    try:
+        out = subprocess.run([clang, "--version"], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return clang
+    for line in out.splitlines():
+        if line.startswith("InstalledDir:"):
+            real = os.path.join(line.split(":", 1)[1].strip(), _exe("clang"))
+            if os.path.isfile(real):
+                return real
+    return clang
+
+
 def find_clang():
     env = os.environ.get("LEONIDA_AMD_CLANG")
     if env:
@@ -62,7 +81,7 @@ def find_clang():
     cands.append(os.path.join(REPO, ".venv", tail))   # only the repo root's venv, never a glob under the cwd
     for c in cands:
         if c and os.path.isfile(c) and _has_amdgcn(c):
-            return c
+            return _installed_clang(c)
     raise Unavailable("no AMD clang (set LEONIDA_AMD_CLANG; `pip install rocm-sdk-core` from "
                       "https://stable.repo.amd.com/rocm/whl-next/ provides one)")
 
@@ -222,13 +241,14 @@ class Oracle:
         if co is None:
             raise Unavailable("probe kernel did not assemble: " + err[:300])
         rc, out, err = self._launch(co, names)
-        if rc == 3 and "hip error 209" in err and self.code_object is None:
+        if rc == 3 and any(e in err for e in ("hip error 209", "hip error 303")) and self.code_object is None:
             # LLVM 23 writes code object v6, which HIP runtimes from 2024 (amdhip64_6.dll) refuse as "no binary for
-            # this GPU". Ask for v5; a 209 that stays has another cause and is reported below.
+            # this GPU" (209) or "shared object init failed" (303). Ask for v5; an error that stays has another cause
+            # and is reported below.
             self.code_object = 5
             co, why = self._assemble(text)
             if co is None:
-                raise Unavailable("the HIP runtime refused the code object (209) and v5 did not assemble: " + why[:300])
+                raise Unavailable("the HIP runtime refused the code object and v5 did not assemble: " + why[:300])
             rc, out, err = self._launch(co, names)
         if rc == 77:
             raise Unavailable(err.strip() or "no AMD device")
@@ -241,12 +261,7 @@ class Oracle:
 
     def _needs_true16(self):
         """Whether this assembler rejects `v_cvt_f16_f32 v8, v1` and takes `v8.l` (LLVM 23 on GFX11)."""
-        if asm.family(self.arch) == "gfx10":
-            return False
-        bare = "v_cvt_f16_f32 v8, v1\n"
-        if self._assemble(bare)[0] is not None:
-            return False
-        return self._assemble(asm.true16_spelling(bare))[0] is not None
+        return asm.family(self.arch) != "gfx10" and asm.needs_true16(lambda text: self._assemble(text)[0] is not None)
 
     def _probe_waves(self):
         """Each wave size really runs as that size: a 64-thread group stores v_mbcnt lane ids. In a wave64 kernel
@@ -282,7 +297,14 @@ class Oracle:
         return co, ""
 
     def _launch(self, co, names, words=4):
-        r = subprocess.run([self.exe, co, str(words), self.dll], input="\n".join(names) + "\n", capture_output=True, text=True)
+        try:
+            r = subprocess.run([self.exe, co, str(words), self.dll], input="\n".join(names) + "\n", capture_output=True, text=True)
+        except OSError as e:
+            if getattr(e, "winerror", None) != 225:
+                raise
+            # Defender quarantined the launcher just built (a small unsigned exe that loads a DLL): not a crash
+            raise Unavailable(f"Windows Defender blocked the launcher {self.exe} (WinError 225); add an exclusion for "
+                              f"{os.path.dirname(self.exe)} (Windows Security, Virus & threat protection) and rerun") from None
         return r.returncode, r.stdout, r.stderr
 
     def run(self, programs, words=4):
@@ -309,6 +331,8 @@ class Oracle:
             text, names, starts = asm.module_text([programs[i] for i in live], self.arch, wave=wave)
             if self.true16:
                 text = asm.true16_spelling(text)
+            if asm.family(self.arch) != "gfx10":
+                text = asm.opsel16_spelling(text)    # needed even where the true16 probe says no (asm.py)
             co, err = self._assemble(text, wave)
             if co is not None:
                 break

@@ -566,6 +566,17 @@ class CpuRefTest(unittest.TestCase):
                 self.assertIn(option, result.stderr)
                 self.assertIn("N=VALUE", result.stderr)
 
+    def test_out_of_range_lane_is_a_cli_error(self):
+        path = self.write("s_endpgm")
+        for lane in ("100", "-1", "64"):
+            with self.subTest(lane=lane):
+                result = subprocess.run([sys.executable, "-I", cpu_ref.__file__, path, "--lane", lane],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--lane", result.stderr)
+                self.assertIn("0..63", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

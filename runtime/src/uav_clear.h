@@ -203,7 +203,7 @@ inline std::uint32_t to_rgb9e5(float r, float g, float b) {
     const float max_c = std::max(r, std::max(g, b));
     if (max_c == 0.0f) return 0u;
     int exp_raw = 0;
-    std::frexp(max_c, &exp_raw);  // floor(log2(max_c)) == exp_raw - 1
+    (void)std::frexp(max_c, &exp_raw);  // floor(log2(max_c)) == exp_raw - 1
     int exp_shared = std::max(0, exp_raw + 15);
     double denom = std::ldexp(1.0, exp_shared - 24);  // 2^(exp_shared - 15 - 9)
     const int max_m = static_cast<int>(std::floor(double(max_c) / denom + 0.5));

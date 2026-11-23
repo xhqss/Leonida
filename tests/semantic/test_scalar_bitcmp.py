@@ -201,7 +201,8 @@ class TestRdna2SpirvBitcmpEmission(unittest.TestCase):
         }
         g.insn(ins)
         emitted = "\n".join(g.body)
-        self.assertIn("OpGroupNonUniformBitwiseOr", emitted)
+        self.assertIn("OpGroupNonUniformBallot %v4uint_bal", emitted)
+        self.assertIn("%c20", emitted)
         self.assertIn("OpStore %scc", emitted)
 
     def test_s_bcnt0_i32_b32_emission(self):

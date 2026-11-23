@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -98,6 +99,67 @@ class Resolve(unittest.TestCase):
         one = sk.collect_keys([self.jsav])
         self.assertEqual(sk.collect_keys([folder]), collections.Counter({k: 4 * n for k, n in one.items()}))
 
+    def test_unlistable_subfolder_is_a_clean_error_not_a_silent_skip(self):
+        # os.walk skips a directory it cannot list unless onerror raises; the collection used to report
+        # the remaining saves and exit 0, hiding the incomplete directory.
+        with open(self.jsav, "rb") as f:
+            data = f.read()
+        folder = os.path.join(self.dir, "saves_sub")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "a.jsav"), "wb") as f:
+            f.write(data)
+        sub = os.path.join(folder, "sub")
+        os.makedirs(sub)
+        with open(os.path.join(sub, "b.jsav"), "wb") as f:
+            f.write(data)
+        os.chmod(sub, 0o000)
+        try:
+            try:
+                os.listdir(sub)
+                self.skipTest("the sub-folder is still listable (running as root, or Windows)")
+            except OSError:
+                pass
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = sk.main(["collect", folder])
+            self.assertEqual(rc, 1)
+            self.assertIn("error:", err.getvalue())
+            self.assertIn(sub, err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+        finally:
+            os.chmod(sub, 0o755)
+
+    def test_unlistable_subfolder_is_a_clean_error_when_chmod_is_not_enough(self):
+        # The chmod case above self-skips on Windows and as root, and CI only runs this file on
+        # windows-latest, so the guard went unexercised there. Forcing os.scandir to raise for one
+        # folder gives the same PermissionError os.walk hits for real, on every platform.
+        with open(self.jsav, "rb") as f:
+            data = f.read()
+        folder = os.path.join(self.dir, "saves_scandir")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "a.jsav"), "wb") as f:
+            f.write(data)
+        sub = os.path.join(folder, "sub")
+        os.makedirs(sub)
+        with open(os.path.join(sub, "b.jsav"), "wb") as f:
+            f.write(data)
+        real_scandir = os.scandir
+        locked = os.path.normcase(os.path.abspath(sub))
+
+        def scandir(path, *args, **kwargs):
+            if os.path.normcase(os.path.abspath(str(path))) == locked:
+                raise PermissionError(13, "Access is denied", str(path))
+            return real_scandir(path, *args, **kwargs)
+
+        err = io.StringIO()
+        with mock.patch.object(sk.os, "scandir", scandir):
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = sk.main(["collect", folder])
+        self.assertEqual(rc, 1, err.getvalue())
+        self.assertIn("error:", err.getvalue())
+        self.assertIn(sub, err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
     def test_resolve_counts_per_family(self):
         res = os.path.join(self.dir, "res.json")
         text = run(["resolve", self.jsav, "--dict", self.dict, "--out", res])
@@ -122,10 +184,16 @@ class Resolve(unittest.TestCase):
         inside = os.path.join(folder, "more.json")
         with open(inside, "w", encoding="utf-8") as f:
             f.write("{}")
+        cases = [(self.dict, [self.jsav]), (self.jsav, [self.jsav]), (inside, [folder])]
         link = os.path.join(self.dir, "link.bin")
-        os.link(self.dict, link)
-        for out, inputs in ((self.dict, [self.jsav]), (self.jsav, [self.jsav]), (inside, [folder]),
-                            (link, [self.jsav])):
+        try:
+            os.link(self.dict, link)
+        except (OSError, NotImplementedError) as e:
+            with self.subTest(out=os.path.basename(link)):
+                self.skipTest(f"hard links unavailable: {e}")
+        else:
+            cases.append((link, [self.jsav]))
+        for out, inputs in cases:
             with self.subTest(out=os.path.basename(out)):
                 with open(out, "rb") as f:
                     before = f.read()

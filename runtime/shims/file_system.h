@@ -20,11 +20,17 @@
 
 namespace rt::fs {
 
+inline constexpr wchar_t kPersistentStorageDir[] = L".gta6rt-persistent";
+
 // Sets the roots. main.cpp calls this once, before anything is mapped; the test calls it per case. The overlay is
 // created on the first write, not here.
 void configure(const std::filesystem::path& game_dir, const std::filesystem::path& overlay_dir);
 
 std::filesystem::path game_dir();
 std::filesystem::path overlay_dir();
+
+// For tests: true makes the CopyFile2 shim use its CopyFileExW fallback even where the host has CopyFile2, so the
+// path Wine 9 takes can be checked on Windows. Off by default; main.cpp never sets it.
+void force_copy_file2_fallback(bool force);
 
 }  // namespace rt::fs

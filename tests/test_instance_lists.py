@@ -220,7 +220,7 @@ class ArchiveTests(unittest.TestCase):
             with open(path, "wb") as fh:
                 fh.write(b"RPF9" + struct.pack("<I", 16) + b"\0" * 8 + first + zlib.compress(P))
             out = os.path.join(tmp, "out.json")
-            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 0, r.stderr)
             with open(out, encoding="utf-8") as fh:
                 T = json.load(fh)
@@ -229,7 +229,7 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(T["grass"]["instances"], 3)
 
     def test_bad_limit(self):
-        r = subprocess.run([sys.executable, "-I", TOOL, TOOL, "--limit", "0"], capture_output=True, text=True)
+        r = subprocess.run([sys.executable, "-I", TOOL, TOOL, "--limit", "0"], capture_output=True, text=True, errors="replace")
         self.assertEqual(r.returncode, 2)
 
     @staticmethod
@@ -247,7 +247,7 @@ class ArchiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path, data = self._archive(tmp)
             other = os.path.join(tmp, ".", "fake.rpf")
-            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", other], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", other], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("would overwrite the input", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
@@ -258,7 +258,7 @@ class ArchiveTests(unittest.TestCase):
     def test_json_that_is_a_directory_is_refused_before_the_scan(self):
         with tempfile.TemporaryDirectory() as tmp:
             path, _ = self._archive(tmp)
-            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", tmp], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", tmp], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("is a directory", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
@@ -268,7 +268,7 @@ class ArchiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path, _ = self._archive(tmp)
             out = os.path.join(tmp, "reports", "lists", "out.json")
-            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 0, r.stderr)
             with open(out, encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh)["prop"]["instances"], 2)
@@ -280,7 +280,7 @@ class ArchiveTests(unittest.TestCase):
             with open(blocker, "w", encoding="utf-8") as fh:
                 fh.write("a file, not a folder")
             out = os.path.join(blocker, "out.json")
-            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("cannot write", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
@@ -300,7 +300,7 @@ class ArchiveTests(unittest.TestCase):
                     bad = os.path.join(tmp, name)
                     with open(bad, "wb") as fh:
                         fh.write(payload)
-                    r = subprocess.run([sys.executable, "-I", TOOL, bad], capture_output=True, text=True)
+                    r = subprocess.run([sys.executable, "-I", TOOL, bad], capture_output=True, text=True, errors="replace")
                     self.assertEqual(r.returncode, 2, r.stderr)
                     self.assertIn(expected, r.stderr)
                     self.assertNotIn("Traceback", r.stderr)
@@ -312,7 +312,7 @@ class ArchiveTests(unittest.TestCase):
             for bad in ("-1", "nope"):
                 with self.subTest(start=bad):
                     r = subprocess.run([sys.executable, "-I", TOOL, path, "--start", bad],
-                                       capture_output=True, text=True)
+                                       capture_output=True, text=True, errors="replace")
                     self.assertEqual(r.returncode, 2, r.stderr)
                     self.assertNotIn("<lambda>", r.stderr)
                     self.assertNotIn("Traceback", r.stderr)

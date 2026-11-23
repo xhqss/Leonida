@@ -3,30 +3,17 @@ from __future__ import annotations
 """Semantic interpreter tests and reference oracle for relative register move (v_movrels_b32).
 
 RDNA2 ISA (VOP1 opcode 71 / 0x47):
-  v_movrels_b32   D = VGPR[(S0.addr + M0) % 256]
-  v_movreld_b32   VGPR[(D.addr + M0) % 256] = S0
-  v_movrelsd_b32  VGPR[(D.addr + M0) % 256] = VGPR[(S0.addr + M0) % 256]
+  v_movrels_b32   D = VGPR[S0.addr + M0]
+  v_movreld_b32   VGPR[D.addr + M0] = S0
+  v_movrelsd_b32  VGPR[D.addr + M0] = VGPR[S0.addr + M0]
 
 The relative register move instruction indexes the vector register file (VGPR)
 dynamically relative to the value stored in the scalar M0 register.
 
-In RDNA2 hardware, VGPR indexing is governed by the scalar index register M0.
-When performing v_movrels_b32, the source register index is dynamically calculated
-as (S0 + M0) mod 256, allowing indexed lookup table reads, dynamic array indexing,
-and dynamic register indirection across the 256-entry physical register file.
-
-This test suite covers:
-  1. A mathematical reference oracle (MovrelOracle) and pure-Python register file model
-     implementing dynamic VGPR indexing with modulo-256 arithmetic.
-  2. M0-indexed register file dynamic addressing tests across the full register space,
-     computed M0 values via SALU, chained dynamic moves, and downstream VALU usage.
-  3. Boundary conditions, index boundary clamping, and out-of-bounds rejection:
-     accessing register 255 at the top boundary vs out-of-bounds index rejection.
-  4. Multi-lane SIMD divergence under partial, checkerboard, full, and zero EXEC masks
-     in both wave32 and wave64 modes using spirv_wave_interp.
-  5. Negative controls verifying detection of arithmetic mutations, register operand swaps,
-     missing modulo wrap-around, and inactive-lane write leakage.
-  6. Synthetic shader translation and execution via rdna2spirv and spirv_mini_interp.
+RDNA2 ISA §3.6.1: a source index outside the VGPR allocation reads VGPR0;
+an out-of-range destination discards the write. These tests model the
+translator's 256-entry register array and the existing 32-bit index addition.
+They also cover EXEC masking in wave32 and wave64.
 """
 
 from collections.abc import Sequence
@@ -41,7 +28,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from spirv_mini_interp import UnsupportedConstruct  # noqa: E402
 import spirv_wave_interp as wi  # noqa: E402
 from support import STUB_DXBC, mrt0_words, rdna2spirv  # noqa: E402
 
@@ -59,26 +45,17 @@ SENTINELS: dict[int, int] = {i: sentinel(i) for i in range(1, 9)}
 V0_VALUE = 0x5EED0000  # Loaded into v0 by cases that write or seed v0
 
 
-def compute_movrels_target_vgpr(base_vgpr: int, m0_offset: int, modulo: int = NUM_VGPRS) -> int:
-    """Compute effective VGPR index under RDNA2 dynamic relative addressing: (base + M0) mod 256."""
-    return (base_vgpr + m0_offset) % modulo
+def compute_movrels_target_vgpr(base_vgpr: int, m0_offset: int, count: int = NUM_VGPRS) -> int | None:
+    """Return the effective index if it falls within the model's VGPR array."""
+    index = (base_vgpr + m0_offset) & MASK32
+    return index if index < count else None
 
 
-def ref_movrels_b32(
-    dst: int,
-    src: int,
-    m0: int,
-    vgpr_file: Sequence[int],
-    modulo: int = NUM_VGPRS,
-) -> list[int]:
-    """Pure-Python reference oracle for v_movrels_b32 execution.
-
-    Loads VGPR[(src + m0) % 256] and writes it to VGPR[dst].
-    Returns the updated register file list.
-    """
+def ref_movrels_b32(dst: int, src: int, m0: int, vgpr_file: Sequence[int]) -> list[int]:
+    """Return a copy of the file after a relative source read."""
     out = list(vgpr_file)
-    target_idx = compute_movrels_target_vgpr(src, m0, modulo)
-    out[dst] = out[target_idx] & MASK32
+    target_idx = compute_movrels_target_vgpr(src, m0, len(out))
+    out[dst] = out[target_idx if target_idx is not None else 0] & MASK32
     return out
 
 
@@ -102,25 +79,24 @@ class MovrelOracle:
         return self.vgpr[reg % NUM_VGPRS]
 
     def execute_v_movrels(self, dst: int, src: int) -> int:
-        """Execute v_movrels_b32: VGPR[dst] = VGPR[(src + M0) % 256]. Returns value written."""
-        src_idx = compute_movrels_target_vgpr(src, self.m0, NUM_VGPRS)
-        val = self.vgpr[src_idx]
-        self.vgpr[dst % NUM_VGPRS] = val
+        src_idx = compute_movrels_target_vgpr(src, self.m0)
+        val = self.vgpr[src_idx if src_idx is not None else 0]
+        self.vgpr[dst] = val
         return val
 
     def execute_v_movreld(self, dst: int, src: int) -> int:
-        """Execute v_movreld_b32: VGPR[(dst + M0) % 256] = VGPR[src]. Returns value written."""
-        dst_idx = compute_movrels_target_vgpr(dst, self.m0, NUM_VGPRS)
-        val = self.vgpr[src % NUM_VGPRS]
-        self.vgpr[dst_idx] = val
+        dst_idx = compute_movrels_target_vgpr(dst, self.m0)
+        val = self.vgpr[src]
+        if dst_idx is not None:
+            self.vgpr[dst_idx] = val
         return val
 
     def execute_v_movrelsd(self, dst: int, src: int) -> int:
-        """Execute v_movrelsd_b32: VGPR[(dst + M0) % 256] = VGPR[(src + M0) % 256]."""
-        src_idx = compute_movrels_target_vgpr(src, self.m0, NUM_VGPRS)
-        dst_idx = compute_movrels_target_vgpr(dst, self.m0, NUM_VGPRS)
-        val = self.vgpr[src_idx]
-        self.vgpr[dst_idx] = val
+        src_idx = compute_movrels_target_vgpr(src, self.m0)
+        dst_idx = compute_movrels_target_vgpr(dst, self.m0)
+        val = self.vgpr[src_idx if src_idx is not None else 0]
+        if dst_idx is not None:
+            self.vgpr[dst_idx] = val
         return val
 
     def dump_registers(self, regs: Sequence[int]) -> tuple[int, ...]:
@@ -129,20 +105,17 @@ class MovrelOracle:
 
 def model(op: str, dst: int, src: int, m0: int, init: dict[int, int]) -> list[int]:
     """Plain-Python register file model applying `op dst, src` with M0 = m0."""
-    vgpr = [0] * NUM_VGPRS
-    for r, v in init.items():
-        vgpr[r] = v & MASK32
+    oracle = MovrelOracle(init)
+    oracle.set_m0(m0)
     if op == "v_movrels_b32":
-        vgpr[dst] = vgpr[compute_movrels_target_vgpr(src, m0, NUM_VGPRS)]
+        oracle.execute_v_movrels(dst, src)
     elif op == "v_movreld_b32":
-        vgpr[compute_movrels_target_vgpr(dst, m0, NUM_VGPRS)] = vgpr[src]
+        oracle.execute_v_movreld(dst, src)
     elif op == "v_movrelsd_b32":
-        vgpr[compute_movrels_target_vgpr(dst, m0, NUM_VGPRS)] = vgpr[
-            compute_movrels_target_vgpr(src, m0, NUM_VGPRS)
-        ]
+        oracle.execute_v_movrelsd(dst, src)
     else:
         raise ValueError(op)
-    return vgpr
+    return oracle.vgpr
 
 
 S = SENTINELS
@@ -240,7 +213,7 @@ class TestMovrelsReferenceOracle(unittest.TestCase):
         self.assertEqual(oracle.get_vgpr(10), 0x12345678)
 
     def test_oracle_positive_displacement(self) -> None:
-        """Target register index is (S0 + M0) mod 256 for positive displacements."""
+        """An in-range relative address selects the requested register."""
         oracle = MovrelOracle()
         oracle.set_vgpr(15, 0xCAFEBABE)
         oracle.set_m0(5)
@@ -249,32 +222,16 @@ class TestMovrelsReferenceOracle(unittest.TestCase):
         self.assertEqual(val, 0xCAFEBABE)
         self.assertEqual(oracle.get_vgpr(0), 0xCAFEBABE)
 
-    def test_oracle_modulo_256_wraparound(self) -> None:
-        """Indexing beyond register 255 wraps cleanly to the beginning of the file."""
-        self.assertEqual(compute_movrels_target_vgpr(250, 10), 4)
-        self.assertEqual(compute_movrels_target_vgpr(255, 1), 0)
-        self.assertEqual(compute_movrels_target_vgpr(255, 255), 254)
-        self.assertEqual(compute_movrels_target_vgpr(128, 128), 0)
-
-        oracle = MovrelOracle()
-        oracle.set_vgpr(4, 0xDEADBEEF)
+    def test_oracle_out_of_range_reads_vgpr0(self) -> None:
+        oracle = MovrelOracle({0: 0x12345678, 4: 0xDEADBEEF})
         oracle.set_m0(10)
-        oracle.execute_v_movrels(dst=1, src=250)
-        self.assertEqual(oracle.get_vgpr(1), 0xDEADBEEF)
+        self.assertIsNone(compute_movrels_target_vgpr(250, 10))
+        self.assertEqual(oracle.execute_v_movrels(dst=1, src=250), 0x12345678)
 
     def test_oracle_large_m0_values(self) -> None:
-        """Arbitrary 32-bit M0 offsets undergo modulo-256 reduction in the register file."""
-        self.assertEqual(compute_movrels_target_vgpr(10, 256), 10)
-        self.assertEqual(compute_movrels_target_vgpr(5, 512 + 7), 12)
-        self.assertEqual(compute_movrels_target_vgpr(0, 1024), 0)
-        self.assertEqual(compute_movrels_target_vgpr(1, 0x10000), 1)
-        self.assertEqual(compute_movrels_target_vgpr(10, 0x10000003), 13)
-
-        oracle = MovrelOracle()
-        oracle.set_vgpr(13, 0xA1B2C3D4)
-        oracle.set_m0(0x10000003)
-        oracle.execute_v_movrels(dst=2, src=10)
-        self.assertEqual(oracle.get_vgpr(2), 0xA1B2C3D4)
+        for base, offset in ((10, 256), (5, 519), (0, 1024), (1, 0x10000), (10, 0x10000003)):
+            with self.subTest(base=base, offset=offset):
+                self.assertIsNone(compute_movrels_target_vgpr(base, offset))
 
     def test_oracle_preserves_other_vgprs(self) -> None:
         """Only the destination register is written; all other registers remain unchanged."""
@@ -499,30 +456,19 @@ class TestIndexBoundaryAndClamping(unittest.TestCase):
         words = mrt0_words(translate_listing(lines))
         self.assertEqual(words, [0x12345678] * 4)
 
-    def test_out_of_bounds_raises_unsupported_construct(self) -> None:
-        """Accessing an index >= 256 is out of bounds in SPIR-V OpAccessChain and rejected."""
+    def test_out_of_bounds_reads_vgpr0(self) -> None:
         lines = [
-            "v_mov_b32 v250, 0x1234",
+            "v_mov_b32 v0, 0x12345678",
+            "v_mov_b32 v4, 0xDEADBEEF",
             "s_mov_b32 m0, 10",
-            "v_movrels_b32 v0, v250",  # 250 + 10 = 260 >= 256
-            "exp mrt0 v0, v0, v0, v0 done vm",
+            "v_movrels_b32 v1, v250",  # The index 260 must not select v4 or an invalid pointer.
+            "exp mrt0 v1, v1, v1, v1 done vm",
         ]
-        spv = translate_listing(lines)
-        with self.assertRaises(UnsupportedConstruct):
-            mrt0_words(spv)
+        self.assertEqual(mrt0_words(translate_listing(lines)), [0x12345678] * 4)
 
-    def test_oracle_modulo_256_clamping_and_wrapping(self) -> None:
-        """The mathematical reference oracle accurately calculates modulo-256 wrapping."""
-        self.assertEqual(compute_movrels_target_vgpr(255, 1), 0)
-        self.assertEqual(compute_movrels_target_vgpr(250, 10), 4)
-        self.assertEqual(compute_movrels_target_vgpr(128, 128), 0)
-        self.assertEqual(compute_movrels_target_vgpr(200, 100), 44)
-
-    def test_oracle_negative_m0_wrapping(self) -> None:
-        """Negative displacements in 32-bit unsigned arithmetic wrap correctly."""
-        # 0xFFFFFFFF is -1 as 32-bit signed
+    def test_oracle_32_bit_addition(self) -> None:
         self.assertEqual(compute_movrels_target_vgpr(5, 0xFFFFFFFF), 4)
-        self.assertEqual(compute_movrels_target_vgpr(0, 0xFFFFFFFF), 255)
+        self.assertIsNone(compute_movrels_target_vgpr(0, 0xFFFFFFFF))
 
 
 class TestSimdDivergenceUnderExec(unittest.TestCase):
@@ -672,15 +618,12 @@ class TestNegativeControls(unittest.TestCase):
         self.assertEqual(oracle.get_vgpr(0), 0x11111111)
         self.assertNotEqual(oracle.get_vgpr(1), 0x11111111)
 
-    def test_detect_missing_modulo_wrap_mutation(self) -> None:
-        """Missing modulo-256 reduction on register wrap is detected."""
-        base_src = 250
-        m0 = 10
-        correct_target = compute_movrels_target_vgpr(base_src, m0)
-        unreduced_target = base_src + m0
-        self.assertEqual(correct_target, 4)
-        self.assertEqual(unreduced_target, 260)
-        self.assertNotEqual(correct_target, unreduced_target)
+    def test_out_of_range_relative_writes_preserve_registers(self) -> None:
+        init = {0: 0xAAAA, 1: 0x1111, 4: 0xDEADBEEF}
+        for op in ("v_movreld_b32", "v_movrelsd_b32"):
+            with self.subTest(op=op):
+                self.assertEqual(model(op, dst=250, src=1, m0=10, init=init),
+                                 MovrelOracle(init).vgpr)
 
     def test_detect_instruction_swap_mutation(self) -> None:
         """Swapping v_movrels_b32 with v_movreld_b32 produces distinctly different register states."""

@@ -2,14 +2,21 @@
 
 One pixel shader per case runs the instruction on a hand-built 64-byte triangle node and exports the four result
 words. The node holds a unit quad in slots 0..3, v0 (0,0,0) v1 (1,0,0) v2 (0,1,0) v3 (1,1,0), and a fifth vertex in
-slot 4 (words 12..14). The ray starts at (x, y, -1) and runs along +z, so t = 1. The result is
-(t/|det|, sign(det), b_i/|det|, b_j/|det|) scaled so that dividing by .y gives (t, -, b_i, b_j): -1, -1, -b_i, -b_j
-for a triangle wound like v0 v1 v2, and +1, +1, b_i, b_j for one wound the other way (TRI3 here).
+slot 4 (words 12..14). The ray starts at (x, y, -1) and runs along +z, so t = 1 and k = |d.z|^3 = 1. The result is
+the hardware's (t*det, det, b_i*det, b_j*det), so dividing by .y gives (t, -, b_i, b_j), and on a miss
+(copysign(inf, det), det, b_i*det, b_j*det) with the weights of the triangle's plane (docs/design.md, Ray tracing row;
+measured on RDNA2, tests/semantic/test_image_bvh_tri_hw.py). det is twice the projected area with the sign of the
+winding: -1 for TRI0..TRI2, wound like v0 v1 v2, and +0.5 for TRI3, wound the other way. Until the measurement the
+expected words here were the normalised (t/|det|, sign(det), b_i/|det|, b_j/|det|) and a miss (inf, 1, 0, 0); the
+slots, the remap selectors and the quotients checked are the same.
 
 Expected rules (docs/design.md, Ray tracing row; docs/bvh.md 7a): TRI0 reads slots (0,1,2), TRI1 (1,3,2), TRI2 (2,3,4)
 and TRI3 (2,4,0). Byte `type` of the word at +60 holds two selectors: bits [1:0] for the first weight and [3:2] for
 the second, where 0/1/2 name the triangle's vertex 0/1/2. The weights below are written by hand and checked against
 a plain-Python solve of the 2x2 system.
+
+The descriptor dword0 is 0x10: the base in 256-byte units (0x1000). The GPU measured this nonzero base against the
+CPU walker on the real-BVH first call, so this case also pins the `<< 8`, not a masked byte address.
 
     python -m unittest tests/semantic/test_image_bvh_tri.py -v
 """
@@ -61,33 +68,40 @@ def weights(tri, x, y):
 
 
 class TriangleSlots(unittest.TestCase):
-    # (type, point inside that type's triangle and outside TRI0's, hand-written weights of vertices 0, 1, 2)
+    # (type, point inside that type's triangle and outside TRI0's, hand-written weights of vertices 0, 1, 2, det)
     CASES = [
-        (0, (0.2, 0.3), (0.5, 0.2, 0.3)),          # (v0, v1, v2)
-        (1, (0.75, 0.6), (0.4, 0.35, 0.25)),       # (v1, v3, v2)
-        (2, (0.6, 1.3), (0.25, 0.45, 0.3)),        # (v2, v3, v4)
-        (3, (0.2, 1.0), (0.2, 0.4, 0.4)),          # (v2, v4, v0): wound the other way, so det > 0
+        (0, (0.2, 0.3), (0.5, 0.2, 0.3), -1.0),          # (v0, v1, v2)
+        (1, (0.75, 0.6), (0.4, 0.35, 0.25), -1.0),       # (v1, v3, v2)
+        (2, (0.6, 1.3), (0.25, 0.45, 0.3), -1.0),        # (v2, v3, v4)
+        (3, (0.2, 1.0), (0.2, 0.4, 0.4), 0.5),           # (v2, v4, v0): wound the other way, half the area
     ]
     ORDER = {0: (0, 1, 2), 1: (1, 3, 2), 2: (2, 3, 4), 3: (2, 4, 0)}
 
     def test_reference_weights(self):
-        for t, (x, y), want in self.CASES:
+        for t, (x, y), want, _ in self.CASES:
             got = weights([SLOTS[s] for s in self.ORDER[t]], x, y)
             for g, w in zip(got, want):
                 self.assertAlmostEqual(g, w, places=12, msg=(t, got))
 
     def test_each_type_reads_its_slots(self):
-        for t, (x, y), want in self.CASES:
+        for t, (x, y), want, det in self.CASES:
             with self.subTest(type=t):
                 r = run(t, 0x09 << (8 * t), x, y)
-                self.assertEqual(r[1], 1.0 if t == 3 else -1.0)       # sign(det)
+                self.assertEqual(r[1], det)                           # k*det, k = 1
                 self.assertAlmostEqual(r[0] / r[1], 1.0, places=6)    # t, as the game's code divides by .y
                 self.assertAlmostEqual(r[2] / r[1], want[1], places=6)
                 self.assertAlmostEqual(r[3] / r[1], want[2], places=6)
 
     def test_tri1_misses_where_only_tri0_is(self):
-        self.assertEqual(run(1, 0x0900, 0.2, 0.3), [INF, 1.0, 0.0, 0.0])
-        self.assertEqual(run(0, 0x09, 0.75, 0.6), [INF, 1.0, 0.0, 0.0])
+        # a miss keeps det and the weights' numerators, here of a point outside the triangle (one weight < 0)
+        for t, (x, y) in ((1, (0.2, 0.3)), (0, (0.75, 0.6))):
+            with self.subTest(type=t):
+                r = run(t, 0x09 << (8 * t), x, y)
+                w = weights([SLOTS[s] for s in self.ORDER[t]], x, y)
+                self.assertTrue(min(w) < 0)
+                self.assertEqual(r[:2], [-INF, -1.0])                 # copysign(inf, det), det
+                self.assertAlmostEqual(-r[2], w[1], places=6)
+                self.assertAlmostEqual(-r[3], w[2], places=6)
 
 
 class RemapByte(unittest.TestCase):

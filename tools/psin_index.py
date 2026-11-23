@@ -317,18 +317,23 @@ def _with_schema(record, schema, structs, enums, lsch_error="", lenm_error=""):
     return record
 
 
-def files_in(src):
+def input_paths(src):
+    """Paths read from a single source file or a directory of carved PSIN streams."""
     if os.path.isfile(src):
-        with open(src, "rb") as f:
-            yield os.path.basename(src), f.read()
+        yield src
         return
     for name in sorted(os.listdir(src)):
         if not name.endswith(".bin"):
             continue
         path = os.path.join(src, name)
         if os.path.isfile(path):
-            with open(path, "rb") as f:
-                yield name, f.read()
+            yield path
+
+
+def files_in(src):
+    for path in input_paths(src):
+        with open(path, "rb") as f:
+            yield os.path.basename(path), f.read()
 
 
 def collect(src, limit=None, schema=False):

@@ -355,6 +355,37 @@ class Classification(unittest.TestCase):
             "s_cbranch_execz 1", "s_add_u32 s5, s5, 1", "s_or_b64 exec, exec, s[12:13]", "v_mov_b32_e32 v6, s5"]),
             "C", ["stale-scalar"])
 
+    def test_slist_taint_and_stale_tracking(self):
+        # LLVM VCCTuple scalar lists (slist, e.g. [s104,s105,vcc_lo,vcc_hi]) must propagate taint and stale defs/uses.
+        self.tier("ps_a_slist_clean", ps([
+            "buffer_store_dword v0, v1, [s104,s105,vcc_lo,vcc_hi], 0 offen"]), "A", [], [])
+        self.tier("ps_c_slist_src_taint", ps([
+            "v_cmp_eq_u32_e32 vcc, 1, v0", "s_bcnt1_i32_b64 s104, vcc",
+            "buffer_store_dword v0, v1, [s104,s105,vcc_lo,vcc_hi], 0 offen"]), "C", ["lane-count"])
+        self.tier("ps_c_slist_dst_taint", ps([
+            "v_cmp_eq_u32_e32 vcc, 1, v0", "s_bcnt1_i32_b64 s4, vcc",
+            "s_load_dwordx4 [s104,s105,vcc_lo,vcc_hi], s[4:5], 0", "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v6, s104"]), "C", ["lane-count"])
+        self.tier("ps_c_slist_stale_def", ps([
+            "v_cmp_eq_u32_e32 vcc, 0, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_mov_b32 s104, 7",
+            "s_cbranch_execz 1", "s_load_dwordx4 [s104,s105,vcc_lo,vcc_hi], s[0:1], 0",
+            "s_or_b64 exec, exec, s[12:13]", "v_mov_b32_e32 v6, s104"]), "C", ["stale-scalar"])
+        self.tier("ps_c_slist_stale_use", ps([
+            "v_cmp_eq_u32_e32 vcc, 0, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_mov_b32 s104, 7",
+            "s_cbranch_execz 1", "s_add_u32 s104, s104, 1", "s_or_b64 exec, exec, s[12:13]",
+            "buffer_store_dword v0, v1, [s104,s105,vcc_lo,vcc_hi], 0 offen"]), "C", ["stale-scalar"])
+        # VOP3b scalar carry-out destination written as an slist must be classified as a destination, not a source.
+        import wave64_halves
+        ins = {"op": "v_add_co_u32_e64", "args": [
+            {"k": "vgpr", "r": 6, "n": 1},
+            {"k": "slist", "r": [105, "vcc_lo"], "n": 2},
+            {"k": "vgpr", "r": 0, "n": 1},
+            {"k": "vgpr", "r": 1, "n": 1},
+        ], "mods": []}
+        dests, srcs, _, _ = wave64_halves.operands(ins)
+        self.assertEqual([wave64_halves._regs(d) for d in dests], [[("v", 6)], [("s", 105), "vcc"]])
+        self.assertEqual([wave64_halves._regs(s) for s in srcs], [[("v", 0)], [("v", 1)]])
+
     def test_c_branch_on_count(self):
         self.tier("ps_c_brcnt", ps([
             "v_cmp_eq_u32_e32 vcc, 1, v0", "s_bcnt1_i32_b64 s6, vcc", "s_cmp_eq_u32 s6, 5", "s_cbranch_scc1 1",
@@ -368,6 +399,16 @@ class Classification(unittest.TestCase):
         self.tier("ps_c_half", ps(["s_mov_b32 exec_hi, 0"]), "C", ["mask-half"])
         self.tier("ps_c_half2", ps(["v_cmp_eq_u32_e32 vcc, 1, v0", "s_mov_b32 s6, vcc_hi", "v_mov_b32_e32 v6, s6"]),
                   "C", contains=["mask-half"])
+
+    def test_c_vcmpx_on_the_lane_id(self):
+        # v_cmpx writes EXEC like v_cmp + s_and_b64 exec: on 32-wide waves lanes 32..63 see ids 0..31 and stay on.
+        for form in ("e32", "e64"):
+            self.tier(f"vs_c_vcmpx_{form}", vs([*LANE_ID, "v_mov_b32_e32 v6, 1", f"v_cmpx_gt_u32_{form} 32, v10",
+                                                "v_mov_b32_e32 v6, 2"]), "C", ["tainted-exec"])
+
+    def test_a_vcmpx_on_a_uniform_value(self):
+        self.tier("vs_a_vcmpx_uniform", vs(["s_mov_b32 s20, 5", "v_mov_b32_e32 v6, 1", "v_cmpx_gt_u32_e32 s20, 3",
+                                             "v_mov_b32_e32 v6, 2"]), "A", [])
 
     def test_c_mask_stored_as_data(self):
         self.tier("ps_c_maskdata", ps(["v_cmp_eq_u32_e32 vcc, 1, v0", "s_mov_b64 s[6:7], vcc",
@@ -806,6 +847,130 @@ class SccVotePolarity(unittest.TestCase):
             "v_add_nc_u32_e32 v6, 3, v0", "s_mov_b64 exec, s[10:11]"]), "C", contains=["unsafe-vote-branch"])
 
 
+UNIFORM = [[0, 0, 0, 0, 9], [0, 0, 0, 0, 1]]     # s4 = 9: the compare 5 < s4 says yes; s4 = 1: no
+VCCZ_SIDES = ["s_cbranch_vccz 3", "v_mov_b32_e32 v6, 7", "s_mov_b32 s20, 1", "s_branch 2", "v_mov_b32_e32 v6, 5",
+              "s_mov_b32 s20, 2", "v_add_nc_u32_e32 v7, s20, v0"]
+
+
+class UniformVote(unittest.TestCase):
+    """A vote on a compare of a wave-uniform value made while EXEC is the launch mask is no lane vote: the mask is every
+    launch lane or none, so each half votes as the wave does, and both sides may have code (scalars included) of their
+    own. The near misses vote differently in the two halves and must stay tier C."""
+    run_both = Execution.run_both
+
+    def invariant(self, name, body, tier, idioms, want):
+        for push in UNIFORM:
+            t, whole, halves = self.run_both(name, vs(body), push)
+            (_, reasons, got_idioms), _ = meta_of(name, vs(body))
+            self.assertEqual((t, reasons, got_idioms), (tier, [], idioms), name)
+            self.assertEqual(whole, halves, (name, push))
+            self.assertEqual([w[:2] for w in whole], [want(push[4], k) for k in range(64)], (name, push))
+
+    def differs(self, name, body, reason, push=UNIFORM[0]):
+        t, whole, halves = self.run_both(name, vs(body), push)
+        (_, reasons, _), _ = meta_of(name, vs(body))
+        self.assertEqual(t, "C", name)
+        self.assertIn(reason, reasons, name)
+        self.assertNotEqual(whole, halves, name)
+        return whole, halves
+
+    def test_a_vccz_if_else_with_scalars_read_after_the_join(self):
+        self.invariant("vs_uv_vccz", ["v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e32 vcc, 5, v1"] + VCCZ_SIDES, "A", [],
+                       lambda s4, k: (7, 1 + k) if s4 > 5 else (5, 2 + k))
+
+    def test_a_llvm_and_exec_vccnz(self):
+        self.invariant("vs_uv_and_exec", [
+            "v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e64 s[14:15], 5, v1", "s_and_b64 vcc, exec, s[14:15]",
+            "s_cbranch_vccnz 3", "v_mov_b32_e32 v6, 5", "s_mov_b32 s20, 2", "s_branch 2", "v_mov_b32_e32 v6, 7",
+            "s_mov_b32 s20, 1", "v_add_nc_u32_e32 v7, s20, v0"], "A", [],
+            lambda s4, k: (7, 1 + k) if s4 > 5 else (5, 2 + k))
+
+    def test_a_uniform_loop_back_edge(self):
+        # s20 counts the trips in an SGPR across the back edge: every half runs s4 of them, as the wave does
+        self.invariant("vs_uv_loop", [
+            "s_mov_b32 s20, 0", "s_add_u32 s20, s20, 1", "v_add_nc_u32_e32 v6, 3, v6", "v_mov_b32_e32 v1, s20",
+            "v_cmp_gt_u32_e32 vcc, s4, v1", "s_cbranch_vccnz -5", "v_add_nc_u32_e32 v7, s20, v0"], "A", [],
+            lambda s4, k: (3 * s4, s4 + k))
+
+    def test_b_readfirstlane_of_a_uniform_value_feeds_the_vote(self):
+        self.invariant("vs_uv_rfl", ["v_mov_b32_e32 v1, s4", "v_readfirstlane_b32 s21, v1", "v_mov_b32_e32 v2, s21",
+                                     "v_cmp_lt_u32_e32 vcc, 5, v2"] + VCCZ_SIDES, "B", ["readfirstlane-uniform"],
+                       lambda s4, k: (7, 1 + k) if s4 > 5 else (5, 2 + k))
+
+    def test_c_compare_under_a_narrowed_exec(self):
+        # EXEC narrowed to lanes 0..31: the second half has no active lane, votes no and sets s20 = 2, which the lanes
+        # of that half read once EXEC is restored; the wave voted yes (s20 = 1)
+        whole, halves = self.differs("vs_uv_narrowed", [
+            "v_mov_b32_e32 v1, s4", "v_cmp_gt_u32_e32 vcc, 32, v0", "s_and_saveexec_b64 s[12:13], vcc",
+            "v_cmp_lt_u32_e32 vcc, 5, v1", "s_cbranch_vccz 3", "v_mov_b32_e32 v6, 7", "s_mov_b32 s20, 1",
+            "s_branch 2", "v_mov_b32_e32 v6, 5", "s_mov_b32 s20, 2", "s_mov_b64 exec, s[12:13]",
+            "v_add_nc_u32_e32 v7, s20, v0"], "unsafe-vote-branch")
+        self.assertEqual([w[1] for w in whole[32:]], [1 + k for k in range(32, 64)])
+        self.assertEqual([w[1] for w in halves[32:]], [2 + k for k in range(32, 64)])
+
+    def test_c_half_of_a_uniform_mask_rewritten(self):
+        # s15 (the high half of the uniform mask) is rewritten before the mask becomes VCC: the wave still sees the low
+        # half's bits and votes yes, the second half sees s15 = 0 and votes no
+        name = "vs_uv_half_rewritten"
+        body = vs(["v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e64 s[14:15], 5, v1", "s_mov_b32 s15, 0",
+                   "s_mov_b64 vcc, s[14:15]"] + VCCZ_SIDES)
+        (t, reasons, _), _ = meta_of(name, body)
+        self.assertEqual(t, "C", name)
+        self.assertIn("unsafe-vote-branch", reasons, name)
+
+    def test_c_readfirstlane_of_a_varying_value(self):
+        # the first lane is vertex 0 in the wave and vertex 32 in the second half
+        self.differs("vs_uv_rfl_varying", ["v_readfirstlane_b32 s21, v0", "v_mov_b32_e32 v1, s21",
+                                           "v_cmp_eq_u32_e32 vcc, 0, v1"] + VCCZ_SIDES, "tainted-branch")
+
+    def test_c_compare_on_a_lane_count(self):
+        # 64 lanes in the wave, 32 in a half: 40 < count is yes for the wave, no for each half
+        self.differs("vs_uv_bcnt", ["s_bcnt1_i32_b64 s21, exec", "v_mov_b32_e32 v1, s21",
+                                    "v_cmp_lt_u32_e32 vcc, 40, v1"] + VCCZ_SIDES, "lane-count")
+
+    def test_c_scc_of_a_lane_mask_with_a_uniform_vcc_written_after_it(self):
+        # SCC is the vote of the AND (vertex 1 on: the wave and the first half say yes); the uniform v_cmp after it
+        # writes VCC but not SCC, so the branch still votes on the lane mask; since SHADER-820 (#4620) the new VCC
+        # ends SCC's tag as a vote, so the branch is reported as a tainted one
+        self.differs("vs_uv_scc_stale", ["v_cmp_eq_u32_e64 s[16:17], 1, v0", "s_and_b64 vcc, exec, s[16:17]",
+                                         "v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e32 vcc, 5, v1", "s_cbranch_scc0 3"]
+                     + VCCZ_SIDES[1:], "tainted-branch")
+
+    def test_c_uniform_mask_anded_with_a_lane_mask(self):
+        # only vertex 1 survives the AND: the wave and the first half vote yes, the second half no
+        self.differs("vs_uv_and_lane", ["v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e32 vcc, 5, v1",
+                                        "v_cmp_eq_u32_e64 s[16:17], 1, v0", "s_and_b64 vcc, vcc, s[16:17]"]
+                     + VCCZ_SIDES, "unsafe-vote-branch")
+
+    def test_c_partial_write_keeps_varying_bits(self):
+        # v1 = lane << 8, then its low byte (SDWA, UNUSED_PRESERVE) or low half (16-bit add) from s4: the sources are
+        # uniform but bits the write keeps are not, so 0x2000 > v1 is yes for lanes 0..31 only (found by @shdann)
+        sides = ["s_cbranch_vccz 3", "v_mov_b32_e32 v6, 7", "s_mov_b32 s20, 1", "s_branch 2", "v_mov_b32_e32 v6, 5",
+                 "s_mov_b32 s20, 2", "v_add_nc_u32_e32 v7, s20, v0"]
+        self.differs("vs_uv_sdwa_partial", [
+            "v_lshlrev_b32_e32 v1, 8, v0",
+            "v_mov_b32_sdwa v1, s4 dst_sel:BYTE_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD",
+            "v_cmp_gt_u32_e32 vcc, 0x2000, v1"] + sides, "unsafe-vote-branch", push=[0, 0, 0, 0, 9])
+        self.differs("vs_uv_u16_partial", [
+            "v_lshlrev_b32_e32 v1, 16, v0", "v_add_u16_e64 v1, 1, s4",
+            "v_cmp_gt_u32_e32 vcc, 0x200000, v1"] + sides, "unsafe-vote-branch", push=[0, 0, 0, 0, 9])
+
+    def test_a_whole_register_16_bit_forms_stay_uniform(self):
+        # a packed convert, a SAD and a VOP2 16-bit integer op write the whole VGPR: uniform sources, uniform result
+        for name, op in (("vs_uv_pkrtz", "v_cvt_pkrtz_f16_f32_e32 v1, s4, v2"), ("vs_uv_sad", "v_sad_u16 v1, s4, 0, v2"),
+                         ("vs_uv_add_u16_e32", "v_add_u16_e32 v1, s4, v2")):
+            (t, reasons, _), _ = meta_of(name, vs(["v_mov_b32_e32 v2, s4", op, "v_cmp_lt_u32_e32 vcc, 5, v1"]
+                                                  + VCCZ_SIDES))
+            self.assertEqual((t, reasons), ("A", []), name)
+
+    def test_a_partial_write_over_a_uniform_register(self):
+        # the kept bits come from s4 too, so the register stays uniform
+        name = "vs_uv_sdwa_uniform"
+        (t, reasons, _), _ = meta_of(name, vs([
+            "v_mov_b32_e32 v1, s4", "v_mov_b32_sdwa v1, s4 dst_sel:BYTE_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD",
+            "v_cmp_lt_u32_e32 vcc, 5, v1"] + VCCZ_SIDES))
+        self.assertEqual((t, reasons), ("A", []), name)
+
 class KillExit(unittest.TestCase):
     """The early exit of a pixel kill (`s_andn2_b64 live, live, exec/vcc`, `s_cbranch_scc0` to a block that only
     empties EXEC from that mask, exports and ends): a half whose live mask is empty writes nothing there, and in the
@@ -877,9 +1042,10 @@ class KillExit(unittest.TestCase):
                   "C", contains=["unsafe-vote-branch"])
 
     def test_c_mask_redefined_or_not_the_vote(self):
-        # the mask is rewritten after the vote (s_mov leaves SCC alone): the exit reads another value
+        # the mask is rewritten after the vote (s_mov leaves SCC alone): the exit reads another value. Since
+        # SHADER-820 (#4620) the new value ends SCC's tag as a vote on that mask, so the branch is a tainted one.
         self.tier("ps_kill_redef", kill(KILL + ["s_mov_b64 s[20:21], exec"], RUN_WQM, EXIT_PS),
-                  "C", contains=["unsafe-vote-branch"])
+                  "C", contains=["tainted-branch"])
         # SCC = (mask == 0): the branch to the "exit" is taken when the mask is not empty
         self.tier("ps_kill_cmp_eq", kill(KILL + ["s_cmp_eq_u64 s[20:21], 0"], RUN_WQM, EXIT_PS),
                   "C", contains=["unsafe-vote-branch"])
@@ -924,6 +1090,81 @@ class KillExit(unittest.TestCase):
         self.assertEqual(tier, "C")
         self.assertEqual([w[:2] for w in whole], [(3 * k, 1) for k in range(64)])
         self.assertEqual([w[:2] for w in halves[:32]], [(0, 0)] * 32)      # the first half took the exit
+
+
+class AddTidBuffer(unittest.TestCase):
+    """A MUBUF/MTBUF access with no idxen through a literal V# whose word3 has ADD_TID_ENABLE (bit 23) takes the
+    wave lane as its index (idxen ignores the bit), so what it reads or writes depends on the lane id: tier C
+    `lane-id`. A literal with the bit clear and any access with idxen are tier A. (A run-time V# is assumed to
+    have the bit clear: docs/design.md, SHADER-10.)"""
+    TID, NO_TID = 0x31816fac, 0x31016fac
+
+    def v_sharp(self, word3):
+        # SWIZZLE_ENABLE, stride 4, 8-index swizzle: with ADD_TID_ENABLE, lane i reads the dword at base + 4 * i
+        return ["s_mov_b32 s0, 0x1000", "s_mov_b32 s1, 0x80040000", "s_mov_b32 s2, 0x1000",
+                f"s_mov_b32 s3, {word3:#x}", "v_mov_b32_e32 v9, 0"]
+
+    def program(self, word3, access):
+        return vs(self.v_sharp(word3) + [access, "s_waitcnt vmcnt(0)"])
+
+    def test_literal_add_tid_without_idxen_is_lane_dependent(self):
+        for load in ("buffer_load_dword v6, off, s[0:3], 0", "buffer_load_format_x v6, off, s[0:3], 0"):
+            lines = self.program(self.TID, load)
+            (tier, reasons, _), _ = meta_of("vs_add_tid", lines)
+            self.assertEqual((tier, "lane-id" in reasons), ("C", True), load)
+
+    def test_literal_add_tid_clear_is_tier_a(self):
+        lines = self.program(self.NO_TID, "buffer_load_dword v6, off, s[0:3], 0")
+        (tier, reasons, _), _ = meta_of("vs_no_tid", lines)
+        self.assertEqual((tier, reasons), ("A", []))
+
+    def test_idxen_ignores_add_tid(self):
+        lines = self.program(self.TID, "buffer_load_dword v6, v9, s[0:3], 0 idxen")
+        (tier, reasons, _), _ = meta_of("vs_idxen_tid", lines)
+        self.assertEqual((tier, reasons), ("A", []))
+
+    def test_literal_copied_through_another_sgpr_still_counts(self):
+        lines = vs(self.v_sharp(self.NO_TID)[:3] + ["s_mov_b32 s20, 0x31816fac", "s_mov_b32 s3, s20",
+                   "buffer_load_dword v6, off, s[0:3], 0"])
+        self.assertEqual(meta_of("vs_tid_copy", lines)[0][0], "C")
+
+    def test_word3_built_by_other_scalar_ops_counts(self):
+        # rdna2spirv folds these into the literal word3; the analysis must see the same bit
+        head = ["s_mov_b32 s0, 0x1000", "s_mov_b32 s1, 0x80040000", "s_mov_b32 s2, 0x1000"]
+        load = "buffer_load_dword v6, off, s[0:3], 0"
+        for name, build, tier in (
+                ("mov64_set", ["s_mov_b64 s[2:3], 0x31816fac00001000"], "C"),
+                ("mov64_clear", ["s_mov_b64 s[2:3], 0x31016fac00001000"], "A"),
+                ("mov64_pair_copy", ["s_mov_b64 s[20:21], 0x31816fac00001000", "s_mov_b64 s[2:3], s[20:21]"], "C"),
+                ("pack_set", ["s_pack_ll_b32_b16 s3, 0x6fac, 0x3181"], "C"),
+                ("pack_clear", ["s_pack_ll_b32_b16 s3, 0x6fac, 0x3101"], "A"),
+                ("bfm_set", ["s_bfm_b32 s3, 9, 23"], "C"),
+                ("bfm_clear", ["s_bfm_b32 s3, 3, 12"], "A"),
+                ("movk_clear", ["s_movk_i32 s3, 0x1234"], "A")):
+            lines = vs(head + (["s_mov_b32 s3, 0"] if name.startswith("mov64") else []) + build
+                       + ["v_mov_b32_e32 v9, 0", load, "s_waitcnt vmcnt(0)"])
+            self.assertEqual(meta_of("vs_w3_" + name, lines)[0][0], tier, name)
+
+    def test_offen_tbuffer_and_store_format_follow_the_bit(self):
+        for access in ("buffer_load_dword v6, v9, s[0:3], 0 offen",
+                       "tbuffer_load_format_x v6, off, s[0:3], 0 format:[BUF_FMT_32_FLOAT]",
+                       "buffer_store_format_x v6, off, s[0:3], 0"):
+            (tier, reasons, _), _ = meta_of("vs_tid_variant", self.program(self.TID, access))
+            self.assertEqual((tier, "lane-id" in reasons), ("C", True), access)
+            (tier, reasons, _), _ = meta_of("vs_notid_variant", self.program(self.NO_TID, access))
+            self.assertEqual((tier, reasons), ("A", []), access)
+
+    def test_stores_and_atomics_by_lane_are_tier_c(self):
+        for access in ("buffer_store_dword v6, off, s[0:3], 0", "buffer_atomic_add v6, off, s[0:3], 0"):
+            (tier, reasons, _), _ = meta_of("vs_tid_write", self.program(self.TID, access))
+            self.assertEqual((tier, "lane-id" in reasons), ("C", True), access)
+            (tier, _, _), _ = meta_of("vs_notid_write", self.program(self.NO_TID, access))
+            self.assertEqual(tier, "A", access)
+
+    def test_run_time_v_sharp_is_assumed_to_have_the_bit_clear(self):
+        # the word3 comes from user data: nothing in the code says the bit is set (design.md, SHADER-10)
+        lines = vs(["buffer_load_dword v6, off, s[4:7], 0", "s_waitcnt vmcnt(0)"])
+        self.assertEqual(meta_of("vs_runtime_vsharp", lines)[0][0], "A")
 
 
 class Refusal(unittest.TestCase):

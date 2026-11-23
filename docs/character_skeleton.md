@@ -124,6 +124,49 @@ largest difference between a joint's composed origin and the one its inverse bin
 matrices are row-vector (D3D) matrices; stored row by row they are glTF's column-major layout as
 is. `tools/anim_glb.py` exports them as the glTF skin's `inverseBindMatrices` and checks them.
 
+## Master skeletons and standing space
+
+Master `crSkeletonData` tables (`root + 0x18`, bone count `u16` at `skel + 0x6c`, `0x50`-byte
+`crBoneData` records at `skel + 0x28`, inverse bind matrices at `skel + 0x30`) live inside the 22
+`ambient_*` ped fragment resources in `packs.rpf`. They fall into five master skeleton classes:
+
+| Master skeleton fragment | Rig token | Named bones | `SKEL_*` | `BM_*` | `MH_*` | `FB_*` | `PH_*` | `OH_*` | `HH_*` | `RB_*` | `SEC_*` |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `ambient_femalebody` / `femalexxl` | `fr1` / `fo1` | **596** | 78 | 131 | 151 | 56 | 51 | 40 | 23 | 22 | 4 |
+| `ambient_femalebb` | `fb1` | **574** | 78 | 131 | 134 | 54 | 50 | 40 | 23 | 22 | 4 |
+| `ambient_malebody` / `malexxl` / `alien` | `mr1` / `mo1` | **560** | 78 | 131 | 129 | 46 | 51 | 40 | 23 | 22 | 4 |
+| `ambient_malebb` | `mb1` | **552** | 78 | 130 | 126 | 44 | 49 | 40 | 23 | 22 | 4 |
+| `ambient_kidbody` / `infantbody` | `mk1` / `mi1` | **454** | 78 | 104 | 124 | 44 | 15 | 36 | 0 | 22 | 4 |
+
+Subsystem roles (counts shown for the 596-bone `ambient_femalebody` master rig):
+
+- **`SKEL_*` (78):** Core animation tree — `SKEL_ROOT`, `SKEL_Pelvis`, a 7-segment spine
+  (`SKEL_Spine_Root`, `SKEL_Spine0..6`), a 3-segment neck (`SKEL_Neck0..2`), `SKEL_Head`,
+  clavicles, scapulae, limbs, 4-joint fingers (`Finger00..43`) and 3-part toes (`Toe0`, `Toe10`,
+  `Toe20`).
+- **`BM_*` (131):** Body-morph and anatomical definition drivers (`BM_L/R_Bicep`, `BM_L/R_Deltoid*`,
+  `BM_L/R_Breast*`, `BM_Cleavage`, `BM_L/R_Butt`, `BM_Stomach*`, `BM_Spine0..5`).
+- **`MH_*` (151 female / 129 male):** Muscle/crease helpers (`MH_L_KneeCrease`, `MH_L_PecUpper`,
+  `MH_L_Butt`) and garment/jewelry anchors (`MH_BraStrap`, `MH_BeltLoop`, `MH_Necklace_*`,
+  `MH_Choker_Spr_01`).
+- **`FB_*` (56 female / 46 male):** Oral, jaw and mask rig — `FB_Root`, `FB_Jaw`, 24 individual
+  tooth bones, an 11-bone articulated tongue, mouth bags, plus female mask and earring anchors.
+- **`PH_*` (51) and `HH_*` (23):** Prop, weapon, ground-contact and holster attachment bones.
+- **`OH_*` (40) and `RB_*` (22):** Orientation/recoil helpers and limb twist/roll bones.
+- **`SEC_*` (4):** Dedicated secondary-motion breast physics bones (`SEC_L/R_Full_Breast`,
+  `SEC_L/R_Mid_Breast`); buttocks and belly have zero `SEC_*` / `SPR_*` bones.
+- **Ear and specialised helpers (40):** `EarRig_*` (10), `EarJaw_*` (2), `TGT_*` (2), `XH_*` (5),
+  `EO_*` (4), `IK_*` (4), `Tuck_L/R_Tgt` (2), `CH_*`/`WH_*` (4), `UV_L/R_Scapular` (2), plus watch,
+  ponytail, capsule-offset and camera-attach helpers. The 36-bone female-over-male delta is 39
+  female clothing/jewelry/mask/scapular helpers minus 3 male-only bones (`MH_L/R_Toe`, `PH_HAT_LOC`).
+
+**Standing-space coordinate convention:** In bind space, bipedal feet sit near `Z = -1.0 m` below
+`SKEL_ROOT` at the origin, whereas modular drawable bounds (`root + 0x30..0x4f`) are authored in
+standing space with **`SKEL_ROOT = (0, 0, +1.0 m)`** in RAGE Z-up (`(0, +1.0 m, 0)` in glTF Y-up)
+so feet rest on the ground plane. Translating the skeleton root node (or static mesh vertices) by
+`+1.0 m` vertically aligns all modular ped parts without per-slot offset tables; see
+`tools/ped_assemble.py` and [character_models.md](character_models.md#standing-space-coordinate-convention).
+
 ## Model-side bone mapping
 
 Each character drawable's `grmModel` header points at a **bone-hash array** (at `+0x28`, as
@@ -427,16 +470,12 @@ shared base is `cs_lucia_legacypedcs`
 about 25 million generated strings — gives **0/18** exact matches. The sibling nine-entry table
 resolves 9 of 18 values to `joaat("outfit_01")` … `joaat("outfit_10")` (frequency corroborates
 it), so the table stores build-time design labels, not shipped asset names; the 18 component
-values are not recoverable by name enumeration. `common.rpf` contains one variation manager,
-`CPedVariationBodyTypeManager` (77,422 bytes, 67 keys). Its keys are literal model names;
-`joaat32` of all 67 keys gives 0 hits against the 18. The `3cba3fe6` float (0.942 / 0.971 for
-Lucia and Monalisa) is a body/height scale, not a name. There is no component/outfit-name
-manager in `common.rpf`; `outfit_NN` exists only as a hash in the packs table.
 values are not recoverable by name enumeration. `common.rpf` holds `CPedVariationBodyTypeManager`
 (77,422 bytes, 67 keys) and `CPedComponentSetManager`; neither maps a variation index to a
 drawable plus texture. The first manager's keys are literal model names, and `joaat32` of all
 67 gives 0 hits against the 18. The `3cba3fe6` float (0.942 / 0.971 for Lucia and Monalisa) is a
-per-character scale, not a name; `outfit_NN` exists only as a hash in the packs table.
+per-character body/height scale, not a name; there is no component/outfit-name manager in
+`common.rpf`, and `outfit_NN` exists only as a hash in the packs table.
 
 The entities linked to Mandy carry three different per-state archetype hashes
 (`0x18BB2550`, `0x73E83886`, `0x57DDFFC2`), which fits her outfit changing between states, not

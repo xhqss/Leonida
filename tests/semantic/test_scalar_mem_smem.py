@@ -427,6 +427,8 @@ class SmemBodyEvaluator:
             pc += 1
 
     def _value(self, name):
+        if name == "%heap_base":          # built once in the entry block, outside the body run here
+            return self.heap_base
         if name == "%c64_32":
             return 32
         if name in self.ids:
@@ -452,10 +454,6 @@ class SmemBodyEvaluator:
             if kind != "psb":
                 raise AssertionError(f"PSB access chain on {kind}")
             value = ("mem", (address + 4 * self._value(args[1])) & MASK64)
-        elif op == "OpLoad" and ty == "%uint" and args[0] == "%ud_base_lo_p":
-            value = self.heap_base & MASK32
-        elif op == "OpLoad" and ty == "%uint" and args[0] == "%ud_base_hi_p":
-            value = (self.heap_base >> 32) & MASK32
         elif op == "OpLoad" and ty == "%uint":
             kind, where = self._value(args[0])
             if kind == "sgpr":

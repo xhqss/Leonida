@@ -12,8 +12,10 @@
 // Exit 77 with "unsupported: ..." when the device lacks a feature the shader or sampler needs.
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
+#include "vk_shader_fma.h"
 #include "../src/vulkan_device_filter.h"
 #include "vk_pc_tail.h"
+#include "vk_shader_fma.h"
 
 #include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
@@ -117,11 +119,19 @@ int main(int argc, char** argv) {
     std::printf("device: %s, driver 0x%x, Vulkan %u.%u.%u\n", props.deviceName, props.driverVersion,
                 VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion),
                 VK_API_VERSION_PATCH(props.apiVersion));
-    VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan11Features have11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &have11};
     VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have12};
     vkGetPhysicalDeviceFeatures2(pd, &have);
     if (!have12.bufferDeviceAddress || !have12.runtimeDescriptorArray || !have.features.shaderInt64) {
         std::printf("unsupported: the device lacks bufferDeviceAddress, runtimeDescriptorArray or shaderInt64\n");
+        return unsupported;
+    }
+    const auto fragment_code = read_spv(argv[2]);
+    const bool dynamic_sampled = leonida::vk_test::spirv_declares_capability(
+        fragment_code.data(), fragment_code.size() * 4, leonida::vk_test::spv_sampled_image_array_dynamic_indexing);
+    if (dynamic_sampled && !have.features.shaderSampledImageArrayDynamicIndexing) {
+        std::printf("unsupported: shaderSampledImageArrayDynamicIndexing\n");
         return unsupported;
     }
     if (sampler_info.anisotropyEnable && !have.features.samplerAnisotropy) {
@@ -144,12 +154,26 @@ int main(int argc, char** argv) {
     enable12.bufferDeviceAddress = VK_TRUE;
     enable12.runtimeDescriptorArray = VK_TRUE;
     enable12.descriptorIndexing = have12.descriptorIndexing;
+    // The translated vs_ids reads BaseVertex / BaseInstance (DrawParameters) for the zero-based v0 / v3, as in
+    // vk_harness and vk_texture_test. Without the feature, creating its module breaks
+    // VUID-VkShaderModuleCreateInfo-pCode-08740.
+    VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    enable11.shaderDrawParameters = have11.shaderDrawParameters;
+    enable12.pNext = &enable11;
     VkPhysicalDeviceFeatures2 enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &enable12};
     enable.features.shaderInt64 = VK_TRUE;
+    enable.features.shaderSampledImageArrayDynamicIndexing = dynamic_sampled;
     enable.features.samplerAnisotropy = sampler_info.anisotropyEnable;
+    leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr), when the device has it
+    fma.query(gipa, inst, pd);
+    // A device without VK_KHR_shader_fma cannot create a pipeline from a stage that uses OpFmaKHR: skip the pair.
+    if (!fma.accepts_file(argv[1]) || !fma.accepts_file(argv[2])) return unsupported;
+    fma.link_after(&enable);
+    const char* fma_extension = fma.extension();
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    if (fma.supported()) { dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = &fma_extension; }
     VkDevice dev = VK_NULL_HANDLE;
     CHECK(vkCreateDevice(pd, &dci, nullptr, &dev));
 #define LD(n) const auto n = reinterpret_cast<PFN_##n>(vkGetDeviceProcAddr(dev, #n))
@@ -356,13 +380,14 @@ int main(int argc, char** argv) {
 
     // Pipeline.
     VkShaderModule modules[2];
+    const auto vertex_code = read_spv(argv[1]);
     // LEONIDA_PC_TAIL_UBO=1 (rdna2spirv.py --pc-tail-ubo): s0..s31 in 128 push-constant bytes; the heap base, if a
     // stage reads it, in a uniform block at set 1 (vk_pc_tail.h).
     const bool pc_tail = leonida::vk_test::pc_tail_requested();
     const std::uint32_t push_bytes = pc_tail ? 128u : 144u;
     bool tail_block = false;
     for (int stage = 0; stage < 2; ++stage) {
-        const auto code = read_spv(argv[1 + stage]);
+        const auto& code = stage == 0 ? vertex_code : fragment_code;
         if (code.empty()) {
             std::fprintf(stderr, "cannot read %s\n", argv[1 + stage]);
             return 1;
@@ -507,7 +532,13 @@ int main(int argc, char** argv) {
     si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
     CHECK(vkQueueWaitIdle(queue));
-    std::ofstream(argv[3], std::ios::binary).write(static_cast<const char*>(readback_map), std::streamsize(W) * H * 16);
+    std::ofstream output(argv[3], std::ios::binary);
+    output.write(static_cast<const char*>(readback_map), std::streamsize(W) * H * 16);
+    output.close();
+    if (!output) {
+        std::fprintf(stderr, "failed to write %s\n", argv[3]);
+        return 1;
+    }
     std::printf("ok -> %s\n", argv[3]);
     return 0;
 }

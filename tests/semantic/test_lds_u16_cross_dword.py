@@ -93,18 +93,28 @@ class LdsU16CrossDwordTests(unittest.TestCase):
                   "ds_read_b32 v15, v1 offset:8", "ds_read_b32 v16, v1 offset:12", "s_waitcnt lgkmcnt(0)"]
         self.assertEqual(run(lines, 7), [0x1141, 0x2242, 0x3343, 0x41000000, 0x42000011, 0x43000022, 0x33])
 
-    def test_crossing_past_the_allocation_reads_zero_and_drops_the_high_byte(self):
-        # 512 B allocated (offset:1024 elsewhere makes the shader bounds-checked). A halfword at byte 511 has its
-        # high byte at byte 512: written nowhere (word 0 keeps its sentinel), read as 0.
-        _, mem = run_one(["v_mov_b32_e32 v1, 0", "v_mov_b32_e32 v2, 0x5e17", "ds_write_b32 v1, v2",
-                          "v_mov_b32_e32 v3, 0x1fc", "v_mov_b32_e32 v2, 0x00ffffff", "ds_write_b32 v3, v2",
-                          "s_waitcnt lgkmcnt(0)", "v_mov_b32_e32 v4, 0xc3d4", "ds_write_b16 v3, v4 offset:3",
-                          "s_waitcnt lgkmcnt(0)", "v_mov_b32_e32 v5, 0xdead", "v_mov_b32_e32 v6, 0xdead",
-                          "v_mov_b32_e32 v7, 0xdead", "ds_read_u16 v5, v3 offset:3", "ds_read_b32 v6, v1",
-                          "ds_read_b32 v7, v3", "v_mov_b32_e32 v8, 0xdead", "ds_read_b32 v8, v1 offset:1024",
-                          "s_waitcnt lgkmcnt(0)"] + out(5, 6, 7, 8), 1)
-        self.assertEqual([mem.get(4 * k) for k in range(4)], [0xD4, 0x5E17, 0xD4FFFFFF, 0])
-
+    def test_crossing_past_the_allocation_drops_the_whole_halfword(self):
+        # 512 B allocated. A halfword at byte 511 ends past it: gfx1036 drops the whole access (TheMrBeez, #3817):
+        # neither byte is written (dword 127 and dword 0 keep their sentinels, no wrap to byte 0) and both reads
+        # give 0. Halfwords at bytes 507 (crossing into dword 127) and 510 stay inside it and are written and read.
+        # Both with the ordinary wrapped array and with offset:1024 elsewhere, which makes every access of the
+        # shader bounds-checked (SHADER-309).
+        for forced in (False, True):
+            with self.subTest(bounds_checked=forced):
+                lines = ["v_mov_b32_e32 v1, 0", "v_mov_b32_e32 v2, 0x5e17", "ds_write_b32 v1, v2",
+                         "v_mov_b32_e32 v3, 0x1f8", "v_mov_b32_e32 v2, 0x7e7e7e7e", "ds_write_b32 v3, v2",
+                         "v_mov_b32_e32 v2, 0x00ffffff", "ds_write_b32 v3, v2 offset:4", "s_waitcnt lgkmcnt(0)",
+                         "v_mov_b32_e32 v4, 0xc3d4", "ds_write_b16 v3, v4 offset:7", "ds_write_b16 v3, v4 offset:3",
+                         "v_mov_b32_e32 v4, 0xa5b6", "ds_write_b16 v3, v4 offset:6", "s_waitcnt lgkmcnt(0)"]
+                lines += [f"v_mov_b32_e32 v{r}, 0xdead" for r in range(5, 12)]
+                lines += ["ds_read_u16 v5, v3 offset:7", "ds_read_i16 v6, v3 offset:7", "ds_read_b32 v7, v1",
+                          "ds_read_b32 v8, v3", "ds_read_b32 v9, v3 offset:4", "ds_read_u16 v10, v3 offset:3",
+                          "ds_read_u16 v11, v3 offset:6"]
+                if forced:
+                    lines.append("ds_read_b32 v12, v1 offset:1024")
+                _, mem = run_one(lines + ["s_waitcnt lgkmcnt(0)"] + out(5, 6, 7, 8, 9, 10, 11), 1)
+                self.assertEqual([mem.get(4 * k) for k in range(7)],
+                                 [0, 0, 0x5E17, 0xD47E7E7E, 0xA5B6FFC3, 0xC3D4, 0xA5B6])
 
 if __name__ == "__main__":
     unittest.main()

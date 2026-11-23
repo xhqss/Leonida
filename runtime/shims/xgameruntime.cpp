@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -232,6 +234,7 @@ static_assert(std::size(kThreadingVtable) == 31, "IUnknown + IXThreadingImpl's 2
 using XErrorCallback = bool(CALLBACK*)(HRESULT hr, const char* message, void* context);
 std::atomic<XErrorCallback> g_error_callback{nullptr};
 std::atomic<void*> g_error_context{nullptr};
+std::mutex g_error_mutex{};   // guards g_error_callback + g_error_context as one consistent pair
 
 // HRESULT XErrorReport(HRESULT, const char*) (xgameruntime-docs' XErrorReport.md): S_OK once reported.
 HRESULT STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
@@ -239,10 +242,12 @@ HRESULT STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
     if (s_logged.fetch_add(1) < 64)
         std::fprintf(stderr, "[rt] xgameruntime: XErrorReport(0x%08lx, %s)\n", static_cast<unsigned long>(hr),
                      message ? message : "(null)");
+    std::lock_guard<std::mutex> lock(g_error_mutex);
     if (XErrorCallback cb = g_error_callback.load()) cb(hr, message, g_error_context.load());
     return S_OK;
 }
 void STDMETHODCALLTYPE error_set_callback(void*, XErrorCallback callback, void* context) {
+    std::lock_guard<std::mutex> lock(g_error_mutex);
     g_error_context = context;
     g_error_callback = callback;
 }
@@ -263,8 +268,9 @@ const void* const kErrorVtable[] = {
 // "Class layouts, measured"): the UTF-16 security-information query for a URL, the server certificate check, the
 // connectivity hint and its change registration. Signatures follow Microsoft's public XNetworking documentation.
 // Offline there is no network: the hint says so (initialized, no connectivity), every query that would need the
-// network fails with kNoNetwork (asynchronously, through XAsync, for the *Async calls), change registrations hand
-// out tokens whose callbacks never fire, and the IXNetworkingImpl2 additions are E_NOTIMPL.
+// network fails with kNoNetwork (asynchronously, through XAsync, for the *Async calls), a change registration sends
+// the initial notification Microsoft documents (on the queue's completion port) and none after, since nothing
+// changes, and the IXNetworkingImpl2 additions are E_NOTIMPL.
 
 constexpr GUID kNetworkingClass = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
 constexpr GUID kNetworking2 = {0xbf2346b2, 0x39af, 0x4658, {0xb5, 0xea, 0x44, 0x71, 0x3c, 0x7e, 0x83, 0xb3}};
@@ -298,13 +304,6 @@ HRESULT STDMETHODCALLTYPE net_query_port_result(void*, XAsyncBlock* async, uint1
     *port = 0;
     return XAsyncGetStatus(async, false);
 }
-std::atomic<uint64_t> g_net_tokens{0};
-HRESULT STDMETHODCALLTYPE net_register(void*, XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken* token) {
-    if (!token) return E_POINTER;
-    token->token = g_net_tokens.fetch_add(1) + 1;  // never fires offline: nothing changes
-    return S_OK;
-}
-bool STDMETHODCALLTYPE net_unregister(void*, XTaskQueueRegistrationToken, bool) { return true; }
 HRESULT STDMETHODCALLTYPE net_security_async(void*, const void* url, XAsyncBlock* async) {
     if (!url) return E_INVALIDARG;
     return start_failed_async(async);
@@ -331,6 +330,94 @@ HRESULT STDMETHODCALLTYPE net_connectivity_hint(void*, ConnectivityHint* hint) {
     hint->network_initialized = true;
     return S_OK;
 }
+
+using PortChangedCallback = void(CALLBACK*)(void* context, uint16_t port);
+using HintChangedCallback = void(CALLBACK*)(void* context, const ConnectivityHint* hint);
+
+struct NetRegistration {
+    bool running = false;
+    bool unregistered = false;
+};
+std::mutex g_net_mu;
+std::condition_variable g_net_cv;
+std::unordered_map<uint64_t, NetRegistration> g_net_registrations;
+std::atomic<uint64_t> g_net_tokens{0};
+
+void notify(PortChangedCallback callback, void* context) {
+    uint16_t port = 0;
+    net_query_port(nullptr, &port);
+    callback(context, port);
+}
+void notify(HintChangedCallback callback, void* context) {
+    ConnectivityHint hint{};
+    net_connectivity_hint(nullptr, &hint);
+    callback(context, &hint);
+}
+
+template <class Callback> struct InitialNotification {
+    uint64_t token;
+    void* context;
+    Callback callback;
+
+    static void CALLBACK run(void* self, bool canceled) {
+        std::unique_ptr<InitialNotification> n(static_cast<InitialNotification*>(self));
+        {
+            std::lock_guard lock(g_net_mu);
+            const auto it = g_net_registrations.find(n->token);
+            if (canceled || it == g_net_registrations.end()) return;
+            it->second.running = true;
+        }
+        notify(n->callback, n->context);
+        {
+            std::lock_guard lock(g_net_mu);
+            const auto it = g_net_registrations.find(n->token);
+            if (it->second.unregistered) g_net_registrations.erase(it);
+            else it->second.running = false;
+        }
+        g_net_cv.notify_all();
+    }
+};
+
+template <class Callback>
+HRESULT STDMETHODCALLTYPE net_register(void*, XTaskQueueHandle queue, void* context, Callback callback,
+                                       XTaskQueueRegistrationToken* token) {
+    if (!callback) return E_INVALIDARG;
+    if (!token) return E_POINTER;
+    XTaskQueueHandle process_queue = nullptr;
+    if (!queue) {
+        if (!XTaskQueueGetCurrentProcessTaskQueue(&process_queue)) return HRESULT_FROM_WIN32(ERROR_NO_TASK_QUEUE);
+        queue = process_queue;
+    }
+    const uint64_t id = g_net_tokens.fetch_add(1) + 1;
+    {
+        std::lock_guard lock(g_net_mu);
+        g_net_registrations.emplace(id, NetRegistration{});
+    }
+    token->token = id;
+    auto* initial = new InitialNotification<Callback>{id, context, callback};
+    const HRESULT hr = XTaskQueueSubmitCallback(queue, XTaskQueuePort::Completion, initial,
+                                                &InitialNotification<Callback>::run);
+    if (process_queue) XTaskQueueCloseHandle(process_queue);
+    if (FAILED(hr)) {
+        delete initial;
+        token->token = 0;
+        std::lock_guard lock(g_net_mu);
+        g_net_registrations.erase(id);
+    }
+    return hr;
+}
+bool STDMETHODCALLTYPE net_unregister(void*, XTaskQueueRegistrationToken token, bool wait) {
+    std::unique_lock lock(g_net_mu);
+    const auto it = g_net_registrations.find(token.token);
+    if (it == g_net_registrations.end()) return true;
+    if (!it->second.running) {
+        g_net_registrations.erase(it);
+        return true;
+    }
+    it->second.unregistered = true;
+    if (wait) g_net_cv.wait(lock, [&] { return !g_net_registrations.contains(token.token); });
+    return wait;
+}
 HRESULT STDMETHODCALLTYPE net_not_implemented(void*) { return E_NOTIMPL; }
 
 #define NM(fn) reinterpret_cast<const void*>(&fn)
@@ -339,7 +426,7 @@ const void* const kNetworkingVtable[] = {
     NM(net_query_port),            // 3  XNetworkingQueryPreferredLocalUdpMultiplayerPort
     NM(net_query_port_async),      // 4  ...Async
     NM(net_query_port_result),     // 5  ...AsyncResult
-    NM(net_register),              // 6  XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged
+    NM(net_register<PortChangedCallback>),  // 6  XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged
     NM(net_unregister),            // 7  XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged
     NM(net_security_async),        // 8  XNetworkingQuerySecurityInformationForUrlAsync
     NM(net_security_result_size),  // 9  ...AsyncResultSize
@@ -349,7 +436,7 @@ const void* const kNetworkingVtable[] = {
     NM(net_security_result),       // 13 ...Utf16AsyncResult (XCurl)
     NM(net_verify_certificate),    // 14 XNetworkingVerifyServerCertificate (XCurl)
     NM(net_connectivity_hint),     // 15 XNetworkingGetConnectivityHint (XCurl)
-    NM(net_register),              // 16 XNetworkingRegisterConnectivityHintChanged (XCurl)
+    NM(net_register<HintChangedCallback>),  // 16 XNetworkingRegisterConnectivityHintChanged (XCurl)
     NM(net_unregister),            // 17 XNetworkingUnregisterConnectivityHintChanged (XCurl)
     NM(net_not_implemented),       // 18 XNetworkingQueryConfigurationSetting (IXNetworkingImpl2)
     NM(net_not_implemented),       // 19 XNetworkingSetConfigurationSetting
@@ -364,9 +451,9 @@ static_assert(std::size(kNetworkingVtable) == 21, "IUnknown + IXNetworkingImpl's
 // can ask where it may keep its cache. Slots 3-7 follow Microsoft's XPersistentLocalStorage reference and the ids and
 // layout in the public xgameruntime-docs and Wine IDL (facts only): GetPathSize, GetPath, GetSpaceInfo,
 // PromptUserForSpaceAsync and PromptUserForSpaceResult; IXPersistentLocalStorageImpl3 adds MountForPackage at slot 8.
-// The storage is <overlay>\persistent, so the package stays read-only and --overlay moves it with everything else a
-// title writes. Offline there is nobody to ask for more room: a prompt for space the quota can hold succeeds, one it
-// cannot fails with ERROR_DISK_FULL.
+// The storage is <overlay>\.gta6rt-persistent, so the package stays read-only, --overlay moves it with everything
+// else a title writes, and GAME: does not see it. Offline there is nobody to ask for more room: a prompt for space the
+// quota can hold succeeds, one it cannot fails with ERROR_DISK_FULL.
 
 constexpr GUID kPersistentStorageClass = {0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3a, 0x3e, 0x84}};
 constexpr GUID kPersistentStorage2 = {0xd29411df, 0x0794, 0x4553, {0x8b, 0x27, 0x95, 0xfc, 0x02, 0xd0, 0xf7, 0x5d}};
@@ -387,7 +474,7 @@ static_assert(sizeof(PersistentSpaceInfo) == 32, "XPersistentLocalStorageSpaceIn
 std::filesystem::path persistent_storage_dir() {
     const std::filesystem::path overlay = rt::fs::overlay_dir();
     if (overlay.empty()) return {};
-    std::filesystem::path dir = overlay / L"persistent";
+    std::filesystem::path dir = overlay / rt::fs::kPersistentStorageDir;
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     return ec ? std::filesystem::path{} : dir;

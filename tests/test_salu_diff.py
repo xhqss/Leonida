@@ -224,5 +224,20 @@ class CliOps(unittest.TestCase):
             self.assertNotIn("Traceback", proc.stderr)
 
 
+class EverythingSkipped(unittest.TestCase):
+    def test_a_run_where_every_program_was_skipped_is_not_a_success(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        def refuse(lines, *args):
+            raise d.Skip("unsupported form")
+        out = io.StringIO()
+        with mock.patch.object(d, "translated", refuse), contextlib.redirect_stdout(out):
+            rc = d.main(["--programs", "3", "--seed", "1"])
+        self.assertEqual(rc, 2, out.getvalue())
+        self.assertIn("no program ran: every one was skipped", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

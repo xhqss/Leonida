@@ -106,9 +106,12 @@ def load_names(path, source=None):
     out = collections.defaultdict(dict)
     ambiguous = collections.defaultdict(set)
     with open(path, encoding="utf-8-sig", newline="") as fh:
-        for row in csv.DictReader(fh):
+        reader = csv.DictReader(fh)
+        for row in reader:
             if source and row.get("source") != source:
                 continue
+            if row["bank"] is None or row["stream_id"] is None or row["name"] is None:   # a row cut short, e.g. by an interrupted write
+                raise ValueError(f"{path}: line {reader.line_num} is missing bank, stream_id or name")
             bank = row["bank"].replace("\\", "/")
             sid = int(row["stream_id"], 16) & 0x1FFFFFFF
             if sid in out[bank]:
@@ -120,6 +123,7 @@ def load_names(path, source=None):
         for sid in ids:
             del out[bank][sid]
     return dict(out), {bank: ids for bank, ids in ambiguous.items()}
+
 
 def load_dialogue(path):
     """{wave: row} from text_tables.py dialogue CSV, and the language codes in column order."""
@@ -160,10 +164,13 @@ def bank_names(names, rel_dir):
 
 
 def tag_folder(root, names, dialogue=None, langs=(), dry_run=False, ambiguous=None):
+    def scan_failed(error):
+        raise error
+
     stats = collections.Counter()
     dialogue = dialogue or {}
     ambiguous = ambiguous or {}
-    for folder, _dirs, files in os.walk(root):
+    for folder, _dirs, files in os.walk(root, onerror=scan_failed):
         rel = os.path.relpath(folder, root).replace(os.sep, "/")
         streams, label = None, None
         for fname in sorted(files):

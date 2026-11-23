@@ -295,6 +295,8 @@ bool draw(CommandList& list, std::uint32_t index, bool indexed) {
     return list.draw(d);
 }
 
+constexpr char texture_barrier_kind[] = "texture barrier pair (enh.)";
+
 const Kind kinds[] = {
     {"transition pair",
      [](CommandList& l, std::uint32_t) {
@@ -307,6 +309,17 @@ const Kind kinds[] = {
          return l.barrier(BufferBarrier{y::copy, y::pixel_shading, a::copy_dest, a::shader_resource, Scene::constants});
      },
      1},
+    {texture_barrier_kind,
+     [](CommandList& l, std::uint32_t) {
+         const BarrierSubresourceRange all{all_subresources, 0, 0, 0, 0, 0};
+         return l.barrier(TextureBarrier{y::pixel_shading, y::copy, a::shader_resource, a::copy_dest,
+                                         d3d12_layout::shader_resource, d3d12_layout::copy_dest, Scene::texture, all,
+                                         0}) &&
+                l.barrier(TextureBarrier{y::copy, y::pixel_shading, a::copy_dest, a::shader_resource,
+                                         d3d12_layout::copy_dest, d3d12_layout::shader_resource, Scene::texture, all,
+                                         0});
+     },
+     2},
     {"clear RTV, whole view", [](CommandList& l, std::uint32_t) { return l.clear_render_target(color_view, black); }, 1},
     {"clear RTV, 2 rects",
      [](CommandList& l, std::uint32_t) { return l.clear_render_target(color_view, black, two_rects); }, 1},
@@ -565,6 +578,12 @@ int main(int argc, char** argv) {
             },
             reps, warmup);
         check(kind.name, r);
+        // One image barrier for each piece: emit keeps the usual one or two on the stack.
+        if (std::strcmp(kind.name, texture_barrier_kind) == 0 && r.emit.allocations != 0) {
+            std::fprintf(stderr, "FAIL %s: emit makes %.2f heap allocations per command\n", kind.name,
+                         r.emit.allocations);
+            ++failures;
+        }
         if (!self_test) print_row(kind.name, r, csv);
     }
     const auto frame = [&](CommandList& list) {

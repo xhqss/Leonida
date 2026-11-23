@@ -52,6 +52,8 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 // chunk names its "lod" tier and its grid "cell": [minx, minz, maxx, maxz].
 // Each chunk is a .glb in world space (Y up, metres). Validate the manifest before
 // the camera and streaming code use its coordinates and chunk identifiers.
+const WORLD_MANIFEST_TIMEOUT_MS = 10_000;
+
 function manifestError(world) {
   const isPosition = (value, length) =>
     Array.isArray(value) && value.length === length && value.every(Number.isFinite);
@@ -94,20 +96,20 @@ function formatCamHash(pos, yaw, pitch) {
 
 async function loadWorld() {
   if (new URLSearchParams(location.search).has("test")) return testWorld("Test mode was requested.");
-  let response;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), WORLD_MANIFEST_TIMEOUT_MS);
+  let response, world;
   try {
-    response = await fetch("world/world.json", { cache: "no-store" });
-  } catch {
-    return testWorld("world/world.json could not be loaded.");
-  }
-  if (response.status === 404) return testWorld("world/world.json was not found.");
-  if (!response.ok) return testWorld(`world/world.json returned HTTP ${response.status}.`);
-
-  let world;
-  try {
+    response = await fetch("world/world.json", { cache: "no-store", signal: controller.signal });
+    if (response.status === 404) return testWorld("world/world.json was not found.");
+    if (!response.ok) return testWorld(`world/world.json returned HTTP ${response.status}.`);
     world = await response.json();
   } catch {
-    return testWorld("world/world.json could not be read as valid JSON.");
+    if (controller.signal.aborted) return testWorld("world/world.json download timed out.");
+    return testWorld(response ? "world/world.json could not be read as valid JSON."
+                              : "world/world.json could not be loaded.");
+  } finally {
+    clearTimeout(timer);
   }
   const error = manifestError(world);
   if (error) return testWorld(`Invalid world/world.json: ${error}.`);
@@ -223,6 +225,8 @@ addEventListener("blur", () => { keys.clear(); dragging = false; });
 const world = await loadWorld();
 addEventListener("keydown", e => {
   keys.add(e.code);
+  // Track Ctrl for slow movement, but leave modified shortcuts to the browser.
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
   if (e.code === "KeyF" && !e.repeat) wire = !wire, applyWire();
   if (e.code === "KeyT" && !e.repeat) clay = !clay, applyClay();
   if (e.code === "KeyG" && !e.repeat) toggleBounds();
@@ -273,10 +277,11 @@ function applyWire(root) {
 }
 function disposeObject(obj) {
   const disposedGeo = new Set(), disposedMat = new Set(), disposedTex = new Set();
-  const bitmaps = new Set();
+  const bitmaps = new Set(), skeletons = new Set();
   obj.traverse(n => {
     if (n.geometry && !disposedGeo.has(n.geometry)) { disposedGeo.add(n.geometry); n.geometry.dispose(); }
     if (n.isInstancedMesh && typeof n.dispose === "function") n.dispose();
+    if (n.isSkinnedMesh && n.skeleton) skeletons.add(n.skeleton);
     const allMats = [].concat(n.material || [], originalMaterials.get(n) || []);
     for (const m of allMats) {
       if (!m || m === clayMat || disposedMat.has(m)) continue;
@@ -292,6 +297,7 @@ function disposeObject(obj) {
     }
     originalMaterials.delete(n);
   });
+  for (const skeleton of skeletons) skeleton.dispose();
   for (const bitmap of bitmaps) bitmap.close();
 }
 function dist(c, p) {

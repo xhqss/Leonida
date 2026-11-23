@@ -85,6 +85,11 @@ void main() {
     if (pc.mode == 2) color = texelFetch(ms_images[image], xy, sample_index);
     else color = texelFetch(ms_arrays[image], ivec3(xy, pc.layer), sample_index);
     result[pc.first + i] = packUnorm4x8(color);
+#elif defined(TEST_GATHER_ALPHA)
+    const uint smp = lookup(sampler_key);
+    const vec2 uv = (vec2(i % 8, i / 8) + 1.0) / 8.0;
+    const vec4 alpha = textureGather(sampler2D(images[image], samplers[smp]), uv, 3);
+    result[pc.first + i] = packUnorm4x8(alpha);
 #else
     const uint smp = lookup(sampler_key);
     const vec2 uv = (vec2(i % 8, i / 8) + 0.5) / 8.0 + vec2(1.0, 0.0);

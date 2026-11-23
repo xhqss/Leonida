@@ -157,12 +157,32 @@ both paths. It is used to check exported assets without keeping a second copy.
 of each zlib stream and indexes the measured `name.#dr`/`#ft`/`#dd` spellings with their archive offsets. It
 does not decode a resource or need the TOC; see [resource_names.md](resource_names.md).
 
+### The trailer at EOF
+
+The header's `u32 +12` is the size of a block that ends the file: the last `+12` bytes of an RPF9 are not part of
+any stored file (ASSET-318, measured on the 22 RPF9 archives of the 1.0.2.1 package, offsets and counts only).
+`+12` is a multiple of 16 in all 22 (64 to 119,520 bytes); `+8` is always larger than `+12` except in `levels.rpf`
+and `core_bvh4.rpf`, and its role is not established.
+
+| Evidence | Archives |
+|---|---|
+| The data before it ends in zeros up to a 4 KiB boundary, and exactly `+12` non-zero bytes follow to EOF | 10: `anim`, `audio`, `common`, `data`, `levels`, `movies`, `packs`, `shared_minigame000`, `story000`, `core_bvh4` |
+| Files are packed at 16-byte alignment; walking the zlib streams to the end leaves exactly `+12` bytes after the last one | 4: `core_licenses_data`, `core_restofworld`, `shared_minigame000_bvh4`, `story000_bvh4` |
+| Undecided: the last stored file is not zlib (or the walk stops at a non-zlib file), so its end is not known without the TOC | 8: `appdata0`, `navmeshes`, `script`, `shaders`, `textures`, `core_restofworld001`, `story000_script`, `story000_restofworld` |
+
+No archive contradicts the rule, but 8 don't test it. In the 14, the trailer starts with no zlib or Bink 2 header and is
+high-entropy like the TOC after the header: 7.95 to 8.00 bits per byte in the nine of 3 KiB or more, and 6.6 to 7.9
+in the five smaller ones (random 144-byte blocks average about 6.7); what they hold is not
+decoded here. `tools/bink_index.py` counts it as `rpf_trailer` instead of unread bytes, only for an `RPF9` header
+whose `+12` is a multiple of 16 and fits in the tail after the last stream; in `movies.rpf` it is the
+18,928 bytes after 3,884 zeros that [movies.md](movies.md) listed as unread.
+
 ### Viewing a header in ImHex
 
 [tools/imhex/rpf9.hexpat](../tools/imhex/rpf9.hexpat) is a pattern for the [ImHex](https://imhex.werwolv.net/) hex
-editor. It names the magic and the data offset at `+4`, shows the u32s at `+8` and `+12` unnamed, and shows the range
-from `+0x10` to the data offset (the rest of the header and the TOC) as one opaque byte array. It decodes nothing in
-that range. `python -I tests/test_imhex_patterns.py` runs it on a synthetic header when ImHex is installed.
+editor. It names the magic, the data offset at `+4` and the trailer size at `+12`, shows the u32 at `+8` unnamed,
+and shows the range from `+0x10` to the data offset (the rest of the header and the TOC) as one opaque byte array.
+It decodes nothing in that range. `python -I tests/test_imhex_patterns.py` runs it on a synthetic header when ImHex is installed.
 
 ## Limits
 

@@ -5,11 +5,11 @@ Supports legacy and DX10 DDS headers across uncompressed 32-bit formats
 legacy 24-bit RGB layouts (BGR8/RGB8, e.g. the D3DFMT_R8G8B8 byte order),
 and block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
 
-BC7 covers all eight modes. DXGI 97/98/99 (typeless, UNORM, UNORM_SRGB) emit
-the stored RGBA8 values with no sRGB transfer, and the reserved mode (no mode
-bit in the first byte) decodes as transparent black. BC6H is not supported.
-DXT2, DXT4 and premultiplied DX10 images are converted to straight alpha for PNG; sRGB colors are
-unpremultiplied in linear light and returned in their sRGB encoding.
+BC7 covers all eight modes. Decoding DXGI 97/98/99 (typeless, UNORM, UNORM_SRGB)
+preserves the stored RGBA8 values. The reserved mode (no mode bit in the first
+byte) decodes as transparent black. BC6H is not supported.
+DXT2, DXT4 and premultiplied DX10 images are converted to straight alpha for PNG.
+For tagged sRGB images, unpremultiplication and downscaling use linear light. The PNG stores sRGB bytes.
 
 R11G11B10_FLOAT previews clamp RGB to [0, 1], map NaN to zero and use opaque alpha.
 
@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 from functools import cache
 import math
 import os
@@ -71,6 +72,8 @@ _DXGI_MAP: dict[int, str] = {
     92: "BGRX8",
     93: "BGRX8",
     26: "R11G11B10_FLOAT",
+    56: "R16_UNORM",
+    65: "A8_UNORM",
     70: "BC1",
     71: "BC1",
     72: "BC1",
@@ -92,10 +95,18 @@ _DXGI_MAP: dict[int, str] = {
 }
 
 _SRGB_DXGI_FORMATS = frozenset((29, 72, 75, 78, 91, 93, 99))
-_SRGB_TO_LINEAR = tuple(
-    x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4
-    for x in (v / 255.0 for v in range(256))
-)
+
+
+def _srgb_byte_to_linear(value: float) -> float:
+    # Use the intensity of sRGB byte 1 as the unit so half-byte ties on the linear segment are exact.
+    if value <= 0.04045 * 255:
+        return value
+    return ((value / 255.0 + 0.055) / 1.055) ** 2.4 * (255 * 12.92)
+
+
+_SRGB_TO_LINEAR = tuple(_srgb_byte_to_linear(v) for v in range(256))
+# Crossing the linear intensity of encoded value n + 0.5 rounds the output up to byte n + 1.
+_SRGB_HALF_STEPS = tuple(_srgb_byte_to_linear(v + 0.5) for v in range(255))
 
 _CANONICAL_MASKS: dict[tuple[int, int, int, int], str] = {
     (0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000): "BGRA8",
@@ -872,6 +883,33 @@ def _decode_r11g11b10(payload: memoryview, width: int, height: int, pitch: int) 
     return bytes(rgba)
 
 
+def _decode_single_channel(payload: memoryview, width: int, height: int, pitch: int, fmt: str) -> bytes:
+    """R16_UNORM (opaque, red only) and A8_UNORM (alpha only, as D3D samples it)."""
+    bpp = 2 if fmt == "R16_UNORM" else 1
+    row_bytes = width * bpp
+    pitch = pitch or row_bytes
+    if pitch < row_bytes:
+        raise DdsError(f"Invalid {fmt} row pitch: {pitch} bytes (need at least {row_bytes})")
+    expected = (height - 1) * pitch + row_bytes
+    if len(payload) < expected:
+        raise DdsError(f"Truncated {fmt} payload: {len(payload)} bytes (need {expected})")
+
+    rgba = bytearray(width * height * 4)
+    if fmt == "R16_UNORM":
+        rgba[3::4] = b"\xff" * (width * height)
+    dst = 0
+    for start in range(0, height * pitch, pitch):
+        row = payload[start:start + row_bytes]
+        if bpp == 2:
+            for (v,) in struct.iter_unpack("<H", row):
+                rgba[dst] = (v * 255 + 32767) // 65535
+                dst += 4
+        else:
+            rgba[dst + 3:dst + 4 * width:4] = row
+            dst += 4 * width
+    return bytes(rgba)
+
+
 def _bc7_read_indices(bits: int, index_bits: int, is_anchor: tuple[int, ...]) -> tuple[list[int], int]:
     """Read 16 LSB-first pixel indices; anchor pixels omit their implicit zero MSB."""
     indices = []
@@ -1001,6 +1039,10 @@ def _decode_bc7(data: bytes | bytearray | memoryview, offset: int, width: int, h
     return bytes(out)
 
 
+def _linear_to_srgb_byte(linear: float) -> int:
+    return bisect_right(_SRGB_HALF_STEPS, linear)
+
+
 def _unpremultiply_rgba(rgba: bytes, srgb: bool) -> bytes:
     """Straight RGBA8, rounding color channels to the nearest byte and keeping alpha unchanged."""
     out = bytearray(rgba)
@@ -1011,18 +1053,15 @@ def _unpremultiply_rgba(rgba: bytes, srgb: bool) -> bytes:
         elif alpha < 255:
             for c in range(p, p + 3):
                 if srgb:
-                    linear = min(1.0, _SRGB_TO_LINEAR[rgba[c]] * 255.0 / alpha)
-                    encoded = (12.92 * linear if linear <= 0.0031308
-                               else 1.055 * linear ** (1.0 / 2.4) - 0.055)
-                    out[c] = min(255, int(encoded * 255.0 + 0.5))
+                    out[c] = _linear_to_srgb_byte(_SRGB_TO_LINEAR[rgba[c]] * 255.0 / alpha)
                 else:
                     out[c] = min(255, (rgba[c] * 255 + alpha // 2) // alpha)
     return bytes(out)
 
 
-def decode_dds(data: bytes) -> tuple[int, int, bytes]:
-    """Decode mip 0 into top-down row-major RGBA8 with straight alpha."""
+def _decode_dds(data: bytes) -> tuple[int, int, bytes, bool]:
     info, masks, alpha_mode = _parse_header_internal(data)
+    srgb = info["dxgi_format"] in _SRGB_DXGI_FORMATS
     width = int(info["width"])  # type: ignore[arg-type]
     height = int(info["height"])  # type: ignore[arg-type]
     fmt = str(info["format"])
@@ -1055,18 +1094,28 @@ def decode_dds(data: bytes) -> tuple[int, int, bytes]:
         flags = struct.unpack_from("<I", data, 8)[0]
         pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
         rgba = _decode_r11g11b10(memoryview(data)[offset:], width, height, pitch)
+    elif fmt in ("R16_UNORM", "A8_UNORM"):
+        flags = struct.unpack_from("<I", data, 8)[0]
+        pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
+        rgba = _decode_single_channel(memoryview(data)[offset:], width, height, pitch, fmt)
     elif fmt == "BC7":
         rgba = _decode_bc7(data, offset, width, height)
     else:
         raise DdsError(f"Unsupported DDS format: {fmt}")
 
     if alpha_mode == DDS_ALPHA_MODE_PREMULTIPLIED:
-        rgba = _unpremultiply_rgba(rgba, info["dxgi_format"] in _SRGB_DXGI_FORMATS)
+        rgba = _unpremultiply_rgba(rgba, srgb)
     elif alpha_mode == DDS_ALPHA_MODE_OPAQUE:
         opaque = bytearray(rgba)
         opaque[3::4] = b"\xff" * (width * height)
         rgba = bytes(opaque)
 
+    return width, height, rgba, srgb
+
+
+def decode_dds(data: bytes) -> tuple[int, int, bytes]:
+    """Decode mip 0 into top-down row-major RGBA8 with straight alpha."""
+    width, height, rgba, _ = _decode_dds(data)
     return width, height, rgba
 
 
@@ -1084,7 +1133,7 @@ def _box_spans(source: int, target: int) -> list:
     return spans
 
 
-def _resample_box(width: int, height: int, rgba: bytes, nw: int, nh: int) -> bytes:
+def _resample_box(width: int, height: int, rgba: bytes, nw: int, nh: int, srgb: bool = False) -> bytes:
     x_spans = _box_spans(width, nw)
     y_spans = _box_spans(height, nh)
     area = width * height
@@ -1101,54 +1150,51 @@ def _resample_box(width: int, height: int, rgba: bytes, nw: int, nh: int) -> byt
             out[dst + 3] = (coverage + area // 2) // area
             if coverage:
                 for channel in range(3):
-                    total = sum(rgba[offset + channel] * weight for offset, weight in samples)
-                    out[dst + channel] = (total + coverage // 2) // coverage
+                    if srgb:
+                        light = sum(_SRGB_TO_LINEAR[rgba[offset + channel]] * weight for offset, weight in samples)
+                        out[dst + channel] = _linear_to_srgb_byte(light / coverage)
+                    else:
+                        total = sum(rgba[offset + channel] * weight for offset, weight in samples)
+                        out[dst + channel] = (total + coverage // 2) // coverage
     return bytes(out)
 
 
-def _halve_rgba(width: int, height: int, rgba: bytes) -> tuple[int, int, bytes]:
+def _halve_rgba(width: int, height: int, rgba: bytes, srgb: bool = False) -> tuple[int, int, bytes]:
     nw = max(1, width // 2)
     nh = max(1, height // 2)
     if (width > 1 and width % 2) or (height > 1 and height % 2) or rgba[3::4].count(255) != width * height:
-        return nw, nh, _resample_box(width, height, rgba, nw, nh)
+        return nw, nh, _resample_box(width, height, rgba, nw, nh, srgb)
     row_bytes = width * 4
     out_row_bytes = nw * 4
     out = bytearray(nw * nh * 4)
-
+    out[3::4] = b"\xff" * (nw * nh)
+    # A column has the same contiguous pixel pairs as a single row.
     if width == 1:
-        for oy in range(nh):
-            y0 = oy * 2
-            y1 = y0 + 1 if height >= 2 else 0
-            s0 = y0 * 4
-            s1 = y1 * 4
-            d = oy * 4
-            out[d] = (rgba[s0] + rgba[s1] + 1) >> 1
-            out[d + 1] = (rgba[s0 + 1] + rgba[s1 + 1] + 1) >> 1
-            out[d + 2] = (rgba[s0 + 2] + rgba[s1 + 2] + 1) >> 1
-            out[d + 3] = (rgba[s0 + 3] + rgba[s1 + 3] + 1) >> 1
-        return nw, nh, bytes(out)
-
-    used = nw * 8
-    for oy in range(nh):
-        y0 = oy * 2
-        y1 = y0 + 1 if height >= 2 else 0
-        s0 = y0 * row_bytes
-        s1 = y1 * row_bytes
-        r0 = rgba[s0 : s0 + used]
-        r1 = rgba[s1 : s1 + used]
+        if height == 1:
+            return nw, nh, rgba
+        row_bytes, out_row_bytes = height * 4, nh * 4
+    linear = _SRGB_TO_LINEAR
+    for oy, s0 in enumerate(range(0, len(rgba), 2 * row_bytes)):
+        r0 = rgba[s0 : s0 + row_bytes]
+        r1 = rgba[s0 + row_bytes : s0 + 2 * row_bytes] or r0
         dst = oy * out_row_bytes
         dst_end = dst + out_row_bytes
-        for c in (0, 1, 2, 3):
-            out[dst + c : dst_end : 4] = bytes(
-                (a + b + d + e + 2) >> 2
-                for a, b, d, e in zip(r0[c::8], r0[c + 4 :: 8], r1[c::8], r1[c + 4 :: 8])
-            )
+        for c in range(3):
+            samples = zip(r0[c::8], r0[c + 4 :: 8], r1[c::8], r1[c + 4 :: 8])
+            if srgb:
+                values = (_linear_to_srgb_byte((linear[a] + linear[b] + linear[d] + linear[e]) * 0.25)
+                          for a, b, d, e in samples)
+            else:
+                values = ((a + b + d + e + 2) >> 2 for a, b, d, e in samples)
+            out[dst + c : dst_end : 4] = bytes(values)
 
     return nw, nh, bytes(out)
 
 
-def downscale_rgba(width: int, height: int, rgba: bytes, max_size: int) -> tuple[int, int, bytes]:
-    """Halve straight-alpha RGBA8 with an alpha-weighted box filter until max(w, h) <= max_size."""
+def downscale_rgba(
+    width: int, height: int, rgba: bytes, max_size: int, *, srgb: bool = False,
+) -> tuple[int, int, bytes]:
+    """Halve straight-alpha RGBA8 with an alpha-weighted box filter. Tagged sRGB uses linear light."""
     if width <= 0 or height <= 0:
         raise DdsError(f"Invalid image dimensions: {width}x{height}")
     expected = width * height * 4
@@ -1163,7 +1209,7 @@ def downscale_rgba(width: int, height: int, rgba: bytes, max_size: int) -> tuple
     w, h = width, height
     cur = bytes(rgba) if not isinstance(rgba, bytes) else rgba
     while max(w, h) > max_size:
-        w, h, cur = _halve_rgba(w, h, cur)
+        w, h, cur = _halve_rgba(w, h, cur, srgb)
     return w, h, cur
 
 
@@ -1202,9 +1248,9 @@ def dds_to_png_bytes(data: bytes, max_size: int = 0) -> bytes:
     """Decode a DDS buffer (optionally downscaling) and encode as PNG bytes."""
     if max_size < 0:
         raise DdsError(f"Invalid max_size: {max_size}")
-    w, h, rgba = decode_dds(data)
+    w, h, rgba, srgb = _decode_dds(data)
     if max_size > 0:
-        w, h, rgba = downscale_rgba(w, h, rgba, max_size)
+        w, h, rgba = downscale_rgba(w, h, rgba, max_size, srgb=srgb)
     return encode_png(w, h, rgba)
 
 

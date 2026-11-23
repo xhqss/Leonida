@@ -200,8 +200,12 @@ def main(argv=None) -> int:
                 rows.append({"off": s, "stored": blen, "size": blen, "type": "bink2", "w": w, "h": h,
                              "frames": struct.unpack_from("<I", m, s + 8)[0], "pre": "", "head": m[s:s + 16].hex()})
                 if not a.index_only:
-                    with open(os.path.join(a.out, f"{s:012x}.bk2"), "wb") as f:
-                        f.write(m[s:s + blen])
+                    out_file = os.path.join(a.out, f"{s:012x}.bk2")
+                    try:
+                        with open(out_file, "wb") as f:
+                            f.write(m[s:s + blen])
+                    except OSError as e:
+                        sys.exit(f"{out_file}: cannot write: {e.strerror or e}")
                 last = pos = s + blen
                 continue
             d = zlib.decompressobj()
@@ -229,8 +233,12 @@ def main(argv=None) -> int:
             rows.append({"off": s, "stored": used, "size": len(out), "pre": m[max(0, s - 16):s].hex(),
                          "head": out[:16].hex()})
             if not a.index_only:
-                with open(os.path.join(a.out, f"{s:012x}.bin"), "wb") as f:
-                    f.write(out)
+                out_file = os.path.join(a.out, f"{s:012x}.bin")
+                try:
+                    with open(out_file, "wb") as f:
+                        f.write(out)
+                except OSError as e:
+                    sys.exit(f"{out_file}: cannot write: {e.strerror or e}")
             last = pos = s + used
             if len(rows) % 2000 == 0:
                 done = (pos - (a.start or 0)) / max(1, end - (a.start or 0))

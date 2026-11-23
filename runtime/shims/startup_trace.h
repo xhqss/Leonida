@@ -47,6 +47,10 @@ inline unsigned long long seq = 0;
 inline std::chrono::steady_clock::time_point start;
 inline void* veh = nullptr;
 inline thread_local bool in_handler = false;
+// With nothing to handle it, OutputDebugStringW's DBG_PRINTEXCEPTION_WIDE_C falls back to OutputDebugStringA on its
+// own ANSI copy (ExceptionInformation[3]), a second, lossy exception for the same text. Every debug string on the
+// thread resets this, so only the exception right after the wide one, with that same pointer, is skipped.
+inline thread_local ULONG_PTR wide_fallback = 0;
 
 inline void append_escaped(std::string& out, const char* s, size_t n) {
     static const char hex[] = "0123456789abcdef";
@@ -161,6 +165,10 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
     const EXCEPTION_RECORD& r = *info.ExceptionRecord;
     try {
         if (r.ExceptionCode == kDbgPrint || r.ExceptionCode == kDbgPrintWide) {
+            const ULONG_PTR fallback = wide_fallback;
+            const bool wide = r.ExceptionCode == kDbgPrintWide;
+            wide_fallback = wide && r.NumberParameters >= 4 ? r.ExceptionInformation[3] : 0;
+            if (!wide && fallback && r.NumberParameters >= 2 && r.ExceptionInformation[1] == fallback) return;
             std::string text = debug_text(r);
             while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
             event("debug_string", "\"text\":" + quote(text));

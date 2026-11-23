@@ -64,6 +64,20 @@ def run(*args):
 
 @unittest.skipUnless(os.environ.get("RPF9DUMP_DLL"), "requires a built rpf9dump")
 class Rpf9dumpExitCodeTest(unittest.TestCase):
+    def test_missing_or_directory_source_exits_2_before_the_output_folder_is_created(self):
+        # A mistyped source used to create <out>/<name> and then die with an unhandled FileNotFoundException
+        # from FileInfo.Length. Both mistakes are usage errors (exit 2) and must leave the output alone.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for label, src in (("missing", root / "missing.rpf"), ("directory", root)):
+                with self.subTest(source=label):
+                    out = root / f"out-{label}"
+                    done = run("ttpf", src, out)
+                    self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+                    self.assertIn("source is not a file", done.stderr)
+                    self.assertNotIn("Unhandled exception", done.stderr)
+                    self.assertFalse(out.exists(), f"{label} source left {out} behind")
+
     def test_failed_xma_write_exits_nonzero_and_rerun_completes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -103,6 +117,25 @@ class Rpf9dumpExitCodeTest(unittest.TestCase):
             self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
             self.assertTrue((sub / "manifest.json").exists())
             self.assertEqual(dds.read_bytes()[:4], b"DDS ")
+
+    def test_unknown_mode_exits_nonzero_before_the_source_or_output_is_touched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "package.rpf"     # never created: the mode is rejected before the source is opened
+            out = root / "out"
+            bad = run("invalidmode", src, out)
+            self.assertNotEqual(bad.returncode, 0, bad.stdout + bad.stderr)
+            self.assertIn("unknown mode 'invalidmode'", bad.stdout + bad.stderr)
+            self.assertNotIn("ok=0 fail=0 skip=0", bad.stdout, "an unknown mode still reported a finished run")
+            self.assertFalse(out.exists(), "an unknown mode created the output folder")
+            self.assertEqual([p.name for p in root.iterdir()], [], "an unknown mode touched the work folder")
+
+    def test_usage_lists_every_mode(self):
+        short = run()
+        self.assertEqual(short.returncode, 2, short.stdout + short.stderr)
+        self.assertIn("usage: rpf9dump", short.stdout)
+        for mode in ("ttpf", "models", "textures", "audio", "xma"):
+            self.assertIn(mode, short.stdout, f"usage does not list {mode}")
 
 
 if __name__ == "__main__":

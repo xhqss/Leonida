@@ -375,17 +375,22 @@ def main(argv=None):
         norm = probe_norm(oracle, asm, wave)
         two = probe_two_comp(oracle, asm, wave)
         out["waves"][str(wave)] = {"norm": norm, "two_comp": two}
-        for name, _code, _kind, _bits in NORM_FORMATS:
-            for inst, info in norm[name].items():
-                if info["exact"] != info["inputs"]:
-                    mismatches += 1
-        if norm["snorm2_ties"]["exact"] != norm["snorm2_ties"]["inputs"]:
+        sweeps = [(f"{name} {inst}", info) for name, *_ in NORM_FORMATS for inst, info in norm[name].items()]
+        bad_sweeps = [(label, info) for label, info in sweeps if info["exact"] != info["inputs"]]
+        mismatches += len(bad_sweeps)
+        ties = norm["snorm2_ties"]
+        if ties["exact"] != ties["inputs"]:
             mismatches += 1
         if two["formats_ok"] != two["formats_total"] or two["triples_ok"] != two["triples_total"]:
             mismatches += 1
-        print(f"wave{wave} ({oracle.arch}): norm exact across {len(NORM_FORMATS)} formats + snorm2 ties, "
+        print(f"wave{wave} ({oracle.arch}): norm {len(sweeps) - len(bad_sweeps)}/{len(sweeps)} sweeps exact across "
+              f"{len(NORM_FORMATS)} formats, snorm2 ties {ties['exact']}/{ties['inputs']}, "
               f"2-comp {two['formats_ok']}/{two['formats_total']} formats, "
               f"{two['triples_ok']}/{two['triples_total']} DST_SEL triples")
+        for label, info in bad_sweeps:
+            first = info["first_mismatch"]
+            print(f"  {label}: {info['exact']}/{info['inputs']} exact, first mismatch f32 {first['f32']} "
+                  f"hw {first['hw']} want {first['want']} (double-rounded {first['double']})")
     if args.json_out is not None:
         err = write_json_report(args.json_out, out)
         if err:

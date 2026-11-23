@@ -261,6 +261,41 @@ Uniform bytes in exact 16-byte units that repeat record by record fit a determin
 also fit 128-bit hashes of inputs outside the tested dictionary and functions. Which one it is has not been
 established. Per the project rules, no decryption is attempted.
 
+## `PMAP`, `PSCH`, `PSIG` and `STNS`: the PSO-style variant
+
+The 57 complete `PSIN` streams without `LSCH` (54 in `data.rpf`, 2 in `packs.rpf`, 1 in `anim.rpf`) replace
+`LSCH`/`LENM`/`LSNS`/`LRSC` with a big-endian PSO schema chain: `PMAP`, `PSCH`, `PSIG`, optional `STFN`/`STDN`, `STNS`
+and `CHKS`. Measured with `tools/psin_psch.py` over all **54** containers in `data.rpf` (`54/54` valid):
+
+- **Header and instance region:** bytes `+0x08..+0x0F` hold `pppppppp` (`0x70` x 8) and instance data blocks sit at
+  `+0x10..first_section` (in contrast to `LSCH` containers, which place the block table at `+8`).
+- **`PMAP` (287 blocks across 54 files):** starts with a 16-byte big-endian header (`u32 root_block_id`, `u16 flags`,
+  `u16 0`, `u16 block_count`, 6-byte `pppppp` fill), followed by `block_count` x 16-byte rows `{u32 name_hash, u32 offset,
+  u32 0, u32 length}`. On **54 of 54**, blocks begin at `0x10` and end at exact `first_section`; 237 blocks reference a
+  struct in `PSCH` (`237/237` have `length % struct_size == 0`) and 50 are anonymous (`0x1`: 41, `0xc`: 7, `0x8`: 1,
+  `0x6`: 1).
+- **`PSCH` (`689` structs / `69` distinct, `3,250` members / `500` distinct, `146` enums / `17` distinct, `662` values):**
+  `u32be entry_count` followed by `entry_count` directory pairs `(u32be name_hash, u32be section_offset)`. Kind `0`
+  entries are structs (`u8 0`, `u8 flags`, `u16be member_count`, `u32be byte_size`, `u32be 0`, then `12`-byte big-endian
+  members `{u32 hash, u8 type, u8 sub, u16 offset, u32 ref}`); kind `1` entries are enums (`u8 1`, `u8 flags`, `u16be
+  value_count`, then `16`-byte values `{u32 hash, u32 0, i64be value}`). Every array member (`0x0d`, 226/226) and map
+  member (`0x10`, 3/3 key/value pairs) points at `0x100` element descriptors inside its struct; all 185 enum members
+  (`0x0e`) resolve locally, and 718 struct members (`0x0c`) hold `671` local hashes, `11` zero references, `33`
+  cross-file `data.rpf` references and `3` external references.
+- **`PSIG` and `STNS`/`STDN`/`STFN`:** `PSIG` stores `entry_count` big-endian `u32` layout signatures (`83` distinct).
+  `STNS` mirrors `LSNS` as a little-endian `u32 block_count` table of `(u32 kind, u32 bytes)` pairs and 16-byte-aligned
+  records (`867` total across `54` blocks) padded with zeros to a 16-byte payload boundary
+  (`align16(4 + 8 * block_count + data_bytes)` on all 54 containers: 4 zero bytes for `1`-block sections and 12 zero
+  bytes for `0`- and `2`-block sections). Where present, `STDN` (`2/2`) matches the prefix of `STNS`'s block data
+  byte-for-byte.
+
+```text
+python -I tools/psin_psch.py <file_or_carve_dir_or_rpf> [--carve-dir DIR] [--json FILE]
+```
+
+`tests/test_psin_psch.py` builds synthetic `PMAP`/`PSCH`/`PSIG`/`STDN`/`STNS` containers and tests block validation,
+member descriptor checks, carve-directory filtering and `--json` collision refusal.
+
 ## Instance data
 
 The region between the 8-byte header and `LSCH` is a block table followed by its data blocks. The schema in
@@ -426,6 +461,22 @@ field table. `--refs` writes one row per resolved value: file, struct, field, ty
 so keep them in your local work folder; only the counts belong in git, issues or pull requests. On the data above the
 run takes about 50 s. `tests/test_psin_names.py` builds containers from invented names.
 
+#### Vehicle names in the navmesh PSIN map
+
+The version 256 PSIN at `navmeshes.rpf` offset `0x1749fe000` has a root map of type `0x73`. Its pointer
+resolves to an anonymous `0x100` block of 28,672 bytes. The schema gives a `0x4a` key at slot offset
+`+0x00` and a 48-byte struct value at `+0x08`, for a stride of 56 bytes. The map declares 512 slots and
+209 entries. Counting distinct nonzero keys gives 209.
+
+On the 1.0.2.1 package, compare the lower-case joaat hashes of `ModelName` and the nonempty
+`ModDefs/Item` names in the 32 `CVehiclePoints` documents in `common.rpf` with every occupied slot.
+Of 31 distinct model names, 25 match the map key. Of 55 distinct part names, 20 match `0x4a` members
+in the value: 6 at slot `+0x18`, 2 at `+0x1c`, 4 at `+0x28`, and 8 at `+0x34`. Appending `#zq`
+to the model names gives zero key matches. All the original matches lie in the instance block before
+the first section. The container's 493 `LSNS` records have zero matches for either set of hashes.
+The map identifies vehicles and parts in the container. Which entry refers to each of the 161
+local-space navmeshes remains open.
+
 ## What it does not give
 
 - No plaintext script code, function names or string table. `LSNS` has a decoded block layout, but its
@@ -481,6 +532,58 @@ editor that lays out one container as this page describes it:
 A section that runs past the end of a truncated stream is shown as raw bytes. `tests/test_imhex_patterns.py` builds a
 synthetic container, checks it with `psin_index.py` and `psin_data.block_table`, and when ImHex is installed compares
 the pattern's output with both.
+
+## Non-PSIN object-tree table in `script.rpf`
+
+Besides its 1,012 `PSIN` containers (1,015 streams, 3,477,872 inflated bytes), `script.rpf` contains one large non-`PSIN`
+binary container carved at offset `0x53000` (`42` contiguous deflate streams: 41 x 65,536 + 15,408 = **2,702,384**
+inflated bytes / `0x293C30`, 461,333 stored bytes, 43.7% of `script.rpf`'s inflated output). It is not `PSIN`, `RBF0`
+or `0DRP`, and carries no strings: it is a dense 483-tree forest serialized in preorder with `0x71717171` (`'qqqq'`)
+relocatable pointers, measured with `tools/script_qtable.py` on package 1.0.2.1.
+
+### Layout and header (`0x000000..0x293C2F`)
+
+| Region | Offset | Size | Layout |
+|---|---:|---:|---|
+| Header | `0x000000` | 40 B | ten `u32` words: `record_count = 30,683` (`0x000077DB`) at `+0x14`; all other nine words `0` |
+| Offset table | `0x000028` | 245,464 B | `30,683` strictly ascending, 16-byte-aligned `u64` offsets (`0x03BF00` to `0x293C00`) |
+| Record pool | `0x03BF00` | 2,456,880 B | `30,683` 16-byte-aligned records (`32` to `6,704` bytes), ending at exact EOF (`0x293C30`) |
+
+Each record `i` begins with an 8-byte prefix before its body at `offsets[i] + 8`:
+
+- **`+0x00` `u32 root_key_hash`**: non-zero on **483** records (`483` distinct values) and `0` on the other **30,200**
+  records.
+- **`+0x04` `u32 root_flags`**: `0` on all 30,200 non-root records; on the 483 roots, `0xFFFF0000` (385), `0` (86) or
+  `(1..8) << 16` (12).
+
+### Relocatable pointers and tree bijection
+
+Every 8-byte-aligned `u64` word from `+0x08` onward whose high 32 bits equal `0x71717171` (`'qqqq'`) is an internal
+pointer whose low 32 bits equal `offsets[target] + 8` (the start of record `target`'s body):
+
+- **30,200 of 30,200** `0x71717171` pointers resolve to a valid record (`0` unresolved, `0` outside the pool).
+- **Exact root bijection:** the **483** records with `root_key_hash != 0` are the exact **483** records with
+  in-degree `0`; all **30,200** records with `root_key_hash == 0` have in-degree `1`.
+- **Contiguous preorder forest:** all **30,200** edges point strictly forward (`target > source`, `0` back-edges or
+  cycles), remain inside their root's contiguous index slice `[root_k, root_{k+1})` (`0` cross-tree edges), and match
+  strict depth-first preorder in stored pointer-field sibling order across all **30,683** positions. Tree sizes range
+  from `1` to `1,131` nodes (median `53`, depths `0..9`).
+
+### Array and struct records
+
+| Kind | Count | Header at `+0x08` | Notes |
+|---|---:|---|---|
+| Array records | 10,294 | `+0x08 = 0x14`, `+0x0C = 0`, `+0x10 = +0x14 = count` (`0..220`), `+0x18 = stride`, `+0x1C = flags`, `+0x20 = 0` (`u64`), `+0x28 = element_type_hash` (35 distinct, none 0), `+0x2C = 0` | Elements start at `+0x30`; `align16(48 + count * stride) == len(rec)` holds on **10,294 of 10,294**. `flags = 0` (8,211 value/struct arrays, strides `4, 8, 12, 16, 20, 24, 32, 48, 64, 128`) and `flags = 0x10000` (2,083 pointer arrays, all stride `8`, holding 7,297 `0x71717171` pointers). |
+| Typed struct records | 20,389 | `+0x08 = struct_type_hash` (66 distinct hashes), `+0x0C = 0` on all 20,389 | Sizes `32` B (17,106: 12,332 wrapper nodes pointing at `+0x10` to `i + 1` with `+0x18 = 0`, 3,540 single-pointer at `+0x18`, 3 two-pointer, 1,231 leaves), `48` B (1,642: 1,641 two-pointer, 1 leaf) and `64` B (1,641 leaves). |
+
+```text
+python -I tools/script_qtable.py <carve_dir_or_rpf_or_bin> [--root-hash HEX] [--type-hash HEX] [--json FILE]
+```
+
+Accepts an `rpf9_carve.py` carve directory (`script`), a `script.rpf` archive or a joined `.bin` payload.
+Default stdout and `--json` output emit aggregate counts, histograms and structural invariant checks only; `--root-hash`
+and `--type-hash` report local tree/type counts in hex. `tests/test_script_qtable.py` covers synthetic multi-tree parsing,
+64 KiB stream reassembly across a carve folder, pointer validation and output collision guards.
 
 ## Limits
 

@@ -187,31 +187,32 @@ class F16FmaRoundingTests(unittest.TestCase):
 
     def test_fmac_output_modifiers(self):
         # LLVM gfx10_asm_vop2.s encodes clamp, mul:2, mul:4 and div:2 on v_fmac_f16_e64.
+        # On RDNA2 with denormals kept, omod is ignored on f16 results; clamp applies.
         # High half (0xAAAA) of destination VGPR must remain untouched.
         got = run([
             "v_mov_b32 v0, 0xaaaa3c00",           # acc = 1.0h, hi = 0xAAAA
             "v_fmac_f16_e64 v0, 1.0, 1.0 clamp",  # 1*1 + 1 = 2.0 -> clamp -> 1.0 (0x3c00)
             "v_mov_b32 v1, 0xaaaa3800",           # acc = 0.5h
-            "v_fmac_f16_e64 v1, 0.5, 0.5 mul:2",  # (0.25 + 0.5) * 2 = 1.5 (0x3e00)
+            "v_fmac_f16_e64 v1, 0.5, 0.5 mul:2",  # (0.25 + 0.5) = 0.75 (0x3a00) (mul:2 ignored)
             "v_mov_b32 v2, 0xaaaa3400",           # acc = 0.25h
-            "v_fmac_f16_e64 v2, 0.5, 0.5 mul:4",  # (0.25 + 0.25) * 4 = 2.0 (0x4000)
+            "v_fmac_f16_e64 v2, 0.5, 0.5 mul:4",  # (0.25 + 0.25) = 0.5 (0x3800) (mul:4 ignored)
             "v_mov_b32 v3, 0xaaaa4000",           # acc = 2.0h
-            "v_fmac_f16_e64 v3, 1.0, 2.0 div:2",  # (2 + 2) / 2 = 2.0 (0x4000)
+            "v_fmac_f16_e64 v3, 1.0, 2.0 div:2",  # (2 + 2) = 4.0 (0x4400) (div:2 ignored)
         ])
-        self.assertEqual(got, [0xAAAA3C00, 0xAAAA3E00, 0xAAAA4000, 0xAAAA4000])
+        self.assertEqual(got, [0xAAAA3C00, 0xAAAA3A00, 0xAAAA3800, 0xAAAA4400])
 
-        # omod applies before clamp, and negative values clamp to 0.0.
+        # Clamp applies, negative values clamp to 0.0, and omod is ignored.
         got2 = run([
             "v_mov_b32 v0, 0xaaaa3400",                  # acc = 0.25h
-            "v_fmac_f16_e64 v0, 0.5, 0.5 mul:2 clamp",   # (0.25 + 0.25) * 2 = 1.0 (0x3c00)
+            "v_fmac_f16_e64 v0, 0.5, 0.5 mul:2 clamp",   # (0.25 + 0.25) = 0.5 -> clamp -> 0.5 (0x3800)
             "v_mov_b32 v1, 0xaaaabc00",                  # acc = -1.0h
             "v_fmac_f16_e64 v1, 0.5, 0.5 clamp",         # (0.25 - 1.0) = -0.75 -> clamp -> 0.0 (0x0000)
             "v_mov_b32 v2, 0xaaaa3400",                  # acc = 0.25h
-            "v_fmac_f16_e64 v2, 0.5, 0.5 mul:4 clamp",   # (0.25 + 0.25) * 4 = 2.0 -> clamp -> 1.0 (0x3c00)
+            "v_fmac_f16_e64 v2, 0.5, 0.5 mul:4 clamp",   # (0.25 + 0.25) = 0.5 -> clamp -> 0.5 (0x3800)
             "v_mov_b32 v3, 0xaaaa3800",                  # acc = 0.5h
-            "v_fmac_f16_e64 v3, 1.0, 0.5 div:2 clamp",   # (0.5 + 0.5) / 2 = 0.5 (0x3800)
+            "v_fmac_f16_e64 v3, 1.0, 0.5 div:2 clamp",   # (0.5 + 0.5) = 1.0 -> clamp -> 1.0 (0x3c00)
         ])
-        self.assertEqual(got2, [0xAAAA3C00, 0xAAAA0000, 0xAAAA3C00, 0xAAAA3800])
+        self.assertEqual(got2, [0xAAAA3800, 0xAAAA0000, 0xAAAA3800, 0xAAAA3C00])
 
 
 if __name__ == "__main__":

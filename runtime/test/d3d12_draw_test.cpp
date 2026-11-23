@@ -9,7 +9,9 @@
 //   - the image read back through CopyTextureRegion and compared pixel by pixel. Where the quadrants land also
 //     checks the viewport flip (D3D clip space is y-up) and the front-face winding;
 //   - full-screen blends that read destination alpha into B8G8R8X8 and B8G8R8A8 targets cleared with alpha 0.25:
-//     B8G8R8X8 has no alpha, so destination alpha reads 1 there, as on WARP and AMD's D3D12 driver.
+//     B8G8R8X8 has no alpha, so destination alpha reads 1 there, as on WARP and AMD's D3D12 driver;
+//   - draws through RTVs in a format the texture's castable list names, in the other channel order (RGBA8 and BGRA8)
+//     or across B8G8R8X8 and B8G8R8A8: the bytes land in the view's order and encoding.
 // The shaders are GLSL written to the translator's contract (test/glsl/vs_draw.vert, ps_draw.frag). No game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "shader_fixture_path.h"
@@ -26,8 +28,9 @@
 #include <cstdlib>
 #include <cstring>
 
-#if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV) || !defined(LEONIDA_TEST_VS_INT_SPV)
-#error "LEONIDA_TEST_VS_SPV, LEONIDA_TEST_PS_SPV and LEONIDA_TEST_VS_INT_SPV must name the compiled test shaders"
+#if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV) || !defined(LEONIDA_TEST_VS_INT_SPV) || \
+    !defined(LEONIDA_TEST_PS_UINT_SPV)
+#error "LEONIDA_TEST_VS_SPV, LEONIDA_TEST_PS_SPV, LEONIDA_TEST_PS_UINT_SPV and LEONIDA_TEST_VS_INT_SPV must name the compiled test shaders"
 #endif
 
 #define EXPECT(condition) do { \
@@ -66,13 +69,15 @@ int main() {
     const auto ps_program = fssm_program({0x50530001, 0xbf810000});
     const auto fullscreen_program = fssm_program({0x56530002, 0xbf810000});
     const auto vs_int_program = fssm_program({0x56530003, 0xbf810000});
+    const auto ps_uint_program = fssm_program({0x50530002, 0xbf810000});
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
     const auto fullscreen_container = shader_container(fullscreen_program);
-    const auto vs_int_container = shader_container(vs_int_program);
+    const auto vs_int_container = shader_container(vs_int_program), ps_uint_container = shader_container(ps_uint_program);
     const testfiles::ScratchDir scratch("leonida_draw_test");
     const auto& library = scratch.path();
     EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_SPV), library / "vs_draw.spv"));
     EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_PS_SPV), library / "ps_draw.spv"));
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_PS_UINT_SPV), library / "ps_draw_uint.spv"));
     EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_FULLSCREEN_SPV),
                                 library / "vs_fullscreen.spv"));
     EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_INT_SPV), library / "vs_draw_int.spv"));
@@ -93,11 +98,13 @@ int main() {
                  " \"vs_fullscreen\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(fullscreen_program)
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": []},\n"
                  " \"ps_draw\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]},\n"
+                 " \"ps_draw_uint\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_uint_program)
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]}}";
     }
 
     constexpr UINT size = 64;
-    std::vector<std::uint8_t> pixels(size * 256), second_pixels(size * 256);
+    std::vector<std::uint8_t> pixels(size * 256), second_pixels(size * 256), logic_pixels(size * 256);
     std::vector<std::uint8_t> strip16_pixels(size * 256), strip32_pixels(size * 256), strip_nocut_pixels(size * 256);
     std::vector<std::uint8_t> msaa_full_pixels(size * 256), msaa_half_pixels(size * 256);
     bool ran_msaa = false;
@@ -260,8 +267,11 @@ int main() {
         needs_feature.RasterizerState.DepthClipEnable = FALSE;  // depthClamp
         EXPECT(device->CreateGraphicsPipelineState(&needs_feature, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL && !refused.p);
 
-        // XOR on render target 0: applied where the GPU has logicOp (the device passes it on), refused elsewhere.
+        // XOR on render target 0, which must be a UINT format (D3D12 allows logic ops on no other, and Intel Arc
+        // returns the source on UNORM): applied where the GPU has logicOp (the device passes it on), refused elsewhere.
         D3D12_GRAPHICS_PIPELINE_STATE_DESC xor_desc = pso_desc;
+        xor_desc.PS = {ps_uint_container.data(), ps_uint_container.size()};
+        xor_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UINT;
         xor_desc.BlendState.RenderTarget[0].LogicOpEnable = TRUE;
         xor_desc.BlendState.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_XOR;
         EXPECT(device->CreateGraphicsPipelineState(&xor_desc, IID_PPV_ARGS(&xor_pso.p)) ==
@@ -283,7 +293,7 @@ int main() {
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
         const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
-        Ref<ID3D12Resource> vertex_buffer, upload, readback, target;
+        Ref<ID3D12Resource> vertex_buffer, upload, readback, target, uint_target;
         const auto vb_desc = buffer_desc(sizeof(vertices));
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &vb_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
@@ -434,9 +444,8 @@ int main() {
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         std::memcpy(pixels.data(), mapped, pixels.size());
 
-        // Second pass on the same target, cleared blue again: the red quad XORed into the top-left quadrant, which
-        // gives (255,0,255,0) where logicOp exists, and the full-screen triangle (yellow, red tint: red) through a
-        // viewport on the bottom-right quadrant, with no vertex buffer in its pipeline.
+        // Second pass on the same target, cleared blue again: the full-screen triangle (yellow, red tint: red)
+        // through a viewport on the bottom-right quadrant, with no vertex buffer in its pipeline.
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
         D3D12_RESOURCE_BARRIER to_target = transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
                                                       D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -454,14 +463,6 @@ int main() {
         list->RSSetViewports(1, &bottom_right);
         list->SetPipelineState(fullscreen.p);
         list->DrawInstanced(3, 1, 0, 0);
-        if (logic_op) {
-            list->RSSetViewports(1, &viewport);
-            list->SetPipelineState(xor_pso.p);
-            list->IASetVertexBuffers(0, 1, &vbv);
-            list->IASetIndexBuffer(&ibv);
-            list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
-            list->DrawIndexedInstanced(6, 1, 0, 0, 0);
-        }
         list->ResourceBarrier(1, &to_copy);
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         EXPECT(list->Close() == S_OK);
@@ -469,6 +470,50 @@ int main() {
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
         std::memcpy(second_pixels.data(), mapped, second_pixels.size());
+
+        // Logic-op pass on its own R8G8B8A8_UINT target: D3D12 applies logic ops to UINT formats only. Cleared to
+        // (0,0,255,255); the red quad (255,0,0,255) XORed into the top-left quadrant gives (255,0,255,0) there.
+        if (logic_op) {
+            auto uint_rt_desc = rt_desc;
+            uint_rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uint_rt_desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&uint_target.p))));
+            Ref<ID3D12DescriptorHeap> uint_rtv_heap;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&uint_rtv_heap.p))));
+            const D3D12_CPU_DESCRIPTOR_HANDLE uint_rtv{
+                SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(uint_rtv_heap.p, 9))(uint_rtv_heap.p))};
+            device->CreateRenderTargetView(uint_target.p, nullptr, uint_rtv);
+
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, xor_pso.p)));
+            D3D12_RESOURCE_BARRIER to_uint_target = transition(uint_target.p, D3D12_RESOURCE_STATE_COMMON,
+                                                               D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &to_uint_target);
+            const FLOAT uint_blue[4] = {0, 0, 255, 255};  // a UINT target is cleared with whole numbers
+            list->ClearRenderTargetView(uint_rtv, uint_blue, 0, nullptr);
+            list->SetGraphicsRootSignature(root.p);
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list->RSSetViewports(1, &viewport);
+            list->RSSetScissorRects(1, &scissor);
+            list->OMSetRenderTargets(1, &uint_rtv, FALSE, nullptr);
+            list->IASetVertexBuffers(0, 1, &vbv);
+            list->IASetIndexBuffer(&ibv);
+            list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+            list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+            list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+            D3D12_RESOURCE_BARRIER uint_to_copy = transition(uint_target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                             D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &uint_to_copy);
+            D3D12_TEXTURE_COPY_LOCATION uint_dst = dst, uint_src = src;
+            uint_dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+            uint_src.pResource = uint_target.p;
+            list->CopyTextureRegion(&uint_dst, 0, 0, 0, &uint_src, nullptr);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)) && SUCCEEDED(fence->SetEventOnCompletion(3, nullptr)));
+            std::memcpy(logic_pixels.data(), mapped, logic_pixels.size());
+        }
 
         // Third pass: indexed triangle-strip cuts (0xFFFF for UINT16, 0xFFFFFFFF for UINT32) and negative control
         // without a cut. Two disjoint quads (top-left and bottom-right); without the cut, bridge triangle (2, 3, 4)
@@ -874,6 +919,96 @@ int main() {
             }
         }
 
+        // An opaque draw through an RTV in a format the texture's castable list names, in the other channel order or
+        // across B8G8R8X8 and B8G8R8A8, is stored in the view's channel order and encoding, as WARP and AMD's D3D12
+        // driver store it. The X byte after a draw through an X8 view differs between them (WARP 0, AMD the alpha),
+        // so it isn't compared.
+        {
+            const float cast_tint[3] = {0.8f, 0.6f, 0.4f};  // with the full-screen VS's yellow: (0.8, 0.6, 0, 1)
+            void* cast_up = nullptr;
+            EXPECT(SUCCEEDED(upload->Map(0, nullptr, &cast_up)));
+            std::memcpy(static_cast<std::uint8_t*>(cast_up) + 2048, cast_tint, sizeof(cast_tint));
+            upload->Unmap(0, nullptr);
+            Ref<ID3D12Device10> inner10;
+            EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&inner10.p))));
+            // The bytes of (0.8, 0.6, 0, 1) in the view's order; sRGB encodes 0.8 as 231 and 0.6 as 203.
+            struct Cast { DXGI_FORMAT resource, view; const char* name; std::uint8_t bytes[4]; };
+            const Cast casts[] = {
+                {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, "R8G8B8A8{B8G8R8A8}", {0, 153, 204, 255}},
+                {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, "B8G8R8A8{R8G8B8A8}", {204, 153, 0, 255}},
+                {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, "R8G8B8A8{B8G8R8A8_SRGB}",
+                 {0, 203, 231, 255}},
+                {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, "B8G8R8A8{R8G8B8A8_SRGB}",
+                 {231, 203, 0, 255}},
+                {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, "B8G8R8A8{B8G8R8A8_SRGB}",
+                 {0, 203, 231, 255}},
+                {DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, "B8G8R8X8{B8G8R8A8}", {0, 153, 204, 255}},
+                {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM, "B8G8R8A8{B8G8R8X8}", {0, 153, 204, 0}},
+                {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM, "R8G8B8A8{B8G8R8X8}", {0, 153, 204, 0}},
+            };
+            const D3D12_DESCRIPTOR_HEAP_DESC cast_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                                            D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            Ref<ID3D12DescriptorHeap> cast_heap;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&cast_heap_desc, IID_PPV_ARGS(&cast_heap.p))));
+            const D3D12_CPU_DESCRIPTOR_HANDLE cast_rtv{
+                SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(cast_heap.p, 9))(cast_heap.p))};
+            const D3D12_VIEWPORT cast_viewport{0, 0, 4, 4, 0, 1};
+            const D3D12_RECT cast_scissor{0, 0, 4, 4};
+            UINT64 cast_fence = 70;  // after the step-rate block's 61 and 62
+            for (const Cast& c : casts) {
+                D3D12_RESOURCE_DESC1 cast_desc{};
+                cast_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                cast_desc.Width = cast_desc.Height = 4;
+                cast_desc.DepthOrArraySize = 1;
+                cast_desc.MipLevels = 1;
+                cast_desc.Format = c.resource;
+                cast_desc.SampleDesc.Count = 1;
+                cast_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+                Ref<ID3D12Resource> cast_target;
+                EXPECT(SUCCEEDED(inner10->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &cast_desc,
+                    D3D12_BARRIER_LAYOUT_RENDER_TARGET, nullptr, nullptr, 1, &c.view, IID_PPV_ARGS(&cast_target.p))));
+                D3D12_RENDER_TARGET_VIEW_DESC cast_view{};
+                cast_view.Format = c.view;
+                cast_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                device->CreateRenderTargetView(cast_target.p, &cast_view, cast_rtv);
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC cast_pso_desc = fullscreen_desc;
+                cast_pso_desc.RTVFormats[0] = c.view;
+                Ref<ID3D12PipelineState> cast_pso;
+                EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&cast_pso_desc, IID_PPV_ARGS(&cast_pso.p))));
+                EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, cast_pso.p)));
+                list->SetGraphicsRootSignature(root.p);
+                list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                list->RSSetViewports(1, &cast_viewport);
+                list->RSSetScissorRects(1, &cast_scissor);
+                list->OMSetRenderTargets(1, &cast_rtv, FALSE, nullptr);
+                list->SetGraphicsRootConstantBufferView(1, upload_va + 2048);
+                list->DrawInstanced(3, 1, 0, 0);
+                const auto cast_to_copy = transition(cast_target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                     D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->ResourceBarrier(1, &cast_to_copy);
+                D3D12_TEXTURE_COPY_LOCATION cast_dst{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+                cast_dst.PlacedFootprint = {0, {c.resource, 4, 4, 1, 256}};
+                D3D12_TEXTURE_COPY_LOCATION cast_src{cast_target.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+                list->CopyTextureRegion(&cast_dst, 0, 0, 0, &cast_src, nullptr);
+                EXPECT(list->Close() == S_OK);
+                queue->ExecuteCommandLists(1, lists);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                ++cast_fence;
+                EXPECT(SUCCEEDED(queue->Signal(fence.p, cast_fence)) &&
+                       SUCCEEDED(fence->SetEventOnCompletion(cast_fence, nullptr)));
+                const auto* got = static_cast<const std::uint8_t*>(mapped);
+                const unsigned compared = c.view == DXGI_FORMAT_B8G8R8X8_UNORM ? 3 : 4;
+                for (unsigned b = 0; b < compared; ++b) {
+                    if (std::abs(int(got[b]) - int(c.bytes[b])) <= 1) continue;
+                    std::fprintf(stderr, "draw through %s: got bytes %u,%u,%u,%u, byte %u wants %u\n", c.name, got[0],
+                                 got[1], got[2], got[3], b, unsigned(c.bytes[b]));
+                    return 1;
+                }
+            }
+            std::printf("castable RTVs: %u draws stored in the view's channel order and encoding\n",
+                        unsigned(std::size(casts)));
+        }
+
         // A draw without a topology is invalid; Close reports it.
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
         list->SetGraphicsRootSignature(root.p);
@@ -884,7 +1019,7 @@ int main() {
         list->OMSetRenderTargets(9, &rtv, TRUE, nullptr);
         EXPECT(list->Close() == E_INVALIDARG);
 
-        for (auto* r : {&vertex_buffer, &upload, &readback, &target}) r->reset();
+        for (auto* r : {&vertex_buffer, &upload, &readback, &target, &uint_target}) r->reset();
         for (auto* p : {&mrt, &instanced, &refused, &unfed, &xor_pso, &fullscreen}) p->reset();
         pso.reset();
         root.reset();
@@ -916,14 +1051,12 @@ int main() {
         }
     }
     EXPECT(!mismatches);
-    // Second pass: XOR quad top-left (where logicOp exists), full-screen triangle bottom-right, blue elsewhere.
+    // Second pass: full-screen triangle bottom-right, blue elsewhere.
     for (UINT row = 0; row < size; ++row) {
         for (UINT col = 0; col < size; ++col) {
             const bool top = row < size / 2, left = col < size / 2;
             using Pixel = std::array<std::uint8_t, 4>;
-            const Pixel want = top && left && logic_op ? Pixel{255, 0, 255, 0}
-                               : !top && !left         ? Pixel{255, 0, 0, 255}
-                                                       : Pixel{0, 0, 255, 255};
+            const Pixel want = !top && !left ? Pixel{255, 0, 0, 255} : Pixel{0, 0, 255, 255};
             const std::uint8_t* got = second_pixels.data() + row * 256 + col * 4;
             if (std::equal(want.begin(), want.end(), got)) continue;
             if (mismatches++ < 6)
@@ -932,6 +1065,25 @@ int main() {
         }
     }
     EXPECT(!mismatches);
+    // Logic-op pass (UINT target): the integer XOR of source (255,0,0,255) and destination (0,0,255,255) top-left.
+    if (logic_op) {
+        for (UINT row = 0; row < size; ++row) {
+            for (UINT col = 0; col < size; ++col) {
+                const bool top = row < size / 2, left = col < size / 2;
+                using Pixel = std::array<std::uint8_t, 4>;
+                const Pixel dest{0, 0, 255, 255}, source{255, 0, 0, 255};
+                Pixel want = dest;
+                if (top && left)
+                    for (std::size_t ch = 0; ch < 4; ++ch) want[ch] = std::uint8_t(source[ch] ^ dest[ch]);
+                const std::uint8_t* got = logic_pixels.data() + row * 256 + col * 4;
+                if (std::equal(want.begin(), want.end(), got)) continue;
+                if (mismatches++ < 6)
+                    std::fprintf(stderr, "logic-op pixel (%u, %u): got %u,%u,%u,%u want %u,%u,%u,%u\n", col, row,
+                                 got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+            }
+        }
+        EXPECT(!mismatches);
+    }
     // Strip-cut passes: 0xFFFF (UINT16) and 0xFFFFFFFF (UINT32) must produce only the top-left and bottom-right quads
     // (pure blue in top-right and bottom-left). Negative control without cut must paint bridge pixels in bottom-left.
     UINT nocut_bl_red = 0;

@@ -6,6 +6,10 @@
 // and written again as d3d12_blas_update; then its postbuild COMPACTED_SIZE and a TLAS rebuild's CURRENT_SIZE are
 // checked against the prebuild sizes, and the BLAS is compacted (CopyRaytracingAccelerationStructure COMPACT) into a
 // buffer of exactly that size, written as d3d12_blas_compacted as <case>.bin + <case>.json at their console GPU virtual addresses.
+// Last, the BLAS again with MINIMIZE_MEMORY (BOX16 nodes: a smaller prebuild size and postbuild size), written as
+// d3d12_blas_box16, then updated in place with the same flags (d3d12_blas_box16_update); and once more without
+// ALLOW_UPDATE, so that its triangles are paired into TRI0/TRI1 leaves (d3d12_blas_paired; the ALLOW_UPDATE builds
+// must have no pairs, since a refit rewrites the leaves one triangle each).
 // `python -I tools/xdxr_bvh.py check-build <out dir>` validates them and traces rays against brute force (ctest:
 // d3d12_xdxr_rt + d3d12_xdxr_rt_check). Exit 77 without a Vulkan device, or with LEONIDA_RT_AS=khr. No game files.
 #include "../shims/d3d12_com.h"
@@ -291,8 +295,9 @@ int main(int argc, char** argv) {
         return tris + "]";
     };
     const std::string tris = triangles_json(soup);
+    // ALLOW_UPDATE: never paired, since a refit rewrites the leaves one triangle each ("pairs": false)
     if (!dump(blas_rb.p, blas_info.ResultDataMaxSizeInBytes, "d3d12_blas",
-              "{\"kind\": \"blas\", \"address\": " + std::to_string(blas->GetGPUVirtualAddress()) +
+              "{\"kind\": \"blas\", \"pairs\": false, \"box16\": false, \"address\": " + std::to_string(blas->GetGPUVirtualAddress()) +
                   ", \"triangles\": " + tris + "}\n"))
         return fail("BLAS readback");
     std::string inst = "[";
@@ -335,7 +340,7 @@ int main(int argc, char** argv) {
     if (event) CloseHandle(event);
     if (!updated) return fail("the update did not complete");
     if (!dump(blas_rb.p, blas_info.ResultDataMaxSizeInBytes, "d3d12_blas_update",
-              "{\"kind\": \"blas\", \"address\": " + std::to_string(blas->GetGPUVirtualAddress()) +
+              "{\"kind\": \"blas\", \"pairs\": false, \"address\": " + std::to_string(blas->GetGPUVirtualAddress()) +
                   ", \"triangles\": " + triangles_json(moved) + "}\n"))
         return fail("BLAS readback after the update");
 
@@ -378,9 +383,12 @@ int main(int argc, char** argv) {
         std::memcpy(sizes, p, sizeof sizes);
         info_rb->Unmap(0, nullptr);
     }
-    // the builds are exactly their prebuild size, so the compacted size is that size
-    if (sizes[0] != blas_info.ResultDataMaxSizeInBytes || sizes[1] != tlas_info.ResultDataMaxSizeInBytes ||
-        sizes[2] != tlas_info.ResultDataMaxSizeInBytes) {
+    // A build's size is the nodes it wrote, within the prebuild size (room for the most a tree of that many
+    // elements can have), and it is already as small as it gets: COMPACTED_SIZE and CURRENT_SIZE are that size. The
+    // same TLAS built twice has the same tree.
+    auto fits = [](UINT64 size, UINT64 max) { return size && size % 64 == 0 && size <= max; };
+    if (!fits(sizes[0], blas_info.ResultDataMaxSizeInBytes) || !fits(sizes[1], tlas_info.ResultDataMaxSizeInBytes) ||
+        sizes[2] != sizes[1]) {
         std::fprintf(stderr, "postbuild sizes %llu %llu %llu, prebuild %llu %llu\n",
                      static_cast<unsigned long long>(sizes[0]), static_cast<unsigned long long>(sizes[1]),
                      static_cast<unsigned long long>(sizes[2]),
@@ -403,6 +411,91 @@ int main(int argc, char** argv) {
               "{\"kind\": \"blas\", \"address\": " + std::to_string(compacted->GetGPUVirtualAddress()) +
                   ", \"triangles\": " + triangles_json(moved) + "}\n"))
         return fail("compacted BLAS readback");
+
+    // ---- MINIMIZE_MEMORY: the same BLAS with BOX16 nodes (half boxes, 64 bytes a node instead of 128). Prebuild
+    // info must already count the smaller nodes, and an update with the same flags must refit them as BOX16 ----
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS box16_inputs = blas_inputs;
+    box16_inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY;
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO box16_info{};
+    device->GetRaytracingAccelerationStructurePrebuildInfo(&box16_inputs, &box16_info);
+    if (!box16_info.ResultDataMaxSizeInBytes || box16_info.ResultDataMaxSizeInBytes >= blas_info.ResultDataMaxSizeInBytes)
+        return fail("MINIMIZE_MEMORY prebuild size is not below the default one");
+    Ref<ID3D12Resource> box16_blas, box16_rb;
+    if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, box16_info.ResultDataMaxSizeInBytes, as_state, uav,
+                           box16_blas.put())) ||
+        FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, box16_info.ResultDataMaxSizeInBytes,
+                           D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, box16_rb.put())))
+        return fail("MINIMIZE_MEMORY buffers", hr);
+    if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset for MINIMIZE_MEMORY");
+    build = {};
+    build.Inputs = box16_inputs;
+    build.DestAccelerationStructureData = box16_blas->GetGPUVirtualAddress();
+    build.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+    list->BuildRaytracingAccelerationStructure(&build, 1, &compacted_desc);   // its COMPACTED_SIZE, at info + 0
+    list->ResourceBarrier(1, &barrier);
+    list->CopyBufferRegion(box16_rb.p, 0, box16_blas.p, 0, box16_info.ResultDataMaxSizeInBytes);
+    list->CopyBufferRegion(info_rb.p, 0, info.p, 0, 8);
+    if (!submit(5)) return fail("MINIMIZE_MEMORY submission");
+    UINT64 box16_size = 0;
+    {
+        void* p = nullptr;
+        if (FAILED(info_rb->Map(0, nullptr, &p))) return fail("Map postbuild (MINIMIZE_MEMORY)");
+        std::memcpy(&box16_size, p, 8);
+        info_rb->Unmap(0, nullptr);
+    }
+    // the nodes the build wrote and the spare unit, within the prebuild size and below the BOX32 build's own size
+    if (!box16_size || box16_size % 64 || box16_size > box16_info.ResultDataMaxSizeInBytes || box16_size >= sizes[0])
+        return fail("MINIMIZE_MEMORY postbuild size");
+    if (!dump(box16_rb.p, box16_info.ResultDataMaxSizeInBytes, "d3d12_blas_box16",
+              "{\"kind\": \"blas\", \"pairs\": false, \"box16\": true, \"address\": " +
+                  std::to_string(box16_blas->GetGPUVirtualAddress()) +
+                  ", \"triangles\": " + triangles_json(moved) + "}\n"))
+        return fail("MINIMIZE_MEMORY BLAS readback");
+    // the soup moves back to where it started, and the BOX16 BLAS is refitted in place
+    if (FAILED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped)))) return fail("Map upload (MINIMIZE_MEMORY)");
+    std::memcpy(mapped + (soup_va - upload->GetGPUVirtualAddress()), soup.data(), std::size_t(soup_bytes));
+    upload->Unmap(0, nullptr);
+    if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset for the BOX16 update");
+    build.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+    build.SourceAccelerationStructureData = box16_blas->GetGPUVirtualAddress();
+    list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+    list->ResourceBarrier(1, &barrier);
+    list->CopyBufferRegion(box16_rb.p, 0, box16_blas.p, 0, box16_info.ResultDataMaxSizeInBytes);
+    if (!submit(6)) return fail("BOX16 update submission");
+    if (!dump(box16_rb.p, box16_info.ResultDataMaxSizeInBytes, "d3d12_blas_box16_update",
+              "{\"kind\": \"blas\", \"pairs\": false, \"box16\": true, \"address\": " +
+                  std::to_string(box16_blas->GetGPUVirtualAddress()) +
+                  ", \"triangles\": " + tris + "}\n"))
+        return fail("BOX16 BLAS readback after the update");
+    std::printf("d3d12_xdxr_rt: MINIMIZE_MEMORY BLAS %llu bytes (BOX16)\n", static_cast<unsigned long long>(box16_size));
+
+    // ---- a BLAS that will not be updated (no ALLOW_UPDATE): sibling triangles that share an edge are paired into
+    // TRI0/TRI1 leaves. Pairing changes neither the layout nor the size ----
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS static_inputs = blas_inputs;
+    static_inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO static_info{};
+    device->GetRaytracingAccelerationStructurePrebuildInfo(&static_inputs, &static_info);
+    if (static_info.ResultDataMaxSizeInBytes != blas_info.ResultDataMaxSizeInBytes)
+        return fail("a BLAS without ALLOW_UPDATE has another prebuild size");
+    Ref<ID3D12Resource> static_blas, static_rb;
+    if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, static_info.ResultDataMaxSizeInBytes, as_state, uav,
+                           static_blas.put())) ||
+        FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, static_info.ResultDataMaxSizeInBytes,
+                           D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, static_rb.put())))
+        return fail("static BLAS buffers", hr);
+    if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset for the static BLAS");
+    build = {};
+    build.Inputs = static_inputs;
+    build.DestAccelerationStructureData = static_blas->GetGPUVirtualAddress();
+    build.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+    list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+    list->ResourceBarrier(1, &barrier);
+    list->CopyBufferRegion(static_rb.p, 0, static_blas.p, 0, static_info.ResultDataMaxSizeInBytes);
+    if (!submit(7)) return fail("static BLAS submission");
+    if (!dump(static_rb.p, static_info.ResultDataMaxSizeInBytes, "d3d12_blas_paired",
+              "{\"kind\": \"blas\", \"pairs\": true, \"address\": " +
+                  std::to_string(static_blas->GetGPUVirtualAddress()) + ", \"triangles\": " + tris + "}\n"))
+        return fail("static BLAS readback");
     std::printf("d3d12_xdxr_rt: BLAS %llu bytes (prebuild %llu), TLAS (prebuild %llu), written to %s\n",
                 static_cast<unsigned long long>(blas_info.ResultDataMaxSizeInBytes),
                 static_cast<unsigned long long>(blas_info.ResultDataMaxSizeInBytes),

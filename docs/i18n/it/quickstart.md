@@ -26,7 +26,7 @@ Il progetto è in fase iniziale: **il gioco non si avvia ancora**.
 
 - **La tua copia** del pacchetto Xbox Series, versione `1.0.2.1` (la cartella che contiene `MicrosoftGame.Config`
   e gli archivi `.rpf` come file normali su disco).
-- **Windows 10/11 x64** con circa **350 GB liberi** per i file di lavoro (possono stare su un altro disco con
+- **Windows 10/11 x64** con circa **400 GB liberi** per i file di lavoro (possono stare su un altro disco con
   `--work`).
 - [Python 3.12+](https://www.python.org/downloads/) (spunta «Add python.exe to PATH»).
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
@@ -111,7 +111,7 @@ avvio non devono essere compilati. La traduzione degli shader è il passaggio pi
   `--no-float-controls`, `--bary-fallback` (GPU senza `VK_KHR_fragment_shader_barycentric`),
   `--texel-offset-fallback` (GPU senza `VK_KHR_maintenance8`) e `--mesh-compute` (GPU senza
   `VK_EXT_mesh_shader`). Sono documentate in [`docs/design.md`](../../design.md).
-- **`--work`**: conviene puntarlo a un disco con almeno 350 GB liberi.
+- **`--work`**: conviene puntarlo a un disco con almeno 400 GB liberi.
 - **`--wav`**: disattivato di default perché il WAV PCM a 16 bit occupa molto più dell'Ogg Opus.
 - **Linux e Wine/Proton**: `make_game.py` funziona anche su Linux. Per la fase `runtime` fuori da Windows passa
   `--runtime-build <cartella>` con una build Windows (`gta6rt.exe` e `gta6rt_tls_host.dll`, per esempio

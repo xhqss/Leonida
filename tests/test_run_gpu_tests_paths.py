@@ -3,6 +3,7 @@
 import io
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -119,6 +120,32 @@ class RelativePaths(unittest.TestCase):
             for got, want in ((seen["build"], build), (seen["work"], Path(tmp) / "work")):
                 self.assertTrue(os.path.isabs(got), got)
                 self.assertEqual(Path(got).resolve(), want.resolve())
+
+
+class WorkDirectory(unittest.TestCase):
+    def test_file_blocking_work_directory_is_a_cli_error(self):
+        ext = ".exe" if os.name == "nt" else ""
+        for blocked_child in ("", "spirv"):
+            with self.subTest(blocked_child=blocked_child), tempfile.TemporaryDirectory() as tmp:
+                build = Path(tmp) / "build"
+                build.mkdir()
+                for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS:
+                    (build / (tool + ext)).touch()
+                work = Path(tmp) / "work"
+                blocker = work / blocked_child
+                blocker.parent.mkdir(exist_ok=True)
+                blocker.write_text("keep me", encoding="utf-8")
+
+                result = subprocess.run(
+                    [sys.executable, "-I", run_gpu_tests.__file__, "--build", str(build),
+                     "--work", str(work), "--filter", "cs_lds"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("error: cannot prepare GPU test directory", result.stderr)
+                self.assertIn(str(blocker), result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(blocker.read_text(encoding="utf-8"), "keep me")
 
 
 class BuildConfigurations(unittest.TestCase):

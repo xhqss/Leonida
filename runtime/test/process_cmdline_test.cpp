@@ -204,6 +204,27 @@ int main() {
         }
     }
 
+    // The game thread that ends a run must park, not ExitProcess, even when run_entry has already returned and
+    // cleared the run: main.cpp still prints "game exited with code N" and cleans up after it. On one CPU the
+    // host preempts the game thread right after SetEvent(g_done), and Sleep lets the game thread run again before
+    // the next run starts. A thread that exits the process here ends this test with code 77 before its last line.
+    {
+        auto returns_77 = +[](void*) -> DWORD { return 77; };
+        DWORD_PTR process_mask = 0, system_mask = 0;
+        GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask);
+        SetProcessAffinityMask(GetCurrentProcess(), process_mask & (~process_mask + 1));  // its lowest CPU
+        for (int i = 0; i < 50; ++i) {
+            const int code = rt::process::run_entry(reinterpret_cast<void*>(returns_77), 64 << 10);
+            if (code != 77) {
+                std::fprintf(stderr, "FAIL run %d of an entry point returning 77 returned %d\n", i, code);
+                ++failures;
+                break;
+            }
+            Sleep(1);
+        }
+        SetProcessAffinityMask(GetCurrentProcess(), process_mask);
+    }
+
     if (failures) return 1;
     std::printf("process_cmdline: GetCommandLineW parses back to __wargv, non-ASCII arguments intact (code page %u); "
                 "the WinMain line and the kernelbase/API-set names are the game's\n",

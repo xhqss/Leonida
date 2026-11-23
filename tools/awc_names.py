@@ -159,13 +159,17 @@ def _files(path: str):
 
 
 def read_words(path: str) -> list:
-    """Words from a text file (one per line) or a hashdict.py JSON object."""
+    """Words from a text file (one per line), a hashdict.py JSON object or a JSON list of words."""
     with open(path, "rb") as fh:
         head = fh.read(1).lstrip()
     if path.lower().endswith(".json") or head == b"{":
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
-        return [str(v) for v in (doc.values() if isinstance(doc, dict) else doc)]
+        if isinstance(doc, dict):
+            return [str(v) for v in doc.values()]
+        if isinstance(doc, list):
+            return [str(v) for v in doc]
+        raise ValueError(f"expected a JSON object of hash -> word or a list of words, got {type(doc).__name__}")
     with open(path, encoding="utf-8", errors="replace") as fh:
         return [line.strip() for line in fh if line.strip()]
 
@@ -320,14 +324,26 @@ def source_labels(sources):
     return labels
 
 
+def positive_int(text):
+    """--min-token: a count of dictionary words a token must appear in, at least 1. 0 or a negative silently
+    turned the common-token filter off, since every token passes tokens[t] >= min_token."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("banks", nargs="+", help="an .awc file, a bank directory, or JSON from awc_manifest.py or rpf9dump audio")
     ap.add_argument("--words", action="append", default=[], help="word list or hashdict.py JSON (repeatable)")
     ap.add_argument("--conversations", action="append", default=[],
                     help="file or directory with conversation key/label pairs (repeatable)")
-    ap.add_argument("--min-token", type=int, default=MIN_TOKEN,
-                    help="dictionary words a family base token must appear in (default 5)")
+    ap.add_argument("--min-token", type=positive_int, default=MIN_TOKEN,
+                    help="dictionary words a family base token must appear in (default 5, at least 1)")
     ap.add_argument("--out", help="names.csv or names.json; default is a summary only")
     a = ap.parse_args(argv)
     if not a.words and not a.conversations:

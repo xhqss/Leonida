@@ -22,7 +22,13 @@ def ref_alignbyte(s0, s1, s2):
     return ((((s0 & MASK32) << 32) | (s1 & MASK32)) >> (8 * (s2 & 3))) & MASK32
 
 
-def run(s0, s1, s2, form="vgpr"):
+def run(s0, s1, s2, form="vgpr", dst=None):
+    """dst: None for a fresh v0, or 0/1/2 to write the result over S0/S1/S2 (vgpr form) and export that register."""
+    if dst is not None:
+        lines = [f"v_mov_b32 v1, {s0:#x}", f"v_mov_b32 v2, {s1:#x}", f"v_mov_b32 v3, {s2 & MASK32:#x}",
+                 f"v_alignbyte_b32 v{dst + 1}, v1, v2, v3", f"exp mrt0 v{dst + 1}, v{dst + 1}, v{dst + 1}, v{dst + 1} done vm",
+                 "s_endpgm"]
+        return support.mrt0_words(support.translate_lines("ps_alignbyte", lines))[0]
     if form == "vgpr":
         setup = [f"v_mov_b32 v1, {s0:#x}", f"v_mov_b32 v2, {s1:#x}", f"v_mov_b32 v3, {s2 & MASK32:#x}"]
         srcs = "v1, v2, v3"
@@ -71,6 +77,20 @@ class AlignByte(unittest.TestCase):
                 self.assertEqual(run(s0, s1, s2, "sgpr"), want)
             with self.subTest(name, form="inline"):
                 self.assertEqual(run(s0, s1, s2, "inline"), want)
+
+    def test_inline_shift_above_three(self):
+        # Immediate shifts 4 and 5 use only the low two bits (0 and 1); a mask of 7 would give other words.
+        for shift, want in ((4, 0x12345678), (5, 0xF0123456), (6, 0xDEF01234), (7, 0xBCDEF012)):
+            self.assertEqual(ref_alignbyte(0x9ABCDEF0, 0x12345678, shift), want)
+            with self.subTest(shift=shift):
+                self.assertEqual(run(0x9ABCDEF0, 0x12345678, shift, "inline"), want)
+
+    def test_destination_overlaps_each_source(self):
+        # Distinct operand values, so a destination that is cleared or overwritten before a source is read changes D.
+        for name, s0, s1, s2, want in CASES:
+            for dst, what in ((0, "S0"), (1, "S1"), (2, "S2 (the shift)")):
+                with self.subTest(name, dst=what):
+                    self.assertEqual(run(s0, s1, s2, dst=dst), want)
 
     def test_random_operands(self):
         rng = random.Random(0x616C676E)

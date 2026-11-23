@@ -597,7 +597,12 @@ def main(argv=None):
     finally:
         if oracle:
             oracle.close()
-    return 1 if failures else 0
+    if failures:
+        return 1
+    if not counts["pass"]:   # nothing was compared: every program was skipped
+        print("no program ran: every one was skipped")
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

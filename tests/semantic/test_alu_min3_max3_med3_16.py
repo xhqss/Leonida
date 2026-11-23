@@ -448,30 +448,30 @@ class Float16SpecialsAndModsTests(unittest.TestCase):
             self.assertTrue(math.isnan(f16_to_float(got_all_nan & MASK16)))
 
     def test_source_and_output_modifiers(self):
-        # Input neg/abs apply to the selected half; omod (mul:2/mul:4/div:2) runs before clamp [0, 1].
+        # Input neg/abs apply to the selected half; on RDNA2 omod is ignored for f16 with denorms kept; clamp applies [0, 1].
         w1 = float_to_f16_bits(-3.0) << 16 | float_to_f16_bits(0.5)
         w2 = float_to_f16_bits(0.25) << 16 | float_to_f16_bits(-2.0)
         w3 = float_to_f16_bits(-0.125) << 16 | float_to_f16_bits(4.0)
 
-        # neg(|v1.hi|) = -3.0, |v2.lo| = +2.0, v3.hi = -0.125 -> min = -3.0 -> div:2 = -1.5
+        # neg(|v1.hi|) = -3.0, |v2.lo| = +2.0, v3.hi = -0.125 -> min = -3.0 (div:2 ignored on RDNA2)
         got_div2 = run_insn(
             "v_min3_f16",
             (w1, w2, w3),
             src_mods={0: "-|{}|", 1: "|{}|"},
             tail_mods="op_sel:[1,0,1,0] div:2",
         )
-        self.assertEqual(got_div2, merge_half(float_to_f16_bits(-1.5), 0))
+        self.assertEqual(got_div2, merge_half(float_to_f16_bits(-3.0), 0))
 
-        # min(|v1.lo|=0.5, v2.hi=0.25, -v3.hi=0.125) = 0.125 -> mul:4 = 0.5 -> clamp = 0.5 (hi half)
+        # min(|v1.lo|=0.5, v2.hi=0.25, -v3.hi=0.125) = 0.125 (mul:4 ignored on RDNA2, clamp keeps 0.125) (hi half)
         got_mul4_clamp = run_insn(
             "v_min3_f16",
             (w1, w2, w3),
             src_mods={0: "|{}|", 2: "-{}"},
             tail_mods="op_sel:[0,1,1,1] mul:4 clamp",
         )
-        self.assertEqual(got_mul4_clamp, merge_half(float_to_f16_bits(0.5), 1))
+        self.assertEqual(got_mul4_clamp, merge_half(float_to_f16_bits(0.125), 1))
 
-        # max(v1.lo=0.5, v2.hi=0.25, v3.lo=4.0) = 4.0 -> div:2 = 2.0 -> clamp = 1.0
+        # max(v1.lo=0.5, v2.hi=0.25, v3.lo=4.0) = 4.0 -> div:2 ignored on RDNA2 -> clamp = 1.0
         got_max_clamp = run_insn(
             "v_max3_f16",
             (w1, w2, w3),

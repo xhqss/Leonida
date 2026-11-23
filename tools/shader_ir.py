@@ -192,7 +192,8 @@ def parse_line(line):
     if parts and len(parts[0].split()) == 2:
         parts = parts[0].split() + parts[1:]
     args = [operand(a) for a in parts]
-    if op.startswith(("v_add_f64", "v_cvt_f32_f64", "v_trunc_f64", "v_ceil_f64",
+    if op.startswith(("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64",
+                      "v_frexp_mant_f64", "v_frexp_exp_i32_f64", "v_trunc_f64", "v_ceil_f64",
                       "v_rndne_f64", "v_floor_f64")):
         for src, spelling in zip(args[1:], parts[1:]):
             # LLVM prints inline integers in decimal and the separate literal dword in hex,
@@ -209,6 +210,9 @@ def parse_file(path):
     m = HDR.match(lines[0]) if lines else None
     pc = int(m.group(2), 16) if m else 0
     info["code_start"] = pc
+    # the end of the code range the header declares (exclusive), None without a header: undecodable words can sit
+    # between the last printed instruction and it
+    info["code_end"] = int(m.group(3), 16) if m else None
     start = 1 if (lines and not lines[0].startswith("\t")) else 0
     for ln in lines[start:]:
         if ln.startswith("; ---"):

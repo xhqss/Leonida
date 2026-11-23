@@ -284,7 +284,10 @@ class TestCli(unittest.TestCase):
                         out = os.path.join(os.path.dirname(target), "..", "nested", os.path.basename(target))
                     elif alias == "hardlink":
                         out = os.path.join(tmp, "names.csv")
-                        os.link(target, out)
+                        try:
+                            os.link(target, out)
+                        except (OSError, NotImplementedError) as e:
+                            self.skipTest(f"hard links unavailable: {e}")
                     else:
                         out = target
                     err = io.StringIO()
@@ -339,6 +342,31 @@ class TestCli(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(A.main(["/nonexistent", "--words", "/nonexistent.txt"]), 2)
 
+    def test_min_token_below_one_is_rejected(self):
+        # --min-token counts the dictionary words a token must appear in. 0 or a negative used to pass
+        # type=int and silently disable the common-token filter (every token passes tokens[t] >= min_token).
+        with tempfile.TemporaryDirectory() as tmp:
+            bank = write(os.path.join(tmp, "b.awc"), make_bank(["abc_01", "abc_02", "abc_03"]))
+            words = write(os.path.join(tmp, "w.txt"), "abc_01\nabc_02\nabc_03\n")
+            for bad in ("0", "-1", "-5"):
+                with self.subTest(min_token=bad):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        with self.assertRaises(SystemExit) as cm:
+                            A.main([bank, "--words", words, "--min-token", bad])
+                    self.assertEqual(cm.exception.code, 2)
+                    self.assertIn("at least 1", err.getvalue())
+                    self.assertNotIn("Traceback", err.getvalue())
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([bank, "--words", words, "--min-token", "x"])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertNotIn("Traceback", err.getvalue())
+            # 1 is the smallest meaningful value and still runs.
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(A.main([bank, "--words", words, "--min-token", "1"]), 0)
+
     @unittest.skipUnless(sys.platform == "win32", "the exclusive-lock repro needs Windows")
     def test_locked_words_input_reports_rc_2_without_traceback(self):
         # An exclusively locked (share-none) existing file passes the os.path.exists check, so the
@@ -371,6 +399,27 @@ class TestCli(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertIn("cannot read", err.getvalue())
             self.assertNotIn("Traceback", err.getvalue())
+
+    def test_scalar_json_words_report_rc_2_without_traceback(self):
+        # A JSON scalar is neither a hashdict object nor a word list: one error line, exit 2. A string
+        # must not be read as one word per character.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "o.csv")
+            for doc in ("42", "null", "true", '"abc"'):
+                with self.subTest(doc=doc):
+                    words = write(os.path.join(tmp, "words.json"), doc)
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        rc = A.main([tmp, "--words", words, "--out", out])
+                    self.assertEqual(rc, 2)
+                    self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
+                    self.assertIn("awc_names: error: cannot read", err.getvalue())
+                    self.assertFalse(os.path.exists(out))
+
+    def test_json_word_list_still_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(os.path.join(tmp, "words.json"), json.dumps(["a_word", 2]))
+            self.assertEqual(A.read_words(path), ["a_word", "2"])
 
 
 if __name__ == "__main__":

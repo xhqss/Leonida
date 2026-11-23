@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -41,6 +42,7 @@ class PartialFailure(unittest.TestCase):
     def test_every_process_ran(self):
         code, out = bench({})
         self.assertEqual(code, 0, out)
+        self.assertIn("65535 workgroups", out)
         self.assertIn("emulated output equals the reference", out)
 
     def test_emulated_config_fails_on_its_second_process(self):
@@ -57,6 +59,24 @@ class PartialFailure(unittest.TestCase):
 
 
 class HarnessError(unittest.TestCase):
+    def test_harness_is_found_in_a_cmake_configuration_subdirectory(self):
+        executable = "vk_compute_test.exe" if os.name == "nt" else "vk_compute_test"
+        output = "bench ms: median=1.0 min=0.9 max=1.1\nbench out fnv1a: abc\n4 groups x 64: 0 mismatches\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = Path(tmp) / "RelWithDebInfo" / executable
+            harness.parent.mkdir()
+            harness.touch()
+            argv = ["bench_wave64.py", "--build", tmp, "--procs", "1"]
+            with patch.object(bench_wave64, "build", return_value="test.spv"), \
+                    patch.object(bench_wave64, "segments", return_value=None), \
+                    patch.object(bench_wave64.subprocess, "run") as launch, \
+                    patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+                launch.return_value.stdout = output
+                launch.return_value.stderr = ""
+                launch.return_value.returncode = 0
+                self.assertEqual(bench_wave64.main(), 0)
+            self.assertEqual([call.args[0][0] for call in launch.call_args_list], [str(harness)] * 3)
+
     def test_missing_binary_reports_failure(self):
         with patch.object(bench_wave64, "build", lambda work, name, emulate, llvm_mc: "x.spv"), \
                 patch.object(bench_wave64, "segments", lambda spv: None), \

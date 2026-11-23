@@ -1,5 +1,6 @@
-﻿# Builds runtime\build\gta6rt.exe with MSVC at BelowNormal priority, on half the cores by default.
-# Uses VS's CMake + Ninja when the "C++ CMake tools" component is installed, otherwise calls cl.exe directly.
+﻿﻿# Builds runtime\build\gta6rt.exe with MSVC at BelowNormal priority, on half the cores by default.
+# Uses VS's CMake + Ninja when the "C++ CMake tools" component is installed (or native Windows cmake + ninja on PATH),
+# otherwise calls cl.exe directly.
 # The GameInput controller shim (SDL3, docs/gameinput.md) is built only on the CMake path: with an installed SDL3, or
 # with -FetchSdl3, which lets CMake download the pinned SDL3 release. The cl.exe fallback never builds it.
 param(
@@ -8,6 +9,30 @@ param(
     [ValidateRange(1, 2147483647)][int]$jobs = [Math]::Max(1, [int]([Environment]::ProcessorCount / 2))
 )
 $ErrorActionPreference = "Stop"
+
+function Invoke-ToolProbe([string]$Exe, [string[]]$ProbeArgs) {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $global:LASTEXITCODE = 0
+        $text = (& $Exe @ProbeArgs 2>$null) -join "`n"
+        if ($LASTEXITCODE -eq 0) { return $text }
+    } catch {
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    return $null
+}
+
+function Find-BuildTool([string]$Preferred, [string]$CommandName, [scriptblock]$Validate) {
+    if ($Preferred -and (Test-Path $Preferred)) { return $Preferred }
+    foreach ($cmd in @(Get-Command $CommandName -CommandType Application -All -ErrorAction SilentlyContinue)) {
+        if ($cmd.Source -and ($cmd.Source -match "\.(exe|cmd|bat)$") -and (Test-Path $cmd.Source) -and (& $Validate $cmd.Source)) {
+            return $cmd.Source
+        }
+    }
+    return ""
+}
 
 $root = Split-Path $PSScriptRoot -Parent
 $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
@@ -20,22 +45,30 @@ $out = Join-Path $src "build"
 New-Item -ItemType Directory -Force $out | Out-Null
 
 $cmakeDir = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake"
-$cmake = Join-Path $cmakeDir "CMake\bin\cmake.exe"
-$ninja = Join-Path $cmakeDir "Ninja\ninja.exe"
+# Skip MSYS/devkitPro cmake on PATH (docs/design.md): native Windows builds advertise Visual Studio + Ninja generators.
+$cmake = Find-BuildTool (Join-Path $cmakeDir "CMake\bin\cmake.exe") "cmake" {
+    param($p)
+    $help = Invoke-ToolProbe $p @("--help")
+    ($null -ne $help) -and ($help -match "Visual Studio") -and ($help -match "\bNinja\b")
+}
+$ninja = Find-BuildTool (Join-Path $cmakeDir "Ninja\ninja.exe") "ninja" {
+    param($p)
+    $null -ne (Invoke-ToolProbe $p @("--version"))
+}
 $cfg = if ($Debug) { "Debug" } else { "RelWithDebInfo" }
 $sdl = if ($FetchSdl3) { "-DLEONIDA_SDL3_FETCH=ON" } else { "" }
 # With VULKAN_SDK set, a configure that still finds no Vulkan headers fails instead of dropping the Vulkan D3D12 device.
 $vk = if ($env:VULKAN_SDK) { "-DLEONIDA_REQUIRE_VULKAN=ON" } else { "" }
 
-if ((Test-Path $cmake) -and (Test-Path $ninja)) {
+if ($cmake -and $ninja) {
     $body = @"
-"$cmake" -S "$src" -B "$out" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=$cfg $sdl $vk || exit /b 1
-"$cmake" --build "$out" -j $jobs || exit /b 1
+call "$cmake" -S "$src" -B "$out" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=$cfg $sdl $vk || exit /b 1
+call "$cmake" --build "$out" -j $jobs || exit /b 1
 "@
 } else {
     # Keep this list in step with runtime\CMakeLists.txt. Optional parts that need a dependency are left out here:
     # the GameInput shim (SDL3), so controllers go through the host's GameInput.dll, if any, as without the shim.
-    Write-Warning "VS C++ CMake tools not found: building with cl.exe directly, without the GameInput shim (SDL3). Install the CMake tools component to get it."
+    Write-Warning "CMake and Ninja weren't found (neither VS C++ CMake tools nor native PATH tools): building with cl.exe directly, without the GameInput shim (SDL3). Install CMake + Ninja or VS's CMake tools component to get it."
     $xtaskqueueDir = Join-Path $root "third_party\xtaskqueue"
     $xtaskqueueFiles = "Source\Task\TaskQueue.cpp", "Source\Task\AsyncLib.cpp", "Source\Task\ThreadPool_win32.cpp", "Source\Task\WaitTimer_win32.cpp" | ForEach-Object { "`"$xtaskqueueDir\$_`"" }
     $files = "src\main.cpp", "src\pe_loader.cpp", "shims\registry.cpp", "shims\file_system.cpp", "shims\xmem.cpp", "shims\d3d12_xs.cpp", "shims\d3d12_xs_device.cpp", "shims\d3d12_xs_rootsig.cpp", "shims\xgameruntime.cpp", "shims\xgameruntime_user.cpp", "shims\xgameruntime_gamesave.cpp", "shims\xgameruntime_store.cpp", "shims\xgameruntime_offline.cpp", "shims\winhttp_offline.cpp", "shims\library_loader.cpp", "shims\process.cpp" | ForEach-Object { "`"$src\$_`"" }

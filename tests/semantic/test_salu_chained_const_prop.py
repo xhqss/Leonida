@@ -11,7 +11,8 @@ Verifies:
 - s_andn2, s_orn2, s_nand, s_nor, s_xnor bitwise logic constant tracking in sgpr_imm.
 - s_abs_i32, s_absdiff_i32, s_sext_i32_i8/i16 constant tracking in sgpr_imm.
 - s_pack_*_b32_b16 and s_bfm_b32 constant tracking in sgpr_imm.
-- s_buffer_load offset computed through chained SALU folds into a static load without branch diamonds.
+- s_buffer_load offset computed through chained SALU folds into a static load without branch diamonds, and the
+  load reads the word at the folded offset.
 - v_bfe constant folding.
 """
 
@@ -33,6 +34,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import rdna2spirv  # noqa: E402
+import support  # noqa: E402
 
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
@@ -53,6 +55,12 @@ class ChainedScalarConstPropTests(unittest.TestCase):
                 warnings.simplefilter("ignore", ResourceWarning)
                 return rdna2spirv.translate(s_path)
 
+    def assert_loads_offset(self, spv: str, offset: int) -> None:
+        # Each buffer word holds 0xA000 + its byte offset, so a wrong fold that stays in bounds still reads the wrong
+        # word. SMEM ignores the low two offset bits.
+        memory = {off: 0xA000 + off for off in range(0, 4096, 4)}
+        self.assertEqual(support.mrt0_words(spv, memory=memory)[0], 0xA000 + (offset & ~3))
+
     def test_chained_propagation_and_folding(self):
         # s_mov_b32 -> s_lshl_b32 -> s_add_u32 -> s_buffer_load_dword chains completely into static load
         lines = [
@@ -71,6 +79,7 @@ class ChainedScalarConstPropTests(unittest.TestCase):
         self.assertNotIn("OpSelectionMerge", spv)
         self.assertNotIn("OpBranchConditional", spv)
         self.assertNotIn("OpPhi", spv)
+        self.assert_loads_offset(spv, 1056)
         self.assertIn("OpLoad %uint", spv)
 
     def test_s_add_u32_and_s_sub_u32_folding(self):
@@ -87,6 +96,7 @@ class ChainedScalarConstPropTests(unittest.TestCase):
         self.assertNotIn("OpSelectionMerge", spv_add)
         self.assertNotIn("OpBranchConditional", spv_add)
         self.assertNotIn("OpPhi", spv_add)
+        self.assert_loads_offset(spv_add, 48)
 
         # Chained subtraction into buffer offset: 80 - 16 = 64
         lines_sub = [
@@ -101,6 +111,7 @@ class ChainedScalarConstPropTests(unittest.TestCase):
         self.assertNotIn("OpSelectionMerge", spv_sub)
         self.assertNotIn("OpBranchConditional", spv_sub)
         self.assertNotIn("OpPhi", spv_sub)
+        self.assert_loads_offset(spv_sub, 64)
 
     def test_s_lshl_add_u32_folding(self):
         # D = (S0 << N) + S1. (0x10 << 2) + 0x5 = 0x45 (69)
@@ -116,6 +127,7 @@ class ChainedScalarConstPropTests(unittest.TestCase):
         self.assertNotIn("OpSelectionMerge", spv)
         self.assertNotIn("OpBranchConditional", spv)
         self.assertNotIn("OpPhi", spv)
+        self.assert_loads_offset(spv, 69)
         self.assertIn("OpLoad %uint", spv)
 
     def test_s_bfe_u32_and_i32_constant_folding(self):
@@ -157,6 +169,7 @@ class ChainedScalarConstPropTests(unittest.TestCase):
         self.assertNotIn("OpSelectionMerge", spv)
         self.assertNotIn("OpBranchConditional", spv)
         self.assertNotIn("OpPhi", spv)
+        self.assert_loads_offset(spv, 64)
 
     def test_s_andn2_orn2_nand_nor_xnor_folding(self):
         # Chained bitwise into buffer offset: 0xFF & ~0xBF = 0x40 (64)
@@ -172,6 +185,7 @@ class ChainedScalarConstPropTests(unittest.TestCase):
         self.assertNotIn("OpSelectionMerge", spv)
         self.assertNotIn("OpBranchConditional", spv)
         self.assertNotIn("OpPhi", spv)
+        self.assert_loads_offset(spv, 64)
 
     def test_s_abs_and_absdiff_and_sext_folding(self):
         # Chained absdiff into buffer offset: |10 - 74| = 64
@@ -187,6 +201,7 @@ class ChainedScalarConstPropTests(unittest.TestCase):
         self.assertNotIn("OpSelectionMerge", spv)
         self.assertNotIn("OpBranchConditional", spv)
         self.assertNotIn("OpPhi", spv)
+        self.assert_loads_offset(spv, 64)
 
     def test_s_pack_and_bfm_folding(self):
         # Chained bfm into buffer offset: ((1 << 4) - 1) << 2 = 15 << 2 = 60
@@ -202,6 +217,7 @@ class ChainedScalarConstPropTests(unittest.TestCase):
         self.assertNotIn("OpSelectionMerge", spv)
         self.assertNotIn("OpBranchConditional", spv)
         self.assertNotIn("OpPhi", spv)
+        self.assert_loads_offset(spv, 60)
 
     def test_s_buffer_load_chained_offset_folding(self):
         # Compute buffer offset through chained SALU:
@@ -224,6 +240,7 @@ class ChainedScalarConstPropTests(unittest.TestCase):
         self.assertNotIn("OpSelectionMerge", spv)
         self.assertNotIn("OpBranchConditional", spv)
         self.assertNotIn("OpPhi", spv)
+        self.assert_loads_offset(spv, 96)
         # OpLoad is emitted directly
         self.assertIn("OpLoad %uint", spv)
 

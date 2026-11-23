@@ -39,6 +39,28 @@ class ArgumentTypes(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(argparse.ArgumentTypeError):
                 rdna2spirv._shard_arg(text)
 
+    def test_max_structured_depth(self):
+        self.assertEqual(rdna2spirv._depth_arg("0"), 0)
+        self.assertEqual(rdna2spirv._depth_arg("64"), 64)
+        for text in ("-1", "x", "", "1.5"):
+            with self.subTest(text=text), self.assertRaises(argparse.ArgumentTypeError):
+                rdna2spirv._depth_arg(text)
+
+    def test_max_structured_depth_sets_the_bound(self):
+        # SHADER-427: the option replaces MAX_STRUCTURED_DEPTH for the run; without it the default is 64, written out
+        # here rather than read from the module so that changing the default fails this test.
+        self.assertEqual(rdna2spirv.MAX_STRUCTURED_DEPTH, 64)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(rdna2spirv, "MAX_STRUCTURED_DEPTH", rdna2spirv.MAX_STRUCTURED_DEPTH):
+            for extra, expected in (([], 64), (["--max-structured-depth", "0"], 0),
+                                    (["--max-structured-depth", "40"], 40)):
+                with self.subTest(extra=extra), \
+                        mock.patch.object(sys, "argv", [TOOL, tmp, "--out", os.path.join(tmp, "o")] + extra), \
+                        redirect_stdout(io.StringIO()):
+                    rdna2spirv.MAX_STRUCTURED_DEPTH = 64
+                    rdna2spirv.main()
+                    self.assertEqual(rdna2spirv.MAX_STRUCTURED_DEPTH, expected)
+
 
 class SourceDiscovery(unittest.TestCase):
     """The src argument is a .s file or a folder of .s files; other names are not inputs."""
@@ -66,7 +88,7 @@ class SourceDiscovery(unittest.TestCase):
             out = os.path.join(tmp, "spirv")
             # The .s suffix matters: without isfile() a missing shader path would be trusted as a file.
             p = subprocess.run([sys.executable, "-I", TOOL, os.path.join(tmp, "absent.s"), "--out", out],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(p.returncode, 2, p.stderr)
             self.assertIn("not a .s file or a folder of .s files", p.stderr)
             self.assertNotIn("Traceback", p.stderr)
@@ -78,7 +100,7 @@ class SourceDiscovery(unittest.TestCase):
             src = os.path.join(tmp, "shader.s")
             os.mkdir(src)
             p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", os.path.join(tmp, "spirv")],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(p.returncode, 0, p.stderr)
             self.assertNotIn("Traceback", p.stderr)
             self.assertIn("0 shaders:", p.stdout)
@@ -146,7 +168,7 @@ class SourceDiscovery(unittest.TestCase):
             src = os.path.join(tmp, "notes.txt")
             Path(src).write_text("not a shader", encoding="utf-8")
             p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", os.path.join(tmp, "spirv")],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(p.returncode, 2, p.stderr)
             self.assertNotIn("Traceback", p.stderr)
 
@@ -166,7 +188,7 @@ class CommandLine(unittest.TestCase):
                 out = os.path.join(tmp, "spirv")
                 with self.subTest(args=args):
                     p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", out, *args],
-                                       capture_output=True, text=True)
+                                       capture_output=True, text=True, errors="replace")
                     self.assertEqual(p.returncode, 2)
                     self.assertIn(message, p.stderr)
                     self.assertNotIn("Traceback", p.stderr)
@@ -184,7 +206,7 @@ class OutputFolderValidation(unittest.TestCase):
 
     def run_tool(self, out, *extra, timeout=None):
         return subprocess.run([sys.executable, "-I", TOOL, str(self.src), "--out", os.fspath(out), *extra],
-                              capture_output=True, text=True, timeout=timeout)
+                              capture_output=True, text=True, errors="replace", timeout=timeout)
 
     def assert_usage_error(self, p, message):
         self.assertEqual(p.returncode, 2, p.stderr)
@@ -439,7 +461,7 @@ class EmptyShader(unittest.TestCase):
             with open(os.path.join(tmp, "ps_empty.dxbc"), "wb") as f:
                 f.write(b"DXBC" + bytes(28))
             out = os.path.join(tmp, "spirv")
-            p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", out], capture_output=True, text=True)
+            p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", out], capture_output=True, text=True, errors="replace")
             self.assertEqual(p.returncode, 0, p.stderr)
             self.assertIn("0 translated", p.stdout, p.stdout)
             self.assertIn("no instructions (nothing tab-indented?)", p.stdout, p.stdout)

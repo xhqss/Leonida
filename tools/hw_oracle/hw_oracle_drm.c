@@ -7,11 +7,12 @@
  *   name@offset/rsrc1/rsrc2/wave[:threads[:words]]
  *     offset        where the kernel starts in code.bin, a multiple of 256
  *     rsrc1, rsrc2  COMPUTE_PGM_RSRC1 and COMPUTE_PGM_RSRC2 from the kernel's descriptor: its register counts and
- *                   float mode, and its user and system SGPRs (drm.py reads them out of the assembled object)
+ *                   float mode, and its user and system SGPRs. drm.py reads them out of the assembled object and
+ *                   puts the descriptor's group segment into RSRC2's LDS_SIZE field, which the assembler leaves 0
  *     wave          32 or 64, from the descriptor too
  * Each kernel gets what the Windows launcher (hw_oracle.c) gives it: s[0:1] points at an 8-byte kernarg holding
- * the address of a <words> dword buffer pre-filled with 0xDEAD0000, and it runs as one workgroup of `threads`
- * threads (1..1024), started the way its descriptor says.
+ * the address of a <words> dword buffer pre-filled with 0xDEAD0000 (1..16384 words), and it runs as one workgroup
+ * of `threads` threads (1..1024), started the way its descriptor says.
  * Output, one line per kernel:  <name> <hex word> ...   The first line is "# device=<name> arch=<gfxNNNN> ...".
  * Exit 0 ok, 77 no usable device, 2 usage, 3 failure (a kernel that does not finish within five seconds is one:
  * the kernel driver then resets the GPU).
@@ -103,7 +104,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     const unsigned words = (unsigned)strtoul(argv[2], NULL, 0);
-    if (words < 1 || words > 4096) { fprintf(stderr, "words must be 1..4096\n"); return 2; }
+    if (words < 1 || words > 16384) { fprintf(stderr, "words must be 1..16384\n"); return 2; }
 
     const int fd = open(argv[3], O_RDWR);
     if (fd < 0) { perror(argv[3]); return 77; }

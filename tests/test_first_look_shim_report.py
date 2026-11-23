@@ -18,15 +18,17 @@ class FirstLookShimReportTest(unittest.TestCase):
         source = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            # every tool first_look.ps1 runs (gdk_runtime_calls since round 43, find_hash_lookup for mods,
-            # exe_checklist for the notes to confirm)
+            # Every tool first_look.ps1 runs: a missing one fails its step, and the test's stand-in loader (an alias)
+            # leaves that exit code in $LASTEXITCODE for the script's exit. (gdk_runtime_calls since round 43,
+            # find_hash_lookup for mods, exe_checklist for the notes to confirm.)
             for name in ("scripts/first_look.ps1", "tools/pe_inspect.py", "tools/gdk_runtime_calls.py",
-                         "tools/find_hash_lookup.py", "tools/exe_checklist.py"):
+                         "tools/gdk_runtime_classes.json", "tools/find_hash_lookup.py", "tools/exe_checklist.py"):
                 (root / name).parent.mkdir(exist_ok=True)
                 shutil.copyfile(source / name, root / name)
             loader = root / "runtime/build/gta6rt.exe"
             loader.parent.mkdir(parents=True)
             loader.touch()
+            loader.with_name("gta6rt_tls_host.dll").touch()
             (root / "fixture.exe").write_bytes(build_image().replace(b"xmem.dll", b"demo.dll"))
             # The report depends on the real PE inspection. Echo the dry-run arguments
             # in place of a native loader so the test needs no runtime build.
@@ -46,6 +48,7 @@ Set-Alias -Name (Join-Path $PWD 'runtime\build\gta6rt.exe') -Value Write-Output
                      "-Command", script], cwd=root, env=env, capture_output=True, timeout=30,
                 )
                 self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertTrue((reports / "fixture.exe.gdk_calls.json").is_file(), run.stdout)
                 imports = json.loads((reports / "fixture.exe.json").read_text("utf-8"))["imports"]
                 return {entry["dll"].lower() for entry in imports if entry["where"] == "shim"}
 

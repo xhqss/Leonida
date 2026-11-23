@@ -121,6 +121,16 @@ class TestScanAndWrite(unittest.TestCase):
         self.assertEqual(rows[0]["frames"], 7)
         self.assertEqual(summary["streams"], 1)
 
+    def test_nested_sources_use_slashes_and_sort_alike_everywhere(self):
+        # "movies/x.bk2" sorts before "movies0.bk2" ("/" < "0"); with "\" it would sort after.
+        os.mkdir(os.path.join(self.dir, "movies"))
+        for name, frames in (("movies0.bk2", 3), (os.path.join("movies", "x.bk2"), 5)):
+            with open(os.path.join(self.dir, name), "wb") as fh:
+                fh.write(make_stream(frames=frames))
+        rows, _summary = bink.scan_target(self.dir)
+        self.assertEqual([(r["source"], r["frames"]) for r in rows],
+                         [("movies/x.bk2", 5), ("movies0.bk2", 3), ("one.bk2", 7)])
+
     def test_short_file_bytes_are_accounted_for(self):
         path = os.path.join(self.dir, "tiny.bk2")
         with open(path, "wb") as fh:
@@ -130,6 +140,35 @@ class TestScanAndWrite(unittest.TestCase):
         self.assertEqual(summary["span"], 20)
         self.assertEqual(summary["unread_bytes"], 20)
         self.assertEqual(summary["zero_padding"], 0)
+
+    def rpf(self, trailer_size, trailer, magic=b"9FPR"):
+        """A synthetic RPF9: header (data start 0x40, +12 = trailer_size), one stream, 100 zeros, the trailer."""
+        header = magic + struct.pack("<III", 0x40, 0x30, trailer_size) + bytes(0x30)
+        path = os.path.join(self.dir, "synthetic.rpf")
+        with open(path, "wb") as fh:
+            fh.write(header + make_stream(frames=3) + bytes(100) + trailer)
+        return path
+
+    def test_rpf_trailer_after_the_last_stream(self):
+        rows, summary = bink.scan_target(self.rpf(48, bytes(range(1, 49))))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((summary["zero_padding"], summary["rpf_trailer"], summary["unread_bytes"]), (100, 48, 0))
+
+    def test_rpf_trailer_longer_than_the_gap_is_not_split_off(self):
+        rows, summary = bink.scan_target(self.rpf(4096, bytes(range(1, 49))))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((summary["zero_padding"], summary["rpf_trailer"], summary["unread_bytes"]), (0, 0, 148))
+
+    def test_only_an_rpf9_header_declares_a_trailer(self):
+        # An RPF8-style or other "?FPR" header still gives the data start, but its +12 is not a measured trailer.
+        rows, summary = bink.scan_target(self.rpf(48, bytes(range(1, 49)), magic=b"8FPR"))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((summary["zero_padding"], summary["rpf_trailer"], summary["unread_bytes"]), (0, 0, 148))
+
+    def test_a_trailer_size_that_is_not_a_multiple_of_16_is_not_split_off(self):
+        rows, summary = bink.scan_target(self.rpf(47, bytes(range(1, 48))))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((summary["zero_padding"], summary["rpf_trailer"], summary["unread_bytes"]), (0, 0, 147))
 
     def test_fractional_rates_are_indexed(self):
         path = os.path.join(self.dir, "fractional.bk2")
@@ -226,6 +265,25 @@ class TestCommandLine(unittest.TestCase):
                              [f"bink_index: error: cannot read {source}: input is locked"])
             self.assertFalse(os.path.exists(out))
 
+    def test_incomplete_directory_walk_does_not_replace_the_report(self):
+        target = self.tmp.name
+        blocked = os.path.join(target, "blocked")
+        out = os.path.join(target, "report.json")
+        with open(out, "wb") as f:
+            f.write(b"old report")
+
+        def walk(root, onerror=None):
+            yield root, ["blocked"], ["one.bk2"]
+            if onerror:
+                onerror(PermissionError(13, "directory is locked", blocked))
+
+        with mock.patch.object(bink.os, "walk", walk), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(bink.main([target, "--out", out]), 2)
+        self.assertIn(f"cannot read {blocked}: directory is locked", err.getvalue())
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), b"old report")
+
     def test_output_write_failure_is_an_error(self):
         for extension in ("csv", "json"):
             with self.subTest(extension=extension):
@@ -236,6 +294,19 @@ class TestCommandLine(unittest.TestCase):
                 self.assertEqual(out.getvalue(), "")
                 self.assertIn(f"cannot write {path}", err.getvalue())
 
+
+    def test_output_cannot_create_a_report_in_place_of_the_carve_manifest(self):
+        # <target>/index.json is the carve manifest's name even before a carve has written it.
+        carve = os.path.join(self.tmp.name, "carve_no_manifest")
+        os.makedirs(carve, exist_ok=True)
+        manifest = os.path.join(carve, "index.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bink.main([carve, "--out", manifest])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("would overwrite the carve manifest", err.getvalue())
+        self.assertFalse(os.path.exists(manifest))
 
     def test_output_cannot_overwrite_carve_manifest(self):
         carve = os.path.join(self.tmp.name, "carve")

@@ -374,6 +374,20 @@ class ScanTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_summary_write_failure_is_one_error_line(self) -> None:
+        # --out naming a directory: IsADirectoryError/PermissionError on most systems. The input half
+        # of main already answers with one ERROR line; the write half must too.
+        target = os.path.join(self.tmp.name, "as-a-directory")
+        os.makedirs(target)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = T.main([self.rpf, "--entities", self.entities, "--out", target])
+        self.assertEqual(rc, 2)
+        self.assertIn("ERROR: cannot write", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertNotIn("IsADirectoryError", err.getvalue())
+        self.assertNotIn("PermissionError", err.getvalue())
+
     def test_lights_out_uses_posn_when_position120_is_absent(self) -> None:
         archive = os.path.join(self.tmp.name, "posn-only.rpf")
         write_rpf(archive, [light_resource(posn_only=True), map_resource(posn_only=True)])
@@ -474,6 +488,30 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(summary["placement"]["archetype_lights_placed"], 4)
         xs = sorted(r["position"][0] for r in rows if r["owner"] == "archetype")
         self.assertEqual(xs, [0.0, 0.0, 50.0, 50.0])
+
+    def test_cli_rejects_report_aliasing_an_input(self):
+        with open(self.rpf, "rb") as f:
+            rpf_bytes = f.read()
+        with open(self.entities, "rb") as f:
+            entities_bytes = f.read()
+        cases = [
+            (["--out", self.rpf], "--out must use a different path than archive"),
+            (["--out", self.entities], "--out must use a different path than --entities"),
+            (["--lights-out", self.rpf], "--lights-out must use a different path than archive"),
+            (["--lights-out", self.entities], "--lights-out must use a different path than --entities"),
+        ]
+        for args, msg in cases:
+            err = io.StringIO()
+            with mock.patch.object(T, "scan", side_effect=AssertionError("scan started before rejecting the alias")) as scan, \
+                    contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                T.main([self.rpf, "--entities", self.entities] + args)
+            scan.assert_not_called()
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn(msg, err.getvalue())
+        with open(self.rpf, "rb") as f:
+            self.assertEqual(f.read(), rpf_bytes)
+        with open(self.entities, "rb") as f:
+            self.assertEqual(f.read(), entities_bytes)
 
     def test_light_export_preserves_zero_entity_scale(self) -> None:
         write_rpf(self.rpf, [light_resource(), map_resource(scale_xy=0.0, scale_z=0.0)])

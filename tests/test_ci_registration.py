@@ -180,6 +180,37 @@ def job_of(root: str, rel: str, rules: tuple[str, str, str, str, str]) -> str | 
     return None
 
 
+DOCS_ONLY_STEP = "Check documentation when only documentation changed"
+# The tests that read only the documents. `check` is skipped for a docs-only pull request, so the docs-only step
+# of `change-scope` is the one place they run for it.
+DOCUMENT_TESTS = ("tests/test_docs_*.py", "tests/test_i18n_index.py")
+
+
+def docs_only_patterns(root):
+    """The test files or globs the docs-only step runs, exactly as the workflow spells them."""
+    text = read(root, WORKFLOW)
+    start = text.find("- name: " + DOCS_ONLY_STEP)
+    if start < 0:
+        raise AssertionError(
+            f"ci.yml no longer has the step '{DOCS_ONLY_STEP}'; update tests/test_ci_registration.py together "
+            "with the workflow")
+    # The step ends at the next line indented no deeper than its own "- name:": another step, or another job.
+    end = re.compile(r"^ {0,6}\S", re.M).search(text, text.index("\n", start))
+    # A commented-out command is the usual way a test stops running: shell comments don't count. (`#` starts one
+    # at the beginning of a line or after a space, as in bash.)
+    lines = [re.sub(r"(^|\s)#.*", "", line) for line in text[start:end.start() if end else len(text)].splitlines()]
+    return re.findall(r"tests/[\w*./-]+\.py", "\n".join(lines))
+
+
+def document_tests_not_run_for_docs_only(root, files):
+    """Document tests the docs-only step does not run, and names in the step that match no tracked file."""
+    patterns = docs_only_patterns(root)
+    wanted = [f for f in files if any(matches_nonrecursive_glob(f, p) for p in DOCUMENT_TESTS)]
+    missing = [f for f in wanted if not any(matches_nonrecursive_glob(f, p) for p in patterns)]
+    stale = [p for p in patterns if not any(matches_nonrecursive_glob(f, p) for f in files)]
+    return missing, stale
+
+
 def defines_a_test(source, require_test_case=False):
     """Would the runner find a test here? TestCase subclasses (through local bases) and test* functions.
 
@@ -207,6 +238,9 @@ def defines_a_test(source, require_test_case=False):
         if isinstance(node, ast.ClassDef) and is_test_case(node.name):
             if any(isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test")
                    for item in node.body):
+                return True
+            # a mixin imported from another module (tests/semantic/f16_unary_cases.py's UnaryF16) brings its tests
+            if any(b not in bases and b not in ("TestCase", "object") for b in bases[node.name]):
                 return True
         if not require_test_case and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
                 and node.name.startswith("test"):
@@ -246,6 +280,19 @@ def spirv_tools_problem(workflow, gated):
     if not re.search(r"LEONIDA_REQUIRE_SPIRV_TOOLS:[^\n]*['\"]1['\"]", job):
         problems.append("it never sets LEONIDA_REQUIRE_SPIRV_TOOLS to 1")
     return "; ".join(problems) or None
+
+
+def spirv_using_stdlib_files(root, files, rules):
+    """Files the standard-library loop runs that call spirv-as / spirv-val only when they are installed."""
+    return [rel for rel in files if job_of(root, rel, rules) == "stdlib"
+            and re.search(r"which\(\s*[\"']spirv-(?:as|val)[\"']", read(root, rel))]
+
+
+def stdlib_loop_jobs_with_spirv_tools(workflow):
+    """Jobs that `apt-get install` spirv-tools and run the standard-library loop (`python -I "$t"`)."""
+    jobs = re.findall(r"^  ([A-Za-z0-9_-]+):\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", workflow, re.M | re.S)
+    return [name for name, job in jobs if re.search(r'python\s+-I\s+"\$t"', job)
+            and re.search(r"apt-get\s+install[^\n]*\bspirv-tools\b", job)]
 
 
 def has_main_guard(source):
@@ -335,6 +382,16 @@ class RepositoryRegistrationTest(unittest.TestCase):
                           str(problem) + ".\nInstall spirv-tools on the Linux leg and set LEONIDA_REQUIRE_SPIRV_TOOLS "
                           "to '1' there (see tests/semantic/test_spirv_tools_required.py).")
 
+    def test_a_job_runs_the_spirv_using_stdlib_files_with_spirv_tools(self):
+        # The check job's Windows runner has no SPIRV-Tools, so these files skip their spirv-val checks there.
+        used = spirv_using_stdlib_files(ROOT, self.files, self.rules)
+        self.assertIn("tests/test_split_big_switch.py", used)
+        workflow = read(ROOT, WORKFLOW)
+        self.assertEqual(stdlib_loop_jobs_with_spirv_tools(workflow.replace("spirv-tools", "curl")), [])
+        self.assertTrue(stdlib_loop_jobs_with_spirv_tools(workflow), "no job in ci.yml installs SPIRV-Tools and "
+                        "runs the standard-library loop, so the spirv-val checks of these files never run:\n  " +
+                        "\n  ".join(used))
+
     def test_the_spirv_tools_check_flags_a_job_that_installs_nothing(self):
         workflow = read(ROOT, WORKFLOW)
         gated = ["tests/semantic/test_fma_khr.py"]
@@ -350,6 +407,54 @@ class RepositoryRegistrationTest(unittest.TestCase):
                                      "LEONIDA_REQUIRE_SPIRV_TOOLS: ${{ runner.os == 'Linux' && 'yes' || 'no' }}")
         self.assertNotEqual(no_switch, workflow)
         self.assertIn("never sets LEONIDA_REQUIRE_SPIRV_TOOLS", spirv_tools_problem(no_switch, gated) or "")
+
+    def test_a_docs_only_pull_request_runs_every_document_test(self):
+        # `check` is skipped when only documents changed, so a document test left out of the docs-only step never
+        # sees the pull request that breaks it: the pull request is green and `main` fails after the merge.
+        missing, stale = document_tests_not_run_for_docs_only(ROOT, self.files)
+        self.assertEqual(missing, [], f"the '{DOCS_ONLY_STEP}' step in ci.yml does not run: " + ", ".join(missing))
+        self.assertEqual(stale, [], "that step names test files that do not exist: " + ", ".join(stale))
+        # The step runs them with `python3 -I`: each has to be a standard-library script with a main guard.
+        ran = [f for f in self.files if any(matches_nonrecursive_glob(f, p) for p in docs_only_patterns(ROOT))]
+        self.assertGreaterEqual(len(ran), 5, ran)
+        for rel in ran:
+            with self.subTest(file=rel):
+                self.assertEqual(job_of(ROOT, rel, self.rules), "stdlib")
+                self.assertTrue(has_main_guard(read(ROOT, rel)))
+
+    def test_the_scan_flags_a_document_test_the_docs_only_step_leaves_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, ".github", "workflows"))
+            files = ["tests/test_docs_links.py", "tests/test_docs_design_rows.py", "tests/test_i18n_index.py",
+                     "tests/test_other.py"]
+
+            def workflow(run_lines):
+                with open(os.path.join(tmp, WORKFLOW), "w", encoding="utf-8") as f:
+                    f.write("jobs:\n  change-scope:\n    steps:\n"
+                            f"      - name: {DOCS_ONLY_STEP}\n        run: |\n"
+                            + "".join(f"          {line}\n" for line in run_lines)
+                            + "  check:\n    steps:\n      - run: python -I tests/test_other.py\n")
+
+            # The step as it was: two files by name. The design-rows test is a document test it never ran.
+            workflow(["python3 -I tests/test_docs_links.py", "python3 -I tests/test_i18n_index.py"])
+            self.assertEqual(document_tests_not_run_for_docs_only(tmp, files),
+                             (["tests/test_docs_design_rows.py"], []))
+            workflow(["for t in tests/test_docs_*.py tests/test_i18n_index.py; do", "  python3 -I \"$t\" || exit 1",
+                      "done"])
+            self.assertEqual(document_tests_not_run_for_docs_only(tmp, files), ([], []))
+            # A name that matches nothing: bash would hand the literal pattern to python3 and the step would fail.
+            workflow(["python3 -I tests/test_docs_links.py", "python3 -I tests/test_docs_gone.py"])
+            self.assertEqual(document_tests_not_run_for_docs_only(tmp, files),
+                             (["tests/test_docs_design_rows.py", "tests/test_i18n_index.py"],
+                              ["tests/test_docs_gone.py"]))
+            # The step is read up to the next step or job, not to the end of the file.
+            self.assertNotIn("tests/test_other.py", docs_only_patterns(tmp))
+            # A commented-out command does not run: neither a whole line nor the rest of a line after ` #`.
+            workflow(["# for t in tests/test_docs_*.py tests/test_i18n_index.py; do", "echo skipped",
+                      "python3 -I tests/test_docs_links.py  # python3 -I tests/test_i18n_index.py"])
+            self.assertEqual(docs_only_patterns(tmp), ["tests/test_docs_links.py"])
+            self.assertEqual(document_tests_not_run_for_docs_only(tmp, files),
+                             (["tests/test_docs_design_rows.py", "tests/test_i18n_index.py"], []))
 
     def test_the_scan_flags_an_unlisted_file_and_a_file_pytest_cannot_collect(self):
         with tempfile.TemporaryDirectory() as tmp:

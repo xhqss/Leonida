@@ -6,6 +6,7 @@
 // LEONIDA_VK_VALIDATION=1 runs the test-made device under VK_LAYER_KHRONOS_validation; any validation error fails
 // the test.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 
@@ -193,6 +194,52 @@ int check_held_cpu_signal(ID3D12Device* device, ID3D12CommandQueue* queue) {
     EXPECT(SUCCEEDED(gate->Signal(2)));
     EXPECT(SUCCEEDED(f->SetEventOnCompletion(50, nullptr)));
     EXPECT(f->GetCompletedValue() == 50);
+
+    // A cross-queue Wait held in QueueHolds for a deferred CPU Signal must wake when the dispatcher applies it.
+    D3D12_COMMAND_QUEUE_DESC desc{};
+    Ref<ID3D12CommandQueue> queue_b;
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue_b.p))));
+    Ref<ID3D12Fence> done;
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done.p))));
+
+    EXPECT(SUCCEEDED(queue->Wait(gate.p, 3)));
+    EXPECT(SUCCEEDED(queue->Signal(f.p, 60)));
+    EXPECT(SUCCEEDED(queue_b->Wait(f.p, 70)));
+    EXPECT(SUCCEEDED(queue_b->Signal(done.p, 1)));
+    EXPECT(SUCCEEDED(f->Signal(70)));
+    Event done_ev;
+    EXPECT(SUCCEEDED(done->SetEventOnCompletion(1, done_ev.h)));
+    EXPECT(!done_ev.set_within(50));
+    EXPECT(done->GetCompletedValue() == 0);
+    EXPECT(SUCCEEDED(gate->Signal(3)));
+    if (!done_ev.set_within(5000)) {
+        std::fprintf(stderr, "held CPU signal did not wake QueueHolds: f=%llu done=%llu\n",
+                     static_cast<unsigned long long>(f->GetCompletedValue()),
+                     static_cast<unsigned long long>(done->GetCompletedValue()));
+        return 1;
+    }
+    EXPECT(done->GetCompletedValue() == 1);
+    EXPECT(f->GetCompletedValue() == 70);
+
+    // Same release when the Wait is queued while the CPU signal is already held behind the GPU signal.
+    EXPECT(SUCCEEDED(queue->Wait(gate.p, 4)));
+    EXPECT(SUCCEEDED(queue->Signal(f.p, 80)));
+    EXPECT(SUCCEEDED(f->Signal(90)));
+    EXPECT(SUCCEEDED(queue_b->Wait(f.p, 90)));
+    EXPECT(SUCCEEDED(queue_b->Signal(done.p, 2)));
+    Event done_ev2;
+    EXPECT(SUCCEEDED(done->SetEventOnCompletion(2, done_ev2.h)));
+    EXPECT(!done_ev2.set_within(50));
+    EXPECT(done->GetCompletedValue() == 1);
+    EXPECT(SUCCEEDED(gate->Signal(4)));
+    if (!done_ev2.set_within(5000)) {
+        std::fprintf(stderr, "already-held CPU signal did not wake QueueHolds: f=%llu done=%llu\n",
+                     static_cast<unsigned long long>(f->GetCompletedValue()),
+                     static_cast<unsigned long long>(done->GetCompletedValue()));
+        return 1;
+    }
+    EXPECT(done->GetCompletedValue() == 2);
+    EXPECT(f->GetCompletedValue() == 90);
     return 0;
 }
 
@@ -235,7 +282,8 @@ int check_custom_heap_properties(ID3D12Device* device) {
 
     // The host runtime on a NUMA adapter (the answer the layer gives in D3D12_FEATURE_ARCHITECTURE) must agree.
     Ref<ID3D12Device> host;
-    if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+    if (hostwine::host_is_wine() ||
+        FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
         std::printf("GetCustomHeapProperties: no host D3D12 device to compare with\n");
         return 0;
     }

@@ -389,7 +389,7 @@ class WorldArgumentTest(unittest.TestCase):
                     result = subprocess.run(
                         [sys.executable, "-I", str(VIEWER / "serve.py"), "--port", "0",
                          "--world", str(path)],
-                        capture_output=True, text=True, timeout=5)
+                        capture_output=True, text=True, errors="replace", timeout=5)
                     self.assertEqual(result.returncode, 2)
                     self.assertIn("--world", result.stderr)
                     self.assertIn(str(path), result.stderr)
@@ -413,7 +413,7 @@ class PortArgumentTest(unittest.TestCase):
     def test_the_cli_reports_a_bad_port_without_a_traceback(self):
         result = subprocess.run(
             [sys.executable, "-I", str(VIEWER / "serve.py"), "--port", "70000"],
-            capture_output=True, text=True)
+            capture_output=True, text=True, errors="replace")
         self.assertEqual(result.returncode, 2)
         self.assertIn("must be 0-65535", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
@@ -425,7 +425,7 @@ class PortArgumentTest(unittest.TestCase):
             port = taken.getsockname()[1]
             result = subprocess.run(
                 [sys.executable, "-I", str(VIEWER / "serve.py"), "--port", str(port)],
-                capture_output=True, text=True, timeout=60)
+                capture_output=True, text=True, errors="replace", timeout=60)
         self.assertEqual(result.returncode, 2)
         self.assertIn(f"can't listen on port {port}", result.stderr)
         self.assertIn("--port 0", result.stderr)
@@ -484,7 +484,7 @@ class PortArgumentTest(unittest.TestCase):
         # A test runner started in the background has SIGINT ignored, and a child inherits that: Python then
         # leaves it ignored and Ctrl+C would never arrive. Give the child the default disposition back.
         proc = subprocess.Popen([sys.executable, "-I", str(VIEWER / "serve.py"), "--port", "0"],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace",
                                 preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
         try:
             self.assertIn("viewer: http://127.0.0.1:", proc.stdout.readline())   # it is serving now

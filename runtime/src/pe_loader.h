@@ -50,7 +50,8 @@ struct Module {
     // __declspec(thread) reads; it is not a TlsAlloc slot. The loader reserves distinct indices by loading
     // gta6rt_tls_host.dll (and cloning it on demand for additional simultaneous TLS modules, up to 16 at a time).
     // Every thread started after load() gets its own copy through the helper's DLL_THREAD_ATTACH, and gives it back
-    // at DLL_THREAD_DETACH; install_tls_for_thread() is for threads that already existed.
+    // at DLL_THREAD_DETACH. A thread that was already running gets its copy from load() itself, as it would from
+    // Windows for a DLL Windows loads: a block, no DLL_THREAD_ATTACH, and DLL_THREAD_DETACH when it ends.
     uint32_t tls_index = kNoTlsIndex;
     uint32_t tls_slot = kNoTlsIndex;   // index into the loader's reserved TLS-host slot pool
     uint64_t tls_generation = 0;       // unique token per TLS initialisation, distinguishing reused slots/addresses
@@ -104,11 +105,11 @@ public:
     void run_tls_callbacks(Module& m, uint32_t reason);
 
     // Installs/removes this module's template copy in the calling thread's TEB slot. load() does this for its caller
-    // and the thread events for threads started after it; both are no-ops on a thread that already has this module's
-    // copy. Call install on a thread that existed before load(), before mapped code runs there, and uninstall before
-    // that thread exits. Each module's copy sits in its own TEB slot, so one thread can hold copies of several
-    // modules. These do not run TLS callbacks (use
-    // run_tls_callbacks with DLL_THREAD_ATTACH/DETACH for that).
+    // and for every other thread running at the time, and the thread events for threads started after it, so on any
+    // of those both are no-ops. They remain for a thread load() could not reach (pe_loader.cpp, "Threads that
+    // existed before load()", lists the cases): install before mapped code runs there, uninstall before the thread
+    // exits. Each module's copy sits in its own TEB slot, so one thread can hold copies of several modules. These do
+    // not run TLS callbacks (use run_tls_callbacks with DLL_THREAD_ATTACH/DETACH for that).
     void install_tls_for_thread(Module& m);
     void uninstall_tls_for_thread(Module& m);
 

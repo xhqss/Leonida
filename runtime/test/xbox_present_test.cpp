@@ -11,6 +11,7 @@
 // Set LEONIDA_VK_VALIDATION=1 for VK_LAYER_KHRONOS_validation; any validation error fails the test, except that
 // the NVIDIA layer's known sRGB-swapchain STORAGE check makes the run skip rather than pass or fail.
 #include "vk_test_device.h"
+#include "xbox_present_readback_size.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/xbox_present.h"
@@ -294,12 +295,18 @@ int main() {
             for (const auto& e : available) loader_has = loader_has || !std::strcmp(e.extensionName, "VK_EXT_swapchain_colorspace");
             auto standalone_presenter = rt::d3d12::create_window_presenter(standalone.p, window);
             if (standalone_presenter) {
-                EXPECT(rt::d3d12::device_has_swapchain_colorspace(standalone.p) == loader_has);
+                const bool colorspace_enabled = rt::d3d12::device_has_swapchain_colorspace(standalone.p);
+                EXPECT(colorspace_enabled == loader_has);
+                // The presenter owns the remaining reference to the device and its Vulkan instance.
+                standalone.reset();
                 EXPECT(standalone_presenter->enable_capture());
                 EXPECT(SUCCEEDED(standalone_presenter->present_blank(1)));
+                Frame frame;
+                EXPECT(standalone_presenter->read_back(frame.bytes, &frame.extent, &frame.format));
+                EXPECT(!frame.bytes.empty());
                 std::printf("standalone device (real instance path): VK_EXT_swapchain_colorspace %s on the instance (loader has it: %s)\n",
-                            rt::d3d12::device_has_swapchain_colorspace(standalone.p) ? "enabled" : "not enabled",
-                            loader_has ? "yes" : "no");
+                            colorspace_enabled ? "enabled" : "not enabled", loader_has ? "yes" : "no");
+                std::printf("standalone presenter: frame captured after releasing the caller's device reference\n");
             } else {
                 std::printf("standalone device: no window presenter (skipped the instance-extension check)\n");
             }
@@ -410,7 +417,8 @@ int main() {
         UINT want_w = width, want_h = height;  // the client size the frames are expected at (the resize case changes it)
         const auto grab = [&](Frame& frame) -> bool {
             return xbox.presenter().read_back(frame.bytes, &frame.extent, &frame.format) &&
-                   (want_w == 0 || (frame.extent.width == want_w && frame.extent.height == want_h));
+                   xbox_present_readback_size_matches(frame.bytes.size(), frame.extent.width, frame.extent.height,
+                                                     want_w, want_h);
         };
 
         const FLOAT blue_ish[4] = {0.2f, 0.6f, 0.9f, 1.0f};  // 51, 153, 230
@@ -1248,6 +1256,14 @@ int main() {
             EXPECT(fifo_only.presenter().read_back(frame.bytes, &frame.extent, &frame.format));
             EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
             std::printf("no tearing mode (LEONIDA_PRESENT_NO_TEAR): late frame waits for the vblank: ok\n");
+        }
+        // The device a title holds is the Xbox-ABI proxy, not `inner`: the presenter comes from it all the same
+        // (D3D-414: it used to be null, with nothing in the log).
+        {
+            auto from_proxy = rt::d3d12::create_window_presenter(device.p, window);
+            EXPECT(from_proxy && from_proxy->enable_capture());
+            EXPECT(SUCCEEDED(from_proxy->present_blank(1)));
+            std::printf("presenter from the Xbox device proxy: created, a blank frame presented: ok\n");
         }
         // Real time, 60 Hz: 30 frames cycling through three colours; tokens count up one per wait, each frame shows
         // the colour that was presented, and the loop takes about 30 vblanks.

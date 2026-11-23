@@ -1,14 +1,16 @@
-"""v_readfirstlane_b32 in a vertex shader takes the first active lane without OpGroupNonUniformBallotFindLSB.
+"""v_readfirstlane_b32 handles first-active lanes without crossing wave32 pixel halves.
 
     python -I tests/semantic/test_vs_readfirstlane.py
 
 A native (not --wave64-emulate) readfirstlane is a ballot of the EXEC lanes, its lowest set bit and a shuffle from
-that lane. MoltenVK lowers OpGroupNonUniformBallotFindLSB, like the SubgroupSize built-in, to Metal's
+that lane. A wave32 pixel shader selects the ballot word and physical lane for its own 32-lane half, since a
+fragment subgroup may contain two logical waves. MoltenVK lowers OpGroupNonUniformBallotFindLSB, like the SubgroupSize built-in, to Metal's
 `threads_per_simdgroup` input, which a vertex function can't declare ("invalid 'threads_per_simdgroup' attribute for
 input declaration in a vertex function", Apple M4, MoltenVK 1.4.2), so every VS with a readfirstlane failed to
-compile there. A vertex shader now takes the lowest set bit with FindILsb over the ballot's four words, which Metal
-accepts in a vertex function; other stages keep BallotFindLSB. A ballot has no bits at or above the subgroup size, so
-the two give the same lane (docs/design.md, the v_readfirstlane_b32 row).
+compile there. A vertex shader takes the lowest set bit with FindILsb over the ballot's four words, which Metal
+accepts in a vertex function; wave32 pixel shaders use the same word-wise operation to isolate a logical wave.
+Other stages keep BallotFindLSB. A ballot has no bits at or above the subgroup size, so the two give the same lane
+(docs/design.md, the v_readfirstlane_b32 row).
 
 Hand-written listings run on the strict wave interpreter (spirv_wave_interp.py) with vertex index = lane, with the
 first EXEC lane in each ballot word. No llvm-mc, GPU or game data.
@@ -97,12 +99,15 @@ class VertexReadFirstLane(unittest.TestCase):
         self.assertIn("OpGroupNonUniformBallot ", asm)
         self.assertIn("FindILsb", asm)
 
-    def test_a_pixel_shader_keeps_ballot_find_lsb(self):
+    def test_wave32_pixel_shader_selects_its_subgroup_half(self):
         lines = ["s_mov_b32 s10, exec_lo", "v_cmp_lt_u32_e32 vcc, 5, v2", "s_and_saveexec_b32 s12, vcc_lo",
                  "v_readfirstlane_b32 s20, v2", "s_mov_b32 exec_lo, s10", "v_mov_b32_e32 v6, s20",
                  "exp mrt0 v6, v6, v6, v6 done vm", "s_endpgm"]
         asm = translate_listing("ps_rfl", listing("ps", lines))
-        self.assertIn("OpGroupNonUniformBallotFindLSB", asm)
+        self.assertNotIn("OpGroupNonUniformBallotFindLSB", asm)
+        self.assertIn("FindILsb", asm)
+        self.assertRegex(asm, r"OpBitwiseAnd %uint %\w+ %c20")
+        self.assertIn("OpGroupNonUniformShuffle", asm)
 
 
 if __name__ == "__main__":

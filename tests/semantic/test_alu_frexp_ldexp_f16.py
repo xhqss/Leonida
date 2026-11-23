@@ -81,7 +81,7 @@ def run(line: str, v1: int, v2: int = 0, v0: int = 0) -> int:
     lines = [f"v_mov_b32 v1, {v1 & 0xFFFFFFFF:#x}", f"v_mov_b32 v2, {v2 & 0xFFFFFFFF:#x}",
              f"v_mov_b32 v0, {v0 & 0xFFFFFFFF:#x}", line]
     asm = "; test_frexp_ldexp_f16\n" + "".join(f"\t{ln}\n" for ln in lines) + "\texp mrt0 v0, v0, v0, v0 done vm\n\ts_endpgm\n"
-    with open(_SRC_PATH, "w", encoding="utf-8") as f:
+    with open(_SRC_PATH, "w", encoding="utf-8", newline="\n") as f:
         f.write(asm)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ResourceWarning)
@@ -227,10 +227,20 @@ class FrexpTests(unittest.TestCase):
         self.assertEqual(run("v_frexp_mant_f16_e64 v0, v1 clamp", 0xDEAD0000, v0=0xBEEF1234), 0xBEEF0000)
         self.assertEqual(run("v_frexp_mant_f16_e64 v0, v1 clamp", 0xDEAD0000 | f2h(0.5), v0=0xBEEF1234), 0xBEEF0000 | f2h(0.5))
 
-    def test_output_modifiers_are_rejected(self):
-        for line in ("v_frexp_mant_f16_e64 v0, v1 mul:2", "v_frexp_mant_f16_e64 v0, v1 div:2",
-                     "v_frexp_exp_i16_f16_e64 v0, v1 clamp", "v_frexp_exp_i16_f16_e64 v0, v1 mul:2"):
-            with self.subTest(line=line), self.assertRaises(rdna2spirv.Unsupported):
+    def test_output_modifiers(self):
+        # Under console MODE (denorm_mode_16_64 = 3), mul:2/mul:4/div:2 are hardware no-ops on frexp_mant_f16,
+        # clamp still saturates to [0.0, 1.0], and frexp_exp_i16_f16 ignores both clamp and omod.
+        for mod in ("mul:2", "mul:4", "div:2"):
+            with self.subTest(op="v_frexp_mant_f16", mod=mod):
+                self.assertEqual(run(f"v_frexp_mant_f16_e64 v0, v1 {mod}", f2h(1.0), v0=0xBEEF1234), 0xBEEF0000 | f2h(0.5))
+                self.assertEqual(run(f"v_frexp_mant_f16_e64 v0, v1 clamp {mod}", f2h(-1.0), v0=0xBEEF1234), 0xBEEF0000)
+                self.assertEqual(run(f"v_frexp_mant_f16_e64 v0, v1 clamp {mod}", 0x7C00, v0=0xBEEF1234), 0xBEEF3C00)
+        for mod in ("clamp", "mul:2", "mul:4", "div:2", "clamp mul:2", "clamp mul:4", "clamp div:2"):
+            with self.subTest(op="v_frexp_exp_i16_f16", mod=mod):
+                self.assertEqual(run(f"v_frexp_exp_i16_f16_e64 v0, v1 {mod}", f2h(8.0), v0=0xBEEF1234), 0xBEEF0004)
+        for line in ("v_frexp_mant_f16_e64 v0, v1 mul:8", "v_frexp_mant_f16_e64 v0, v1 op_sel_hi:[1,0]",
+                     "v_frexp_exp_i16_f16_e64 v0, v1 div:4", "v_frexp_exp_i16_f16_e64 v0, v1 neg_lo:[1]"):
+            with self.subTest(rejected=line), self.assertRaises(rdna2spirv.Unsupported):
                 run(line, f2h(1.0))
 
 
@@ -335,9 +345,18 @@ class LdexpTests(unittest.TestCase):
         self.assertEqual(run("v_ldexp_f16_e64 v0, v1, v2 clamp", 0xDEAD0000, 0, v0=0xBEEF1234), 0xBEEF0000)
         self.assertEqual(run("v_ldexp_f16_e64 v0, v1, v2 clamp", 0xDEAD0000 | f2h(0.5), 0, v0=0xBEEF1234), 0xBEEF0000 | f2h(0.5))
 
-    def test_output_modifiers_are_rejected(self):
-        for line in ("v_ldexp_f16_e64 v0, v1, v2 mul:2", "v_ldexp_f16_e64 v0, v1, v2 div:2"):
-            with self.subTest(line=line), self.assertRaises(rdna2spirv.Unsupported):
+    def test_output_modifiers(self):
+        # Under console MODE (denorm_mode_16_64 = 3), mul:2/mul:4/div:2 are hardware no-ops on v_ldexp_f16,
+        # while clamp applies [0.0, 1.0] saturation alone or combined with mul:*/div:*.
+        for mod in ("mul:2", "mul:4", "div:2"):
+            with self.subTest(mod=mod):
+                self.assertEqual(run(f"v_ldexp_f16_e64 v0, v1, v2 {mod}", f2h(0.5), 1, v0=0xBEEF1234), 0xBEEF3C00)
+                self.assertEqual(run(f"v_ldexp_f16_e64 v0, v1, v2 {mod}", f2h(1.0), 1, v0=0xBEEF1234), 0xBEEF4000)
+                self.assertEqual(run(f"v_ldexp_f16_e64 v0, v1, v2 clamp {mod}", f2h(1.0), 1, v0=0xBEEF1234), 0xBEEF3C00)
+                self.assertEqual(run(f"v_ldexp_f16_e64 v0, v1, v2 clamp {mod}", f2h(-1.0), 1, v0=0xBEEF1234), 0xBEEF0000)
+        for line in ("v_ldexp_f16_e64 v0, v1, v2 mul:8", "v_ldexp_f16_e64 v0, v1, v2 div:4",
+                     "v_ldexp_f16_e64 v0, v1, v2 neg_lo:[1,0]"):
+            with self.subTest(rejected=line), self.assertRaises(rdna2spirv.Unsupported):
                 run(line, f2h(1.0), 1)
 
 

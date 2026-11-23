@@ -601,6 +601,43 @@ class ArchiveAndCliTest(unittest.TestCase):
         self.assertEqual(table[0], odrp_7a.COLUMNS)
         self.assertEqual(len(table), 6)
 
+    def test_reports_can_be_replaced_inside_the_carve_folder(self):
+        folder = os.path.join(self.root, "carved")
+        os.mkdir(folder)
+        source = os.path.join(folder, "00000001.bin")
+        with open(source, "wb") as f:
+            f.write(self.meta_single)
+        for name in ("report.json", "report.csv"):
+            with self.subTest(name=name):
+                out = os.path.join(folder, name)
+                with open(out, "wb") as f:
+                    f.write(b"old report")
+                result = subprocess.run([sys.executable, "-I", TOOL, folder, out, "--quiet"],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                with open(out, "rb") as f:
+                    self.assertNotEqual(f.read(), b"old report")
+        with open(source, "rb") as f:
+            self.assertEqual(f.read(), self.meta_single)
+
+    def test_report_alias_to_a_binary_payload_is_rejected(self):
+        folder = os.path.join(self.root, "carved")
+        os.mkdir(folder)
+        source = os.path.join(folder, "00000001.bin")
+        alias = os.path.join(folder, "report.json")
+        with open(source, "wb") as f:
+            f.write(self.meta_single)
+        try:
+            os.link(source, alias)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(str(e))
+        result = subprocess.run([sys.executable, "-I", TOOL, folder, alias, "--quiet"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("would overwrite", result.stderr)
+        with open(source, "rb") as f:
+            self.assertEqual(f.read(), self.meta_single)
+
     def test_cli_validation_and_error_handling(self):
         # Bad numeric flags exit 2 without creating output.
         for flag, value, message in (

@@ -14,8 +14,9 @@
 ;   triangle node 0x40 (address 0x200, vertices (0,0,10) (1,0,10) (0,1,10)): the ray runs along z, so the vertices
 ;   relative to the origin project onto xy unsheared: A = (-0.25, -0.25), B = (0.75, -0.25), C = (-0.25, 0.75). The
 ;   edge functions are u = Cx By - Cy Bx = -0.5, v = Ax Cy - Ay Cx = -0.25 and w = Bx Ay - By Ax = -0.25, all of one
-;   sign (a hit); det = u + v + w = -1 and t = 10 (u + v + w) = -10. The result is (t / |det|, sign(det), v / |det|,
-;   w / |det|) = (-10, -1, -0.25, -0.25): out[4..7] = 0xc1200000 0xbf800000 0xbe800000 0xbe800000. The shader's
+;   sign (a hit); det = u + v + w = -1 and T = 10 (u + v + w) = -10. The result, as RDNA2 returns it, is
+;   k (T, det, v, w) with k = |d.z|^3 = 1, so (-10, -1, -0.25, -0.25): out[4..7] = 0xc1200000 0xbf800000 0xbe800000
+;   0xbe800000 (the same words natively on gfx1030, tests/semantic/test_image_bvh_tri_hw.py's cs_bvh row). The shader's
 ;   division by the second word gives t = 10 and the barycentrics 0.25, 0.25.
 v_cmpx_eq_u32_e32 0, v0
 v_mov_b32_e32 v2, 0x25

@@ -264,12 +264,17 @@ def solid_chain(layout, fmt=71, color_fn=None):
     return out
 
 
-def write_rds5_pool(path, records, chunks):
-    """Write a synthetic RDS5/ETPF pool with one or more zlib-compressed chunks."""
+def write_rds5_pool(path, records, chunks, area=None):
+    """Write a synthetic RDS5/ETPF pool with one or more zlib-compressed chunks.
+
+    `area` is the size of the record region in bytes. The default, len(records) * 24, fits
+    every 8-byte asset key after the 16-byte descriptors. A smaller area (at least
+    len(records) * 16) lets the key array continue into the 32-byte ID region, as most
+    retail pools do."""
     count = len(chunks) + 2
     table_end = 24 + (count - 1) * 8
     etpf = ttpf.align(table_end, 256)
-    area = len(records) * 24
+    area = len(records) * 24 if area is None else area
     metadata = 16 + area + len(records) * 32
     padded = ttpf.align(metadata, 4096)
 
@@ -1189,6 +1194,27 @@ class SyntheticPoolTest(unittest.TestCase):
             self.assertIn(why, err.getvalue())
             self.assertIn(bad, err.getvalue())
 
+    def test_scan_skips_directories_named_like_pools(self):
+        root = os.path.join(self.tmp.name, "game")
+        standard = os.path.join(root, "data", "ttdb")
+        os.makedirs(os.path.join(standard, "backup.ttpf"))
+        os.makedirs(os.path.join(root, "pack", "patch", "data", "ttdb", "backup.ttpf"))
+
+        fallback = os.path.join(root, "extra", "backup.ttpf")
+        os.makedirs(fallback)
+        fallback_pool = os.path.join(fallback, "actual.ttpf")
+        build_pool(fallback_pool)
+        self.assertEqual(ttpf.find_pools(root), [fallback_pool])
+
+        standard_pool = os.path.join(standard, "actual.ttpf")
+        build_pool(standard_pool)
+        self.assertEqual(ttpf.find_pools(root), [standard_pool])
+        out = os.path.join(self.tmp.name, "scan.json")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ttpf.main(["scan", root, "--json", out]), 0)
+        with open(out, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["total"]["pools"], 1)
+
     def test_scan_counts_an_unlisted_tuple_as_gated(self):
         path = os.path.join(self.tmp.name, "unlisted.ttpf")
         build_pool(path, meta=0x599)
@@ -1324,7 +1350,63 @@ def build_bc1_bcpack_pool(path, width=64, height=64, mips=5, non_tail=1, mode=4,
     return layout, linear, bytes(payload)
 
 
+class AssetKeyStraddleTest(unittest.TestCase):
+    """The asset-key array follows the 16-byte records and, in most retail pools, is longer
+    than the record area has room for, so it continues into the 32-byte ID region."""
+
+    RECORDS = 3
+
+    def write(self, tmp, name, area=None):
+        path = os.path.join(tmp, name)
+        records = [pack_etpf_record(4, 4, 1, 0, 71, 1, 1, 4, 4096)] * self.RECORDS
+        write_rds5_pool(path, records, [bytes(4096)], area=area)
+        return path
+
+    def keys(self, path):
+        with closing(ttpf.Pool(path)) as pool:
+            return [pool.descriptor(i)["asset_key_at"] for i in range(self.RECORDS)]
+
+    def test_keys_past_the_record_area_come_from_the_id_region(self) -> None:
+        # Room for exactly one key after the descriptors: the other two sit in the ID region.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(tmp, "straddle.ttpf", area=self.RECORDS * 16 + 8)
+            self.assertEqual(self.keys(path), [0x1234567890ABCDEF + i for i in range(self.RECORDS)])
+
+    def test_keys_inside_the_record_area_are_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(tmp, "plain.ttpf")
+            self.assertEqual(self.keys(path), [0x1234567890ABCDEF + i for i in range(self.RECORDS)])
+
+    def test_a_key_split_by_the_records_ids_boundary_is_refused(self) -> None:
+        # A record area that cuts the first key in half, as TtpfReader refuses it.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(tmp, "split.ttpf", area=self.RECORDS * 16 + 4)
+            with closing(ttpf.Pool(path)) as pool:
+                with self.assertRaises(ValueError):
+                    pool.descriptor(0)
+
+
 class PoolCacheTest(unittest.TestCase):
+    def test_zlib_chunk_rejects_a_decoded_size_larger_than_its_range(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = os.path.join(temp, "pool.ttpf")
+            record = pack_etpf_record(4, 4, 1, 0, 71, 1, 1, 4, 4096)
+            write_rds5_pool(path, [record], [bytes(8192)])
+            with open(path, "r+b") as stream:
+                stream.seek(8)
+                stream.write(struct.pack("<Q", 8192 | (22 << 56)))
+                stream.seek(32)
+                sentinel = struct.unpack("<Q", stream.read(8))[0]
+                stream.seek(32)
+                stream.write(struct.pack("<Q", (sentinel & 0x3FFFFFF) | (2 << 30)))
+
+            with closing(ttpf.Pool(path)) as pool:
+                cache = {}
+                for _ in range(2):
+                    with self.assertRaises(ValueError):
+                        pool.read_range(4096, 16, cache)
+                    self.assertEqual(cache, {})
+
     def test_shared_cache_keeps_matching_chunk_offsets_separate(self) -> None:
         with tempfile.TemporaryDirectory() as temp, ExitStack() as stack:
             record = pack_etpf_record(4, 4, 1, 0, 71, 1, 1, 4, 4096)
@@ -2392,6 +2474,41 @@ class Uncompressed2DTest(unittest.TestCase):
             self.assertEqual(ttpf.check(pool_u, 0), 2)
         with redirect_stderr(io.StringIO()):
             self.assertEqual(ttpf.export(pool_u, 0, os.path.join(self.tmp.name, "dxgi2.dds")), 2)
+
+
+class VolumePatternTest(unittest.TestCase):
+    """3D SW_4KB_S: the intra-tile bit order must be AMD's, and the tile extents must follow from it."""
+
+    # Mesa src/amd/addrlib/src/gfx10/gfx10SwizzlePattern.h, GFX10_SW_4K_S3_PATINFO (1 pipe, 1/2/4/8/16 bpe):
+    # nibble01 + nibble2 entries; GFX10_SW_4K_S3_RBPLUS_PATINFO gives the same rows.
+    MESA_SW_4K_S3 = {
+        0: (1, 2, 101, -1, 102, -2, 3, 103, -3, 4, 104, -4),
+        1: (0, 1, 101, -1, 102, -2, 2, 103, -3, 3, 104, -4),
+        2: (0, 0, 1, -1, 101, -2, 2, 102, -3, 3, 103, -4),
+        3: (0, 0, 0, 1, 101, -1, 2, 102, -2, 3, 103, -3),
+        4: (0, 0, 0, 0, 101, -1, 1, 102, -2, 2, 103, -3),
+    }
+
+    def test_patterns_are_amds_sw_4k_s3(self):
+        self.assertEqual(ttpf.VOLUME_PATTERNS_4K, self.MESA_SW_4K_S3)
+
+    def test_each_row_uses_every_x_y_z_bit_once_from_bit_0(self):
+        for log, pat in ttpf.VOLUME_PATTERNS_4K.items():
+            with self.subTest(element_bytes=1 << log):
+                self.assertEqual(pat[:log], (0,) * log)        # the element's own byte-address bits
+                for axis, keep in (("x", lambda s: 0 < s < 100), ("y", lambda s: s < 0), ("z", lambda s: s >= 101)):
+                    bits = sorted(abs(s) - (100 if s >= 101 else 0) for s in pat if keep(s))
+                    self.assertEqual(bits, list(range(1, len(bits) + 1)), axis)
+
+    def test_tile_extents_follow_from_the_bit_order(self):
+        tex = sys.modules["tex_headers"]   # imported by ttpf_mips.py
+        for log, pat in ttpf.VOLUME_PATTERNS_4K.items():
+            with self.subTest(element_bytes=1 << log):
+                want = (1 << sum(0 < s < 100 for s in pat), 1 << sum(s < 0 for s in pat), 1 << sum(s >= 101 for s in pat))
+                self.assertEqual(tex._VOLUME_4K_TILE[log], want)
+                lay = tex.volume_surface_layout(64, 64, 32, 1, 1 << log)
+                self.assertEqual((lay["block_w"], lay["block_h"], lay["block_d"]), want)
+                self.assertEqual(lay["z_tile_stride"] % 4096, 0)
 
 
 class UnmappedSentinelSpanTest(unittest.TestCase):

@@ -16,7 +16,8 @@
 //
 // --game-dir defaults to LEONIDA_GAME_DIR, the movie to LEONIDA_MOVIE. Without a package or a movie it prints
 // "SKIP (no package/movie)" and exits 77 (CTest skip). --headless decodes without a window (as fast as it can) and
-// prints the decode rate, so CTest can run it; --frames stops after N frames.
+// prints the decode rate, so CTest can run it; --frames stops after N frames. Each headless decode starts from a
+// frame filled with 0xA5 and fails if it leaves the frame untouched, so a pass means every frame wrote the buffer.
 //
 // Keys: Space pause/resume, Left/Right one second back/forward, Home restart, L loop on/off, Esc or closing the
 // window quits. The frame is scaled to the window, keeping its aspect ratio.
@@ -118,8 +119,14 @@ struct Player {
     uint32_t seek_to = 0;
 
     void decode() {
+        // Headless, the frame is filled with a sentinel first, and a decode that leaves every byte of it fails: a
+        // pass then means each decoded frame wrote the buffer (not that its pixels are right).
+        constexpr uint8_t kSentinel = 0xa5;
+        if (!g_windowed) std::fill(frame.begin(), frame.end(), kSentinel);
         api.do_frame(bink);
         api.copy(bink, frame.data(), header.width * 4, header.height, 0, 0, kCopyBgra32);
+        if (!g_windowed && std::all_of(frame.begin(), frame.end(), [](uint8_t v) { return v == kSentinel; }))
+            fatal("headless decode left the BGRA buffer untouched");
     }
     // Bink frame numbers in BinkGoto are 1-based.
     void go_to(uint32_t target) {

@@ -13,8 +13,11 @@ unique location set matches every shader with that interface.
 """
 import json
 import os
+import shutil
 import struct
 import sys
+import time
+import uuid
 
 SPIRV_MAGIC = 0x07230203
 SPIRV_VERSION_1_0 = 0x00010000
@@ -194,27 +197,43 @@ def build_ps_stub(in_locations=(), flat_locations=()):
     return struct.pack(f"<{len(words)}I", *words)
 
 
+def _interface_locations(meta, field, legacy_field=None):
+    if legacy_field is not None and meta.get(field) is None:
+        field = legacy_field
+    locations = meta.get(field, [])
+    if not isinstance(locations, (list, tuple)) or any(type(loc) is not int for loc in locations):
+        raise ValueError(f"{field} must be a list of integer locations")
+    return tuple(sorted(set(locations)))
+
+
 def required_stubs_for_meta(meta):
     """Return list of (kind, tuple(sorted_locations)) partner stubs needed for one index.json entry."""
     stage = meta.get("stage", "")
     if stage == "ps":
-        return [("vs", tuple(sorted({int(x) for x in meta.get("inputs", [])})))]
+        return [("vs", _interface_locations(meta, "inputs"))]
     if stage == "vs":
-        return [("ps", tuple(sorted({int(x) for x in meta.get("outputs", [])})))]
+        return [("ps", _interface_locations(meta, "outputs"))]
     if stage == "ms":
-        return [("ps", tuple(sorted({int(x) for x in meta.get("params", [])})))]
+        return [("ps", _interface_locations(meta, "params"))]
     if stage == "gs":
-        in_locs = meta.get("gs_input_locations")
-        if in_locs is None:
-            in_locs = meta.get("gs_inputs", [])
-        out_locs = meta.get("gs_output_locations")
-        if out_locs is None:
-            out_locs = meta.get("gs_outputs", [])
         return [
-            ("vs", tuple(sorted({int(x) for x in in_locs}))),
-            ("ps", tuple(sorted({int(x) for x in out_locs}))),
+            ("vs", _interface_locations(meta, "gs_input_locations", "gs_inputs")),
+            ("ps", _interface_locations(meta, "gs_output_locations", "gs_outputs")),
         ]
     return []
+
+
+def _replace_stub(source, target):
+    # Windows can briefly deny the rename while another writer publishes the same stub.
+    for delay in (0.01, 0.02, 0.04) if os.name == "nt" else ():
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) not in (5, 32, 33):
+                raise
+            time.sleep(delay)
+    os.replace(source, target)
 
 
 def generate_for_index(spirv_dir, index):
@@ -240,8 +259,25 @@ def generate_for_index(spirv_dir, index):
     for kind, locs in sorted(needed):
         fname = stub_name(kind, locs)
         data = build_vs_stub(locs) if kind == "vs" else build_ps_stub(locs)
-        with open(os.path.join(stubs_dir, fname), "wb") as f:
-            f.write(data)
+        target = os.path.join(stubs_dir, fname)
+        # A sibling file inherits the output directory's permissions.
+        staged = os.path.join(stubs_dir, f".stub-{uuid.uuid4().hex}.tmp")
+        stream = open(staged, "xb")
+        try:
+            with stream as f:
+                f.write(data)
+            if os.name == "posix":
+                try:
+                    shutil.copymode(target, staged)
+                except FileNotFoundError:
+                    pass
+            _replace_stub(staged, target)
+        except BaseException:
+            try:
+                os.remove(staged)
+            except OSError:
+                pass
+            raise
         written.append(fname)
     return written
 

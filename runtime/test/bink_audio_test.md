@@ -47,9 +47,14 @@ With either required variable unset it prints `SKIP (no package/audio movie)` an
 | 1920x1080, 4 tracks | 0 | 900 | 5,760,000 | 30.000 s |
 | 1920x1080, 1 track `0x3000` | 0 | 4350 | 27,840,000 | 145.000 s |
 | 1920x1080, 2 tracks (`0x3000` + `0x7000`) | 1 | 450 | 2,880,000 | 15.000 s |
+| 1280x720, 1 track `0x7000` (`binkaudio_dct`, 48 kHz stereo) | 0 | 181 | 1,158,400 | 6.033 s |
 
 All decoded WAVs are 48 kHz, stereo, `pcm_s16le`. The sampled `0x3000`-only track is entirely silent (peak 0); the
 `0x7000` track in the mixed two-track file has normal signal. This does not establish what each track is used for.
+
+The 1280x720 row is an independent run on a second machine (Windows 11, Ryzen 7 7800X3D, own 1.0.2.1 package):
+every one of the 181 calls returned 6,400 bytes (no 7,680 or 0 calls, so no pre-roll on this stream), and the
+total matches the API shape above (a byte count per call).
 
 ## FFmpeg
 

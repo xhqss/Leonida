@@ -107,9 +107,9 @@ int main() {
         }
         EXPECT(rt::d3d12::bindless_set(device.p) != VK_NULL_HANDLE);
 
-        // Root signature: [0] two constants (s0: the view slot's offset in dwords, s1: the first output element),
-        // [1] a root UAV (s2:s3, the output buffer), [2] the table of views (s4:s5), [3] the table of samplers
-        // (s6:s7).
+        // Root signature, in the console compute layout (rt::rootsig::pack_stage, D3D-448): [0] two constants (s4: the
+        // view slot's offset in dwords, s5: the first output element), [1] a root UAV (s6:s7, the output buffer),
+        // [2] the table of views (s8, its 32-bit VA), [3] the table of samplers (s9).
         D3D12_DESCRIPTOR_RANGE view_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0};
         D3D12_DESCRIPTOR_RANGE sampler_range{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, 0, 0, 0};
         D3D12_ROOT_PARAMETER params[4] = {};

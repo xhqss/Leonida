@@ -39,7 +39,7 @@ def interp_pair(pc):
 
 
 def analyse(insns):
-    g = SimpleNamespace(v_interp_copy={}, pixel_interpolants=None)
+    g = SimpleNamespace(v_interp_copy={}, pixel_interpolants=None, frag_inputs={})
     return rdna2spirv.interp_ij_analysis(insns, g), insns
 
 

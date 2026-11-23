@@ -351,6 +351,16 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         with open(out_json, encoding="utf-8") as f:
             return res.stdout, json.load(f, parse_constant=self.fail)
 
+    def test_cli_default_report_is_next_to_disasm_directory(self):
+        shader_dir = os.path.join(self.tmp.name, "work", "shaders", "dxbc")
+        disasm_dir = os.path.join(shader_dir, "disasm")
+        os.makedirs(disasm_dir)
+        tool = os.path.join(ROOT, "tools", "shader_profile.py")
+        result = subprocess.run([sys.executable, "-I", tool, disasm_dir], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(os.path.join(shader_dir, "profile.json"), encoding="utf-8") as report:
+            self.assertEqual(json.load(report)["shaders"], 0)
+
     def test_cli_bad_source_or_out_is_one_line(self):
         tool = os.path.join(ROOT, "tools", "shader_profile.py")
         a_file = os.path.join(self.disasm_dir, "ps_001.s")

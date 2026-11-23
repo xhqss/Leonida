@@ -35,6 +35,8 @@ IN_VERTS = {"InputPoints": 1, "InputLines": 2, "InputLinesAdjacency": 4, "Triang
             "InputTrianglesAdjacency": 6}
 OUT_TOPOLOGY = {"OutputPoints": "points", "OutputLineStrip": "line_strip", "OutputTriangleStrip": "triangle_strip"}
 KEEP_BUILTINS = ("SubgroupLocalInvocationId", "SubgroupSize", "NumSubgroups", "SubgroupId")
+FLOAT_CONTROL_MODES = {"DenormPreserve", "DenormFlushToZero", "SignedZeroInfNanPreserve",
+                       "RoundingModeRTE", "RoundingModeRTZ"}
 
 
 class Unsupported(Exception):
@@ -196,10 +198,22 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             out += [f"OpEntryPoint GLCompute {m.group(1)} {m.group(2)} {' '.join(iface)}",
                     f"OpExecutionMode {m.group(1)} LocalSize {LOCAL_SIZE} 1 1"]
             continue
-        if re.match(rf"OpExecutionMode {re.escape(main)} ", s):
+        # Floating-point controls apply to compute too.
+        m = re.match(rf"OpExecutionMode {re.escape(main)} (\w+)\b", s)
+        if m and m.group(1) not in FLOAT_CONTROL_MODES:
             continue
         m = re.match(r"Op(?:Decorate|MemberDecorate|Name) (%\w+)\b", s)
         if m and m.group(1) in gone:
+            continue
+        if re.match(r"OpGroupDecorate\s", s):
+            instruction, sep, comment = s.partition(";")
+            opcode, group, *targets = instruction.split()
+            live_targets = [target for target in targets if target not in gone]
+            if live_targets == targets:
+                out.append(ln)
+            elif live_targets:
+                rewritten = " ".join((opcode, group, *live_targets))
+                out.append(rewritten + f" {sep}{comment}" if sep else rewritten)
             continue
         m = re.match(r"(%\w+) = (Op\w+)", s)
         if decos and m and m.group(2).startswith("OpType"):
@@ -234,7 +248,8 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             cur_block = entry_label
             out.append(ln)
             continue
-        if state == "main_vars" and not re.match(r"%\w+ = OpVariable ", s):
+        # OpLine and OpNoLine can be intermixed with the entry block's local variables.
+        if state == "main_vars" and not re.match(r"(?:%\w+ = OpVariable |OpLine |OpNoLine$)", s):
             # after the entry block's variables: p = GlobalInvocationId.x; return when p >= primitive_count
             state = "main"
             out += [f"%gsc_gidv = OpLoad {v3u} %gsc_gid", f"%gsc_prim = OpCompositeExtract {uint} %gsc_gidv 0",

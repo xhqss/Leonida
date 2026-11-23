@@ -5,16 +5,31 @@
 All model.json files, manifests, shaders, textures and counts here are built by the test. No game
 data is read or written.
 """
+import contextlib
 import csv
+import importlib.util
+import io
 import json
+import os
 import pathlib
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TOOL = ROOT / "tools" / "character_census.py"
+
+
+def load_tool():
+    spec = importlib.util.spec_from_file_location("character_census_under_test", TOOL)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+CC = load_tool()
 
 
 def write_json(path, value):
@@ -28,7 +43,6 @@ def skinned_model():
         "type": "dr",
         "vertex_count": 12,
         "triangle_count": 4,
-        "index_count": 12,
         "drawable": {
             "name": "synthetic_skinned",
             "skeleton": [
@@ -61,7 +75,6 @@ def static_model():
         "type": "dr",
         "vertex_count": 6,
         "triangle_count": 2,
-        "index_count": 6,
         "materials": [
             {"shader_name_hash": "12345678", "textures": [{"hash32": "89ABCDEF"}]},
         ],
@@ -77,7 +90,6 @@ def fragment_model():
         "type": "ft",
         "vertex_count": 25,
         "triangle_count": 32,
-        "index_count": 96,
         "drawable": {
             "skeleton": [{"name": "SKEL_ROOT"}, {"name": "SKEL_Pelvis"}],
         },
@@ -136,7 +148,7 @@ class CharacterCensusTest(unittest.TestCase):
         self.assertIn("character census: 5 models", result.stdout)
         self.assertIn("43 vertices (2 without)", result.stdout)
         self.assertIn("38 triangles (2 without)", result.stdout)
-        self.assertIn("114 indices (2 without)", result.stdout)
+        self.assertIn("? indices", result.stdout)
         self.assertIn("8-influence skin: 1 yes, 3 no, 1 unknown", result.stdout)
         self.assertIn("by kind:", result.stdout)
         self.assertIn("by shader (a model with several materials counts under each):", result.stdout)
@@ -153,10 +165,10 @@ class CharacterCensusTest(unittest.TestCase):
         self.assertEqual(summary["models"], 5)
         self.assertEqual(summary["vertices"], 43)
         self.assertEqual(summary["triangles"], 38)
-        self.assertEqual(summary["indices"], 114)
+        self.assertEqual(summary["indices"], 0)
         self.assertEqual(summary["unknown_vertices"], 2)
         self.assertEqual(summary["unknown_triangles"], 2)
-        self.assertEqual(summary["unknown_indices"], 2)
+        self.assertEqual(summary["unknown_indices"], 5)
         self.assertEqual(summary["skin_8"], 1)
         self.assertEqual(summary["skin_unknown"], 1)
         self.assertEqual(summary["malformed"], 2)
@@ -185,7 +197,7 @@ class CharacterCensusTest(unittest.TestCase):
         self.assertEqual(skinned["kind"], "drawable")
         self.assertEqual(skinned["vertices"], 12)
         self.assertEqual(skinned["triangles"], 4)
-        self.assertEqual(skinned["indices"], 12)
+        self.assertIsNone(skinned["indices"])
         self.assertEqual(skinned["bones"], 3)
         self.assertIs(skinned["skin_8"], True)
         self.assertEqual(skinned["shaders"], ["0x210FBC6A", "0xDEADBEEF"])
@@ -215,6 +227,26 @@ class CharacterCensusTest(unittest.TestCase):
                      "vertex count is not a non-negative integer", "missing vertex count",
                      "triangle count is not a non-negative integer", "missing triangle count"):
             self.assertTrue(any(text in issue for issue in partial["issues"]), text)
+
+    def test_optional_index_count_is_counted_when_an_input_supplies_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td) / "one"
+            write_json(root / "model.json", {
+                "name": "synthetic_indexed",
+                "type": "dr",
+                "vertex_count": 4,
+                "triangle_count": 1,
+                "index_count": 12,
+                "materials": [],
+                "meshes": [{"name": "m", "vertex_count": 4, "triangle_count": 1}],
+            })
+            out = pathlib.Path(td) / "report.json"
+            result = self.run_tool(root, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(data["summary"]["indices"], 12)
+            self.assertEqual(data["summary"]["unknown_indices"], 0)
+            self.assertEqual(data["models"][0]["indices"], 12)
 
     def test_csv_has_one_row_per_model(self):
         path = pathlib.Path(self.temp.name) / "report.csv"
@@ -259,6 +291,19 @@ class CharacterCensusTest(unittest.TestCase):
         result = self.run_tool(self.root, "--json", self.root)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("is a directory", result.stderr)
+
+    def test_report_write_failure_names_the_destination(self):
+        blocker = pathlib.Path(self.temp.name) / "file"
+        blocker.write_bytes(b"keep")
+        for flag in ("--json", "--csv"):
+            with self.subTest(flag=flag):
+                target = blocker / ("report." + flag[2:])
+                result = self.run_tool(self.root, flag, target)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(f"cannot write {target}", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(blocker.read_bytes(), b"keep")
 
     def test_report_inside_the_tree_but_not_an_input_is_allowed(self):
         out = self.root / "report.json"
@@ -383,11 +428,81 @@ class CharacterCensusTest(unittest.TestCase):
         self.assertEqual(data["summary"]["models"], 1)
         self.assertEqual(data["models"][0]["name"], "synthetic_static")
 
+    def test_signed_and_underscore_hashes_are_not_hashes(self):
+        # Python's int(text, 16) accepts a sign and underscores; the documented grammar is hex digits only.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "models"
+            model = {
+                "name": "synthetic_bad_hashes",
+                "type": "dr",
+                "vertex_count": 0,
+                "triangle_count": 0,
+                "materials": [
+                    {"shader_name_hash": "-1", "textures": [{"hash32": "+1"}]},
+                    {"shader_name_hash": "+1", "textures": [{"hash32": "12_34"}]},
+                    {"shader_name_hash": "12_34", "textures": [{"hash32": "-1"}]},
+                ],
+            }
+            write_json(root / "bad" / "model.json", model)
+            out = pathlib.Path(tmp) / "report.json"
+            result = self.run_tool(root, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(out.read_text(encoding="utf-8"))
+            row = self.by_name(data)["synthetic_bad_hashes"]
+            self.assertEqual(row["shaders"], [])
+            self.assertEqual(row["textures"], [])
+            shader_issues = [i for i in row["issues"] if "is not an 8-digit shader hash" in i]
+            texture_issues = [i for i in row["issues"] if "is not a hexadecimal texture key" in i]
+            self.assertEqual(len(shader_issues), 3, row["issues"])
+            self.assertEqual(len(texture_issues), 3, row["issues"])
+
     def test_missing_target_is_a_clean_error(self):
         result = self.run_tool(pathlib.Path(self.temp.name) / "absent")
         self.assertEqual(result.returncode, 2)
         self.assertIn("not found", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
+
+    def test_unlistable_subfolder_is_a_clean_error_not_a_silent_undercount(self):
+        # os.walk skips a directory it cannot list unless onerror raises; the census used to report
+        # the remaining models and exit 0, hiding the incomplete scan.
+        sub = self.root / "static"
+        os.chmod(sub, 0o000)
+        try:
+            try:
+                os.listdir(sub)
+                self.skipTest("the sub-folder is still listable (running as root, or Windows)")
+            except OSError:
+                pass
+            result = self.run_tool(self.root)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("ERROR", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+        finally:
+            os.chmod(sub, 0o755)
+
+    def test_unlistable_subfolder_is_a_clean_error_when_chmod_is_not_enough(self):
+        # The chmod case above self-skips on Windows and as root, and CI only runs this file on
+        # windows-latest, so the guard went unexercised there. Forcing os.scandir to raise for one
+        # folder gives the same PermissionError os.walk hits for real, on every platform.
+        sub = self.root / "static"
+        real_scandir = os.scandir
+        locked = os.path.normcase(os.path.abspath(str(sub)))
+
+        def scandir(path, *args, **kwargs):
+            if os.path.normcase(os.path.abspath(str(path))) == locked:
+                raise PermissionError(13, "Access is denied", str(path))
+            return real_scandir(path, *args, **kwargs)
+
+        err = io.StringIO()
+        out = io.StringIO()
+        with mock.patch.object(CC.os, "scandir", scandir):
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                code = CC.main([str(self.root)])
+        self.assertEqual(code, 2, err.getvalue())
+        self.assertIn("ERROR", err.getvalue())
+        self.assertIn("cannot read", err.getvalue())
+        self.assertIn(str(sub), err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
 
 
 if __name__ == "__main__":

@@ -663,6 +663,7 @@ bool Reading::GetRawReport(void** report) {
     if (!report) return false;
     *report = nullptr;
     if (!s_.has_raw) return false;
+    std::lock_guard lock(device_->hid_mu);
     const GameInputRawDeviceReportInfo* info = device_->find_raw(GameInputRawInputReport, s_.raw_id);
     if (!info) return false;
     *report = static_cast<IGameInputRawDeviceReport*>(new RawReport(device_, *info, s_.raw.data(), s_.raw.size()));
@@ -779,6 +780,9 @@ public:
     void sync(Device* device, uint64_t now, bool muted);
     // Poll thread, on unplug: the SDL device went with the pad, so forget its effect id without touching SDL.
     void orphan();
+    // Poll thread, under g().mu: a reference unless the title's last Release already ran (the destructor then waits
+    // for g().mu to unlink the effect, so it is still in the device's list but must not be used or revived).
+    bool add_ref_if_live() { return rt::gameinput::add_ref_if_live(refs_); }
 
 private:
     std::atomic<ULONG> refs_{1};
@@ -839,7 +843,7 @@ bool matches(const Callback& c, const Event& e) {
             if (!(c.kind & e.device->info.supportedInput) && c.kind != GameInputKindUnknown) return false;
             return e.only || ((e.current ^ e.previous) & c.status_filter);
         case CbType::Reading:
-            return (c.kind & kSupportedKinds) || c.kind == GameInputKindUnknown;
+            return c.kind == GameInputKindUnknown || (c.kind & e.device->info.supportedInput);
         default:
             return true;
     }
@@ -1490,10 +1494,11 @@ void apply_effects(Device* d, uint64_t now) {
     {
         std::lock_guard lock(s.mu);
         live.reserve(d->effects.size());
-        for (ForceFeedbackEffect* e : d->effects) {  // referenced: the title may release one while this runs
-            e->AddRef();
-            live.push_back(e);
-        }
+        // Referenced: the title may release one while this runs. An effect whose count already reached 0 is being
+        // destroyed (its destructor waits for this lock to unlink it); a plain AddRef revived it, and this loop's own
+        // Release below freed it a second time.
+        for (ForceFeedbackEffect* e : d->effects)
+            if (e->add_ref_if_live()) live.push_back(e);
         retire.swap(d->retired);
         motor_gain = d->motor_gain;
         muted = !s.config.rumble;
@@ -2121,6 +2126,16 @@ void ForceFeedbackEffect::orphan() {
     applied_ = 0;
 }
 
+// What SDL said about the effect, for output_state (gameinput_probe and the tests): the id it returned, whether it is
+// running, and its error text when it is not. SDL_GetError is read here, on the poll thread that made the call.
+void note_effect(Device* d, int id, bool ran) {
+    const char* error = ran ? "" : SDL_GetError();
+    std::lock_guard lock(g().mu);
+    d->sent.effect_id = id;
+    d->sent.effect_ran = ran;
+    std::snprintf(d->sent.effect_error, sizeof d->sent.effect_error, "%s", error ? error : "");
+}
+
 void ForceFeedbackEffect::sync(Device* d, uint64_t now, bool muted) {
     GameInputForceFeedbackParams params;
     float gain;
@@ -2169,13 +2184,21 @@ void ForceFeedbackEffect::sync(Device* d, uint64_t now, bool muted) {
     }
     if (sdl_effect_ < 0) {
         sdl_effect_ = haptics().create_effect(d->haptic, &fx);  // SDL refused: nothing to drive this effect
-        if (sdl_effect_ < 0) return;
+        if (sdl_effect_ < 0) {
+            note_effect(d, -1, false);
+            return;
+        }
     } else if (!haptics().update_effect(d->haptic, sdl_effect_, &fx)) {
+        note_effect(d, sdl_effect_, false);
         return;
     }
     // GameInput's playCount 0 means "until stopped", which is what SDL's 0 iterations means.
     const uint32_t iterations = endless ? 0 : play_count(params);
-    if (!haptics().run_effect(d->haptic, sdl_effect_, iterations)) return;
+    if (!haptics().run_effect(d->haptic, sdl_effect_, iterations)) {
+        note_effect(d, sdl_effect_, false);
+        return;
+    }
+    note_effect(d, sdl_effect_, true);
     sdl_running_ = true;
     applied_ = version;
     endless_ = endless;

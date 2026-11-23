@@ -405,20 +405,18 @@ class VectorSubF16SpirvTests(unittest.TestCase):
     def test_vop3_scale_output_modifiers(self):
         v1 = H_1P5
         v2 = H_0P5
-        # 1.5 - 0.5 = 1.0 -> mul:2 = 2.0
+        # 1.5 - 0.5 = 1.0; on RDNA2 with denorms kept, mul:2 / mul:4 / div:2 are ignored on f16.
         self.assertEqual(
             run_sub_f16("v_sub_f16_e64 v0, v1, v2 mul:2", v1, v2),
-            merge_half(OLD, H_2P0, 0),
+            merge_half(OLD, H_1P0, 0),
         )
-        # 1.5 - 0.5 = 1.0 -> mul:4 = 4.0
         self.assertEqual(
             run_sub_f16("v_sub_f16_e64 v0, v1, v2 mul:4", v1, v2),
-            merge_half(OLD, H_4P0, 0),
+            merge_half(OLD, H_1P0, 0),
         )
-        # 1.5 - 0.5 = 1.0 -> div:2 = 0.5
         self.assertEqual(
             run_sub_f16("v_sub_f16_e64 v0, v1, v2 div:2", v1, v2),
-            merge_half(OLD, H_0P5, 0),
+            merge_half(OLD, H_1P0, 0),
         )
 
     def test_inline_constants_and_sgpr(self):

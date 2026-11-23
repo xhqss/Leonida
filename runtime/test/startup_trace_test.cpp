@@ -221,6 +221,8 @@ void test_trace(const fs::path& dir) {
         reinterpret_cast<VoidFn>(m.base + caller_rva(1))(kAnsiText);
         raise_bad_dbg_print();
         OutputDebugStringA("after_bad_dbg_print");
+        OutputDebugStringW(L"wide probe \u00e9\u4e2d");  // its ANSI fallback must not be a second, lossy line
+        OutputDebugStringA("after_wide_probe");
         check(call_faulting(m.base + kFaultRva), "the access violation reached the test's handler");
         rt::startup_trace::event("exit", "\"code\":0");
     }
@@ -255,6 +257,15 @@ void test_trace(const fs::path& dir) {
         after_bad_found |=
             l.find("\"kind\":\"debug_string\"") != std::string::npos && l.find("after_bad_dbg_print") != std::string::npos;
     check(after_bad_found, "an SEH fault inside the VEH does not leave in_handler stuck true");
+    int wide_lines = 0, wide_utf8 = 0, after_wide = 0;
+    for (auto& l : lines) {
+        wide_lines += l.find("wide probe") != std::string::npos;
+        wide_utf8 += l.find("\"text\":\"wide probe \xc3\xa9\xe4\xb8\xad\"") != std::string::npos;
+        after_wide += l.find("\"text\":\"after_wide_probe\"") != std::string::npos;
+    }
+    check(wide_lines == 1 && wide_utf8 == 1, "OutputDebugStringW gives one debug_string, in UTF-8 (got " +
+                                                 std::to_string(wide_lines) + ")");
+    check(after_wide == 1, "an OutputDebugStringA after it is still logged");
     check(valid_utf8(trace), "the whole trace is valid UTF-8");
 
     const std::string* e = find_line(lines, "exception");

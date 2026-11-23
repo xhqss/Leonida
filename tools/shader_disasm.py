@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mc_command import mc_command  # noqa: E402
+from report_paths import path_key, same_report_path  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 import rdna2_decode  # noqa: E402
 
@@ -36,6 +37,26 @@ MC = mc_command()
 def fail(msg: str) -> "None":
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def output_path(path: str, out: str) -> str:
+    return os.path.join(out, os.path.splitext(os.path.basename(path))[0] + ".s")
+
+
+def validate_output(out: str, files: list) -> None:
+    """Refuse a planned <out>/<stem>.s that is a folder or names an input, before probing llvm-mc or creating --out.
+    A single `foo.s` given with --out at its own folder (or the default ../disasm of a file already in disasm/) was
+    replaced by its own listing; on Windows and macOS `FOO.S` is the same file as the `FOO.s` written for it."""
+    inputs = {path_key(p): p for p in files}
+    for src in files:
+        dst = output_path(src, out)
+        if os.path.isdir(dst):
+            fail(f"cannot write {dst}: destination is a folder, not a file")
+        hit = inputs.get(path_key(dst))
+        if hit is None and same_report_path(src, dst):  # a hard link or another spelling the name rules missed
+            hit = src
+        if hit is not None:
+            fail(f"output {dst} would overwrite input {hit}")
 
 
 def positive_int(text: str) -> int:
@@ -70,7 +91,7 @@ def probe(mcpu: str) -> None:
 
 def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True):
     if backend == "python":
-        asm, bad = rdna2_decode.disasm_bytes(code, wave32=wave32)
+        asm, bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32)
         return asm, bad, ""
     text = " ".join(f"0x{b:02x}" for b in code)
     try:
@@ -158,7 +179,7 @@ def one(path, out, mcpu, backend="llvm-mc"):
             listing.write(asm)
             if err.strip():
                 listing.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
-        os.replace(listing.name, os.path.join(out, name + ".s"))
+        os.replace(listing.name, output_path(path, out))
     finally:
         if os.path.exists(listing.name):
             os.unlink(listing.name)
@@ -204,6 +225,7 @@ def main():
         fail(f"no .fssm files in {a.src}")
     files = files[: a.limit] if a.limit else files
     out = a.out or os.path.join(os.path.dirname(files[0]), "..", "disasm")
+    validate_output(out, files)
     try:
         os.makedirs(out, exist_ok=True)
     except OSError as e:
@@ -215,7 +237,7 @@ def main():
     if a.skip_existing:
         pending = []
         for path in files:
-            listing = os.path.join(out, os.path.splitext(os.path.basename(path))[0] + ".s")
+            listing = output_path(path, out)
             if not os.path.islink(listing) and os.path.isfile(listing) and os.path.getsize(listing) > 0:
                 res["reused"] += 1
             else:

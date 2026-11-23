@@ -5,6 +5,7 @@
 // when there is one: a refused description leaves the slot as it was. No shaders or game data. Set
 // LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "../src/gfx10_descriptors.h"
 
@@ -414,7 +415,8 @@ int main() {
                                            : nullptr;
             Ref<ID3D12Device11> host;
             Slots host_slots;
-            if (create_host && SUCCEEDED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))) &&
+            if (create_host && !hostwine::host_is_wine() &&
+                SUCCEEDED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))) &&
                 host_slots.create(host.p)) {
                 D3D12_FEATURE_DATA_D3D12_OPTIONS17 theirs17{};
                 EXPECT(SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS17, &theirs17,

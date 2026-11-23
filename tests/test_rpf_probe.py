@@ -9,6 +9,7 @@ import io
 import json
 import os
 import struct
+import stat
 import subprocess
 import sys
 import tempfile
@@ -153,6 +154,16 @@ class MainTests(unittest.TestCase):
         self.write("a.rpf", archive_bytes())
         self.run_main()
         self.assertTrue(os.path.isfile(self.out))
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_refresh_preserves_private_report_permissions(self):
+        self.write("a.rpf", archive_bytes())
+        self.run_main()
+        os.chmod(self.out, 0o600)
+        self.write("b.rpf", archive_bytes())
+        self.run_main()
+        self.assertEqual(len(self.rows()), 2)
+        self.assertEqual(stat.S_IMODE(os.stat(self.out).st_mode), 0o600)
 
     def test_empty_game_directory(self):
         out = self.run_main()

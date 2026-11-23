@@ -17,6 +17,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bcpack
+from report_paths import same_report_path
 
 
 def inspect_stream(raw: bytes, codec: int, out_size: int) -> dict:
@@ -104,6 +105,12 @@ def decode_file(
     history: str | None = None,
 ) -> int:
     """Decode compressed file and write decompressed blocks to disk."""
+    if same_report_path(in_path, out_path):
+        raise ValueError(
+            f"output path {out_path!r} names the compressed input {in_path!r}; "
+            f"refusing to overwrite it"
+        )
+
     with open(in_path, "rb") as f:
         raw = f.read()
 

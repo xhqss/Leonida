@@ -844,7 +844,7 @@ class TestSpirvNegativeControls(unittest.TestCase):
                 [
                     "v_mov_b32_e32 v20, 1.0",
                     "v_mov_b32_e32 v5, 0x200",
-                    "tbuffer_store_format_x v20, v5, s[0:3], 0 format:[BUF_FMT_8_USCALED] offen",
+                    "tbuffer_store_format_x v20, v5, s[0:3], 0 format:[BUF_FMT_INVALID] offen",
                     "s_endpgm",
                 ],
                 fssm=CS_FSSM,

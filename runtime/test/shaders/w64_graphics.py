@@ -21,6 +21,10 @@ files (equal for A and B, different for C).
 A device whose subgroups can be narrower than 32 (Intel: 8..32) and that could not be held to 32 or 64 skips the tier
 A and B pixel fixtures: its fragment stage may run fewer live lanes than 32 (Intel UHD 770 reports 32 but runs 16 live
 invocations), and tiers A and B assume 32 or 64 live lanes (TEST-433).
+A fixture
+listed in NEEDS_LIVE_LANES (it reads lanes beyond the first 16) runs where ps_live_width measures that many live lanes
+per fragment subgroup and skips, naming the width, where it is less. The measured width is not gl_SubgroupSize: the Intel UHD 770 reports 32 and
+runs 16 live lanes (lane ids 0..15), so a read of lane L ^ 16 returns garbage there.
 
 The vs_w64_* fixtures (TEST-251) are vertex shaders: Vulkan cannot require a vertex subgroup size, so the two sizes
 come from RADV, which runs the VS stage as wave64 by default and as wave32 with RADV_PERFTEST=gewave32 (GFX10+).
@@ -62,6 +66,9 @@ def _a_skip(i):
     x, y = _x(i), _y(i)
     return (7 * y + x if x % 4 == 1 else 1000 + x, int(x % 4 < 2), 2000 + y + (9 if y % 4 == 2 else 0), x % 4 + 1)
 
+
+def _a_uniform_vote(i):
+    return (_x(i) + 7, 11, 36, 27)
 
 CLEAR = 0xBF800000     # the harness clears the target to -1.0f: the words of a pixel no shader wrote
 
@@ -179,10 +186,13 @@ FIXTURES = {
     "ps_w64_a_permlane": ("A", _a_permlane, {}),
     "ps_w64_a_swizzle": ("A", _a_swizzle, {}),
     "ps_w64_a_bpermute": ("A", _a_bpermute, {}),
+    "ps_w64_a_uniform_vote": ("A", _a_uniform_vote, {"VKH_SGPRS": "0,0,0,0,9"}),
+
     "ps_w64_a_discard": ("A", _a_discard, {}),
     "ps_w64_b_waterfall": ("B", _b_waterfall, {}),
     "ps_w64_b_readfirstlane": ("B", _b_readfirstlane, {"VKH_SGPRS": "0,0,0,0,123"}),
     "ps_w64_b_readlane_uniform": ("B", _b_readlane_uniform, {"VKH_SGPRS": "0,0,0,0,123"}),
+    "ps_w64_b_readlane_uniform_lane": ("B", _b_readlane_uniform, {"VKH_SGPRS": "0,0,0,0,123"}),
     "ps_w64_b_ballot_atomic": ("B", _b_ballot, {"VKH_SGPRS": "0,0,65536,0x30000000", "VKH_HEAP": "0=0"}),
     "ps_w64_c_waterfall_count": ("C", _c_waterfall_count, {}),
     "ps_w64_c_bcnt_export": ("C", _c_bcnt, {}),
@@ -254,6 +264,26 @@ def _draw_heap(tools, spirv, name, size, tmp):
 
 
 _device_min = [None]   # the smallest subgroup size vk_harness reported for the device
+
+
+# Pixel fixtures that read lanes beyond the first 16 (a half-wave exchange, lane L ^ 16), and how many live lanes per
+# fragment subgroup they need. Empty on purpose: every fixture here passes at 16 live lanes (Intel UHD 770). The
+# permute fixtures of TEST-319 (ps_w64_a_permlane, _a_swizzle, _a_bpermute) go in as {name: 32}.
+NEEDS_LIVE_LANES = {}
+
+
+def live_width(tools, spirv, tmp):
+    """The most live invocations a fragment subgroup has on this device (ps_live_width.asm: popcount of EXEC over the
+    frame), or None when the probe could not run. Not gl_SubgroupSize: an Intel iGPU reports 32 and runs 16."""
+    raw = Path(tmp) / "live_width.raw"
+    cmd = [os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, "vs_ids.spv"),
+           os.path.join(spirv, "ps_live_width.spv"), str(raw)]
+    env = dict(os.environ)
+    env.pop("VKH_SUBGROUP_SIZE", None)
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
+    if r.returncode or not raw.is_file() or raw.stat().st_size != W * H * 16:
+        return None
+    return max(struct.unpack("<%dI" % (W * H * 4), raw.read_bytes()))
 
 
 def draw(tools, spirv, name, size, tmp):
@@ -359,6 +389,16 @@ def check(tools, spirv, name):
                 and _device_min[0] is not None and _device_min[0] < 32:
             return Skip(f"SKIP (the fragment stage may run fewer live lanes than 32 here ({_device_min[0]}..) "
                         "and 32 or 64 could not be required: tiers A and B assume 32 or 64 live lanes)")
+        # A fixture that reads a lane beyond the quad or the first 16 (NEEDS_LIVE_LANES) is judged only where the
+        # measured live width is enough: the stage can report a subgroup size it does not fill (Intel: 32 reported,
+        # 16 live, so a read of lane L ^ 16 is undefined). A required size (64 or 32 applied) is the device saying
+        # the lanes are there, so then nothing is measured.
+        need = NEEDS_LIVE_LANES.get(name)
+        if need and 64 not in runs and 32 not in runs:
+            live = live_width(tools, spirv, tmp)
+            if live is not None and live < need:
+                return Skip(f"SKIP (the fragment stage has {live} live lanes per subgroup here, measured with "
+                            f"ps_live_width; this fixture needs {need})")
         if save and 64 in runs:
             Path(save).mkdir(parents=True, exist_ok=True)
             (Path(save) / (name + ".ref64.raw")).write_bytes(b"".join(struct.pack("<4I", *w) for w in runs[64][0]))

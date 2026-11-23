@@ -237,8 +237,13 @@ def main(argv=None):
         out["waves"][str(wave)] = {"cases": c, "transcendentals": t}
         if c["ok"] != c["total"] or not t["all_ok"]:
             mismatches += 1
+        t_ok = sum(info["ok"] for info in t["ops"].values())
         print(f"wave{wave} ({oracle.arch}): {c['ok']}/{c['total']} f16/f64 RNE/RTZ cases exact; "
-              f"7/7 f16 transcendentals 0/65536 RNE/RTZ diffs")
+              f"{t_ok}/{len(t['ops'])} f16 transcendentals 0/65536 RNE/RTZ diffs")
+        for op, info in t["ops"].items():
+            if not info["ok"]:
+                print(f"  {op}: {info['rne_rtz_diffs']}/{info['inputs']} RNE/RTZ diffs, "
+                      f"RTZ spot word {info['spot_got']} (want {info['spot_want']})")
     if args.json_out is not None:
         write_err = write_json_report(args.json_out, out)
         if write_err:

@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -122,7 +123,7 @@ class RunTestTest(unittest.TestCase):
         missing = self.command_for(self.artifact / "missing.exe")
         for command in (built, missing, None):
             with self.subTest(command=command), \
-                    mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as launch:
+                    mock.patch.object(rwt, "run_test_process", wraps=rwt.run_test_process) as launch:
                 status, detail = self.run_entry(ctest_entry("disabled", command, {"DISABLED": True}))
                 launch.assert_not_called()
                 self.assertEqual(status, "skip", detail)
@@ -164,6 +165,15 @@ class RunTestTest(unittest.TestCase):
         self.assertEqual(status, "skip")
         self.assertIn("exit 77", detail)
 
+    def test_invalid_skip_return_codes_fail_before_launch(self):
+        command = self.command_for(self.exiting(0))
+        for value in ("invalid", True, 1.5, -1, 256):
+            with self.subTest(value=value), mock.patch.object(rwt.subprocess, "run") as launch:
+                status, detail = self.run_entry(ctest_entry("invalid", command, {"SKIP_RETURN_CODE": value}))
+                self.assertEqual(status, "fail")
+                self.assertIn("invalid CTest SKIP_RETURN_CODE", detail)
+                launch.assert_not_called()
+
     def test_ctest_environment_is_applied_only_to_its_child(self) -> None:
         exe = self.program("show_environment.py",
                            "import os\n"
@@ -187,7 +197,7 @@ class RunTestTest(unittest.TestCase):
     def test_malformed_ctest_environment_fails_before_launch(self) -> None:
         command = self.command_for(self.exiting(0))
         props = {"ENVIRONMENT": ["missing_equals"]}
-        with mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as launch:
+        with mock.patch.object(rwt, "run_test_process", wraps=rwt.run_test_process) as launch:
             status, detail = self.run_entry(ctest_entry("bad_environment", command, props))
         launch.assert_not_called()
         self.assertEqual(status, "fail", detail)
@@ -244,7 +254,7 @@ class RunTestTest(unittest.TestCase):
         fake = mock.Mock(returncode=-11, stdout=b"usage: gta6rt")
         for props in ({"WILL_FAIL": True}, {"PASS_REGULAR_EXPRESSION": ["usage: gta6rt"]},
                       {"SKIP_REGULAR_EXPRESSION": ["usage: gta6rt"]}):
-            with self.subTest(props=props), mock.patch.object(rwt.subprocess, "run", return_value=fake):
+            with self.subTest(props=props), mock.patch.object(rwt, "run_test_process", return_value=fake):
                 entry = ctest_entry("segv", self.command_for(exe), props | {"SKIP_RETURN_CODE": 77})
                 status, detail = self.run_entry(entry)
                 self.assertEqual(status, "fail")
@@ -256,6 +266,50 @@ class RunTestTest(unittest.TestCase):
         status, detail = self.run_entry(ctest_entry("slow", self.command_for(slow)))
         self.assertEqual(status, "fail")
         self.assertIn("timed out after 0.2 s", detail)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process groups")
+    def test_timeout_stops_a_helper_even_after_the_launcher_exits(self):
+        import fcntl
+
+        guard_path = self.artifact / "helper.lock"
+        stop_path = self.artifact / "stop"
+        helper = self.program("helper.py", """
+import fcntl
+from pathlib import Path
+import time
+
+with open("helper.lock", "a") as guard:
+    fcntl.flock(guard, fcntl.LOCK_EX)
+    print("helper ready", flush=True)
+    deadline = time.monotonic() + 10
+    while not Path("stop").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+""")
+        launcher = self.program("launcher.py", f"""
+import subprocess
+import sys
+
+subprocess.Popen([sys.executable, {helper!r}])
+""")
+        self.args.timeout = 1
+        entry = ctest_entry("tree", self.command_for(launcher))
+        try:
+            status, detail = self.run_entry(entry)
+            self.assertEqual(status, "fail", detail)
+            self.assertIn("timed out", detail)
+            self.assertIn("helper ready", detail)
+            with guard_path.open("a") as guard:
+                deadline = time.monotonic() + 1
+                while True:
+                    try:
+                        fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            self.fail("helper still holds its lock after the test timed out")
+                        time.sleep(0.01)
+        finally:
+            stop_path.touch()
 
     def test_a_short_ctest_timeout_still_fails_a_will_fail_test(self):
         slow = self.program("slow_failure.py", "import sys, time\ntime.sleep(1)\nsys.exit(1)\n")
@@ -270,7 +324,7 @@ class RunTestTest(unittest.TestCase):
             with self.subTest(timeout=timeout):
                 entry = ctest_entry("bounded", self.command_for(exe), {"TIMEOUT": timeout})
                 result = rwt.subprocess.CompletedProcess([], 0, stdout=b"")
-                with mock.patch.object(rwt.subprocess, "run", return_value=result) as run:
+                with mock.patch.object(rwt, "run_test_process", return_value=result) as run:
                     status, detail = self.run_entry(entry)
                 self.assertEqual(status, "pass", detail)
                 self.assertEqual(run.call_args.kwargs["timeout"], self.args.timeout)
@@ -299,6 +353,19 @@ class RunTestTest(unittest.TestCase):
         self.assertEqual(seen["argv"][1], "--flag")
         self.assertEqual(os.path.normcase(os.path.realpath(seen["cwd"])),
                          os.path.normcase(os.path.realpath(self.artifact / "sub")))
+
+    def test_invalid_mapped_working_directory_fails_without_starting_wine(self):
+        exe = self.exiting(0)
+        (self.artifact / "file").touch()
+        for name in ("missing", "file"):
+            cwd = WINDOWS_ROOT + f"/artifact/{name}"
+            with self.subTest(cwd=cwd), mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as run:
+                entry = ctest_entry("bad_cwd", self.command_for(exe), {"WORKING_DIRECTORY": cwd})
+                status, detail = self.run_entry(entry)
+                self.assertEqual(status, "fail")
+                self.assertIn("working directory", detail)
+                self.assertIn(cwd, detail)
+                run.assert_not_called()
 
 
 @unittest.skipIf(os.name == "nt", "the runner and its dosdevices links are for Linux and macOS")
@@ -337,6 +404,38 @@ class DriveMapTest(unittest.TestCase):
         with rwt.DriveMap("D:/a/Leonida/Leonida", str(self.root), str(self.prefix)) as drive:
             self.assertIn("already set", drive.note)
         self.assertEqual(os.readlink(self.link), str(other))
+
+    def test_drive_created_during_setup_is_left_alone(self):
+        other = self.prefix / "concurrent"
+        other.mkdir()
+        scratch = self.prefix / "scratch"
+        scratch.mkdir()
+        symlink = os.symlink
+
+        def add_mapping(target, link):
+            if Path(link) == self.link:
+                symlink(other, self.link)
+            symlink(target, link)
+
+        with mock.patch.object(rwt.tempfile, "mkdtemp", return_value=str(scratch)), \
+                mock.patch.object(rwt.os, "symlink", side_effect=add_mapping):
+            with rwt.DriveMap(WINDOWS_ROOT, str(self.root), str(self.prefix)) as drive:
+                self.assertIn("already set", drive.note)
+
+        self.assertEqual(os.readlink(self.link), str(other))
+        self.assertFalse(scratch.exists())
+
+    def test_failed_drive_setup_removes_scratch_directory(self):
+        scratch = self.prefix / "scratch"
+        scratch.mkdir()
+        with mock.patch.object(rwt.tempfile, "mkdtemp", return_value=str(scratch)), \
+                mock.patch.object(rwt.os, "symlink", side_effect=PermissionError("link denied")):
+            with self.assertRaisesRegex(PermissionError, "link denied"):
+                with rwt.DriveMap(WINDOWS_ROOT, str(self.root), str(self.prefix)):
+                    self.fail("drive setup unexpectedly succeeded")
+
+        self.assertFalse(scratch.exists())
+        self.assertFalse(os.path.lexists(self.link))
 
     def test_no_prefix_or_no_drive_letter_maps_nothing(self):
         with rwt.DriveMap("D:/a/b", str(self.root), str(self.prefix / "absent")) as drive:
@@ -389,10 +488,10 @@ class MainTest(unittest.TestCase):
     def command(self, name):
         return [WINDOWS_ROOT + "/artifact/" + name]
 
-    def run_main(self, entries, *extra, stderr=False):
+    def run_main(self, entries, *extra, stderr=False, root=None):
         listing = self.list_tests(entries)
         argv = ["run_wine_tests.py", "--tests", listing, "--windows-root", WINDOWS_ROOT,
-                "--root", str(self.root), "--wine", sys.executable.replace(os.sep, "/"), *extra]
+                "--root", str(self.root if root is None else root), "--wine", sys.executable.replace(os.sep, "/"), *extra]
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = rwt.main()
@@ -402,6 +501,16 @@ class MainTest(unittest.TestCase):
         code, out, _ = self.run_main([ctest_entry("ok", self.command("ok.py"))], "--require", "ok")
         self.assertEqual(code, 0)
         self.assertIn("1 passed, 0 failed, 0 skipped under Wine (1 tests)", out)
+
+    def test_relative_root_launches_the_artifact_from_its_working_directory(self):
+        (self.artifact / "check_cwd.py").write_text(
+            "from pathlib import Path\nassert Path.cwd() == Path(__file__).resolve().parent\n",
+            encoding="utf-8", newline="\n")
+        entry = ctest_entry("ok", self.command("check_cwd.py"))
+        with contextlib.chdir(self.root):
+            code, out, _ = self.run_main([entry], "--require", "ok", root=".")
+        self.assertEqual(code, 0, out)
+        self.assertIn("[PASS] ok", out)
 
     def test_a_required_test_that_fails_exits_one(self):
         code, out, _ = self.run_main([ctest_entry("bad", self.command("bad.py"))], "--require", "bad")
@@ -417,6 +526,17 @@ class MainTest(unittest.TestCase):
         code, out, _ = self.run_main([ctest_entry("bad", self.command("bad.py"))])
         self.assertEqual(code, 0)
         self.assertIn("[FAIL] bad", out)
+
+    def test_malformed_skip_return_code_does_not_stop_later_tests(self):
+        entries = [
+            ctest_entry("bad_property", self.command("ok.py"), {"SKIP_RETURN_CODE": "invalid"}),
+            ctest_entry("ok", self.command("ok.py")),
+        ]
+        code, out, err = self.run_main(entries, "--require", "ok")
+        self.assertEqual(code, 0, err)
+        self.assertIn("[FAIL] bad_property", out)
+        self.assertIn("invalid CTest SKIP_RETURN_CODE", out)
+        self.assertIn("[PASS] ok", out)
 
     def test_the_summary_table_is_appended(self):
         summary = self.root / "summary.md"
@@ -481,6 +601,11 @@ class MainTest(unittest.TestCase):
             {"properties": {"TIMEOUT": 10}},
             {"properties": [{"name": "TIMEOUT"}]},
             {"properties": [{"name": ["TIMEOUT"], "value": 10}]},
+            {"properties": [{"name": "WORKING_DIRECTORY", "value": 42}]},
+            {"properties": [{"name": "WORKING_DIRECTORY", "value": "D:/win/\0root"}]},
+            {"properties": [{"name": "PASS_REGULAR_EXPRESSION", "value": [42]}]},
+            {"properties": [{"name": "FAIL_REGULAR_EXPRESSION", "value": {"bad": True}}]},
+            {"properties": [{"name": "SKIP_REGULAR_EXPRESSION", "value": None}]},
             {"name": []},
         ):
             with self.subTest(fields=fields):
@@ -499,6 +624,21 @@ class MainTest(unittest.TestCase):
         self.assertIn("[FAIL] unbuilt", out)
         self.assertIn("no command", out)
         self.assertEqual(err, "")
+
+    def test_ctest_property_strings_and_expression_lists_are_valid_inventory(self):
+        properties = {
+            "WORKING_DIRECTORY": WINDOWS_ROOT + "/artifact",
+            "PASS_REGULAR_EXPRESSION": ["good", "also good"],
+            "FAIL_REGULAR_EXPRESSION": "unexpected",
+            "SKIP_REGULAR_EXPRESSION": [],
+            "MEASUREMENTS": {"custom": "value"},
+        }
+        row = ctest_entry("ok", self.command("ok.py"), properties)
+        with mock.patch.object(rwt, "run_test", return_value=("pass", "")) as launch:
+            code, _, err = self.run_main([row], "--require", "ok")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        launch.assert_called_once()
 
     def test_an_explicit_empty_tests_list_is_accepted(self):
         code, out, _ = self.run_main_json({"tests": []})

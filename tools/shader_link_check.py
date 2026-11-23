@@ -234,8 +234,20 @@ def ensure_report_is_separate(output, inputs):
     if output is None:
         return
     out = output.resolve()
+    try:
+        out_stat = out.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        out_stat = None
     for source in dict.fromkeys(inputs):
-        if out == source.resolve() or (out.exists() and source.exists() and out.samefile(source)):
+        if out_stat is None:
+            aliases = out == source.resolve()
+        else:
+            try:
+                # Existing targets can be compared by file identity, including hard links.
+                aliases = os.path.samestat(out_stat, source.stat())
+            except (FileNotFoundError, NotADirectoryError):
+                aliases = out == source.resolve()
+        if aliases:
             raise ValueError(f"report would overwrite an input file: {source}")
 
 

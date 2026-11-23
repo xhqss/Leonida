@@ -23,8 +23,10 @@ TOOL = os.path.join(ROOT, "tools", "audio_wav.py")
 FFMPEG = shutil.which("ffmpeg")
 
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.insert(0, os.path.join(ROOT, "tests"))
 import audio_wav  # noqa: E402
 import awc_opus  # noqa: E402
+import winbatch  # noqa: E402
 
 
 @unittest.skipUnless(FFMPEG, "ffmpeg is not on PATH")
@@ -416,9 +418,7 @@ def write_fake_ffmpeg(directory, source=FAKE_FFMPEG):
     with open(script, "w", encoding="utf-8") as f:
         f.write(source)
     if os.name == "nt":
-        ffmpeg = os.path.join(directory, "ffmpeg.cmd")
-        with open(ffmpeg, "w", encoding="utf-8") as f:
-            f.write(f'@"{sys.executable}" "{script}" %*\n')
+        ffmpeg = winbatch.write_python_cmd(os.path.join(directory, "ffmpeg.cmd"), sys.executable, script)
     else:
         ffmpeg = os.path.join(directory, "ffmpeg")
         with open(ffmpeg, "w", encoding="utf-8") as f:

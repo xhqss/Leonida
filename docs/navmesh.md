@@ -221,10 +221,13 @@ the first four fields of C's `struct tm` in their order. No month or year is sto
   positions (the `u32@0xC8` sector, above). The 3,002 extra tiles are all on 940 positions that hold 2 to 40 tiles,
   and every one of those positions has day-22 tiles. 2,984 of the 3,003 day-22 tiles share their position with a
   day-9 tile, and on all 938 positions with both, the day-22 tiles come later in the archive. The other 19 are on two
-  positions without a day-9 tile: 17 at sector (255, 248), and 2 with the day-24 tile at (248, 246). On 450 of the 938, the first day-22 tile has the same vertex and polygon
-  counts as the day-9 tile. What the stacked tiles are for is not measured.
-- **Neighbouring tiles share a stamp.** Of the 48,644 pairs of grid neighbours (one tile per position), 98.12% have
-  the same stamp, against 92.58% for stamps placed at random with the same frequencies.
+  positions without a day-9 tile: 17 at sector (255, 248), and 2 with the day-24 tile at (248, 246). On 450 of the
+  938, the first day-22 tile has the same vertex and polygon counts as the day-9 tile. What the stacked tiles are for
+  is not measured.
+- **Neighbouring tiles share a stamp.** Taking the last tile in the archive at each position (the day-22 one where a
+  position has both), 98.12% of the 48,644 pairs of grid neighbours have the same stamp, against 92.58% for stamps
+  placed at random with the same frequencies. Taking the first tile instead gives 99.95% against 99.95%, which says
+  nothing, because almost every first tile is day 9.
 
 Method: `tools/navmesh_decode.py`'s own scan of `navmeshes.rpf`, with each tile's `u32@0xE8`, `u32@0xC8`, flags,
 counts and archive offset recorded per tile. No geometry was kept.
@@ -233,8 +236,8 @@ The `+4` word of a polygon packs `(index start << 4) | count`; the runs tile the
 (`tools/navmesh_decode.py --deep` checks it on all `124,768,148` polygons, 0 failures), which caps a polygon at 15
 vertices. 6stars independently reads the same packing. Its polygon `+0x28` bit 17 and `+0x18` bit 27
 road/pavement labels were not adopted: a 1,027,984-polygon sample over 238 tiles sets both bits on 258 polygons, so
-they are not a partition and neither meaning is confirmed. No 6stars code was copied; the repository has no
-licence.
+they are not a partition, and in the lane-graph count [below](#polygon-flags-under-the-lane-graph) neither is under
+most lane nodes; `+0x18` bits 8 and 13 are. No 6stars code was copied; the repository has no licence.
 
 ### Flags (`u32@0x10`) and 512 Ã— 512 world grid
 
@@ -284,11 +287,16 @@ The `24,480` unique static sector IDs form a complete, gap-free `136 Ã— 180` 
     `poly1 < u32@0xC4` (`26,535,333 / 26,535,333`).
   - `+0x18..+0x1B` (`u16 flags0, u16 flags1`): link attribute and traversal type words (`flags1` top values: `0x0050`
     on `11,492,614`, `0x0040` on `9,705,698`, `0x0030` on `4,281,168`, `0x0060` on `425,369`).
-  - `+0x1C..+0x1D` (`u16 heading`): 8-bit quantized heading angle (`0..254`, `< 256` on `26,679,246 / 26,679,246`).
+  - `+0x1C..+0x1D` (`u16 heading`): 8-bit quantized heading angle (`< 256` on `26,679,246 / 26,679,246`; `u8@0x1C`
+    in `0..254`, `u8@0x1D == 0`).
   - `+0x1E..+0x1F` (`u16 pad`): zero padding (`0` on `26,679,246 / 26,679,246`).
   - Across all `26,903,247 / 26,903,247` entries of `+0xB0`, every entry `li = u16@(b0 + 2*k)` in polygon `pi`'s slice
     `[link_start .. link_start + link_count)` indexes a 32-byte link at `+0xA8` satisfying
-    `(poly0 == pi or poly1 == pi) and (sector0 == u32@0xC8 or sector1 == u32@0xC8)` (`0` failures).
+    `(poly0 == pi or poly1 == pi) and (sector0 == u32@0xC8 or sector1 == u32@0xC8)`, and every referenced link is
+    listed by all of its local-tile endpoints (`poly0` when `sector0 == u32@0xC8`, and `poly1` when
+    `sector1 == u32@0xC8`; on cross-tile links where the foreign endpoint polygon index is `< u32@0xC4`, the offline
+    builder also indexed the link under that polygon index because it matched `poly0/poly1 == pi` without filtering
+    by `sector0/sector1 == u32@0xC8`).
 
 ### Split arrays and quadtree layout
 
@@ -315,6 +323,53 @@ shares the identical 20-byte prefix `+0x00..+0x13` (`3,123,445 / 3,123,445`):
 | `+0x16` | 64 | `i16[32]` | Up to 16 relative 2D `(dx, dy)` footprint vertices in signed 16-bit fixed point around `(x, y)`; trailing unused slots `+0x16 + 4*N .. +0x55` are zero on `6,246,890 / 6,246,890` |
 | `+0x56` / `+0x58` | 4 | `i16`, `u16` | Vertical/extent words (`u16@0x56` range `0..65,535`, high bit set on `1,846,885`; `u16@0x58` range `3..65,534`, high bit set on `13,629`) |
 | `+0x5A` | 6 | `u8[6]` | Trailing zero padding (`0` on `6,246,890 / 6,246,890`) |
+### Polygon flags under the lane graph
+
+`tools/navmesh_nodes.py` puts the lane graph of `levels.rpf` ([world_lights_paths.md](world_lights_paths.md)) on
+the navmesh: for each node it takes the polygon of the node's tile that contains the node in plan view and is
+closest in height, and counts that polygon's flag bits. A polygon's height is the mean of its vertex heights, not
+the surface height under the node, so on a slope the two differ (the 3 m cutoff below absorbs that). For comparison
+it sums the plan area of the polygons that carry each bit over the same tiles; surfaces above one another, such as a
+bridge over a road or the stacked tiles that share one sector id, each add their own area. A bit that most road
+nodes stand on while it covers little of the area marks where the roads are.
+
+A vertex is `tile minimum + u16 / 65535 * tile extent` (the minimum is the quadtree root's, the extent `+0x60`).
+The node heights confirm it: of the 63,806 nodes with a finite position (63,808 read),
+63,802 lie over a polygon and 63,793 have one within 3 m above or below; the height
+difference is 0.032 m at the median, 0.095 m at the 90th percentile and 0.28 m at the 99th.
+
+Measured over the 6,970 static tiles that hold a node (77,880,896 polygons with three
+or more vertices, 120.2 km2 of plan area; 0 tiles unreadable). "Nodes" is how many of the 63,793
+nodes stand on a polygon with the bit; "area" is the share of the plan area such polygons cover:
+
+| Word | Bit | Nodes | Polygons | Area | Reading |
+|---|---|---:|---:|---:|---|
+| `+0x18` | 13 (`0x2000`) | 57,559 (90.2%) | 3,357,132 | 12.0% | under nine in ten nodes; SixNG's "road surface" |
+| `+0x18` | 8 (`0x100`) | 58,528 (91.7%) | 251,917 | 2.6% | under nine in ten nodes, on a fifth of bit 13's area; not named |
+| `+0x18` | 12 (`0x1000`) | 787 (1.2%) | 18,746,182 | 33.6% | not road: a third of the area, almost no node |
+| `+0x18` | 19 (`0x80000`) | 3,980 (6.2%) | 3,263,052 | 23.6% | the water candidate above |
+| `+0x18` | 27 (`0x8000000`) | 5,526 (8.7%) | 2,489,161 | 3.2% | 6stars's label; under few nodes |
+| `+0x28` | 17 (`0x20000`) | 21,246 (33.3%) | 1,083,157 | 4.7% | 6stars's label; seven times its area share, but only a third of the nodes |
+
+No other bit of either word has more than 5% of the nodes, except `+0x28` bit 18 (4,520 nodes, 7.1%, on 1.6% of
+the area).
+
+Bits 8 and 13 are mostly set together. The tool counts the four combinations:
+
+| `+0x18` bits 8 and 13 | Nodes | Polygons | Area |
+|---|---:|---:|---:|
+| both | 57,181 (89.6%) | 236,753 | 2.5% |
+| bit 8 only | 1,347 (2.1%) | 15,164 | 0.1% |
+| bit 13 only | 378 (0.6%) | 3,120,379 | 9.5% |
+| neither | 4,887 (7.7%) | 74,508,600 | 87.8% |
+
+So nine in ten lane nodes stand on polygons that carry both bits, which cover 2.5% of the area. Bit 13
+alone covers almost four times that area (9.5%) with almost no node on it, and bit 8 alone is rare.
+[SixNG](https://github.com/holdmysocks/SixNG) labels bit 13 "road surface" after a visual check
+(`crates/sixng-core/src/navmesh.rs`, commit `0619601`, GPL-3.0; see [related_projects.md](related_projects.md)).
+The count is consistent with that if road surface is wider than the driven lanes. It does not settle which bit,
+or which combination, means road surface. That stays open, as do bit 8's meaning and the other bits. The vertex
+formula above is stated in the same file and is confirmed by the heights.
 
 ## Band-3 `grid` resources (`27,482` resources)
 
@@ -361,8 +416,10 @@ counts.
 3. **`0DRP` unnamed structs and fields.** Several `0x7a` struct/member hashes (including `0x4712787b`, `0x57ad0b12`,
    `0xdd53676a`, `0xf2dd6348`, `0xde5f1345`, and 3 of the 4 singletons) are not yet matched to engine names.
 4. **Per-record bitfields inside `0x00010015` tiles.** `u32@0x10` bit 3's secondary trigger on `289` tiles and bit 6's
-   name, `u32@0xE8` build-stamp encoding, polygon/adjacent-edge/special-link flag bitfields, and the exact C++ class name
-   and `+0x56/+0x58` vertical unit of the paired 96-byte `+0xB8` footprint records remain open.
+   name, `u32@0xE8` build-stamp encoding, the polygon flag bits (`+0x18` bits 8 and 13 lie under nine in ten lane
+   nodes; which of them is road surface is open; see above), the adjacent-edge and special-link flag bitfields, and
+   the exact C++ class name and `+0x56/+0x58` vertical unit of the paired 96-byte `+0xB8` footprint records remain
+   open.
 5. **Band-3 `grid` subsystem and EOF `PSIN` v79.** The Band-3 subsystem identity, the x/y order of the octree key's
    octant bits 0/1, the cube's placement against its sector and the meaning of the `u32[N]` leaf fields are open
    (the key encoding and the inner-node word are decoded above), as is why the final `PSIN` (version `79`)
@@ -370,8 +427,9 @@ counts.
 
 ## Vehicle navmesh settings (`CVehiclePoints`, `common.rpf`)
 
-Navmeshes on vehicles that peds walk around on are configured outside this archive, by 32 `CVehiclePoints` XML
-documents in `common.rpf` (see [gamedata.md](gamedata.md)). One document per vehicle; counts only, no names.
+The settings for navmeshes on vehicles that peds walk around on are outside this archive, in 32 `CVehiclePoints`
+XML documents in `common.rpf` (see [gamedata.md](gamedata.md)); the meshes themselves are stored here (below).
+One document per vehicle; counts only, no names.
 
 | Field | Documents | Values |
 |---|---:|---|
@@ -396,11 +454,78 @@ rated vehicles. Of the mod part names, only the 5 `RoofModName` values that are 
 49 chassis, 32 utility, 35 exterior-propset and 4 interior names match no archive entry, so they are probably
 fragment-part or kit names rather than models.
 
-Not measured here (hypothesis): whether the vehicle navmeshes are generated at runtime from these parameters or
-stored elsewhere, and which vehicles the 31 are (wagons, boats and trains would fit the field set).
+### Stored vehicle navmeshes (ASSET-332)
+
+The vehicle navmeshes are **stored**, not left to a runtime generator: the 161 local-space non-grid meshes in this
+archive (`flags = 7`, the non-grid partition above) were built on cell grids, and 9 of them on the one cell size
+only these documents set. Measured over all 161 on 1.0.2.1 with `tools/navmesh_cell_fit.py`:
+
+- **Cell grid.** A mesh's `u16` vertices are dequantised over its `+0x60` extents (step `extent / 65535`, at most
+  0.0011 m on these meshes) and an x or y coordinate counts as on a grid of cell size `c` when it is within 1.5 steps
+  of a multiple of `c`. Every mesh fits one of the three nonzero `fNavOverrideRecastCellSize` values: at
+  least 90.9% of its x and y coordinates sit on that grid (20,100 vertices in all). The quantisation step alone
+  cannot put them there: over all 65,536 levels of a mesh's own step, at most 5.1% land on its grid (mean 1.0% at
+  0.0625, 1.7% at 0.03125, 0.7% at 0.0325). Taking the coarsest of the three that fits:
+
+  | Cell size | Meshes | Distinct x × y extents | Documents with that value |
+  |---:|---:|---:|---:|
+  | 0.0625 | 87 | 42 | 1 |
+  | 0.03125 | 65 | 20 | 23 |
+  | 0.0325 | 9 | 1 | 3 |
+
+  No mesh fits both 0.03125 and 0.0325. Of six other values tried (0.1, 0.125, 0.15, 0.2, 0.25, 0.5), only 0.125
+  fits any mesh: 2 at the 90.9% cut (4 at 90%), all among the 87 at 0.0625, whose coordinates a coarser grid can
+  also hold. Every mesh's x and y extents are a whole number of its cells.
+- **The static tiles are on a grid too.** Every 200th static 128 m tile (137 tiles) fits 0.0625 and 0.03125 (chance
+  baselines 9.4% and 18.8% at their step of 128/65535 m), and none fits 0.0325. So the world navmesh is built on a
+  0.0625 grid as well, and a fit at 0.0625 or 0.03125 alone does not show that a mesh used a vehicle override.
+- **The 0.0325 meshes.** 0.0325 is the one value that is not a power of two and that no static tile fits, so it
+  is the test that ties meshes to these documents. All 9
+  meshes on it share one footprint, 1.755 × 5.1675 m, which is exactly 54 × 159 cells of 0.0325. They are flat
+  (z extent 0) and have 47 vertices (6) or 55 (3). The 3 documents with that value name 3 different models.
+- **No name hash.** None of the 161 meshes (nor the whole-world coarse mesh) contains the `joaat` of any of
+  the 31 model names, as written, lower-cased, or with `.yft` appended, at any byte offset. So a mesh is not tied
+  to its model by a stored name hash. Where the link is is not measured; the encrypted table of contents is one
+  candidate (see [rpf.md](rpf.md)).
+
+Not measured (hypothesis): which mesh belongs to which model, and so which vehicles they are. 161 meshes for 31
+models means either several meshes per model (states or variants) or meshes for vehicles without a
+`CVehiclePoints` document. The 87 meshes at 0.0625 against 1 document with that value, and the static tiles on the
+same grid, would fit 0.0625 being the default cell size when the override is 0 or absent (5 documents: 4 with 0,
+1 without the field).
+**Stored vs runtime-generated and vehicle classes (ASSET-332).** Cross-checking the 31 distinct `CVehiclePoints`
+models (and 55 `ModDefs/Item` part names) against `navmeshes.rpf`, `common.rpf` metadata, and other package
+archives resolves the earlier hypothesis: **vehicle navmeshes are pre-baked and stored in `navmeshes.rpf` Band 2**,
+so the port does not need a runtime Recast navmesh generator for these vehicles. The `CVehiclePoints` Recast fields
+are authoring/build-time inputs to that partition:
+
+- **Stored in `navmeshes.rpf` Band 2 (`flags = 7` dynamic partition):** the non-grid `PSIN` container at
+  `0x1749fe000` (`37,120` B, version `256`, `493` `LSNS` records) heading the `161` local-space dynamic navmeshes
+  (`0x174a02010..0x174b91010`) contains the lowercase `joaat` hash of **25 of the 31** `CVehiclePoints` model names
+  (100% of the 25 present in the `.yft` catalog) and **20 of the 55** `ModDefs/Item` part names. The remaining 6
+  models appear in neither the `.yft` catalog, `CVehiclePerformanceMaps`, `CTrainConfigs`, nor `PSIN 0x1749fe000`.
+- **Absent from other archives:** scanning `packs.rpf`, `data.rpf`, `common.rpf`, and `story000.rpf` finds **0**
+  `0x00010015` navmesh streams outside `navmeshes.rpf`.
+- **Dynamic partition dimensions (`161` `flags = 7` meshes):** extents `dx` `1.31..63.0` m, `dy` `2.94..69.38` m,
+  `dz` `0.0..13.2` m (`max(dx, dy)`: `81` `<= 10` m, `67` `10..25` m, `11` `25..60` m, `2` `> 60` m); `4..1,058`
+  vertices, `1..631` polygons, `2..1,694` special links, and `0` `+0xB8` volume records on all `161`.
+- **Vehicle class breakdown of the 31 `CVehiclePoints` models** (via `CVehiclePerformanceMaps` and `CTrainConfigs`
+  in `common.rpf`):
+
+| Class (`common.rpf` metadata) | `CVehiclePoints` models | Matched in `PSIN 0x1749fe000` | Broader `common.rpf` set in `PSIN 0x1749fe000` |
+|---|---:|---:|---:|
+| Watercraft (`CVehiclePerformanceMaps` Doc 1, `buoyancyOffsetZ != 0`) | 20 | 20 / 20 | 31 / 34 |
+| Ground/land (`CVehiclePerformanceMaps` Doc 0, `takeOffSpeed == 0`) | 4 | 4 / 4 | 12 / 251 |
+| Air (`CVehiclePerformanceMaps` Doc 0, `takeOffSpeed > 0`) | 0 | 0 | — |
+| Train (`CTrainConfigs`) | 1 | 1 / 1 | — |
+| Absent from `CVehiclePerformanceMaps`, `CTrainConfigs`, and `.yft` catalog | 6 | 0 / 6 | — |
+| **Total** | **31** | **25 / 31** | |
 
 ## Tools
 
+- `tools/navmesh_cell_fit.py` (stdlib-only) measures the cell grid of the local-space meshes and, with `--common`,
+  counts the `CVehiclePoints` cell sizes and searches the meshes for the models' name hashes; `--static-every N`
+  adds a static-tile control. It prints aggregates only (ASSET-332).
 - `tools/navmesh_index.py` (stdlib-only) performs the quick `0DRP` header inventory (`offset`, sizes, version, `+0x20`,
   raw `+0x60`/`+0x68`).
 - `tools/navmesh_decode.py` (stdlib-only) decodes all four resource classes (`0DRP`, `0x00010015`, `grid`, `PSIN`),
@@ -408,6 +533,8 @@ stored elsewhere, and which vehicles the 31 are (wagons, boats and trains would 
   JSON and optional numeric CSV metadata. It never writes payload bytes and never touches the TOC.
 - `tools/navmesh_links.py` (stdlib-only) decodes and verifies the 12-byte `+0x88` adjacent-polygon edges, the polygon
   `+0x20` special-link prefix-sum chain, and the 32-byte `+0xA8` special links and `+0xB0` index table.
+- `tools/navmesh_nodes.py` (stdlib-only) counts the polygon flag bits under the lane-graph nodes
+  ([above](#polygon-flags-under-the-lane-graph)). It reads `navmeshes.rpf` and `levels.rpf` and writes counts only.
 
 ```powershell
 python -I tools/navmesh_decode.py <package>\navmeshes.rpf --out <temp>/navmesh-decode.json --csv <temp>/navmesh-decode.csv
@@ -416,6 +543,9 @@ python -I tools/navmesh_decode.py <carve-dir> --out <temp>/carved-decode.json
 python -I tools/navmesh_links.py <package>\navmeshes.rpf --out <temp>/navmesh-links.json
 python -I -W error::ResourceWarning tests/test_navmesh_decode.py -v
 python -I tests/test_navmesh_links.py -v
+python -I tools/navmesh_nodes.py <package>\navmeshes.rpf <package>\levels.rpf --jobs 8 --out <temp>/navmesh-nodes.json
+python -I -W error::ResourceWarning tests/test_navmesh_decode.py -v
+python -I tests/test_navmesh_nodes.py
 python -I tests/test_navmesh_index.py
 ```
 

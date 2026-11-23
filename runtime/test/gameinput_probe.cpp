@@ -1,13 +1,15 @@
 // gameinput_probe: the GameInput shim on a real controller. Not a CTest; run it by hand with a pad connected.
 //
-//   gameinput_probe [--seconds N] [--rumble]
+//   gameinput_probe [--seconds N] [--rumble] [--force-feedback]
 //
 // Lists the gamepads the shim sees, with the raw HID report tables of each pad opened through HID, then prints the
 // live gamepad reading (and its newest raw input report, when there is one) for N seconds (default 10). With
 // --rumble it first plays, on every pad: the low-frequency motor, the high-frequency motor, the left and the right
 // impulse trigger, one second each. On a DualSense the trigger steps run in the LEONIDA_DS_TRIGGERS mode (rumble by
-// default; set it to resistance to feel that one). Everything goes through GameInputCreate from the shim registry,
-// as a title would call it. No game data.
+// default; set it to resistance to feel that one). With --force-feedback it then creates a constant force at
+// magnitude 1.0 on motor 0 and holds it for a second, which a wheel feels as a steady pull; a pad the shim reports no
+// force-feedback motor for is skipped with the reason shown. Everything goes through GameInputCreate from the shim
+// registry, as a title would call it. No game data.
 #include <windows.h>
 
 #include <cstdio>
@@ -61,16 +63,65 @@ void play(const char* what, GameInputRumbleParams p) {
     Sleep(300);
 }
 
+// A constant force at full magnitude on the pad's first motor, held for a second: the effect a wheel feels as a
+// steady pull. A pad SDL did not open as a haptic device reports no motor, and the step says so and moves on.
+void constant_force() {
+    // g_devices is in connection order, which is what output_state indexes; the SDL outcome is read back per pad.
+    for (size_t n = 0; n < g_devices.size(); ++n) {
+        IGameInputDevice* d = g_devices[n];
+        const GameInputDeviceInfo* i = d->GetDeviceInfo();
+        if (i->forceFeedbackMotorCount == 0) {
+            std::printf("force feedback: %s reports no force-feedback motor; skipped\n",
+                        i->displayName ? i->displayName->data : "?");
+            continue;
+        }
+        const auto* motor = static_cast<const GameInputForceFeedbackMotorInfo*>(i->forceFeedbackMotorInfo);
+        std::printf("force feedback: %u motor(s), motor 0 axes=0x%x constant=%d\n", i->forceFeedbackMotorCount,
+                    motor ? static_cast<unsigned>(motor->supportedAxes) : 0u,
+                    motor != nullptr && motor->isConstantEffectSupported);
+        GameInputForceFeedbackParams p{};
+        p.kind = GameInputForceFeedbackConstant;
+        p.data.constant.magnitude.linearX = 1.0f;
+        IGameInputForceFeedbackEffect* e = nullptr;
+        const HRESULT hr = d->CreateForceFeedbackEffect(0, &p, reinterpret_cast<void**>(&e));
+        if (FAILED(hr) || !e) {
+            std::printf("force feedback: CreateForceFeedbackEffect failed (0x%08lx)\n", static_cast<unsigned long>(hr));
+            continue;
+        }
+        std::printf("force feedback: constant linearX 1.0 on motor 0, 1 s\n");
+        e->SetState(GameInputFeedbackRunning);
+        Sleep(1000);  // the poll thread creates and runs the effect
+        char seen[256] = "no output state";
+        rt::gameinput::OutputState out{};
+        if (rt::gameinput::output_state(static_cast<int>(n), &out)) {
+            if (out.effect_id < 0) {
+                std::snprintf(seen, sizeof seen, "SDL did not create the effect (%s)",
+                              out.effect_error[0] ? out.effect_error : "no error text");
+            } else if (!out.effect_ran) {
+                std::snprintf(seen, sizeof seen, "SDL created effect %d but did not run it (%s)", out.effect_id,
+                              out.effect_error[0] ? out.effect_error : "no error text");
+            } else {
+                std::snprintf(seen, sizeof seen, "SDL created effect %d and is running it", out.effect_id);
+            }
+        }
+        std::printf("force feedback: %s\n", seen);
+        e->SetState(GameInputFeedbackStopped);
+        e->Release();  // the poll thread destroys the SDL effect
+        Sleep(300);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     int seconds = 10;
-    bool rumble = false;
+    bool rumble = false, force_feedback = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--seconds") && i + 1 < argc) seconds = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--rumble")) rumble = true;
+        else if (!std::strcmp(argv[i], "--force-feedback")) force_feedback = true;
         else {
-            std::printf("usage: gameinput_probe [--seconds N] [--rumble]\n");
+            std::printf("usage: gameinput_probe [--seconds N] [--rumble] [--force-feedback]\n");
             return 2;
         }
     }
@@ -97,6 +148,8 @@ int main(int argc, char** argv) {
         play("right trigger", {0, 0, 0, 1});
         play("left trigger at 30%", {0, 0, 0.3f, 0});
     }
+
+    if (force_feedback && !g_devices.empty()) constant_force();
 
     const ULONGLONG end = GetTickCount64() + static_cast<ULONGLONG>(seconds) * 1000;
     while (GetTickCount64() < end) {

@@ -9,7 +9,7 @@ the D3D12 calls by outcome and the first call per method.
 The method field can contain spaces (`SetMarker/BeginEvent with unknown metadata`), so the parser takes the
 outcome as the last field instead of assuming a single-word method. PowerShell 5.1 wraps the first stderr line of
 a native program in an error record (`program.exe : [d3d12-trace] #1 ...`), so a `<name> : ` prefix before the
-tag is accepted too; without it the first call of the run would be lost.
+tag is accepted too. The reader accepts UTF-8 and BOM-marked UTF-16, including PowerShell 5.1 stderr redirection.
 
 Usage:
     python -I boot_trace.py boot.jsonl [--d3d12 d3d12.log] [--json] [--limit N]
@@ -19,7 +19,8 @@ strings instead of printing them, and only the tests' synthetic fixtures go into
 error classes from a real run, not its trace (AGENTS.md, "No game data").
 
 Standard library only; reads files, never runs them. A truncated last line (the expected shape after a crash) is
-counted, not fatal; a file with no valid event is an error (exit 2).
+counted, not fatal; a file with no valid event is an error (exit 2). When one of two requested traces fails to
+parse, the report still includes the other trace.
 """
 
 from __future__ import annotations
@@ -37,19 +38,11 @@ class TraceError(ValueError):
 
 
 def _open_text(path: str):
-    """Open a trace as UTF-8, naming the one encoding trap before any line is parsed."""
+    """Read UTF-8 or use the byte-order mark to decode a UTF-16 trace."""
     try:
         with open(path, "rb") as raw:
-            head = raw.read(3)
-    except OSError as e:
-        raise TraceError(f"cannot read {path}: {e.strerror or e}") from e
-    if head[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        raise TraceError(
-            f"{path} is UTF-16, which PowerShell 5.1 writes for `2>`; "
-            "use `2>&1 | Out-File -Encoding utf8` for the d3d12 log"
-        )
-    encoding = "utf-8-sig" if head == b"\xef\xbb\xbf" else "utf-8"
-    try:
+            head = raw.read(2)
+        encoding = "utf-16" if head in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
         return open(path, encoding=encoding, errors="replace")
     except OSError as e:
         raise TraceError(f"cannot read {path}: {e.strerror or e}") from e
@@ -83,6 +76,8 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 continue
             try:
                 event = json.loads(line)
+                if isinstance(event, dict) and event.get("kind") == "exit" and type(event.get("code")) is not int:
+                    event = None
             except json.JSONDecodeError:
                 trace["bad_lines"] += 1
                 if len(trace["bad_line_numbers"]) < limit:
@@ -109,6 +104,11 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 )
             elif kind == "tls_callback":
                 trace["tls_callbacks"] += 1
+                trace["last_tls_callback"] = {
+                    "module": event.get("module"),
+                    "at": event.get("at"),
+                    "reason": event.get("reason"),
+                }
             elif kind == "dllmain":
                 if event.get("result"):
                     trace["dllmain"]["ok"] += 1
@@ -131,18 +131,21 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 trace["debug_strings"] += 1
             elif kind == "exception":
                 trace["exception_count"] += 1
+                if limit <= 0:
+                    continue
+                stack = event.get("stack")
+                detail = {
+                    "code": event.get("code"),
+                    "at": event.get("at"),
+                    "cpp": event.get("cpp"),
+                    "access": event.get("access"),
+                    "address": event.get("address"),
+                    "stack": stack[:8] if isinstance(stack, list) else [],
+                }
                 if len(trace["exceptions"]) < limit:
-                    stack = event.get("stack")
-                    trace["exceptions"].append(
-                        {
-                            "code": event.get("code"),
-                            "at": event.get("at"),
-                            "cpp": event.get("cpp"),
-                            "access": event.get("access"),
-                            "address": event.get("address"),
-                            "stack": stack[:8] if isinstance(stack, list) else [],
-                        }
-                    )
+                    trace["exceptions"].append(detail)
+                else:
+                    trace["exceptions"][-1] = detail
             elif kind == "exit":
                 trace["exit"] = event.get("code")
             elif kind == "error":
@@ -164,6 +167,7 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
         "failed": [],
         "unsupported": [],
         "refused": [],
+        "partial": [],
         "last_seq": 0,
     }
     with _open_text(path) as fh:
@@ -180,7 +184,7 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
             if method not in trace["first"]:
                 trace["methods"].append(method)
                 trace["first"][method] = {"seq": seq, "outcome": outcome}
-            if outcome in ("failed", "unsupported", "refused"):
+            if outcome in ("failed", "unsupported", "refused", "partial"):
                 bucket = trace[outcome]
                 if len(bucket) < limit:
                     bucket.append({"seq": seq, "method": method})
@@ -216,6 +220,13 @@ def format_text(summary: dict, limit: int) -> str:
             names = [m["module"] for m in startup["modules"]]
             out.append(f"  modules ({len(names)}): {_tail(names, limit)}")
         out.append(f"  tls callbacks: {startup['tls_callbacks']}")
+        if callback := startup.get("last_tls_callback"):
+            reason = callback["reason"]
+            phase = "phase unknown"
+            if type(reason) is int:
+                phase = {0: "process detach", 1: "process attach"}.get(reason, phase)
+            at = callback["at"] or "address unknown"
+            out.append(f"    last observed TLS callback: {at} ({phase})")
         dm = startup["dllmain"]
         line = f"  dllmain: {dm['ok']} ok, {dm['failed']} failed"
         if dm["failed_modules"]:
@@ -273,6 +284,9 @@ def format_text(summary: dict, limit: int) -> str:
         if d3d12["refused"]:
             refused = [f"#{c['seq']} {c['method']}" for c in d3d12["refused"]]
             out.append(f"  refused: {_tail(refused, limit)}")
+        if d3d12.get("partial"):
+            partial = [f"#{c['seq']} {c['method']}" for c in d3d12["partial"]]
+            out.append(f"  partial: {_tail(partial, limit)}")
     return "\n".join(out)
 
 
@@ -293,18 +307,22 @@ def main(argv=None) -> int:
     if a.limit < 1:
         print("error: --limit must be at least 1", file=sys.stderr)
         return 2
-    try:
-        startup = parse_startup(a.startup, a.limit) if a.startup else None
-        d3d12 = parse_d3d12(a.d3d12, a.limit) if a.d3d12 else None
-    except TraceError as e:
-        print(f"error: {e}", file=sys.stderr)
+    summary = summarize(None, None)
+    exit_code = 0
+    for section, path, parse in (("startup", a.startup, parse_startup), ("d3d12", a.d3d12, parse_d3d12)):
+        if path:
+            try:
+                summary[section] = parse(path, a.limit)
+            except TraceError as e:
+                print(f"error: {e}", file=sys.stderr)
+                exit_code = 2
+    if not any(summary.values()):
         return 2
-    summary = summarize(startup, d3d12)
     if a.json:
         print(json.dumps(summary, indent=1))
     else:
         print(format_text(summary, a.limit))
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

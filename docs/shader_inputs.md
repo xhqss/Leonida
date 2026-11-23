@@ -93,22 +93,20 @@ dword and the buffer's bounds first.
 
 #### Light shape size
 
-Reported by @Silliana [on the pull request](https://github.com/ItsNotRexed/Leonida/pull/3157): +0x3C holds two f16,
-the low half a sphere radius and the high half a range. Since intensity is radiance, the light's power grows with
-radius², so a radius that's too big (for example the range written into both halves) gives scattered single-pixel
-specular blowups that look like a translator bug.
++0x3C holds two f16. How they are used depends on the light type (bits 30–31 at +0x28):
 
-What the shader shows confirms the two f16 halves, but their use depends on the light type (bits 30–31 at +0x28):
+| Type | Low half | High half | Source |
+|---|---|---|---|
+| 0 | Sphere radius: clamped against the reflection ray to pick the closest point on the light. Brightness grows with radius², since intensity is radiance. | No effect. | Tested by @Silliana [on the pull request](https://github.com/ItsNotRexed/Leonida/pull/3157): radius 60 → 5 dimmed the light about 134× (radius² predicts 144×). |
+| not decoded | Half-size along one axis of a rectangle. | Half-size along the other axis. | Shader: the light's position is moved by ± each half along its axis, and points are clamped to those bounds. |
+| not decoded | — | A length along the light's axis (clamped to ± half of it), also squared and compared against a distance. Probably a tube light's length (@Silliana's hypothesis, not tested). | Shader. |
 
-- In one path they are the two half-sizes of a rectangle. The light's position is moved by ± the low half along one
-  axis and ± the high half along the other, and points are clamped to those bounds.
-- In another path the high half is a length along the light's axis (clamped to ± half of it), and it is also squared
-  and compared against a distance.
-- The low half also sets one blend factor.
-- No range-style falloff was found: neither half divides a distance.
+The low half also sets one blend factor. No range-style falloff was found: neither half divides a distance, and the
+early reading of the high half as a range is dropped.
 
-So a wrong value here makes the light the wrong size, and an oversized area light is a likely cause of the blowups.
-Which light type reads the low half as a sphere radius isn't decoded yet.
+A value that's too big makes the light too large. On a sphere light, the brightness grows with the square of the
+radius. That gives scattered single-pixel specular blowups that look like a translator bug, for example when a range
+is written into both halves (reported by @Silliana).
 
 #### Correction to #1892
 
@@ -254,3 +252,53 @@ same 32-bit word to all four components of the storage image. The data is useles
 says. The layer's UAV path for `R9G9B9E5_SHAREDEXP` already covers this: on a GPU without native RGB9E5 storage it
 binds an `R32_UINT` storage view ([`d3d12_vulkan.md`](d3d12_vulkan.md), from #1375 and #1388).
 `CS_Transmittance` and `CS_SkyAtmosphereLUT` contain no RGB9E5 packing.
+
+### The shared atmosphere constant buffer
+
+Reported by @Silliana in [#3990](https://github.com/ItsNotRexed/Leonida/issues/3990): the four passes read one
+atmosphere struct, each through its own buffer descriptor fetched from the resource table. Confirmed in the
+disassembly of the 1.0.2.1 package (llvm-mc 23.1.5, gfx1013): the 26,503-program corpus has exactly one program for
+each of the four names, and each reads the offsets below through a single descriptor. The three `sky_scattering`
+passes fetch that descriptor from table offset **+0x220**; `CS_SkyAtmosphereLUT` fetches it from **+0xC60**. So when
+one pass looks right and another looks wrong, check the slot binding before the layout. The +0xD0 output-format
+dword above sits in this same buffer.
+
+Everything is in km (#3990). Field names are #3990's reading; the offsets and the "consumed by" column are measured.
+A pass can load a dword as part of a wider load without using it, so "consumed" means an instruction reads the
+register before it is overwritten.
+
+| Offset | Type | Field (#3990) | Consumed by |
+|---|---|---|---|
+| +0x20 | f32 | Planet radius | all four |
+| +0x30 | f32 | Rayleigh scale height | none (loaded, see below) |
+| +0x34 | 3 × f32 | Rayleigh scattering RGB | all four |
+| +0x40 | f32 | Mie scale height | none (loaded, see below) |
+| +0x44 | 3 × f32 | Mie scattering RGB | all four |
+| +0x50 | f32 | Top of the atmosphere | all four |
+| +0x60 | 3 × f32 | Mie absorption RGB | all four |
+| +0x6C | f32 | Mie g (phase asymmetry) | `CS_SkyView` only |
+| +0x70 | f32 | Ozone layer width | all four |
+| +0x74 | 2 × f32 | Ozone below the layer: constant, slope | all four |
+| +0x7C | 2 × f32 | Ozone above the layer: constant, slope | all four |
+| +0x84 | 3 × f32 | Ozone absorption RGB | all four |
+| +0x90 | 3 × f32 | Sun direction | `CS_SkyView` only |
+| +0xA0 | 3 × f32 | Moon direction | `CS_SkyView` only |
+
+The two scale-height dwords are where the disassembly adds to #3990: every pass loads them inside a wide scalar
+load, but in all four programs the registers holding +0x30 and +0x40 are overwritten or never touched again before
+any instruction reads them. Only the RGB coefficients next to them are consumed. A wrong value in those two dwords
+cannot by itself explain a bad sky from these passes.
+
+The ozone block matches #3990's two-layer linear reading: the dword at +0x70 is compared per lane with a float
+(`v_cmp_gt_f32`) in the ozone block, the constant/slope pairs feed `v_fma_f32`, and the absorption RGB feeds the
+per-channel accumulate. `CS_SkyView` reads the sun direction at +0x90 and a second direction at +0xA0,
+which #3990 reads as the moon; its second output is the sky lit by that direction. The fourth dword of each
+direction (+0x9C, +0xAC) is not consumed.
+
+Some neighbouring dwords are read but not decoded here: +0x24 to +0x2C (next to the planet radius), +0x54 to +0x5C
+(`CS_SkyView`), and +0x04 to +0x13 (`CS_SkyView` and `CS_SkyAtmosphereLUT`).
+
+Sanity checks from #3990 (GPU experiments, not repeated here): zeroing the Rayleigh RGB makes the zenith go basically
+white, zeroing the ozone absorption mostly bumps green, and raising Mie g brightens the sky toward the sun. With
+Earth-like values `CS_Transmittance` lands within about 0.01 of a reference transmittance table, which makes it the
+cheapest pass to sanity-check a translation.

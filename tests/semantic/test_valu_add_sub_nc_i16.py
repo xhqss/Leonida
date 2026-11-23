@@ -113,6 +113,52 @@ class AddSubNcI16(unittest.TestCase):
                 with self.subTest(op=i16, a=hex(a), b=hex(b)):
                     self.assertEqual(run(f"{i16} v0, v1, v2", a, b), run(f"{u16} v0, v1, v2", a, b))
 
+    def test_sgpr_and_inline_constants(self):
+        for op in OPS:
+            with self.subTest(op=op):
+                # s4 as src0, 1 as src1
+                lines = [
+                    "s_mov_b32 s4, 0x00000005",
+                    "v_mov_b32 v0, 0xAAAA0000",
+                    f"{op} v0, s4, 1",
+                    "v_and_b32 v5, 0xffff, v0", "v_lshrrev_b32 v6, 16, v0",
+                    "v_or_b32 v5, 0x40000000, v5", "v_or_b32 v6, 0x40000000, v6",
+                    "exp mrt0 v5, v6, v5, v5 done vm", "s_endpgm",
+                ]
+                lo, hi = si.run_fragment(translate(lines))["%out_mrt0"][:2]
+                got = (lo & 0xFFFF) | (hi & 0xFFFF) << 16
+                want_lo = 6 if op == "v_add_nc_i16" else 4
+                self.assertEqual(got, 0xAAAA0000 | want_lo)
+
+    def test_literal_and_high_half_preservation(self):
+        for op in OPS:
+            with self.subTest(op=op):
+                # 32-bit literal operand preserving high half (0xAAAA)
+                lines = [
+                    "v_mov_b32 v1, 0x00000002",
+                    "v_mov_b32 v0, 0xAAAA0000",
+                    f"{op} v0, 0x1234, v1",
+                    "v_and_b32 v5, 0xffff, v0", "v_lshrrev_b32 v6, 16, v0",
+                    "v_or_b32 v5, 0x40000000, v5", "v_or_b32 v6, 0x40000000, v6",
+                    "exp mrt0 v5, v6, v5, v5 done vm", "s_endpgm",
+                ]
+                lo, hi = si.run_fragment(translate(lines))["%out_mrt0"][:2]
+                got = (lo & 0xFFFF) | (hi & 0xFFFF) << 16
+                want_lo = (0x1234 + 2) if op == "v_add_nc_i16" else (0x1234 - 2)
+                self.assertEqual(got, 0xAAAA0000 | want_lo)
+
+    def test_non_vgpr_opsel_dst_rejected(self):
+        for op in OPS:
+            with self.subTest(op=op):
+                lines = [
+                    "v_mov_b32 v1, 1",
+                    "v_mov_b32 v2, 2",
+                    f"{op} s4, v1, v2 op_sel:[0,0,1]",
+                    "s_endpgm",
+                ]
+                with self.assertRaises(rdna2spirv.Unsupported):
+                    translate(lines)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,6 +15,8 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "glb_inspect.py")
+sys.path.insert(0, os.path.dirname(TOOL))
+import glb_inspect  # noqa: E402
 
 JSON_CHUNK = 0x4E4F534A
 BIN_CHUNK = 0x004E4942
@@ -285,6 +287,23 @@ class GlbInspectTests(unittest.TestCase):
         duplicate = raw_glb([(JSON_CHUNK, payload), (JSON_CHUNK, payload)])
         self.assert_error(duplicate, "duplicate JSON chunk")
 
+    def test_parse_only_copies_the_json_payload(self):
+        metadata = json_bytes({"asset": {"version": "2.0"}, "buffers": [{"byteLength": 3}]})
+        json_end = glb_inspect.GLB_HEADER_SIZE + glb_inspect.CHUNK_HEADER_SIZE + len(metadata)
+
+        class MetadataOnlyBytes(bytes):
+            def __getitem__(self, key):
+                if isinstance(key, slice) and (key.stop is None or key.stop > json_end):
+                    raise AssertionError("copied payload outside the JSON chunk")
+                return super().__getitem__(key)
+
+        data = MetadataOnlyBytes(raw_glb([
+            (JSON_CHUNK, metadata), (BIN_CHUNK, b"abc\x00"), (EXT_CHUNK, b"TEST"),
+        ]))
+        chunks = glb_inspect.parse_glb(data)["chunks"]
+        self.assertEqual(chunks[1]["padding"], 1)
+        self.assertEqual(chunks[2]["byte_length"], 4)
+
     def test_chunk_and_header_lengths_must_be_4_byte_aligned(self):
         payload = b'{"asset":{"version":"2.0"}}'
         self.assertEqual(len(payload) % 4, 3)
@@ -300,7 +319,7 @@ class GlbInspectTests(unittest.TestCase):
     def test_nul_padding_is_accepted_and_counted(self):
         payload = b'{"asset":{"version":"2.0"}}' + b"\x00"
         with tempfile.TemporaryDirectory() as folder:
-            path = os.path.join(folder, "nul.glb")
+            path = os.path.join(folder, "nul_padding.glb")
             out = os.path.join(folder, "report.json")
             with open(path, "wb") as handle:
                 handle.write(raw_glb([(JSON_CHUNK, payload)]))

@@ -182,10 +182,10 @@ _COMPACT_TILE_ORIGIN = {0: (16, 16), 1: (16, 8), 2: (8, 8), 3: (8, 4), 4: (4, 4)
 # AMD Gfx10 3D SW_4KB_S micro-tile extents (blocks_w, blocks_h, blocks_d) by log2(element_bytes).
 _VOLUME_4K_TILE = {
     0: (16, 16, 16),
-    1: (16, 8, 16),
-    2: (8, 8, 16),
+    1: (8, 16, 16),
+    2: (8, 16, 8),
     3: (8, 8, 8),
-    4: (8, 4, 8),
+    4: (4, 8, 8),
 }
 # 5-bit chunk page-count codes packed in the low 20 bits of ((extra << 11) | meta),
 # mapping each non-zero code to its RDS5 chunk virtual size in 4 KiB pages.

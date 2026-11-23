@@ -134,6 +134,28 @@ class True16(unittest.TestCase):
                      "v_cvt_f32_f16 v8, v4.h", "v_mov_b32 v8, v4"):
             self.assertEqual(asm.true16_spelling(same), same)
 
+    def test_op_sel_of_the_16_bit_integer_vop3_ops_is_named_on_their_vgprs(self):
+        """Bit i of op_sel picks source i's half, the last bit the destination's. GFX11+ assemblers reject the bare
+        form of these eight ops (gfx1100, gfx1150 and gfx1201 checked with AMD LLVM 23); SGPRs and constants keep
+        taking their half from the op_sel list, so it stays as written."""
+        for old, new in (
+                ("v_max_u16_e64 v14, s12, v5 op_sel:[1,0,0]", "v_max_u16_e64 v14.l, s12, v5.l op_sel:[1,0,0]"),
+                ("v_mul_lo_u16_e64 v12, s16, v14 op_sel:[0,1,0]",
+                 "v_mul_lo_u16_e64 v12.l, s16, v14.h op_sel:[0,1,0]"),
+                ("v_max_u16_e64 v18, v18, s9 op_sel:[1,1,0]", "v_max_u16_e64 v18.l, v18.h, s9 op_sel:[1,1,0]"),
+                ("v_mul_lo_u16_e64 v16, s19, 0x100 op_sel:[1,1,1]",
+                 "v_mul_lo_u16_e64 v16.h, s19, 0x100 op_sel:[1,1,1]"),
+                ("  v_lshlrev_b16_e64 v2, v19, 32 op_sel:[0,1,1]",
+                 "  v_lshlrev_b16_e64 v2.h, v19.l, 32 op_sel:[0,1,1]"),
+                ("v_ashrrev_i16 v0, s13, v18 op_sel:[0,1,0]", "v_ashrrev_i16 v0.l, s13, v18.h op_sel:[0,1,0]")):
+            self.assertEqual(asm.opsel16_spelling(old), new)
+            self.assertEqual(asm.opsel16_spelling(new), new)        # already spelled that way
+        for same in ("v_max_u16_e64 v5, v1, v3",                   # no op_sel: the bare form still assembles
+                     "v_add_nc_u16 v1, v2, v3 op_sel:[1,0,0]",     # these ops take the bare form on GFX11+
+                     "v_mad_u16 v1, v2, v3, v4 op_sel:[1,0,0,0]",
+                     "v_max_u16_e64 v1, v2 op_sel:[1,0,0]"):       # not a destination and two sources
+            self.assertEqual(asm.opsel16_spelling(same), same)
+
     def test_the_non_returning_compare_and_store_is_respelled_and_swapped_on_gfx11(self):
         """GFX11 has no ds_cmpst_b32, and ds_cmpstore_b32 takes the store value before the compare value."""
         self.assertEqual(asm.ds_line("ds_cmpst_b32 v0, v1, v2", "gfx1150"),
@@ -150,6 +172,19 @@ class True16(unittest.TestCase):
         text = "v_mov_b32 v1, 0\nv_cvt_f32_f16 v8, 0x3c00\nv_cvt_f16_f32 v8, v1\nv_mov_b32 v9, 0\n"
         out = asm.true16_spelling(text)
         self.assertEqual(out, text.replace("v_cvt_f16_f32 v8,", "v_cvt_f16_f32 v8.l,"))
+
+    def test_true16_binary_keeps_explicit_halves_and_other_instruction_forms(self):
+        for old, new in (
+                ("v_mul_f16_e32 v0, v1, v2", "v_mul_f16_e32 v0.l, v1.l, v2.l"),
+                (" v_max_f16_e64 v8.h, -|v4|, s1 // v9", " v_max_f16_e64 v8.h, -|v4.l|, s1 // v9"),
+                ("v_lshlrev_b16 v0, 3, v2", "v_lshlrev_b16 v0.l, 3, v2.l")):
+            self.assertEqual(asm.true16_spelling(old), new)
+            self.assertEqual(asm.true16_spelling(new), new)
+        for text in ("v_mul_lo_u16_e64 v1, v2, v3 op_sel:[0,1,0]",
+                     "v_fma_f16_e64 v0, v1, v2, v3 op_sel:[1,0,1,1]",
+                     "v_pk_add_f16 v0, v1, v2 op_sel:[1,0] op_sel_hi:[1,1]",
+                     ".long 0xd7050014 // v_mul_lo_u16 v20, v21, v22"):
+            self.assertEqual(asm.true16_spelling(text), text)
 
 
 class ToolchainFallbacks(unittest.TestCase):
@@ -184,15 +219,36 @@ class ToolchainFallbacks(unittest.TestCase):
         self.assertEqual(o._probe(), "device=test arch=gfx1103")
         self.assertEqual((seen, o.code_object), ([None, 5], 5))
 
+    def test_error_303_retries_as_v5_and_keeps_it(self):
+        o, seen = self.probe(loads={5}, error="hipModuleLoadData(&mod, img) -> hip error 303")
+        self.assertEqual(o._probe(), "device=test arch=gfx1103")
+        self.assertEqual((seen, o.code_object), ([None, 5], 5))
+
     def test_a_209_that_stays_and_other_errors_are_unavailable(self):
         o, seen = self.probe(loads=set())
         with self.assertRaisesRegex(runner.Unavailable, "209"):
+            o._probe()
+        self.assertEqual(seen, [None, 5])
+        o, seen = self.probe(loads=set(), error="hipModuleLoadData(&mod, img) -> hip error 303")
+        with self.assertRaisesRegex(runner.Unavailable, "303"):
             o._probe()
         self.assertEqual(seen, [None, 5])
         o, seen = self.probe(loads={5}, error="hipMalloc -> hip error 2")
         with self.assertRaisesRegex(runner.Unavailable, "error 2"):
             o._probe()
         self.assertEqual(seen, [None])
+
+    def test_a_launcher_quarantined_by_defender_is_unavailable(self):
+        o = self.oracle()
+        o.exe, o.dll = "leonida_hw_oracle_0123456789.exe", "amdhip64_7.dll"
+        blocked = OSError("Operation did not complete successfully because the file contains a virus")
+        blocked.winerror = 225              # only set by Python on Windows
+        with unittest.mock.patch.object(runner.subprocess, "run", side_effect=blocked):
+            with self.assertRaisesRegex(runner.Unavailable, "Defender.*exclusion"):
+                o._launch("k.co", ["k0"])
+        with unittest.mock.patch.object(runner.subprocess, "run", side_effect=PermissionError("denied")):
+            with self.assertRaises(PermissionError):
+                o._launch("k.co", ["k0"])
 
     def test_v5_that_does_not_assemble_is_unavailable(self):
         o, _ = self.probe(loads={5})
@@ -234,6 +290,19 @@ class ToolchainFallbacks(unittest.TestCase):
             kernel = asm.Kernel(["v_cvt_f16_f32 v8, v1", "s_endpgm"], words=1, raw=True)
             self.assertEqual(o.run([kernel], words=1), [[0x3C00]])
             self.assertEqual("v8.l" in texts[0], true16)
+
+    def test_op_sel_halves_are_named_on_gfx11_and_later_even_without_true16(self):
+        # The assembler that takes a bare v_cvt_f16_f32 (true16 probe: no) still needs v14.l / v5.l on these lines.
+        line = "v_max_u16_e64 v14, s12, v5 op_sel:[1,0,0]"
+        for arch, want in (("gfx1036", line), ("gfx1100", "v_max_u16_e64 v14.l, s12, v5.l op_sel:[1,0,0]"),
+                           ("gfx1201", "v_max_u16_e64 v14.l, s12, v5.l op_sel:[1,0,0]")):
+            o = self.oracle(arch)
+            o.true16, texts = False, []
+            o._assemble = lambda text, wave=32: (texts.append(text) or "k.co", "")
+            o._launch = lambda co, names, words=4: (0, "k0 00000001\n", "")
+            kernel = asm.Kernel([line, "s_endpgm"], words=1, raw=True)
+            self.assertEqual(o.run([kernel], words=1), [[1]])
+            self.assertIn(want, texts[0], arch)
 
     def test_a_mode_the_architecture_cannot_set_is_never_assembled(self):
         # FUZZ-43: gfx1170+ rejects .amdhsa_ieee_mode / .amdhsa_dx10_clamp. Those kernels come back as a reason; the
@@ -282,6 +351,12 @@ class Filters(unittest.TestCase):
             self.assertIsNone(asm.mode_skip_reason({"denorm32": 3, "denorm16_64": 0, "round32": 1,
                                                     "round16_64": 2}, arch), arch)
             self.assertIsNone(asm.mode_skip_reason(None, arch))
+
+    def test_rdna23_skip_reason(self):
+        for arch in ("gfx1013", "gfx1030", "gfx1100", "gfx1150", "gfx1151"):
+            self.assertIsNone(asm.rdna23_skip_reason(arch), arch)
+        for arch in ("gfx1170", "gfx1200", "gfx1201"):
+            self.assertIn(arch, asm.rdna23_skip_reason(arch))
 
     def test_skip_reasons(self):
         self.assertIsNone(asm.skip_reason(PROG, "gfx1150"))
@@ -338,7 +413,8 @@ class VcvarsScript(unittest.TestCase):
             os.makedirs(work)
             argv = runner.build_command("vcvars", "vcvars64.bat", "hw_oracle.c", "hw_oracle.exe", work)
             with open(os.path.join(work, argv[-1]), "rb") as f:
-                lines = f.read().decode("ascii").split("\r\n")
+                # UTF-8, not ASCII: the /Fo folder sits in %TEMP%, which can hold a non-ASCII user name.
+                lines = f.read().decode("utf-8").split("\r\n")
         self.assertEqual(lines[3], 'call "vcvars64.bat" >nul || exit /b 1')
         self.assertTrue(lines[4].startswith("cl /nologo /O1 hw_oracle.c /Fehw_oracle.exe /Fo"))
 
@@ -419,7 +495,7 @@ class Unavailable(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             argv = runner.build_command("vcvars", r"C:\VS 2022\vcvars64.bat", "a.c", "o.exe", tmp)
             self.assertEqual(argv[:3], ["cmd.exe", "/d", "/c"])
-            script = (Path(tmp) / argv[3]).read_text(encoding="ascii")
+            script = (Path(tmp) / argv[3]).read_text(encoding="utf-8")       # UTF-8; tmp may be non-ASCII
             self.assertIn('call "C:\\VS 2022\\vcvars64.bat"', script)          # quoted: the path has a space
             self.assertIn("cl /nologo /O1 a.c /Feo.exe", script)
             self.assertIn("Installer", script)                                 # vcvars needs vswhere on PATH
@@ -444,6 +520,60 @@ class Unavailable(unittest.TestCase):
         r = subprocess.run([sys.executable, "-I", str(TOOLS / "salu_diff.py"), "--oracle", "gpu"],
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)
+
+
+class ClangOnPath(unittest.TestCase):
+    """find_clang when the compiler comes from PATH: real files in a folder, and a stand-in for what each compiler
+    prints for `--print-targets` and `--version`."""
+    EXT = ".exe" if os.name == "nt" else ""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def tool(self, *parts):
+        p = self.root.joinpath(*parts[:-1], parts[-1] + self.EXT)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"")
+        return str(p)
+
+    def tools(self, on_path, installed):
+        """PATH holds on_path ({name: file}); the compiler `c` reports installed[c] as its InstalledDir."""
+        def run(cmd, **kw):
+            out = "amdgcn" if "--print-targets" in cmd else f"clang version 23.0.0\nInstalledDir: {installed[cmd[0]]}\n"
+            return subprocess.CompletedProcess(cmd, 0, out, "")
+        patches = [unittest.mock.patch.object(runner.shutil, "which", side_effect=lambda n: on_path.get(n)),
+                   unittest.mock.patch.object(runner.subprocess, "run", side_effect=run),
+                   unittest.mock.patch.dict(os.environ, {"LEONIDA_AMD_CLANG": "", "HIP_PATH": "", "ROCM_PATH": ""})]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_a_launcher_on_path_stands_for_the_clang_it_is_installed_as(self):
+        # The rocm-sdk wheels in a Python outside the checkout: `amdclang` in Scripts has the amdgcn target, while
+        # clang, ld.lld and amdgpu-arch sit in the folder it names as InstalledDir.
+        launcher = self.tool("Scripts", "amdclang")
+        clang, lld = self.tool("llvm", "bin", "clang"), self.tool("llvm", "bin", "ld.lld")
+        self.tools({"amdclang": launcher}, {launcher: str(self.root / "llvm" / "bin")})
+        found = runner.find_clang()
+        self.assertEqual(found, clang)
+        self.assertEqual(runner._find_lld(found), lld)
+
+    def test_a_clang_with_its_linker_beside_it_is_used_where_it_was_found(self):
+        clang = self.tool("bin", "clang")
+        self.tool("bin", "ld.lld")
+        self.tool("other", "clang")
+        self.tools({"clang": clang}, {clang: str(self.root / "other")})
+        self.assertEqual(runner.find_clang(), clang)
+
+    def test_a_launcher_that_names_a_folder_without_a_clang_is_kept(self):
+        launcher = self.tool("Scripts", "amdclang")
+        self.tools({"amdclang": launcher}, {launcher: str(self.root / "nothing-here")})
+        found = runner.find_clang()
+        self.assertEqual(found, launcher)
+        with self.assertRaises(runner.Unavailable):
+            runner._find_lld(found)
 
 
 def relocatable(sections, symbols):
@@ -514,16 +644,27 @@ class LinuxBackend(unittest.TestCase):
         self.assertEqual(registers(), {"k0": (0xE0AC0001, 0x84, 32)})
         for fields in ({"properties": 0x040A},      # also wants the dispatch pointer
                        {"properties": 0x0400},      # no kernarg pointer
-                       {"group": 1024},             # LDS
                        {"private": 64},             # scratch memory
                        {"rsrc3": 1},
                        {"rsrc2": 0x85},             # the private segment
                        {"rsrc2": 0x86},             # three user SGPRs
-                       {"rsrc2": 0x84 | 1 << 15}):  # an LDS size
+                       {"group": 65536 + 512}):     # more LDS than a workgroup gets
             with self.assertRaises(RuntimeError, msg=str(fields)):
                 registers(**fields)
         with self.assertRaises(ValueError):          # a descriptor cut short
             drm.kernel_registers(relocatable([(".rodata", bytes(32), 0), (".text", bytes(256), 0)], [("k0.kd", 1, 0)]))
+
+    def test_the_group_segment_becomes_the_lds_size_field(self):
+        def registers(**fields):
+            return drm.kernel_registers(relocatable([(".rodata", self.descriptor(**fields), 0), (".text", bytes(256), 0)],
+                                                    [("k0", 2, 0), ("k0.kd", 1, 0)]))
+        # The assembler leaves COMPUTE_PGM_RSRC2.LDS_SIZE (bits 15..23, 512-byte units) 0 and records the size in the
+        # descriptor's group segment: measured on gfx1036, 4096 bytes of LDS give group 4096 and rsrc2 0x84.
+        self.assertEqual(registers(group=4096), {"k0": (0xE0AC0001, 0x84 | 8 << 15, 32)})
+        self.assertEqual(registers(group=4), {"k0": (0xE0AC0001, 0x84 | 1 << 15, 32)})    # rounded up to 512
+        self.assertEqual(registers(group=65536), {"k0": (0xE0AC0001, 0x84 | 128 << 15, 32)})
+        # A descriptor that already carries a size gets the group segment's, as the HIP runtime programs it.
+        self.assertEqual(registers(rsrc2=0x84 | 1 << 15), {"k0": (0xE0AC0001, 0x84, 32)})
 
     def test_launcher_tokens_carry_the_offset_and_the_registers(self):
         offsets = {"k0": 0, "k1": 256}
@@ -623,6 +764,23 @@ class OnHardware(unittest.TestCase):
                    "v_cvt_f32_f16 v9, v8", "v_mov_b32 v10, 0", "v_mov_b32 v11, 0"]
         self.assertEqual(self.oracle.run([program]), [[0xABCD3C00, 0x3F800000, 0, 0]])
 
+    def test_a_kernel_gets_the_lds_its_descriptor_asks_for(self):
+        # The group segment is the workgroup's LDS. A lane writes 0x1234 there, a barrier, and reads it back; the
+        # Linux launcher has to program COMPUTE_PGM_RSRC2.LDS_SIZE from the descriptor for this to read back.
+        kernel = asm.Kernel(["v_mov_b32 v1, 0x1234", "ds_write_b32 v0, v1", "s_barrier", "ds_read_b32 v8, v0",
+                             "s_waitcnt lgkmcnt(0)", "v_mov_b32 v9, 0", "v_mov_b32 v10, 0", "v_mov_b32 v11, 0"],
+                            wave=32, threads=1, words=4, lds=4096)
+        self.assertEqual(self.oracle.run([kernel]), [[0x1234, 0, 0, 0]])
+
+    def test_more_than_4096_words_of_output(self):
+        # 1024 threads store 8 dwords each. The Linux launcher capped its buffer at 4096 words, which is fewer than
+        # image_fuzz's 64x64 cases (16,384) and this one need.
+        lines = ["v_lshlrev_b32 v2, 5, v0", "v_mov_b32 v1, 0xabcd0001"]
+        lines += [f"global_store_b32 v2, v1, s[2:3] offset:{4 * j}" for j in range(8)]
+        lines += ["s_waitcnt vmcnt(0)"]
+        kernel = asm.Kernel(lines, wave=32, threads=1024, words=8192, raw=True)
+        self.assertEqual(self.oracle.run([kernel]), [[0xABCD0001] * 8192])
+
     def test_runs_a_program_and_reports_a_rejected_one(self):
         bad = ["s_add_u32 s4, 0x100, 0x200"] + PROG[-4:]     # two literals: the assembler refuses it
         good, rejected = self.oracle.run([PROG, bad])
@@ -633,6 +791,16 @@ class OnHardware(unittest.TestCase):
 
 class KernelResources(unittest.TestCase):
     """Kernel(vgprs=, sgprs=): the register counts reach the descriptor and the metadata; no hardware needed."""
+
+    def test_lds_reaches_the_descriptor_and_the_metadata(self):
+        # The descriptor's group segment is where the Linux launcher reads the LDS size from (COMPUTE_PGM_RSRC2.
+        # LDS_SIZE), so a wrapped kernel that uses LDS has to declare it there too, not only in the metadata.
+        text, _, _ = asm.module_text([asm.Kernel(["s_endpgm"], lds=4096),
+                                      asm.Kernel(["s_endpgm"], raw=True, lds=8192)], "gfx1150")
+        self.assertEqual(text.count(".amdhsa_group_segment_fixed_size 4096"), 1)
+        self.assertEqual(text.count(".amdhsa_group_segment_fixed_size 8192"), 1)
+        self.assertEqual(text.count("    .group_segment_fixed_size: 4096"), 1)
+        self.assertEqual(text.count("    .group_segment_fixed_size: 8192"), 1)
 
     def test_requested_registers_are_in_the_text(self):
         k = asm.Kernel(["s_endpgm"], wave=32, threads=64, words=8, raw=True, vgprs=40, sgprs=72)

@@ -47,7 +47,7 @@ RSRC2, GROUP = 0x8088, (64, 1, 1)
 # Not built under LEONIDA_BARY_FALLBACK=1 or LEONIDA_F16_INTERP_FALLBACK=1 (see main).
 NEEDS_PER_VERTEX_INPUTS = ("ps_ij_computed",)
 sys.path.insert(0, HERE)  # this script is also run with python -I
-from compute_fixture import compute_header  # noqa: E402
+from compute_fixture import compute_header, shift_user_data, user_data_shift  # noqa: E402
 
 
 def asm_mattr(path):
@@ -128,9 +128,12 @@ def translate_tests(work, names):
     disasm, fssm, spirv = (work / d for d in ("disasm", "fssm", "spirv"))
     disasm.mkdir()
     fssm.mkdir()
+    shift = user_data_shift()   # LEONIDA_USER_DATA_SHIFT: compute fixtures for a D3D12 PSO (compute_fixture.py)
     for n in names:
         asm_path = os.path.join(HERE, shader_source(n) + ".asm")
         raw = Path(asm_path).read_text(encoding="utf-8")
+        if shift and n.startswith("cs_"):
+            raw = shift_user_data(raw, shift)
         mattr = asm_mattr(asm_path)
         cmd = MC + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
         if n in CLIP_CASES:
@@ -149,7 +152,7 @@ def translate_tests(work, names):
         if program:   # where the translator looks for a program to hash, as in the game's work folder
             (fssm / (n + ".fssm")).write_bytes(program)
         if n.startswith("cs_"):
-            program = bytes(compute_header(asm_path))
+            program = bytes(compute_header(asm_path, shift))
             extra = cs_fssm_extra(asm_path)
             if extra:
                 program += bytes(extra[0] - len(program)) + extra[1]
@@ -178,6 +181,9 @@ def translate_tests(work, names):
 
 
 def main():
+    if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
+        print(__doc__)
+        return 0
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     # The CMake test targets name the spirv-as/spirv-val folder here instead of passing a whole PATH, which the Visual

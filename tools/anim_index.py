@@ -27,12 +27,12 @@ import os
 import re
 import struct
 import sys
-import unicodedata
 import zlib
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+from report_paths import same_report_path  # noqa: E402
 from zero_span import gap_split  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
@@ -451,7 +451,7 @@ def scan_rpf(path, start=None, limit=None, progress=None):
 
 def scan_dir(path, progress=None):
     """Index already-carved files. An offset is taken from a leading hexadecimal file name when possible."""
-    entries = []
+    rows, span = [], 0
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
         # rpf9_carve.py's index.json and any .csv report sit next to the streams; they are not payloads.
@@ -460,10 +460,10 @@ def scan_dir(path, progress=None):
         with open(full, "rb") as f:
             data = f.read()
         m = re.match(r"([0-9a-fA-F]{6,})", name)
-        offset = int(m.group(1), 16) if m else len(entries)
-        entries.append((offset, name, data))
-    rows = [classify(data, offset, len(data)) for offset, _, data in entries]
-    summary = summarise(rows, sum(len(data) for _, _, data in entries), 0, 0)
+        offset = int(m.group(1), 16) if m else len(rows)
+        span += len(data)
+        rows.append(classify(data, offset, len(data)))
+    summary = summarise(rows, span, 0, 0)
     summary["mode"] = "directory"
     summary["directory"] = path
     if progress:
@@ -530,42 +530,6 @@ def byte_count(text):
     return value
 
 
-_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
-
-
-def _case_insensitive_volume(path):
-    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
-    os.path.normcase folds case only on Windows, so on macOS `R.json` and `r.json` would pass as two reports."""
-    if sys.platform != "darwin":
-        return False
-    while not os.path.exists(path):
-        parent = os.path.dirname(path)
-        if parent == path:
-            break
-        path = parent
-    try:
-        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
-    except (OSError, ValueError):
-        return True  # the macOS default; folding can only refuse a pair, never overwrite one
-
-
-def _path_key(path):
-    path = os.path.normcase(os.path.realpath(path))
-    if _case_insensitive_volume(path):
-        # APFS and HFS+ also treat composed and decomposed accents as one name.
-        path = unicodedata.normalize("NFD", path.casefold())
-    return path
-
-
-def same_report_path(first, second):
-    if _path_key(first) == _path_key(second):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved .bin files")
@@ -591,7 +555,8 @@ def main():
         for flag, path in (("output", a.out), ("--rigs", a.rigs)):
             if not path:
                 continue
-            if os.path.isfile(manifest) and same_report_path(manifest, path):
+            # Reserved even before the carve writes it: other tools read <source>/index.json as the carve manifest.
+            if same_report_path(manifest, path):
                 ap.error(f"{flag} would overwrite the carve manifest: {path}")
             if os.path.isfile(path):
                 for name in os.listdir(a.source):

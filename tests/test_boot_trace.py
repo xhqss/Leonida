@@ -137,6 +137,35 @@ class BootTraceTests(unittest.TestCase):
         self.assertIs(trace["exceptions"][1]["cpp"], True)
         self.assertEqual(trace["exit"], 0)
 
+    def test_exception_limit_keeps_final_observation(self):
+        early = [
+            {"kind": "exception", "code": "0xe06d7363", "at": f"synthetic.exe+0x{0x1100 + i:x}", "cpp": True}
+            for i in range(10)
+        ]
+        final = {
+            "kind": "exception",
+            "code": "0xc0000005",
+            "at": "synthetic.exe+0x2010",
+            "access": "read",
+            "address": "0x0",
+            "stack": ["synthetic.exe+0x2010", "synthetic.exe+0x1000"],
+        }
+        for limit, preceding in ((1, early), (10, early), (10, early[:-1])):
+            with self.subTest(limit=limit, count=len(preceding) + 1):
+                self.write(self.startup, [STARTUP[0], *preceding, final])
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(bt.main([self.startup, "--limit", str(limit), "--json"]), 0)
+                summary = json.loads(output.getvalue())
+                startup = summary["startup"]
+                self.assertEqual(startup["exception_count"], len(preceding) + 1)
+                self.assertEqual(
+                    [exc["at"] for exc in startup["exceptions"]],
+                    [exc["at"] for exc in preceding[:limit - 1]] + [final["at"]],
+                )
+                self.assertEqual(startup["exceptions"][-1]["stack"], final["stack"])
+                self.assertIn("synthetic.exe+0x2010 (read 0x0)", bt.format_text(summary, limit))
+
     def test_debug_text_is_not_printed(self):
         self.write(self.startup, STARTUP)
         text = bt.format_text(bt.summarize(bt.parse_startup(self.startup), None), 10)
@@ -166,6 +195,28 @@ class BootTraceTests(unittest.TestCase):
         trace = bt.parse_startup(self.startup)
         self.assertEqual(trace["events"], 2)
         self.assertEqual(trace["bad_lines"], 1)
+
+    def test_malformed_exit_records_preserve_the_last_valid_code(self):
+        for code in (0, -7):
+            with self.subTest(code=code):
+                self.write(self.startup, [
+                    {"kind": "trace_open", "pid": 123},
+                    {"kind": "exit", "code": code},
+                    {"kind": "exit"},
+                    {"kind": "exit", "code": "0"},
+                    {"kind": "exit", "code": True},
+                    {"kind": "exit", "code": None},
+                    {"kind": "exit", "code": 0.0},
+                    {"kind": "debug_string", "text": "synthetic"},
+                ])
+                trace = bt.parse_startup(self.startup)
+                self.assertEqual(trace["bad_lines"], 5)
+                self.assertEqual(trace["bad_line_numbers"], [3, 4, 5, 6, 7])
+                self.assertEqual(trace["events"], 3)
+                self.assertEqual(trace["kinds"]["exit"], 1)
+                self.assertIs(type(trace["exit"]), int)
+                self.assertEqual(trace["exit"], code)
+                self.assertEqual(trace["debug_strings"], 1)
 
     def test_d3d12_summary(self):
         self.write_lines(self.d3d12, D3D12)
@@ -238,6 +289,27 @@ class BootTraceTests(unittest.TestCase):
         self.assertIn("ID3D12CommandQueue::ExecuteCommandLists", text)
         self.assertIn("[rt] diagnostics are not summarized", text)
 
+    def test_partial_submissions_are_named_in_text_and_json(self):
+        method = "ID3D12CommandQueue::ExecuteCommandLists"
+        self.write_lines(self.d3d12, [
+            f"[d3d12-trace] #1 {method} ok",
+            f"[d3d12-trace] #2 {method} partial",
+            f"[d3d12-trace] #3 {method} partial",
+        ])
+        trace = bt.parse_d3d12(self.d3d12, limit=1)
+        self.assertEqual(trace["first"][method], {"seq": 1, "outcome": "ok"})
+        self.assertEqual(trace["outcomes"]["partial"], 2)
+        text = bt.format_text(bt.summarize(None, trace), 1)
+        self.assertIn(f"  partial: #2 {method}", text)
+        self.assertNotIn(f"#3 {method}", text)
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(bt.main(["--d3d12", self.d3d12, "--limit", "1", "--json"]), 0)
+        parsed = json.loads(stdout.getvalue())["d3d12"]
+        self.assertEqual(parsed["partial"], [{"seq": 2, "method": method}])
+        self.assertEqual(parsed["outcomes"]["partial"], 2)
+
     def test_json_cli(self):
         self.write(self.startup, STARTUP)
         self.write_lines(self.d3d12, D3D12)
@@ -259,6 +331,31 @@ class BootTraceTests(unittest.TestCase):
             self.assertEqual(bt.main(["--limit", "0", self.startup]), 2)
         self.assertIn("cannot read", err.getvalue())
 
+    def test_attach_failure_is_reported_before_any_d3d12_call(self):
+        self.write(self.startup, [{"kind": "error", "what": "guest.dll: DllMain returned FALSE"}])
+        self.write_lines(self.d3d12, ["error: guest.dll: DllMain returned FALSE"])
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(bt.main([self.startup, "--d3d12", self.d3d12]), 2)
+        self.assertIn("error: guest.dll: DllMain returned FALSE", out.getvalue())
+        self.assertIn("no [d3d12-trace] line", err.getvalue())
+
+    def test_missing_startup_preserves_d3d12_json(self):
+        self.write_lines(self.d3d12, ["[d3d12-trace] #1 CreateCommandQueue failed"])
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(bt.main([self.startup, "--d3d12", self.d3d12, "--json"]), 2)
+        self.assertIn("cannot read", err.getvalue())
+        self.assertEqual(json.loads(out.getvalue()), bt.summarize(None, bt.parse_d3d12(self.d3d12)))
+
+    def test_no_report_when_neither_input_can_be_read(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(bt.main([self.startup, "--d3d12", self.d3d12, "--json"]), 2)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn(self.startup, err.getvalue())
+        self.assertIn(self.d3d12, err.getvalue())
+
     def test_d3d12_log_without_trace_lines_is_an_error(self):
         self.write_lines(self.d3d12, ["[rt] one", "[rt] two"])
         err = io.StringIO()
@@ -266,13 +363,21 @@ class BootTraceTests(unittest.TestCase):
             self.assertEqual(bt.main(["--d3d12", self.d3d12]), 2)
         self.assertIn("no [d3d12-trace] line", err.getvalue())
 
-    def test_utf16_log_is_named_before_parsing(self):
-        with open(self.d3d12, "wb") as f:
-            f.write(b"\xff\xfe" + "[d3d12-trace] #1 Foo ok\n".encode("utf-16-le"))
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            self.assertEqual(bt.main(["--d3d12", self.d3d12]), 2)
-        self.assertIn("UTF-16", err.getvalue())
+    def test_utf16_logs_keep_both_wrapped_and_unwrapped_calls(self):
+        lines = ("synthetic.exe : [d3d12-trace] #1 First called\r\n"
+                 "[d3d12-trace] #2 Second ok\r\n")
+        for encoding, bom in (("utf-16-le", b"\xff\xfe"), ("utf-16-be", b"\xfe\xff")):
+            with self.subTest(encoding=encoding):
+                with open(self.d3d12, "wb") as f:
+                    f.write(bom + lines.encode(encoding))
+                output = io.StringIO()
+                errors = io.StringIO()
+                with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                    result = bt.main(["--d3d12", self.d3d12, "--json"])
+                self.assertEqual(result, 0, errors.getvalue())
+                trace = json.loads(output.getvalue())["d3d12"]
+                self.assertEqual(trace["calls"], 2)
+                self.assertEqual(trace["methods"], ["First", "Second"])
 
     def test_utf8_bom_is_stripped(self):
         with open(self.d3d12, "wb") as f:
@@ -298,6 +403,35 @@ class BootTraceTests(unittest.TestCase):
             "exit: 0",
         ):
             self.assertIn(needle, text)
+
+    def test_last_observed_tls_callback_in_incomplete_startup(self):
+        first = {"kind": "tls_callback", "module": "first.dll", "at": "first.dll+0x1100", "reason": 1}
+        for fields, reason, phase in (
+            ({"reason": 1}, 1, "process attach"),
+            ({"reason": 0}, 0, "process detach"),
+            ({}, None, "phase unknown"),
+        ):
+            with self.subTest(phase=phase):
+                last = {"kind": "tls_callback", "module": "fixture.exe", "at": "fixture.exe+0x2200", **fields}
+                self.write(self.startup, [STARTUP[0], first, last])
+                with open(self.startup, "a", encoding="utf-8", newline="\n") as f:
+                    f.write('{"kind":"tls_callback","at":"truncated')
+
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(bt.main([self.startup, "--json"]), 0)
+                summary = json.loads(output.getvalue())
+                startup = summary["startup"]
+                self.assertEqual(startup["tls_callbacks"], 2)
+                self.assertEqual(startup["bad_lines"], 1)
+                self.assertIsNone(startup["exit"])
+                self.assertEqual(
+                    startup["last_tls_callback"],
+                    {"module": "fixture.exe", "at": "fixture.exe+0x2200", "reason": reason},
+                )
+                text = bt.format_text(summary, 10)
+                self.assertIn("tls callbacks: 2", text)
+                self.assertIn(f"last observed TLS callback: fixture.exe+0x2200 ({phase})", text)
 
 
 if __name__ == "__main__":

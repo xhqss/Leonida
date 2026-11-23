@@ -97,6 +97,40 @@ class SaluCmpkTests(unittest.TestCase):
         self.assertEqual(run_cmpk("s_cmpk_lt_u32", 0, 0x8000, preset_scc=False), 1)
         self.assertEqual(run_cmpk("s_cmpk_gt_u32", 0, 0x8000, preset_scc=True), 0)
 
+    def test_imm16_edges_decimal_tokens_and_s0_kept(self):
+        # S0 one below, at and one above the extended immediate (-32768 for _i32, 65535 for _u32), plus a
+        # high-bit S0 that equals sext16(0x8000) only when sign-extended; decimal immediates written signed.
+        # S0 must read back unchanged after the compare.
+        cases = [
+            ("i32", 0xFFFF7FFF, "0x8000"),   # -32769 vs -32768
+            ("i32", 0xFFFF8000, "0x8000"),   # -32768 vs -32768
+            ("i32", 0xFFFF8001, "0x8000"),   # -32767 vs -32768
+            ("i32", 0xFFFF8000, "-32768"),
+            ("i32", 0xFFFFFFFE, "-1"),
+            ("i32", 0x00007FFE, "32767"),
+            ("u32", 0x0000FFFE, "0xffff"),   # 65534 vs 65535
+            ("u32", 0x00010000, "0xffff"),   # 65536 vs 65535
+            ("u32", 0xFFFF8000, "0x8000"),   # not sign-extended: 0xffff8000 > 0x8000
+        ]
+        for ty, s0_val, tok in cases:
+            imm16 = int(tok, 0) & 0xFFFF
+            for cond, cmp_fn in CONDS.items():
+                lhs = s32(s0_val) if ty == "i32" else s0_val
+                rhs = sext16(imm16) if ty == "i32" else imm16
+                want = int(cmp_fn(lhs, rhs))
+                with self.subTest(op=f"s_cmpk_{cond}_{ty}", s0=hex(s0_val), imm=tok):
+                    spv = support.translate_lines("ps_salu_cmpk_edge", [
+                        "s_cmp_eq_u32 1, 1" if want == 0 else "s_cmp_eq_u32 0, 1",
+                        f"s_mov_b32 s0, {s0_val:#x}",
+                        f"s_cmpk_{cond}_{ty} s0, {tok}",
+                        "s_cselect_b32 s1, 1, 0",
+                        "v_mov_b32 v0, s1",
+                        "v_mov_b32 v1, s0",
+                        "exp mrt0 v0, v1, v0, v0 done vm",
+                        "s_endpgm",
+                    ])
+                    self.assertEqual(support.mrt0_words(spv)[:2], [want, s0_val])
+
     def test_negative_controls_catch_spirv_regressions(self):
         # 1) Signed vs unsigned operator swap: s_cmpk_gt_i32 (0xFFFFFFFF vs -32768 -> True)
         #    becomes OpUGreaterThan (0xFFFFFFFF > 0xFFFF8000 -> True? No, let's pick 0 vs 0xFFFF:

@@ -72,6 +72,9 @@ def _find_llvm_mc():
         candidates.append([found])
     # Debian/Ubuntu install it versioned, out of PATH.
     candidates += [[p] for p in sorted(glob.glob("/usr/lib/llvm-*/bin/llvm-mc"), reverse=True)]
+    # Homebrew's llvm and llvm@N are keg-only, never linked onto PATH.
+    for prefix in ("/opt/homebrew/opt", "/usr/local/opt"):
+        candidates += [[p] for p in sorted(glob.glob(prefix + "/llvm*/bin/llvm-mc"), reverse=True)]
     # Default location of the official Windows installer, which doesn't add LLVM to PATH unless asked to.
     candidates += [[p] for p in glob.glob(r"C:\Program Files\LLVM\bin\llvm-mc.exe")]
     for c in candidates:

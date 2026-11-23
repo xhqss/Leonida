@@ -3,6 +3,7 @@
 ;   LDS[0] = count of lanes seeing wave_id == 0 (must be 64)
 ;   LDS[1] = count of lanes seeing wave_id == 1 (must be 64)
 ;   LDS[2] = count of lanes seeing wave_id >= 2 (must be 0)
+; Only wave 1 sends the mesh allocation. Both waves meet at the barrier before wave 0 exports the triangle.
 ; Threads 0..2 export ms_tri's fullscreen triangle with param0.b = 0.5 iff LDS[0]==64 && LDS[1]==64 && LDS[2]==0,
 ; else 0.0. Needs DXBC with PSV0 (128x1x1 threads, 64/64 outputs, triangles; see scripts/run_gpu_tests.py):
 ;   VKH_MESH=1 vk_harness ms_wave_info_s3.spv fs_passthru.spv out.raw
@@ -42,7 +43,10 @@ v_cndmask_b32_e64 v4, 0, 2.0, vcc
 v_mov_b32_e32 v6, 0
 v_mov_b32_e32 v7, 1.0
 s_mov_b32 m0, 0x1003
+s_cmp_eq_u32 s4, 0
+s_cbranch_scc1 1
 s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)
+s_barrier
 v_cmpx_gt_u32_e32 3, v0
 exp pos0 v1, v2, v6, v7 done
 exp param0 v3, v4, v8, v7

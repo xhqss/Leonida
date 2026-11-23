@@ -166,7 +166,7 @@ class RttiScanCoreTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_tool(self, *args):
-        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True, errors="replace")
 
     def test_type_descriptor_detection_and_parsing(self):
         rdata = bytearray(0x1000)
@@ -559,7 +559,11 @@ class RttiScanCoreTest(unittest.TestCase):
                     f.write(original)
                 if os.path.exists(hardlink):
                     os.remove(hardlink)
-                os.link(image, hardlink)
+                if label == "hard link":
+                    try:
+                        os.link(image, hardlink)
+                    except (OSError, NotImplementedError) as e:
+                        self.skipTest(f"hard links unavailable: {e}")
                 p = self.run_tool(image, "--out", output)
                 self.assertNotEqual(p.returncode, 0)
                 self.assertIn("output must not overwrite the source image", p.stderr)

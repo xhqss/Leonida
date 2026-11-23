@@ -20,6 +20,7 @@ from collections import Counter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+from report_paths import same_report_path  # noqa: E402
 import shader_ir  # noqa: E402
 from shader_meta import SGPR_RMW  # noqa: E402
 
@@ -27,6 +28,10 @@ NO_DEST_OPS = ("s_cmp", "s_bitcmp", "v_cmpx", "s_set", "s_rfe", "s_branch", "s_c
                "s_waitcnt", "s_barrier", "s_nop", "s_endpgm", "s_sendmsg", "s_sleep",
                "exp", "buffer_store", "tbuffer_store", "global_store", "flat_store", "scratch_store",
                "s_store", "s_buffer_store", "image_store", "ds_write")
+# DS ops that write args[0]; every other DS op without "_rtn" (atomics, ds_write*, src2 and GWS forms) only reads its
+# operands. Same rule as tools/lane_masks.py.
+DS_HAS_DST = ("ds_read", "ds_swizzle", "ds_permute", "ds_bpermute", "ds_append", "ds_consume", "ds_ordered_count",
+              "ds_nop")
 WAVE64_RE = re.compile(r"exec_hi|v_mbcnt_hi_u32_b32|_saveexec_b64|_wrexec_b64")
 
 
@@ -37,9 +42,22 @@ def base_op(op):
     return op
 
 
-def load_stage_map(disasm_dir):
+class ReportInputCollision(Exception):
+    pass
+
+
+def protect_input(report_path, input_path, kind):
+    if report_path and os.path.isfile(input_path) and same_report_path(report_path, input_path):
+        raise ReportInputCollision(f"--json {report_path!r} must not overwrite an input {kind} {input_path!r}")
+
+
+def load_stage_map(disasm_dir, *, report_path=None):
     parent = os.path.dirname(os.path.realpath(disasm_dir))
-    for cand in (os.path.join(parent, "index.json"), os.path.join(disasm_dir, "index.json")):
+    candidates = (os.path.join(parent, "index.json"), os.path.join(disasm_dir, "index.json"))
+    # Protect the fallback index even when the first one supplies the stage map.
+    for cand in candidates:
+        protect_input(report_path, cand, "index")
+    for cand in candidates:
         if os.path.isfile(cand):
             try:
                 with open(cand, encoding="utf-8") as _f:
@@ -175,6 +193,7 @@ def rbw_registers(insns):
             op.startswith(NO_DEST_OPS)
             or (is_gf_atomic and "glc" not in mods)
             or (is_bi_atomic and "glc" not in mods)
+            or (op.startswith("ds_") and "_rtn" not in op and not op.startswith(DS_HAS_DST))
         )
         reads_imm_dst = op in SGPR_RMW
         # Instructions that read their destination too (buffer/image atomics with glc read and write vdata at args[0];
@@ -231,16 +250,19 @@ def detect_wave64(insns):
     )
 
 
-def audit(disasm_dir, fssm_dir=None, dxbc_dir=None, stages=("cs", "ms", "gs"), limit=None):
+def audit(disasm_dir, fssm_dir=None, dxbc_dir=None, stages=("cs", "ms", "gs"), limit=None, *, report_path=None):
     if limit is not None and limit < 0:
         raise ValueError("limit must be non-negative")
     parent = os.path.dirname(os.path.realpath(disasm_dir))
     fssm_dir = fssm_dir or os.path.join(parent, "fssm")
     dxbc_dir = dxbc_dir or parent
-    stage_map = load_stage_map(disasm_dir)
 
     with os.scandir(disasm_dir) as it:
         files = sorted(e.name for e in it if e.name.endswith(".s") and e.is_file())
+    if report_path:
+        for fname in files:
+            protect_input(report_path, os.path.join(disasm_dir, fname), "listing")
+    stage_map = load_stage_map(disasm_dir, report_path=report_path)
     if limit is not None:
         files = files[:limit]
 
@@ -285,7 +307,7 @@ def audit(disasm_dir, fssm_dir=None, dxbc_dir=None, stages=("cs", "ms", "gs"), l
             rec["s3_rbw_op_patterns"][pat] += 1
 
         fssm_path = os.path.join(fssm_dir, stem + ".fssm")
-        dxbc_path = os.path.join(dxbc_dir, stem + ".dxbc")
+        protect_input(report_path, fssm_path, "FSSM file")
         if st == "cs":
             dec = decode_cs_rsrc2(fssm_path)
             if dec:
@@ -302,6 +324,8 @@ def audit(disasm_dir, fssm_dir=None, dxbc_dir=None, stages=("cs", "ms", "gs"), l
             words = read_fssm_words(fssm_path)
             if words:
                 rec["fssm_0x138_words"][" ".join(words)] += 1
+            dxbc_path = os.path.join(dxbc_dir, stem + ".dxbc")
+            protect_input(report_path, dxbc_path, "DXBC file")
             psv = read_psv0(dxbc_path)
             if psv:
                 if "threads" in psv:
@@ -382,7 +406,12 @@ def main(argv=None):
             print(f"ERROR: {label}{path}: not a folder", file=sys.stderr)
             return 2
 
-    rep = audit(a.disasm_dir, fssm_dir=a.fssm, dxbc_dir=a.dxbc, limit=a.limit)
+    report_path = a.json_out if a.json_out and os.path.isfile(a.json_out) else None
+    try:
+        rep = audit(a.disasm_dir, fssm_dir=a.fssm, dxbc_dir=a.dxbc, limit=a.limit, report_path=report_path)
+    except ReportInputCollision as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 2
     print_report(rep)
     if a.json_out:
         try:

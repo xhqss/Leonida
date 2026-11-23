@@ -158,9 +158,9 @@ class ParseTest(unittest.TestCase):
         with self.assertRaises(rbf0_index.RbfError):
             rbf0_index.parse_rbf0(b"PSIN" + bytes(16))
 
-    def test_attribute_mismatch_counted_once_per_element_and_not_filled_after_content(self):
+    def test_attribute_mismatch_counted_once_per_element(self):
         # One element declares 1 attribute, has 0 attributes, three child elements, and a trailing value:
-        # must report 1 attribute mismatch (not 4), and the value after child elements must not satisfy it.
+        # must report 1 attribute mismatch at the first content transition (not 3 on main).
         b = bytearray(b"RBF0")
         b += _open(0, b"Root", attrs=1)
         b += _open(1, b"A") + b"\xff\xff"
@@ -323,6 +323,34 @@ class ArgumentTest(unittest.TestCase):
         self.assertIn("nope.rpf", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
         self.assertFalse(os.path.exists(out))
+
+    def test_directory_report_cannot_replace_a_carve_input(self):
+        manifest = os.path.join(self.root, "index.json")
+        stream = os.path.join(self.root, "00000001.bin")
+        for path, original in ((manifest, b'{"files": []}'), (stream, b"synthetic stream")):
+            with self.subTest(path=path):
+                with open(path, "wb") as f:
+                    f.write(original)
+                result = self.run_tool(self.root, path)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("would overwrite", result.stderr)
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), original)
+
+    def test_directory_report_cannot_replace_a_stream_via_a_hard_link(self):
+        stream = os.path.join(self.root, "00000001.bin")
+        out = os.path.join(self.root, "report.csv")
+        with open(stream, "wb") as f:
+            f.write(b"synthetic stream")
+        try:
+            os.link(stream, out)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(str(e))
+        result = self.run_tool(self.root, out)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("would overwrite", result.stderr)
+        with open(stream, "rb") as f:
+            self.assertEqual(f.read(), b"synthetic stream")
 
     def test_unwritable_output_path_fails_before_the_scan(self):
         for out in (os.path.join(self.root, "no_such_folder", "x.json"), self.root):

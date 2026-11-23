@@ -18,6 +18,8 @@
 //   VKH_BINARY_OUT=<file>        writes the pipeline's VK_KHR_pipeline_binary data after building it
 //   VKH_BINARY_IN=<file>         builds the pipeline from such a file instead (tools/ps_oracle.py patches the pixel
 //                                shader in it); both exit 77 without VK_KHR_pipeline_binary
+//   VKH_COLOR_FORMAT=<VkFormat>:<bytes>  the color target's format and texel size (default RGBA32F, 16); out.raw
+//                                holds the texels as stored; 77 when the format is no color attachment
 //   VKH_SUBGROUP_SIZE=32|64      requires that subgroup size of the fragment shader (or of the compute or geometry
 //                                stage under test); stderr says "fragment subgroup size: N" when it took effect and
 //                                "... not available" when the device cannot require it (exit code stays 0).
@@ -265,10 +267,13 @@ int main(int argc, char** argv) {
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+    VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    if (props.apiVersion >= VK_API_VERSION_1_2) sgProps.pNext = &driver;
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     props2.pNext = &sgProps;
     vkGetPhysicalDeviceProperties2(pd, &props2);
     std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
+    if (driver.driverName[0]) std::fprintf(stderr, "driver: %s\n", driver.driverName);
     uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn);
@@ -309,10 +314,13 @@ int main(int argc, char** argv) {
                      argv[2], VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         return 77;
     }
-    // OpFmaKHR (rdna2spirv.py --fma khr) needs VK_KHR_shader_fma; the fragment shader decides whether it is refused.
+    // OpFmaKHR (rdna2spirv.py --fma khr) needs VK_KHR_shader_fma; a module of ANY stage that needs it is refused
+    // (argv[1] is the vertex shader, or the mesh shader run as compute under VKH_MESH_COMPUTE).
     leonida::vk_test::ShaderFma fma;
     fma.query(gipa, inst, pd);
     if (!fma.accepts(fs_code.data(), fs_code.size() * 4, argv[2])) return 77;
+    if (!fma.accepts_file(argv[1])) return 77;
+    if (!fma.accepts_file(std::getenv("VKH_MESH_COMPUTE"))) return 77;
     std::vector<const char*> enable;
     void* chain = nullptr;
     if (fma.supported()) {
@@ -535,7 +543,23 @@ int main(int argc, char** argv) {
         CHECK(vkCreateImageView(dev, &vi, nullptr, &view));
         return 0;
     };
-    const VkFormat fmt = VK_FORMAT_R32G32B32A32_SFLOAT;
+    // VKH_COLOR_FORMAT=<VkFormat number>:<bytes per texel>: the color target's format (default RGBA32F, 16 bytes);
+    // out.raw then holds the target's texels as they are (tools/ps_oracle.py --format).
+    VkFormat fmt = VK_FORMAT_R32G32B32A32_SFLOAT;
+    uint32_t texel_bytes = 16;
+    if (const char* cf = std::getenv("VKH_COLOR_FORMAT"); cf && *cf) {
+        char* end = nullptr;
+        fmt = VkFormat(std::strtoul(cf, &end, 0));
+        texel_bytes = (end && *end == ':') ? uint32_t(std::strtoul(end + 1, nullptr, 0)) : 0;
+        if (!texel_bytes || texel_bytes > 16) { std::fprintf(stderr, "VKH_COLOR_FORMAT: want <format>:<bytes>\n"); return 2; }
+        auto get_fp = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
+            gipa(inst, "vkGetPhysicalDeviceFormatProperties"));
+        VkFormatProperties cp; get_fp(pd, fmt, &cp);
+        if (!(cp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {
+            std::fprintf(stderr, "unsupported: format %u is not a color attachment\n", unsigned(fmt));
+            return 77;
+        }
+    }
     VkImage img;
     VkImageView views[2]{};
     if (attachment(fmt, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
@@ -771,6 +795,11 @@ int main(int argc, char** argv) {
             f.write(reinterpret_cast<const char*>(&n64), 8);
             f.write(data.data(), std::streamsize(n));
         }
+        f.close();
+        if (!f) {
+            std::fprintf(stderr, "failed to write pipeline binaries to %s\n", bin_out);
+            return 1;
+        }
         std::fprintf(stderr, "wrote %u pipeline binaries to %s\n", count, bin_out);
     }
     VkPipeline cpipe = VK_NULL_HANDLE;
@@ -787,7 +816,7 @@ int main(int argc, char** argv) {
         CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &cpipe));
     }
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bi.size = VkDeviceSize(W) * H * 16; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bi.size = VkDeviceSize(W) * H * texel_bytes; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     VkBuffer buf; CHECK(vkCreateBuffer(dev, &bi, nullptr, &buf));
     VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev, buf, &br);
     VkMemoryAllocateInfo bai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};

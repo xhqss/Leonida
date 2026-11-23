@@ -64,13 +64,15 @@ inline uint64_t cgroup_memory_room(const std::string& self_cgroup_file = "/proc/
     }
     std::fclose(f);
     uint64_t room = UINT64_MAX;
-    for (std::string dir = rel; !dir.empty() && dir != "/";) {
+    for (std::string dir = rel; !dir.empty();) {
+        // In a cgroup namespace, "/" can be a constrained cgroup mounted as the visible root.
+        const std::string base = dir == "/" ? cgroup_root : cgroup_root + dir;
         uint64_t max = 0, current = 0;
-        if (read_u64_file(cgroup_root + dir + "/memory.max", max) &&
-            read_u64_file(cgroup_root + dir + "/memory.current", current))
+        if (read_u64_file(base + "/memory.max", max) && read_u64_file(base + "/memory.current", current))
             room = std::min(room, max > current ? max - current : 0);
         const auto slash = dir.find_last_of('/');
-        dir = slash == std::string::npos ? std::string() : dir.substr(0, slash);
+        if (dir == "/" || slash == std::string::npos) break;
+        dir.resize(slash == 0 ? 1 : slash);
     }
     return room;
 }

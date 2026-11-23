@@ -123,18 +123,20 @@ class SubrevF16(unittest.TestCase):
                 self.assertEqual(got & 0xFFFF, want)
 
     def test_output_modifiers_and_clamp(self):
-        # unmodified result: 2.5 - 0.5 = 2.0 (src1 - src0); mul/div scale it, clamp limits it to [0, 1] (negatives and NaN become +0)
-        for suffix, want in ((" mul:2", 0x4400), (" mul:4", 0x4800), (" div:2", ONE), (" clamp", ONE)):
+        # #4542, measured on gfx1036: an f16 destination ignores omod (mul:2/mul:4/div:2) under the game's MODE
+        # (IEEE=0, f16 denormals kept) and keeps clamp (docs/design.md, f16 output modifiers).
+        # unmodified result: 2.5 - 0.5 = 2.0 (src1 - src0); clamp limits it to [0, 1] (negatives and NaN become +0)
+        for suffix, want in ((" mul:2", 0x4000), (" mul:4", 0x4000), (" div:2", 0x4000), (" clamp", ONE)):
             with self.subTest(mod=suffix):
                 got = run("v_subrev_f16_e64 v0, v1, v2" + suffix, {"v1": HALF, "v2": 0x4100})
                 self.assertEqual(got & 0xFFFF, want)
         for (a, b), suffix, want in (((QUARTER, HALF), " clamp", QUARTER), ((ONE, HALF), " clamp", 0x0000),
-                                  ((0xB800, ONE), " div:2 clamp", 0x3A00), ((QUARTER, ONE), " mul:2 clamp", ONE)):
+                                  ((0xB800, ONE), " div:2 clamp", ONE), ((QUARTER, ONE), " mul:2 clamp", 0x3A00)):
             with self.subTest(a=hex(a), b=hex(b), mod=suffix):
                 self.assertEqual(run("v_subrev_f16_e64 v0, v1, v2" + suffix, {"v1": a, "v2": b}) & 0xFFFF, want)
         for suffix, f in ((" mul:2", 2.0), (" mul:4", 4.0), (" div:2", 0.5)):
             got = run("v_subrev_f16_e64 v0, v1, v2" + suffix, {"v1": 0x4900, "v2": 0xC100})      # 10 and -2.5
-            self.assertEqual(got & 0xFFFF, scale(ref_subrev(0x4900, 0xC100), f))
+            self.assertEqual(got & 0xFFFF, ref_subrev(0x4900, 0xC100))
 
     def test_random_operands(self):
         rng = random.Random(0x5B2E5)

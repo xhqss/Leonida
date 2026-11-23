@@ -69,8 +69,10 @@ def _parse_spv(asm):
     gvars = {}       # %name -> (storage_class, elem_type)
     fvars = []       # [(%name, elem_type, init_id_or_None)]
     blocks = {}      # %label -> [(res, op, args), ...]
+    helpers = {}     # %fn -> ([params], [(res, op, args), ...]): single-block functions %main calls
     cur = None
     in_main = False
+    helper = None
 
     for raw in asm.splitlines():
         s = raw.strip()
@@ -84,10 +86,21 @@ def _parse_spv(asm):
 
         if op == "OpFunction":
             in_main = (res == "%main")
+            helper = None if in_main else res
+            if helper:
+                helpers[helper] = ([], [])
             continue
         if op == "OpFunctionEnd":
             in_main = False
+            helper = None
             cur = None
+            continue
+        if helper is not None:
+            # --wave64-emulate outlines the per-round exchange setup (%x_pre_*_fn, #2089) into single-block helpers
+            if op == "OpFunctionParameter":
+                helpers[helper][0].append(res)
+            elif op != "OpLabel":
+                helpers[helper][1].append((res, op, args))
             continue
 
         if not in_main:
@@ -137,6 +150,33 @@ def _parse_spv(asm):
             continue
         if cur is not None:
             blocks[cur].append((res, op, args))
+
+    # Expand each call of a single-block helper inline (fresh result ids per call); OpReturnValue becomes a copy into
+    # the call's result, so the lockstep interpreter only ever runs %main.
+    seq = 0
+    for lbl, insns in blocks.items():
+        if not any(op == "OpFunctionCall" for _, op, _ in insns):
+            continue
+        out = []
+        for res, op, args in insns:
+            if op != "OpFunctionCall":
+                out.append((res, op, args))
+                continue
+            seq += 1
+            params, body = helpers[args[1]]
+            assert len(params) == len(args) - 2, f"OpFunctionCall {args[1]}: argument count"
+            ids = dict(zip(params, args[2:]))
+            for fres, fop, fargs in body:
+                fargs = [ids.get(x, x) for x in fargs]
+                if fop == "OpReturnValue":
+                    out.append((res, "OpCopyObject", [args[0], fargs[0]]))
+                    break
+                if fop == "OpReturn":
+                    break
+                if fres:
+                    ids[fres] = f"%call{seq}_{fres[1:]}"
+                out.append((ids.get(fres) if fres else None, fop, fargs))
+        blocks[lbl] = out
 
     def make_zero(ty_id):
         ty = types.get(ty_id)
@@ -716,7 +756,7 @@ def _resolve_labels(items):
     return out
 
 
-def _translate_cs(name, items, threads=64, lds_bytes=0, emulate=False, size_xyz=None):
+def _translate_cs(name, items, threads=64, lds_bytes=0, emulate=False, size_xyz=None, structured=True):
     lines = _resolve_labels(items)
     sx, sy, sz = size_xyz if size_xyz is not None else (threads, 1, 1)
     lds_blocks = (lds_bytes + 511) // 512
@@ -733,8 +773,9 @@ def _translate_cs(name, items, threads=64, lds_bytes=0, emulate=False, size_xyz=
             f.write(STUB_DXBC)
         with open(os.path.join(tmp, "fssm", name + ".fssm"), "wb") as f:
             f.write(bytes(0x138) + struct.pack("<4I", rsrc2, sx, sy, sz))
-        old_em = rdna2spirv.WAVE64_EMULATE
+        old_em, old_st = rdna2spirv.WAVE64_EMULATE, rdna2spirv.STRUCTURED
         rdna2spirv.WAVE64_EMULATE = emulate
+        rdna2spirv.STRUCTURED = structured      # False: --dispatch-loop, which keeps the emulation's round scheduler
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", ResourceWarning)
@@ -742,7 +783,7 @@ def _translate_cs(name, items, threads=64, lds_bytes=0, emulate=False, size_xyz=
                 gen = rdna2spirv.translate.last_gen
                 gc.collect()
         finally:
-            rdna2spirv.WAVE64_EMULATE = old_em
+            rdna2spirv.WAVE64_EMULATE, rdna2spirv.STRUCTURED = old_em, old_st
     return spv, gen
 
 
@@ -1013,17 +1054,24 @@ class DivergentLoopBallotTests(unittest.TestCase):
             return out
 
         configs = [
-            ("native_64", 64, 64, False),
-            ("native_128", 128, 64, False),
-            ("emulate_64_sg32", 64, 32, True),
-            ("emulate_128_sg32", 128, 32, True),
-            ("emulate_40_partial_sg32", 40, 32, True),
+            ("native_64", 64, 64, False, True),
+            ("native_128", 128, 64, False, True),
+            # a reducible multi-block loop takes the structured emulation since #2089 (no round OpSwitch) ...
+            ("emulate_64_sg32", 64, 32, True, True),
+            ("emulate_128_sg32", 128, 32, True, True),
+            ("emulate_40_partial_sg32", 40, 32, True, True),
+            # ... and --dispatch-loop keeps the round scheduler: both must give the native words
+            ("emulate_64_sg32_rounds", 64, 32, True, False),
+            ("emulate_128_sg32_rounds", 128, 32, True, False),
+            ("emulate_40_partial_sg32_rounds", 40, 32, True, False),
         ]
-        for label, threads, sg_sz, emulate in configs:
+        for label, threads, sg_sz, emulate, structured in configs:
             with self.subTest(mode=label):
-                spv, gen = _translate_cs("cs_div_loop_" + label, prog, threads=threads, emulate=emulate)
+                spv, gen = _translate_cs("cs_div_loop_" + label, prog, threads=threads, emulate=emulate,
+                                         structured=structured)
                 if emulate:
-                    self.assertEqual(gen.control_flow, "emulated wave64 rounds")
+                    self.assertEqual(gen.control_flow,
+                                     "emulated wave64 structured" if structured else "emulated wave64 rounds")
                 mem = run_compute_workgroup(spv, threads, sg_sz, push_constants=VSHARP)
                 want = expected_for(threads)
                 for t in range(threads):

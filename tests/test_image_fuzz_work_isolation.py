@@ -139,10 +139,11 @@ raise SystemExit(image_fuzz.main())
             oracle = Oracle()
             argv = ["image_fuzz.py", "--oracle", "hw", "--programs", "1", "--work", str(parent)]
             stderr = io.StringIO()
-            with (patch.object(sys, "argv", argv), patch.object(runner, "open_oracle", return_value=oracle),
+            with (patch.object(sys, "argv", argv), patch.object(runner, "open_oracle", return_value=oracle) as opened,
                   contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr)):
                 self.assertEqual(imf.main(), 2)
-            self.assertTrue(oracle.closed)
+            # since #4087 a --work that is a file is refused before the oracle is opened; an opened one is closed
+            self.assertTrue(oracle.closed or not opened.called)
             self.assertIn("ERROR:", stderr.getvalue())
             self.assertEqual(parent.read_bytes(), b"caller data")
 

@@ -1314,7 +1314,7 @@ class BaseColorParamTest(unittest.TestCase):
 
     def _run_cli(self, assets_dir, out_dir, *extra_args):
         cmd = [sys.executable, "-I", self.TOOL, assets_dir, "--out", out_dir, *extra_args]
-        return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        return subprocess.run(cmd, capture_output=True, text=True, errors="replace")
 
     def _read_world(self, out_dir):
         with open(os.path.join(out_dir, "world.json"), encoding="utf-8") as f:
@@ -1422,7 +1422,7 @@ class WorldBuildTest(unittest.TestCase):
 
     def _run_cli(self, assets_dir: str, out_dir: str, *extra_args: str) -> subprocess.CompletedProcess:
         cmd = [sys.executable, "-I", self.TOOL, assets_dir, "--out", out_dir, *extra_args]
-        return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        return subprocess.run(cmd, capture_output=True, text=True, errors="replace")
 
     @staticmethod
     def _output_snapshot(directory):

@@ -167,7 +167,12 @@ def main(argv=None):
     ap.add_argument("--max-props", type=int, default=400, help="entities to place, nearest first (each can be several draws)")
     ap.add_argument("--tex-size", type=int, default=256)
     ap.add_argument("--out", required=True)
-    stats = build(ap.parse_args(argv))
+    try:
+        stats = build(ap.parse_args(argv))
+    except OSError as e:
+        # An unreadable --entities/--models or an unwritable --out used to end in a traceback.
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     print(" ".join(f"{k}={v}" for k, v in stats.items()))
     return 0
 

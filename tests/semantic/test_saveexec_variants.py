@@ -84,6 +84,189 @@ class SaveexecVariants(unittest.TestCase):
                 with self.subTest(kind=kind, wave=wave):
                     self.check(kind, wave, exec_hi, *s0, wrexec=True)
 
+    def test_sdst_src0_aliasing(self):
+        # 1. s_nand_saveexec_b32 s4, s4
+        lines32 = [
+            "v_mbcnt_lo_u32_b32 v4, -1, 0",
+            "v_cmp_ge_u32_e64 s4, v4, 8",
+            "v_cmp_lt_u32_e64 s6, v4, 24",
+            "s_and_b32 s4, s4, s6",
+            "v_mov_b32 v1, 0x11",
+            "v_cmpx_gt_u32_e32 16, v4",
+            "s_nand_saveexec_b32 s4, s4",
+            "s_cselect_b32 s10, 1, 0",
+            "v_mov_b32 v1, 0x22",
+            "s_mov_b32 exec, -1",
+            "v_cndmask_b32_e64 v2, 0, 1, s4",
+            "v_mov_b32 v0, s10",
+            "v_mov_b32 v3, 0",
+        ]
+        outs32, _ = run_ps_wave(lines32, wave=32)
+        for lane in range(32):
+            want_scc = 1
+            want_exec = 0x11 if 8 <= lane < 16 else 0x22
+            want_saved = 1 if lane < 16 else 0
+            self.assertEqual(outs32[lane], (want_scc, want_exec, want_saved, 0), f"lane {lane}")
+
+        # 2. s_nand_saveexec_b64 s[4:5], s[4:5]
+        lines64 = [
+            "v_mbcnt_lo_u32_b32 v4, -1, 0",
+            "v_mbcnt_hi_u32_b32 v4, -1, v4",
+            "v_cmp_ge_u32_e64 s[4:5], v4, 16",
+            "v_cmp_lt_u32_e64 s[6:7], v4, 48",
+            "s_and_b64 s[4:5], s[4:5], s[6:7]",
+            "v_mov_b32 v1, 0x11",
+            "v_cmpx_gt_u32_e32 32, v4",
+            "s_nand_saveexec_b64 s[4:5], s[4:5]",
+            "s_cselect_b32 s10, 1, 0",
+            "v_mov_b32 v1, 0x22",
+            "s_mov_b64 exec, -1",
+            "v_cndmask_b32_e64 v2, 0, 1, s[4:5]",
+            "v_mov_b32 v0, s10",
+            "v_mov_b32 v3, 0",
+        ]
+        outs64, _ = run_ps_wave(lines64, wave=64)
+        for lane in range(64):
+            want_scc = 1
+            want_exec = 0x11 if 16 <= lane < 32 else 0x22
+            want_saved = 1 if lane < 32 else 0
+            self.assertEqual(outs64[lane], (want_scc, want_exec, want_saved, 0), f"lane {lane}")
+
+        # 3. s_andn1_wrexec_b32 s4, s4
+        lines_wr = [
+            "v_mbcnt_lo_u32_b32 v4, -1, 0",
+            "v_cmp_ge_u32_e64 s4, v4, 8",
+            "v_cmp_lt_u32_e64 s6, v4, 24",
+            "s_and_b32 s4, s4, s6",
+            "v_mov_b32 v1, 0x11",
+            "v_cmpx_gt_u32_e32 16, v4",
+            "s_andn1_wrexec_b32 s4, s4",
+            "s_cselect_b32 s10, 1, 0",
+            "v_mov_b32 v1, 0x22",
+            "s_mov_b32 exec, -1",
+            "v_cndmask_b32_e64 v2, 0, 1, s4",
+            "v_mov_b32 v0, s10",
+            "v_mov_b32 v3, 0",
+        ]
+        outs_wr, _ = run_ps_wave(lines_wr, wave=32)
+        for lane in range(32):
+            want_scc = 1
+            want_exec = 0x22 if lane < 8 else 0x11
+            want_saved = 1 if lane < 8 else 0
+            self.assertEqual(outs_wr[lane], (want_scc, want_exec, want_saved, 0), f"lane {lane}")
+
+    def test_wave64_upper_dword_scc_boundary(self):
+        # src0 = 0x00000001_00000000 (only lane 32 active)
+        lines = [
+            "v_mbcnt_lo_u32_b32 v4, -1, 0",
+            "v_mbcnt_hi_u32_b32 v4, -1, v4",
+            "v_cmp_eq_u32_e64 s[2:3], v4, 32",
+            "s_mov_b64 exec, -1",
+            "s_and_saveexec_b64 s[4:5], s[2:3]",
+            "s_cselect_b32 s10, 1, 0",
+            "s_mov_b64 exec, -1",
+            "v_cndmask_b32_e64 v2, 0, 1, s[4:5]",
+            "v_mov_b32 v0, s10",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        outs, _ = run_ps_wave(lines, wave=64)
+        for lane in range(64):
+            self.assertEqual(outs[lane][0], 1, "SCC should be 1 when bit 32 is non-zero")
+            self.assertEqual(outs[lane][2], 1, "saved exec should be all 1s")
+
+        # paired with src0 = 0 -> SCC must be 0
+        lines_zero = [
+            "v_mbcnt_lo_u32_b32 v4, -1, 0",
+            "v_mbcnt_hi_u32_b32 v4, -1, v4",
+            "s_mov_b64 exec, -1",
+            "s_and_saveexec_b64 s[4:5], 0",
+            "s_cselect_b32 s10, 1, 0",
+            "s_mov_b64 exec, -1",
+            "v_cndmask_b32_e64 v2, 0, 1, s[4:5]",
+            "v_mov_b32 v0, s10",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        outs_zero, _ = run_ps_wave(lines_zero, wave=64)
+        for lane in range(64):
+            self.assertEqual(outs_zero[lane][0], 0, "SCC should be 0 when new EXEC is 0")
+
+    def test_asymmetric_operand_order_guard(self):
+        # exec = [0, 20), s0 = [10, 30) in wave32
+        m = (1 << 32) - 1
+        e, s = lanes(0, 20, 32), lanes(10, 30, 32)
+        cases = [
+            ("andn1", (~s & e) & m),
+            ("andn2", (s & ~e) & m),
+            ("orn1", (~s | e) & m),
+            ("orn2", (s | ~e) & m),
+        ]
+        for kind, want_new in cases:
+            with self.subTest(kind=kind):
+                op = f"s_{kind}_saveexec_b32 {{d}}, {{s0}}"
+                outs = case(op, 32, 20, 10, 30)
+                for lane in range(32):
+                    want_bit = (want_new >> lane) & 1
+                    self.assertEqual(outs[lane][1], 0x22 if want_bit else 0x11, f"{kind} lane {lane}")
+
+    def test_lane_reactivation(self):
+        # Initial EXEC = [0, 16). s_nor_saveexec_b32 with s2 = [8, 24) reactivates lanes [24, 32).
+        lines = [
+            "v_mbcnt_lo_u32_b32 v4, -1, 0",
+            "v_cmp_ge_u32_e64 s2, v4, 8",
+            "v_cmp_lt_u32_e64 s6, v4, 24",
+            "s_and_b32 s2, s2, s6",
+            "v_mov_b32 v1, 0x55",
+            "v_cmpx_gt_u32_e32 16, v4",
+            "s_nor_saveexec_b32 s4, s2",
+            "v_mov_b32 v1, 0xAA",
+            "s_mov_b32 exec, -1",
+            "v_mov_b32 v0, v1",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        outs, _ = run_ps_wave(lines, wave=32)
+        for lane in range(32):
+            want = 0xAA if 24 <= lane < 32 else 0x55
+            self.assertEqual(outs[lane][0], want, f"lane {lane}")
+
+    def test_inline_constants_and_null_dst(self):
+        # 1. inline constant -1 in wave64
+        lines_imm = [
+            "v_mbcnt_lo_u32_b32 v4, -1, 0",
+            "v_mbcnt_hi_u32_b32 v4, -1, v4",
+            "s_mov_b64 exec, -1",
+            "s_andn1_saveexec_b64 s[4:5], -1",
+            "s_cselect_b32 s10, 1, 0",
+            "s_mov_b64 exec, -1",
+            "v_cndmask_b32_e64 v2, 0, 1, s[4:5]",
+            "v_mov_b32 v0, s10",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        outs_imm, _ = run_ps_wave(lines_imm, wave=64)
+        for lane in range(64):
+            self.assertEqual(outs_imm[lane][0], 0, "SCC should be 0 because ~(-1) & EXEC == 0")
+            self.assertEqual(outs_imm[lane][2], 1, "saved exec should be all 1s")
+
+        # 2. null dst: s_nand_saveexec_b32 null, s4
+        lines_null = [
+            "v_mbcnt_lo_u32_b32 v4, -1, 0",
+            "s_mov_b32 s4, 0x0F0F0F0F",
+            "s_mov_b32 exec, -1",
+            "s_nand_saveexec_b32 null, s4",
+            "s_cselect_b32 s10, 1, 0",
+            "s_mov_b32 exec, -1",
+            "v_mov_b32 v0, s10",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        outs_null, _ = run_ps_wave(lines_null, wave=32)
+        for lane in range(32):
+            self.assertEqual(outs_null[lane][0], 1, "SCC should be 1")
+
 
 if __name__ == "__main__":
     unittest.main()

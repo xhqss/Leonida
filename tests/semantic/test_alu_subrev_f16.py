@@ -865,6 +865,21 @@ class Ieee754SpecialValuesShaderExecutionTests(unittest.TestCase):
         got_ninf_clamp = run("v_subrev_f16_e64 v0, v1, v2 clamp", H_POS_INF, H_NEG_INF) & 0xFFFF
         self.assertEqual(got_ninf_clamp, H_POS_ZERO)
 
+    def test_vop3_omod_and_clamp(self):
+        # An f16 destination ignores omod under the game's MODE (IEEE=0, f16 denormals kept) and keeps clamp:
+        # measured on gfx1036 (#4542, docs/design.md "`v_fmac_f16`, `v_interp_p2/mov_f32`, and f16 output modifiers").
+        # 1.5 - 1.0 = 0.5; mul:2 leaves it.
+        got = run("v_subrev_f16_e64 v0, v1, v2 mul:2", H_ONE, f2h(1.5)) & 0xFFFF
+        self.assertEqual(got, H_HALF)
+        # 2.0 - 1.0 = 1.0; div:2 leaves it.
+        got_div = run("v_subrev_f16_e64 v0, v1, v2 div:2", H_ONE, H_TWO) & 0xFFFF
+        self.assertEqual(got_div, H_ONE)
+        # 1.5 - 1.0 = 0.5; mul:4 is ignored, clamp keeps 0.5. 3.0 - 1.0 = 2.0 clamps to 1.0.
+        got_clamp = run("v_subrev_f16_e64 v0, v1, v2 mul:4 clamp", H_ONE, f2h(1.5)) & 0xFFFF
+        self.assertEqual(got_clamp, H_HALF)
+        got_sat = run("v_subrev_f16_e64 v0, v1, v2 mul:4 clamp", H_ONE, f2h(3.0)) & 0xFFFF
+        self.assertEqual(got_sat, H_ONE)
+
 
 if __name__ == "__main__":
     unittest.main()

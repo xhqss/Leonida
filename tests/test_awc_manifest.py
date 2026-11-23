@@ -89,7 +89,7 @@ class ManifestTest(unittest.TestCase):
 
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True,
-                              text=True, encoding="utf-8", timeout=60)
+                              text=True, errors="replace", timeout=60)
 
     def test_csv_rows_codecs_and_bad_bank_skip(self):
         bank = self.write_bank()
@@ -293,6 +293,26 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual((doc["bank_count"], doc["stream_count"]), (0, 0))
         self.assertEqual(doc["streams"], [])
 
+    def test_incomplete_bank_discovery_preserves_the_previous_manifest(self):
+        root = self.tmp.name
+        blocked = os.path.join(root, "blocked")
+        out = os.path.join(root, "manifest.json")
+        previous = b'{"previous": true}\n'
+        with open(out, "wb") as f:
+            f.write(previous)
+
+        def walk(path, onerror=None):
+            if onerror:
+                onerror(PermissionError(13, "permission denied", blocked))
+            return iter(())
+
+        with mock.patch.object(awc_manifest.os, "walk", walk), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(awc_manifest.main([root, "--out", out]), 1)
+        self.assertIn(blocked, err.getvalue())
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), previous)
+
     def test_unreadable_bank_preserves_the_previous_manifest(self):
         good = os.path.join(self.tmp.name, "good.awc")
         blocked = os.path.join(self.tmp.name, "unreadable.awc")
@@ -334,6 +354,30 @@ class ManifestTest(unittest.TestCase):
         with open(out, encoding="utf-8") as f:
             self.assertEqual(f.read(), '{"previous": true}\n')
         self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])   # no temporary file left
+
+    def test_failed_replace_of_read_only_manifest_removes_writable_temp(self):
+        out = os.path.join(self.tmp.name, "manifest.json")
+        previous = '{"previous": true}\n'
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(previous)
+        os.chmod(out, 0o444)
+        self.addCleanup(lambda: os.path.exists(out) and os.chmod(out, 0o600))
+        made_writable = []
+        real_chmod = os.chmod
+
+        def chmod(path, mode, *args, **kwargs):
+            if isinstance(path, str) and os.path.basename(path).startswith(".awc_manifest-") and mode == 0o600:
+                made_writable.append(path)
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with mock.patch.object(awc_manifest.os, "replace", side_effect=OSError("replace denied")), \
+                mock.patch.object(awc_manifest.os, "chmod", chmod):
+            with self.assertRaises(OSError):
+                awc_manifest.write_manifest([], 0, 0, "json", out)
+        self.assertEqual(len(made_writable), 1)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), previous)
+        self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])
 
     def test_recursive_report_distinguishes_banks_with_the_same_basename(self):
         for folder in ("left", "right"):

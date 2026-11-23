@@ -48,6 +48,8 @@ RUNNER_SKIPS = {
         "test_typed_buffers_and_psv0",
         "test_a_test_that_raises_fails_the_run_and_the_rest_still_run",
         "test_a_failed_check_fails_only_its_own_test",
+        "test_out_via_directory_alias_into_corpus_is_a_usage_error",
+        "test_out_hard_link_to_carved_index_is_a_usage_error",
     },
 }
 

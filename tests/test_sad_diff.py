@@ -131,5 +131,20 @@ class Translated(unittest.TestCase):
             d.translate_listing = real
 
 
+class EverythingSkipped(unittest.TestCase):
+    def test_a_run_where_every_program_was_skipped_is_not_a_success(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        def refuse(lines, name, tmpdir):
+            raise d.rdna2spirv.Unsupported("unsupported form")
+        out = io.StringIO()
+        with (mock.patch.object(d, "translate_listing", refuse), mock.patch.object(sys, "argv", ["sad_diff.py", "--programs", "3"]),
+              contextlib.redirect_stdout(out)):
+            rc = d.main()
+        self.assertEqual(rc, 2, out.getvalue())
+        self.assertIn("no program ran: every one was skipped", out.getvalue())
+
 if __name__ == "__main__":
     unittest.main()

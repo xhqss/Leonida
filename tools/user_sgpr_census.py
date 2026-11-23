@@ -29,7 +29,8 @@ It reads only spirv/index.json (user_sgpr_reads and stage from tools/shader_meta
 Usage:
     python -I tools/user_sgpr_census.py <spirv/index.json> [--json OUT] [--pairs]
     python -I tools/user_sgpr_census.py <spirv/index.json> --expect ps=8 vs=8 cs=4 ms=16
-        (exit 1 if, for a listed stage, the most common lowest-pointer SGPR is not the expected one)
+        (exit 1 if, for a listed stage, the most common lowest-pointer SGPR is not the expected one;
+         ties are broken in favor of the smaller SGPR)
 
 An index that cannot be read, is not JSON or is not the shape tools/shader_meta.py writes, and a --json path that
 cannot be written, each give one ERROR line and exit 2.
@@ -88,7 +89,7 @@ def census(index, base=None):
             "shaders_reading_kind": dict(sorted(kinds[stage].items())),
             "lowest_pointer_sgpr": {f"s{k}": v for k, v in sorted(lp.items())},
             "lowest_pointer_kind": dict(sorted(lowest_pointer_kind[stage].items())),
-            "most_common_lowest_pointer_sgpr": lp.most_common(1)[0][0] if lp else None,
+            "most_common_lowest_pointer_sgpr": max(lp.items(), key=lambda kv: (kv[1], -kv[0]))[0] if lp else None,
             "pointer_gap": dict(sorted(pointer_gap[stage].items())),
             "after_ptr32": dict(sorted(after_ptr32[stage].items())),
         }

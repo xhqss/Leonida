@@ -118,7 +118,7 @@ def translate_lines(lines) -> str:
     ]
     asm = "; test_cvt_pknorm_f16\n" + "".join(f"\t{ln}\n" for ln in out_lines)
     asm += "\texp mrt0 v5, v6, v5, v5 done vm\n\ts_endpgm\n"
-    with open(_SRC_PATH, "w", encoding="utf-8") as f:
+    with open(_SRC_PATH, "w", encoding="utf-8", newline="\n") as f:
         f.write(asm)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ResourceWarning)
@@ -207,12 +207,42 @@ class CvtPknormF16Tests(unittest.TestCase):
             with self.subTest(op=op, x=hex(x), y=hex(y), sel=(sel0, sel1)):
                 self.assertEqual(run_op(op, s0, s1, extra=f"op_sel:[{sel0},{sel1}]"), want)
 
+    def test_clamp_and_opsel_dst(self):
+        s0 = 0x3C003400  # hi = +1.0, lo = +0.25
+        s1 = 0xBC003801  # hi = -1.0, lo = 0.5+2^-11
+        self.assertEqual(run_op("v_cvt_pknorm_i16_f16", s0, s1, extra="clamp"), 0x400F2000)
+        self.assertEqual(run_op("v_cvt_pknorm_u16_f16", s0, s1, extra="clamp"), 0x801F4000)
+        want_dhi_i16 = {
+            "op_sel:[0,0,1]": 0x20000000,
+            "op_sel:[0,1,1]": 0x20000000,
+            "op_sel:[1,0,1]": 0x7FFF0000,
+            "op_sel:[1,1,1]": 0x7FFF0000,
+            "op_sel:[1,0,1] clamp": 0x7FFF0000,
+        }
+        want_dhi_u16 = {
+            "op_sel:[0,0,1]": 0x40000000,
+            "op_sel:[0,1,1]": 0x40000000,
+            "op_sel:[1,0,1]": 0xFFFF0000,
+            "op_sel:[1,1,1]": 0xFFFF0000,
+            "op_sel:[1,0,1] clamp": 0xFFFF0000,
+        }
+        for mod, want in want_dhi_i16.items():
+            with self.subTest(op="v_cvt_pknorm_i16_f16", mod=mod):
+                self.assertEqual(run_op("v_cvt_pknorm_i16_f16", s0, s1, extra=mod), want)
+        for mod, want in want_dhi_u16.items():
+            with self.subTest(op="v_cvt_pknorm_u16_f16", mod=mod):
+                self.assertEqual(run_op("v_cvt_pknorm_u16_f16", s0, s1, extra=mod), want)
+
     def test_rejected_modifiers_and_spirv_val(self):
         for bad in (
-            "v_cvt_pknorm_i16_f16 v0, v1, v2 clamp",
             "v_cvt_pknorm_u16_f16 v0, v1, v2 mul:2",
-            "v_cvt_pknorm_i16_f16 v0, v1, v2 op_sel:[0,0,1]",
+            "v_cvt_pknorm_i16_f16 v0, v1, v2 mul:4",
+            "v_cvt_pknorm_u16_f16 v0, v1, v2 div:2",
             "v_cvt_pknorm_u16_f16 v0, v1, v2 op_sel_hi:[1,1]",
+            "v_cvt_pknorm_i16_f16 v0, v1, v2 neg_lo:[1,0]",
+            "v_cvt_pknorm_u16_f16 v0, v1, v2 neg_hi:[0,1]",
+            "v_cvt_pknorm_i16_f16 v0, v1, v2 op_sel:[0,0,0,1]",
+            "v_cvt_pknorm_u16_f16 v0, v1, v2 op_sel:[2,0,0]",
         ):
             with self.subTest(bad=bad), self.assertRaises(rdna2spirv.Unsupported):
                 translate_lines([bad])

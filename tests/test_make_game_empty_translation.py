@@ -1,4 +1,4 @@
-"""make_game.py: an empty translated shader index is a failed stage, not a finished one.
+"""make_game.py: an empty translated shader index is not kept, and a later stage refuses one.
 
 Standard library only; no GPU, no Vulkan SDK, no game data: the shard processes and rdna2spirv.py are mocked.
 
@@ -110,6 +110,59 @@ class RequireTranslatedShadersTest(unittest.TestCase):
     def test_a_non_empty_index_is_accepted(self):
         write(os.path.join(self.spirv, "index.json"), '{"shader_0": {}}')
         self.assertEqual(self.call()[0], self.spirv)
+
+
+class ShadersStageTest(unittest.TestCase):
+    """shaders(): a saved `{}` from a merge that produced nothing is translated again, and its plan goes with it."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.work = tmp.name
+        self.dxbc = os.path.join(self.work, "shaders", "dxbc")
+        self.spirv = os.path.join(self.work, "shaders", "spirv")
+
+    def index(self):
+        return os.path.join(self.spirv, "index.json")
+
+    def plan(self):
+        return os.path.join(self.spirv, make_game.SHARD_PLAN)
+
+    def run_stage(self):
+        ran = []
+
+        def fake_py(tool, *args):
+            if tool == "shader_carve.py":
+                write(os.path.join(self.dxbc, "index.json"), json.dumps([{"file": "shader.dxbc"}]))
+            elif tool == "fssm_unpack.py":
+                write(os.path.join(self.dxbc, "fssm_index.json"), json.dumps([{"name": "shader"}]))
+            elif tool == "shader_disasm.py":
+                write(os.path.join(self.dxbc, "disasm", "shader.s"), "synthetic listing\n")
+
+        def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
+            ran.append("translate")
+            write(os.path.join(self.spirv, "index.json"), json.dumps({"shader_0": {"stage": "ps"}}))
+
+        with mock.patch.object(make_game, "py", fake_py), \
+                mock.patch.object(make_game, "need", lambda *a: None), \
+                mock.patch.object(make_game, "translate", fake_translate), \
+                mock.patch.object(make_game, "llvm_mc_signature", return_value="test llvm-mc 21"), \
+                mock.patch.object(make_game, "log", lambda *a: None):
+            make_game.shaders(os.path.join(self.work, "game"), self.work, 2)
+        return ran
+
+    def test_an_empty_saved_index_is_translated_again_without_its_plan(self):
+        self.assertEqual(self.run_stage(), ["translate"])
+        write(self.index(), "{}")
+        write(self.plan(), "{}")
+        self.assertEqual(self.run_stage(), ["translate"])
+        self.assertFalse(os.path.exists(self.plan()))
+
+    def test_a_saved_index_that_names_a_shader_is_kept(self):
+        self.run_stage()
+        self.assertEqual(self.run_stage(), [])
+        with open(self.index(), encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"shader_0": {"stage": "ps"}})
 
 
 if __name__ == "__main__":

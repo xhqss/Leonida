@@ -26,8 +26,8 @@ lowercase equivalents accepted for hand-written files:
         {"Param": "1E77BF4C", "Name": "face_bumptex"}]}]}
 
 A top-level ``Items``/``Models`` list is also accepted, so a model manifest can
-be passed directly. Texture names come from ``Name``, then ``Key``, then
-``Id64``.
+be passed directly. The texture column keeps its display name or hash. A separate
+``asset_key`` column carries the 16-digit resource identity from ``Id64`` or ``AssetKey``.
 
     python -I tools/character_textures.py <model.json|dir> [...] [--json FILE] [--csv FILE]
 
@@ -62,10 +62,10 @@ MODEL_FILE_KEYS = ("File", "file")
 MATERIAL_NAME_KEYS = ("Name", "name", "MaterialName", "material_name")
 SHADER_KEYS = ("Shader", "shader", "ShaderName", "shader_name", "ShaderHash", "shader_hash")
 PARAM_KEYS = ("Param", "param", "Slot", "slot", "Parameter", "parameter", "Hash", "hash")
-TEXTURE_NAME_KEYS = ("Name", "name", "Texture", "texture", "Key", "key", "Id64", "id64",
-                     "AssetKey", "asset_key")
+ASSET_KEY_FIELDS = ("Id64", "id64", "AssetKey", "asset_key")
+TEXTURE_NAME_KEYS = ("Name", "name", "Texture", "texture", "Key", "key") + ASSET_KEY_FIELDS
 
-CSV_FIELDS = ("source", "model", "material", "shader", "slot", "role", "texture", "flags")
+CSV_FIELDS = ("source", "model", "material", "shader", "slot", "role", "texture", "flags", "asset_key")
 
 
 def _first(mapping: dict, keys: tuple):
@@ -86,18 +86,18 @@ def _one_line(text: object) -> str:
     return " ".join(str(text).split())
 
 
-def _slot_hash(value: object) -> str | None:
-    """Normalise a 32-bit slot hash to eight uppercase hex digits, or None if malformed."""
+def _hex_field(value: object, digits: int) -> str | None:
+    """Normalise an unsigned field to its declared width, or None if malformed."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return f"{value:08X}" if 0 <= value <= 0xFFFFFFFF else None
+        return f"{value:0{digits}X}" if 0 <= value < 16 ** digits else None
     if not isinstance(value, str):
         return None
     text = value.strip()
     if text[:2].lower() == "0x":
         text = text[2:]
-    if len(text) == 8 and all(ch in "0123456789abcdefABCDEF" for ch in text):
+    if len(text) == digits and all(ch in "0123456789abcdefABCDEF" for ch in text):
         return text.upper()
     return None
 
@@ -174,15 +174,17 @@ def classify_material(material: dict, index: int) -> dict:
     bindings = []
     for reference in texture_bindings(material):
         if isinstance(reference, dict):
-            slot = _slot_hash(_first(reference, PARAM_KEYS))
+            slot = _hex_field(_first(reference, PARAM_KEYS), 8)
             texture = _texture_name(_first(reference, TEXTURE_NAME_KEYS))
+            asset_key = _hex_field(_first(reference, ASSET_KEY_FIELDS), 16)
         else:
-            slot, texture = None, _texture_name(reference)
+            slot, texture, asset_key = None, _texture_name(reference), None
         if slot is None:
-            bindings.append({"slot": "-", "role": "unknown", "texture": texture})
+            label, role = "-", "unknown"
         else:
-            role = SLOT_ROLES.get(slot, f"unknown 0x{slot}")
-            bindings.append({"slot": f"0x{slot}", "role": role, "texture": texture})
+            label = f"0x{slot}"
+            role = SLOT_ROLES.get(slot, f"unknown {label}")
+        bindings.append({"slot": label, "role": role, "texture": texture, "asset_key": asset_key})
 
     missing_albedo = not any(binding["slot"] == f"0x{ALBEDO_SLOT}" for binding in bindings)
     garment = shader is not None and (shader[2:] if shader.startswith("0x") else shader) in GARMENT_SHADERS
@@ -229,11 +231,14 @@ def classify_document(path: str, document: object) -> dict:
 
 def model_files(targets: list) -> list[str]:
     """Resolve explicit files and recurse into directories for model.json, de-duplicated."""
+    def scan_failed(exc: OSError) -> None:
+        raise exc
+
     found = []
     for target in targets:
         if os.path.isdir(target):
             matches = sorted(os.path.join(root, name)
-                             for root, _, names in os.walk(target) for name in names
+                             for root, _, names in os.walk(target, onerror=scan_failed) for name in names
                              if name.lower() == "model.json")
             if not matches:
                 raise ValueError(f"no model.json under {target}")
@@ -300,14 +305,16 @@ def report_rows(report: dict) -> list[dict]:
                     "role": binding["role"],
                     "texture": binding["texture"],
                     "flags": ";".join(material["flags"]),
+                    "asset_key": binding.get("asset_key"),
                 })
     return rows
 
 
 def print_report(report: dict) -> None:
-    print("model\tmaterial\tslot\trole\ttexture")
+    print("model\tmaterial\tslot\trole\ttexture\tasset_key")
     for row in report_rows(report):
-        print("\t".join(_one_line(row[key]) for key in ("model", "material", "slot", "role", "texture")))
+        print(*(_one_line(row[key]) for key in ("model", "material", "slot", "role", "texture")),
+              row["asset_key"] or "-", sep="\t")
     for warning in report["warnings"]:
         print(f"FLAG {warning}")
     summary = report["summary"]

@@ -13,6 +13,11 @@ Usage:
 With ``--probe`` each stream is written to a temporary file and passed to
 ``ffprobe``; the extra columns say only whether that ffprobe build can decode
 the stream. A missing ffprobe leaves the base columns unchanged.
+
+In an RPF9 archive the last ``u32 +12`` bytes of the file are a block of their own
+(``docs/rpf.md``), so when the gap after the last stream reaches EOF and is at least
+that long, those bytes are counted as ``rpf_trailer`` and only the rest of the gap is
+split into zero padding and unread bytes.
 """
 import argparse
 import csv
@@ -137,14 +142,18 @@ def scan_file(path, source):
     size = os.path.getsize(path)
     if size == 0:
         return rows, {"files_scanned": 1, "streams": 0, "bytes": 0, "zero_padding": 0,
-                      "unread_bytes": 0, "span": 0}
+                      "rpf_trailer": 0, "unread_bytes": 0, "span": 0}
     with open(path, "rb") as fh:
         with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as data:
-            start = 0
-            if size >= 8 and bytes(data[1:4]) == b"FPR":
-                hint = struct.unpack_from("<I", data, 4)[0]
+            start = trailer_size = 0
+            if size >= 16 and bytes(data[1:4]) == b"FPR":
+                hint, trailer_size = struct.unpack_from("<I4xI", data, 4)
                 if HDR <= hint < size:
                     start = hint
+                # +12 as the trailer size is measured on RPF9 only, where it is always a multiple of 16
+                # (docs/rpf.md, "The trailer at EOF"); any other value leaves the tail to the zero/unread split.
+                if bytes(data[0:1]) != b"9" or trailer_size % 16:
+                    trailer_size = 0
             pos = start
             last = start
             zero = unread = 0
@@ -164,13 +173,14 @@ def scan_file(path, source):
                 rows.append(row)
                 last = match.start() + row["size"]
                 pos = last
-            z, u = _gap(data, last, len(data))
+            trailer = trailer_size if 0 < trailer_size <= len(data) - last else 0
+            z, u = _gap(data, last, len(data) - trailer)
             zero += z
             unread += u
             span = len(data) - start
     stats = {"files_scanned": 1, "streams": len(rows),
              "bytes": sum(r["size"] for r in rows), "zero_padding": zero,
-             "unread_bytes": unread, "span": span}
+             "rpf_trailer": trailer, "unread_bytes": unread, "span": span}
     return rows, stats
 
 
@@ -182,18 +192,23 @@ def scan_target(target, skip_report=None):
     repeat invocation does not count the previous report's bytes.
     """
     rows, total = [], {"files_scanned": 0, "streams": 0, "bytes": 0,
-                       "zero_padding": 0, "unread_bytes": 0, "span": 0}
+                       "zero_padding": 0, "rpf_trailer": 0, "unread_bytes": 0, "span": 0}
     if os.path.isdir(target):
         base = target
         paths = []
-        for root, _dirs, files in os.walk(target):
+
+        def scan_failed(error):
+            raise error
+
+        for root, _dirs, files in os.walk(target, onerror=scan_failed):
             for name in files:
                 path = os.path.join(root, name)
                 if skip_report is not None and same_output_path(path, skip_report):
                     continue
-                paths.append(path)
-        for path in sorted(paths):
-            got, stats = scan_file(path, os.path.relpath(path, base))
+                # "/" in the source and the sort key, so the report is the same on every platform
+                paths.append((os.path.relpath(path, base).replace(os.sep, "/"), path))
+        for source, path in sorted(paths):
+            got, stats = scan_file(path, source)
             rows.extend(got)
             for key in total:
                 total[key] += stats[key]
@@ -313,7 +328,8 @@ def main(argv=None):
         ap.error(f"--out is a folder, not a report file: {a.out}")
     if a.out and os.path.isdir(a.target):
         manifest = os.path.join(a.target, "index.json")
-        if os.path.isfile(manifest) and same_output_path(a.out, manifest):
+        # Reserved even before the carve writes it: other tools read <target>/index.json as the carve manifest.
+        if same_output_path(a.out, manifest):
             ap.error(f"--out would overwrite the carve manifest: {a.out}")
         if os.path.isfile(a.out):
             for root, _dirs, names in os.walk(a.target):
@@ -356,7 +372,8 @@ def main(argv=None):
             print(f"bink_index: error: cannot write {a.out}: {error}", file=sys.stderr)
             return 2
         print(f"{len(rows)} Bink 2 streams, {summary['bytes']} bytes, "
-              f"{summary['unread_bytes']} unread, {summary['zero_padding']} zero padding")
+              f"{summary['unread_bytes']} unread, {summary['zero_padding']} zero padding, "
+              f"{summary['rpf_trailer']} RPF trailer")
     else:
         if fmt == "json":
             fields = BASE_FIELDS + (PROBE_FIELDS if probe else [])
@@ -371,7 +388,8 @@ def main(argv=None):
             for row in rows:
                 writer.writerow(_flat(row, fields))
         print(f"{len(rows)} Bink 2 streams, {summary['bytes']} bytes, "
-              f"{summary['unread_bytes']} unread, {summary['zero_padding']} zero padding",
+              f"{summary['unread_bytes']} unread, {summary['zero_padding']} zero padding, "
+              f"{summary['rpf_trailer']} RPF trailer",
               file=sys.stderr)
     return 0
 

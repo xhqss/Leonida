@@ -51,6 +51,15 @@ class MergeShardPartsTest(unittest.TestCase):
         self.marker(1, 2)
         self.assertIn("holds no shaders", self.merge_error())
 
+    def test_a_part_that_is_not_json_is_named(self):
+        # A shard killed mid-write leaves a truncated part; the merge must say which part to delete, not traceback.
+        (self.out / "index.part0.json").write_text('{"a": {', encoding="utf-8")
+        self.marker(0, 1)
+        message = self.merge_error()
+        self.assertIn("cannot read", message)
+        self.assertIn("index.part0.json", message)
+        self.assertIn("delete that part", message)
+
     def test_missing_part_is_refused(self):
         self.part(0, {"a": {}})
         self.marker(0, 3)
@@ -102,6 +111,24 @@ class MergeShardPartsTest(unittest.TestCase):
         self.part(0, {"a": {}})
         self.part(1, {"b": {}})
         self.assertEqual(sorted(R.merge_shard_parts(str(self.out))), ["a", "b"])
+
+    def test_legacy_set_with_double_digit_indices_merges(self):
+        for i in range(12):
+            self.part(i, {str(i): {}})
+        self.assertEqual(set(R.merge_shard_parts(str(self.out))), {str(i) for i in range(12)})
+
+    def test_large_gaps_have_a_bounded_diagnostic(self):
+        self.part(0, {"a": {}})
+        self.part(10_000, {"b": {}})
+        for expected in (None, 10_001):
+            with self.subTest(expected=expected):
+                if expected:
+                    self.plan(expected)
+                message = self.merge_error()
+                self.assertIn("incomplete shard set", message)
+                self.assertIn("missing [1, 2", message)
+                self.assertIn("9983 more", message)
+                self.assertLess(len(message), 300)
 
     def test_plan_and_markers_that_agree_merge(self):
         self.part(0, {"a": {}})
@@ -227,6 +254,17 @@ class MergeCliTest(unittest.TestCase):
         result = self.run_merge()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("shard markers say 2 shards but the plan says 3", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse((self.out / "index.json").exists())
+
+    def test_cli_refuses_a_part_that_is_not_json(self):
+        (self.out / "index.part0.json").write_text('{"a": {', encoding="utf-8")
+        self.marker(0, 1)
+        result = self.run_merge()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("ERROR: cannot read", result.stderr)
+        self.assertIn("index.part0.json", result.stderr)
+        self.assertIn("delete that part", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         self.assertFalse((self.out / "index.json").exists())
 

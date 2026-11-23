@@ -43,7 +43,13 @@ def ref_perm(s0, s1, selector):
     return out
 
 
-def run(s0, s1, selector, form="vgpr"):
+def run(s0, s1, selector, form="vgpr", dst=None):
+    """dst: None for a fresh v0, or 0/1/2 to write the result over S0/S1/the selector and export that register."""
+    if dst is not None:
+        lines = [f"v_mov_b32 v1, {s0:#x}", f"v_mov_b32 v2, {s1:#x}", f"v_mov_b32 v3, {selector:#x}",
+                 f"v_perm_b32 v{dst + 1}, v1, v2, v3", f"exp mrt0 v{dst + 1}, v{dst + 1}, v{dst + 1}, v{dst + 1} done vm",
+                 "s_endpgm"]
+        return support.mrt0_words(support.translate_lines("ps_perm", lines))[0]
     if form == "vgpr":
         setup = [f"v_mov_b32 v1, {s0:#x}", f"v_mov_b32 v2, {s1:#x}", f"v_mov_b32 v3, {selector:#x}"]
         srcs = "v1, v2, v3"
@@ -97,6 +103,13 @@ class PermB32(unittest.TestCase):
         for name, s0, s1, selector, want in CASES[:8]:
             with self.subTest(name):
                 self.assertEqual(run(s0, s1, selector, "sgpr"), want)
+
+    def test_destination_overlaps_each_source(self):
+        # The destination is S0, S1 or the selector: every source must be read before the destination is written.
+        for name, s0, s1, selector, want in CASES:
+            for dst, what in ((0, "S0"), (1, "S1"), (2, "selector")):
+                with self.subTest(name, dst=what):
+                    self.assertEqual(run(s0, s1, selector, dst=dst), want)
 
     def test_random_operands(self):
         rng = random.Random(0x7065726D)

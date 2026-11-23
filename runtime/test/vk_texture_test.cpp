@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <vector>
 
 static PFN_vkGetInstanceProcAddr gipa;
@@ -53,17 +54,35 @@ static std::vector<uint32_t> read_spv(const char* p) {
     return w;
 }
 
-// Whether the module declares capability `cap` (OpCapability comes first, right after the 5-word header).
-static bool declares_capability(const std::vector<uint32_t>& spv, uint32_t cap) {
-    for (size_t i = 5; i + 1 < spv.size() && spv[i] == (2u << 16 | 17u); i += 2)   // OpCapability, 2 words
-        if (spv[i + 1] == cap) return true;
-    return false;
-}
-
 #include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
 
+static bool cube_texel_matches(const float* pixel, int tx, int ty, int face) {
+    return std::fabs(pixel[0] - tx * 32 / 255.f) < 1e-3f &&
+           std::fabs(pixel[1] - ty * 32 / 255.f) < 1e-3f &&
+           std::fabs(pixel[2] - (6 + face) * 20 / 255.f) < 1e-3f &&
+           std::fabs(pixel[3] - 1.0f) < 1e-3f;  // The cube upload stores opaque alpha.
+}
+
+static int cube_alpha_self_test() {
+    float pixel[4] = {64.0f / 255.0f, 96.0f / 255.0f, 200.0f / 255.0f, 1.0f};
+    if (!cube_texel_matches(pixel, 2, 3, 4)) {
+        std::fprintf(stderr, "cube alpha self-test: rejected the expected RGBA texel\n");
+        return 1;
+    }
+    for (const float alpha : {0.0f, std::numeric_limits<float>::quiet_NaN()}) {
+        pixel[3] = alpha;
+        if (cube_texel_matches(pixel, 2, 3, 4)) {
+            std::fprintf(stderr, "cube alpha self-test: accepted incorrect alpha %g\n", alpha);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--self-test-cube-alpha") == 0)
+        return cube_alpha_self_test();
     const uint32_t W = 64, H = 64, TW = 8;
     const bool signed_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-sint") == 0;
     const bool two_mip = signed_mips || (argc == 10 && std::strcmp(argv[9], "--two-mip") == 0);
@@ -197,15 +216,27 @@ int main(int argc, char** argv) {
                  pdp.limits.minTexelOffset, int(pdp.limits.maxTexelOffset),
                  pdp.limits.minTexelGatherOffset, int(pdp.limits.maxTexelGatherOffset));
     VkPhysicalDeviceFeatures have; vkGetPhysicalDeviceFeatures(pd, &have);
+    const auto fragment_code = read_spv(fs_path.c_str());
+    using leonida::vk_test::spirv_declares_capability;
+    const bool dynamic_sampled = spirv_declares_capability(fragment_code.data(), fragment_code.size() * 4,
+        leonida::vk_test::spv_sampled_image_array_dynamic_indexing);
+    if (dynamic_sampled && !have.shaderSampledImageArrayDynamicIndexing) {
+        std::printf("unsupported: shaderSampledImageArrayDynamicIndexing\n");
+        return 77;
+    }
+    f2.features.shaderSampledImageArrayDynamicIndexing = dynamic_sampled;
     f2.features.shaderImageGatherExtended = have.shaderImageGatherExtended;
     f2.features.shaderResourceMinLod = have.shaderResourceMinLod;
-    if (declares_capability(read_spv(fs_path.c_str()), 42) && !have.shaderResourceMinLod) {   // 42 = MinLod
+    if (spirv_declares_capability(fragment_code.data(), fragment_code.size() * 4, 42) &&
+        !have.shaderResourceMinLod) {   // 42 = MinLod
         std::printf("unsupported: shaderResourceMinLod (the shader clamps its LOD with MinLod)\n");
         return 77;
     }
     std::vector<const char*> enable;
     leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr), when the device has it
     fma.query(gipa, inst, pd);
+    // A device without VK_KHR_shader_fma cannot create a pipeline from a stage that uses OpFmaKHR: skip the pair.
+    if (!fma.accepts_file(vs_path.c_str()) || !fma.accepts_file(fs_path.c_str())) return 77;
     if (fma.supported()) { enable.push_back(fma.extension()); fma.link_after(&f2); }
     bool m8_on = false;
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME   // the structure type is an enumerator: defined() never sees it
@@ -554,8 +585,7 @@ int main(int argc, char** argv) {
                 for (float ds : {-1e-3f, 1e-3f})
                     for (float dt : {-1e-3f, 1e-3f}) {
                         const int tx = std::min(int(TW) - 1, int(s + ds)), ty = std::min(int(TW) - 1, int(t + dt));
-                        ok |= std::fabs(p[0] - tx * 32 / 255.f) < 1e-3f && std::fabs(p[1] - ty * 32 / 255.f) < 1e-3f &&
-                              std::fabs(p[2] - (6 + face) * 20 / 255.f) < 1e-3f;
+                        ok |= cube_texel_matches(p, tx, ty, face);
                     }
                 checked++;
                 wrong += !ok;

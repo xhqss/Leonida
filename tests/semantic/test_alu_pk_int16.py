@@ -2,7 +2,7 @@
 
 v_pk_add/sub_u16/i16, v_pk_mul_lo_u16, v_pk_mad_u16/i16 and v_pk_max/min_u16/i16. Result half 0 takes each source's
 half from op_sel[i], result half 1 from op_sel_hi[i] (defaults [0,..], [1,..]); each half wraps to 16 bits, and clamp
-(add, sub, mad) saturates it to the type's range. A constant operand reads as a 32-bit dword under op_sel/op_sel_hi
+saturates add/sub/mad to the type's range while acting as a hardware no-op on mul_lo/max/min. A constant operand reads as a 32-bit dword under op_sel/op_sel_hi
 (op_sel=0 selects bits [15:0], op_sel=1 selects bits [31:16], measured on gfx1036). Each case translates a synthetic pixel shader with tools/rdna2spirv.py and runs it in
 tests/semantic/spirv_mini_interp.py; D leaves through exp as 16-bit halves ORed into 0x40000000. Standard library
 only; no GPU, no game files.
@@ -44,7 +44,7 @@ def ref(op, srcs, sel=None, selhi=None, clamp=False):
             v = [s16(x) for x in v]
         r = {"add": lambda: v[0] + v[1], "sub": lambda: v[0] - v[1], "mul_lo": lambda: v[0] * v[1],
              "mad": lambda: v[0] * v[1] + v[2], "max": lambda: max(v[0], v[1]), "min": lambda: min(v[0], v[1])}[kind]()
-        if clamp:
+        if clamp and kind in ("add", "sub", "mad"):
             r = max(-32768, min(32767, r)) if signed else max(0, min(0xFFFF, r))
         out |= (r & 0xFFFF) << (16 * h)
     return out
@@ -126,7 +126,8 @@ class PkInt16Tests(unittest.TestCase):
         self.assertEqual(run(line, [x, y, z]), ref("v_pk_mad_u16", [x, y, z], [1, 0, 1], [0, 1, 0]))
 
     def test_clamp(self):
-        for op in ("v_pk_add_u16", "v_pk_add_i16", "v_pk_sub_u16", "v_pk_sub_i16"):
+        for op in ("v_pk_add_u16", "v_pk_add_i16", "v_pk_sub_u16", "v_pk_sub_i16",
+                   "v_pk_mul_lo_u16", "v_pk_max_u16", "v_pk_min_u16", "v_pk_max_i16", "v_pk_min_i16"):
             for x in WORDS:
                 for y in WORDS[1::2]:
                     with self.subTest(op=op, x=hex(x), y=hex(y)):
@@ -165,7 +166,7 @@ class PkInt16Tests(unittest.TestCase):
 
     def test_rejected_forms(self):
         for line in ("v_pk_add_u16 v0, v1, v2 neg_lo:[1,0]",
-                     "v_pk_max_u16 v0, v1, v2 clamp", "v_pk_mul_lo_u16 v0, v1, v2 clamp"):
+                     "v_pk_mul_lo_u16 v0, v1, v2 neg_hi:[0,1]", "v_pk_max_u16 v0, v1, v2 mul:2"):
             with self.subTest(line=line):
                 with self.assertRaises(rdna2spirv.Unsupported):
                     translate(["v_mov_b32 v1, 1", "v_mov_b32 v2, 2", line, "exp mrt0 v0, v0, v0, v0 done vm",

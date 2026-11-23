@@ -113,15 +113,23 @@ class FmaKhrTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("spirv-as") and shutil.which("spirv-val"), "SPIRV-Tools not installed")
     def test_spirv_tools_accept_it(self):
+        require_tools = os.environ.get("LEONIDA_REQUIRE_SPIRV_TOOLS") == "1"
         spv = translate(F32_FMA_OPS[0], True)
         with tempfile.TemporaryDirectory() as tmp:
             asm, out = os.path.join(tmp, "m.spvasm"), os.path.join(tmp, "m.spv")
             with open(asm, "w", encoding="utf-8") as f:
                 f.write(spv)
             made = subprocess.run(["spirv-as", asm, "-o", out, "--target-env", "vulkan1.2"], capture_output=True, text=True)
+            if (not require_tools and made.returncode
+                    and made.stderr.rstrip().endswith("Invalid capability 'FMAKHR'.")):
+                self.skipTest("spirv-as lacks SPV_KHR_fma")
             self.assertEqual(made.returncode, 0, made.stderr)
             checked = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand", out],
                                      capture_output=True, text=True)
+            # A newer assembler can be paired with an older validator. 6030 is the FMAKHR capability operand.
+            if (not require_tools and checked.returncode
+                    and checked.stderr.rstrip().endswith("Invalid capability operand: 6030")):
+                self.skipTest("spirv-val lacks SPV_KHR_fma")
             self.assertEqual(checked.returncode, 0, checked.stderr)
 
 

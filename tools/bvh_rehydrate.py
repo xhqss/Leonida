@@ -50,10 +50,12 @@ geometry. --compare prints how many bytes differ from a reference structure. Exi
 input error.
 """
 import argparse
+import contextlib
 import math
 import os
 import struct
 import sys
+import tempfile
 
 FLAG_DEHYDRATED = 0x01000000
 FLAG_UPDATABLE = 0x00040000
@@ -432,6 +434,31 @@ def parse_transform(text):
     return tuple(tuple(f32(v) for v in vals[4 * r:4 * r + 4]) for r in range(3))
 
 
+
+
+def _make_parent(path):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _publish(dest, data):
+    """Write output binary next to dest and atomically swap it in, so an interrupted or failing write
+    leaves the previous file intact instead of truncated."""
+    _make_parent(dest)
+    directory = os.path.dirname(os.path.abspath(dest))
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", dir=directory, prefix=".bvh_rehydrate-", suffix=".tmp", delete=False) as f:
+            temp = f.name
+            f.write(data)
+        os.replace(temp, dest)
+    except BaseException:
+        if temp is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temp)
+        raise
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Rehydrate a dehydrated XDXR BVH4 BLAS on the CPU (docs/bvh.md §4a).")
     ap.add_argument("dehydrated")
@@ -443,6 +470,9 @@ def main(argv=None):
     ap.add_argument("--transform")
     ap.add_argument("--compare")
     a = ap.parse_args(argv)
+    if os.path.isdir(a.out):
+        print("error: --out is a folder, not a file: %s" % a.out, file=sys.stderr)
+        return 2
     # The output must never replace a file the tool was asked to read. samefile also catches a
     # case-only difference on Windows and macOS's default volume (tools/hashdict.py).
     if os.path.exists(a.out):
@@ -472,13 +502,20 @@ def main(argv=None):
     except (OSError, ValueError, struct.error) as e:
         print("error: %s" % e, file=sys.stderr)
         return 2
-    with open(a.out, "wb") as f:
-        f.write(out)
+    try:
+        _publish(a.out, out)
+    except OSError as e:
+        print("error: cannot write %s: %s" % (a.out, e), file=sys.stderr)
+        return 2
     print("rehydrated %d bytes, %d leaves, %d geometries -> %s" % (len(out), Header(data, a.header_offset).num_elements,
                                                                   len(geometries), a.out))
     if a.compare:
-        with open(a.compare, "rb") as f:
-            ref = f.read()
+        try:
+            with open(a.compare, "rb") as f:
+                ref = f.read()
+        except OSError as e:
+            print("error: cannot read %s: %s" % (a.compare, e), file=sys.stderr)
+            return 2
         diff = sum(x != y for x, y in zip(out, ref)) + abs(len(out) - len(ref))
         print("differs from %s in %d bytes" % (a.compare, diff))
     return 0

@@ -167,7 +167,7 @@ class DivFixupF16Tests(unittest.TestCase):
         )
         self.assertEqual(got, (H_HALF << 16) | (SEED_DST & 0xFFFF))
 
-        # Output modifier mul:2 clamp on 0.5 -> 1.0, validates with spirv-val
+        # Output modifier mul:2 clamp on 0.5 -> on RDNA2 omod is ignored for f16 with denorms kept; clamp applies
         spv = translate_lines([
             f"v_mov_b32 v1, {H_HALF:#x}",
             f"v_mov_b32 v2, {H_ONE:#x}",
@@ -177,7 +177,7 @@ class DivFixupF16Tests(unittest.TestCase):
         ], safe_v0=True)
         validate_spirv(spv)
         lo, hi = si.run_fragment(spv)["%out_mrt0"][:2]
-        self.assertEqual((lo & 0xFFFF) | ((hi & 0xFFFF) << 16), (SEED_DST & 0xFFFF0000) | H_ONE)
+        self.assertEqual((lo & 0xFFFF) | ((hi & 0xFFFF) << 16), (SEED_DST & 0xFFFF0000) | H_HALF)
 
 
 class DivFixupF64Tests(unittest.TestCase):

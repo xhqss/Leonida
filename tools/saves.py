@@ -81,6 +81,60 @@ def asav_payload(d, h):
     return d[h['payload_offset']:end]
 
 
+PROFILE_PAYLOAD_SIZE = 1644
+PROFILE_HEADER_SIZE = 112
+
+
+def parse_profile(pl):
+    """Decode an ASAV profile record (kind 3) payload.
+
+    The payload has a fixed size of 1,644 bytes:
+    - 0x00..0x70 (112 bytes): active profile header starting with version=10, kind=3.
+    - 0x70..0x66C (1,532 bytes): zero padding / reserved expansion buffer.
+    """
+    if len(pl) < 8:
+        raise ValueError(f'profile payload too short ({len(pl)} bytes, expected at least 8)')
+    ver, kind = struct.unpack_from('<II', pl, 0)
+    if ver != 10:
+        raise ValueError(f'unexpected profile version {ver} (expected 10)')
+    if kind != 3:
+        raise ValueError(f'unexpected profile record kind {kind} (expected 3)')
+
+    active_len = min(len(pl), PROFILE_HEADER_SIZE)
+    dwords = list(struct.unpack_from(f'<{active_len // 4}I', pl, 0))
+    zero_tail = max(0, len(pl) - PROFILE_HEADER_SIZE)
+    zero_clean = not any(pl[PROFILE_HEADER_SIZE:]) if len(pl) > PROFILE_HEADER_SIZE else True
+
+    rec = {
+        'version': ver,
+        'kind': kind,
+        'size': len(pl),
+        'active_bytes': active_len,
+        'zero_padding_bytes': zero_tail,
+        'zero_padding_clean': zero_clean,
+        'dwords': dwords,
+    }
+    if active_len >= 16:
+        rec['subversion'] = dwords[2]
+        rec['flags'] = dwords[3]
+    if active_len >= 24:
+        rec['account_id'] = struct.unpack_from('<Q', pl, 16)[0]
+    return rec
+
+
+def build_profile(dwords=None, account_id=0, total_size=PROFILE_PAYLOAD_SIZE):
+    """Build a synthetic profile payload (kind 3, 1644 bytes)."""
+    buf = bytearray(total_size)
+    struct.pack_into('<II', buf, 0, 10, 3)
+    if dwords:
+        for i, val in enumerate(dwords[:PROFILE_HEADER_SIZE // 4]):
+            struct.pack_into('<I', buf, i * 4, val)
+        struct.pack_into('<II', buf, 0, 10, 3)
+    if account_id:
+        struct.pack_into('<Q', buf, 16, account_id)
+    return bytes(buf)
+
+
 # ---------------------------------------------------------------------------------------------- JSAV
 JSAV_HDR = 16
 JSAV_ENTRY = struct.Struct('<IIIII')  # hash, flags (1), reserved (0), absolute offset, size
@@ -216,6 +270,14 @@ def info_file(p, indent=''):
             print(f'{indent}  {key:15} {v}')
         pl = asav_payload(d, h)
         print(f'{indent}  payload         {len(pl)} bytes, starts {pl[:16]!r}')
+        if h['kind'] == 3 and len(pl) >= 8:
+            try:
+                prof = parse_profile(pl)
+                print(f'{indent}  profile record  version={prof["version"]} kind={prof["kind"]} '
+                      f'active={prof["active_bytes"]}B zero_pad={prof["zero_padding_bytes"]}B '
+                      f'(clean={prof["zero_padding_clean"]})')
+            except ValueError as ex:
+                print(f'{indent}  profile record  failed to decode: {ex}')
     elif k == 'JSAV':
         h, es = parse_jsav(d)
         for key, v in h.items():
@@ -288,6 +350,13 @@ def extract(p, out):
                     json.dump(obj, f, indent=1)
             except ValueError as ex:
                 print('payload looks like text but did not parse as JSON:', ex)
+        elif h['kind'] == 3 and len(pl) >= 8:
+            try:
+                prof = parse_profile(pl)
+                with open(os.path.join(out, 'profile.json'), 'w', encoding='utf-8', newline="\n") as f:
+                    json.dump(prof, f, indent=1)
+            except ValueError as ex:
+                print('profile payload did not parse:', ex)
         print(f'ASAV kind {h["kind"]} ({h["slot_name"]}) -> {out}')
     else:
         sys.exit(f'{p}: extract supports JSAV and ASAV')

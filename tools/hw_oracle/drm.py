@@ -100,8 +100,8 @@ def kernel_registers(elf):
 
     The descriptor is where the assembler puts what a runtime must program before it starts the kernel: the
     register counts and the float mode (rounding, denormals, IEEE, DX10 clamp) in RSRC1, the user and system SGPRs
-    in RSRC2, the wave size in the code properties. The HIP runtime follows it, and so does the launcher. What the
-    launcher does not provide is refused here instead of being run differently."""
+    and the workgroup's LDS in RSRC2, the wave size in the code properties. The HIP runtime follows it, and so does
+    the launcher. What the launcher does not provide is refused here instead of being run differently."""
     sections, symbols = _symbols(elf)
     out = {}
     for name, shndx, value in symbols:
@@ -117,8 +117,15 @@ def kernel_registers(elf):
         if properties & ~0x0408 or not properties & 0x0008:
             raise RuntimeError(f"{kernel}: kernel code properties {properties:#06x}; the launcher passes the kernarg "
                                "pointer in s[0:1] and nothing else")
-        if group or private or rsrc3 or rsrc2 & 1 or (rsrc2 >> 15) & 0x1FF:
-            raise RuntimeError(f"{kernel}: LDS, scratch memory and COMPUTE_PGM_RSRC3 are not supported by the launcher")
+        if private or rsrc3 or rsrc2 & 1:
+            raise RuntimeError(f"{kernel}: scratch memory and COMPUTE_PGM_RSRC3 are not supported by the launcher")
+        # The descriptor's group segment is the workgroup's LDS, and COMPUTE_PGM_RSRC2.LDS_SIZE (bits 15..23) is the
+        # field the hardware reads, in 512-byte units. The assembler leaves that field 0 (measured on gfx1036:
+        # 4096 bytes of LDS give group 4096 and rsrc2 0x84), so the launcher programs it from the group segment, as
+        # the HIP runtime does on Windows. The hardware gives a workgroup at most 65536 bytes of LDS.
+        if group > 65536:
+            raise RuntimeError(f"{kernel}: {group} bytes of LDS; a workgroup gets at most 65536")
+        rsrc2 = (rsrc2 & ~(0x1FF << 15)) | (((group + 511) // 512) << 15)
         if (rsrc2 >> 1) & 0x1F != 2:
             raise RuntimeError(f"{kernel}: {(rsrc2 >> 1) & 0x1F} user SGPRs; the launcher fills two")
         out[kernel] = (rsrc1, rsrc2, 32 if properties & 0x0400 else 64)

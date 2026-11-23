@@ -22,6 +22,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -79,13 +80,16 @@ std::string narrow(const std::wstring& w) {
 }
 
 [[noreturn]] void end_run(int code) {
+    // Read before signalling: once g_done is set, run_entry can return and clear g_running while the host is still
+    // finishing the run (main.cpp's "game exited" line and cleanup), which this thread must not cut short.
+    const bool running = g_running;
     bool expected = false;
     if (g_exited.compare_exchange_strong(expected, true)) {
         g_exit_code = code;
         if (g_done) SetEvent(g_done);
     }
     // Park until the host's ExitProcess, not ExitThread: Wine < 11.2 can exit 0 if the two race (4a9bc42a).
-    if (g_running) for (;;) Sleep(INFINITE);
+    if (running) for (;;) Sleep(INFINITE);
     // The run is already over: this is game code running during host shutdown (an atexit handler the game
     // registered with the shared CRT calling exit again). Finish the process with the game's exit code; ending
     // just this thread here would make the host's last thread, and so the process, exit with `code` instead.
@@ -166,6 +170,15 @@ void __cdecl game_c_exit() {}
 void __stdcall game_exit_process(UINT code) { end_run(static_cast<int>(code)); }
 void __cdecl game_abort() {
     std::fprintf(stderr, "[rt] process: the game called abort()\n");
+    // The game's signal() import is not shimmed: its handler goes into the host CRT's process-wide table, which
+    // std::signal here reads too. UCRT's abort() raises SIGABRT before it terminates; do the same only when a
+    // handler is installed, because raising it with the default action would terminate the host process. A handler
+    // that exits ends the run itself; one that returns falls through to the CRT's abort code below.
+    const auto previous = std::signal(SIGABRT, SIG_DFL);
+    if (previous != SIG_ERR) {
+        std::signal(SIGABRT, previous);
+        if (previous != SIG_DFL && previous != SIG_IGN) std::raise(SIGABRT);
+    }
     end_run(3);  // the CRT's abort exit code
 }
 

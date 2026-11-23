@@ -534,7 +534,11 @@ def main():
         sys.exit(f"{args.source}: {e}")
     except OSError as e:
         sys.exit(f"{args.source}: {e.strerror or e}")
-    write_output(args.out, rows, summary)
+    try:
+        write_output(args.out, rows, summary)
+    except OSError as e:
+        print(f"ERROR: cannot write {args.out}: {e.strerror or e}", file=sys.stderr)
+        return 1
     if not args.quiet:
         print(json.dumps({k: summary[k] for k in
                           ("files", "compressed_bytes", "inflated_bytes", "zero_padding",

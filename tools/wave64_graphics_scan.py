@@ -95,14 +95,12 @@ def scanned_paths(disasm):
                       if entry.name.endswith(".s") and entry.is_file())
 
 
-def metadata_indexes(disasm):
-    """The carve index each scanned listing's stage_of opens (<disasm>/../index.json), deduplicated.
-
-    stage_of (rdna2spirv.py) reads os.path.dirname(os.path.dirname(os.path.realpath(path)))/index.json,
-    so --out must not overwrite any of those either; guard each distinct one for simplicity.
-    """
+def metadata_paths(listings):
+    """The FSSM headers and carve indexes the scan reads for its listings."""
     seen = set()
-    for path in scanned_paths(disasm):
+    for path in listings:
+        name = os.path.splitext(os.path.basename(path))[0]
+        yield rdna2spirv.native_paths(path, name)[0]
         meta = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "index.json")
         if meta not in seen:
             seen.add(meta)
@@ -164,7 +162,7 @@ def main(argv=None) -> int:
         if not os.path.isdir(out_dir):
             ap.error(f"output directory does not exist: {out_dir}")
         # --out must not replace the source directory or any input the scan reads (each scanned listing,
-        # and the carve index each listing's stage_of opens), even through a hardlink or symlink alias the
+        # its FSSM header, and the carve index), even through a hardlink or symlink alias the
         # name check alone would miss. samefile also catches a case-only spelling on Windows and macOS's
         # default volume, so only when the report already exists does it compare --out against each input
         # rather than statting N listings for nothing.
@@ -175,7 +173,8 @@ def main(argv=None) -> int:
                     ap.error("output must not overwrite the source directory")
             except OSError:
                 pass
-            for path in [*scanned_paths(args.src), *metadata_indexes(args.src)]:
+            listings = scanned_paths(args.src)
+            for path in [*listings, *metadata_paths(listings)]:
                 try:
                     if os.path.isfile(path) and os.path.samefile(out_abs, path):
                         ap.error(f"output must not overwrite an input it scans: {path}")

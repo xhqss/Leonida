@@ -643,7 +643,9 @@ int main() {
         invalid.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
         invalid.Texture2DArray = {0, 1, 1, 0};
         if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &invalid)) return 1;
-        for (const auto range : {std::pair{1u, UINT_MAX}, std::pair{0u, 0u}, std::pair{4u, 1u}, std::pair{3u, 2u}}) {
+        // ArraySize -1 from a slice of the array is every slice left (d3d12_view_slices_test); past the array it is
+        // refused.
+        for (const auto range : {std::pair{4u, UINT_MAX}, std::pair{0u, 0u}, std::pair{4u, 1u}, std::pair{3u, 2u}}) {
             invalid.Texture2DArray = {1, range.first, range.second, 0};
             if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &invalid, 3, 4)) return 1;
         }
@@ -668,14 +670,29 @@ int main() {
         // 4x MSAA typeless and castable RGBA8 RTVs (TEXTURE2DMS / TEXTURE2DMSARRAY) compared against WARP.
         {
             const DXGI_FORMAT srgb_list[] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB};
+            // A host without relaxed format casting refuses a castable-format list (in-box WARP 10.0.22621.5415 on
+            // Windows 11 23H2 reports RelaxedFormatCastingSupported = 0 and CreateCommittedResource3 returns
+            // E_INVALIDARG). There the castable RGBA8 resource is compared with an RGBA8_TYPELESS one on the host:
+            // the same views of the same bytes, so the expected readback is the same.
+            bool host_casts = false;
+            {
+                Ref<ID3D12Device10> host10;
+                D3D12_FEATURE_DATA_D3D12_OPTIONS12 options12{};
+                host_casts = SUCCEEDED(host->QueryInterface(IID_PPV_ARGS(&host10.p))) &&
+                             SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &options12,
+                                                                 sizeof(options12))) &&
+                             options12.RelaxedFormatCastingSupported;
+            }
             const auto compare_msaa = [&](DXGI_FORMAT resource_format, const DXGI_FORMAT* cast_list,
                                           UINT32 cast_count, DXGI_FORMAT full, DXGI_FORMAT rect, bool partial,
                                           bool array, UINT first_layer, UINT layer_count) {
                 std::vector<unsigned char> actual, expected;
+                const bool host_typeless = cast_count && !host_casts;
                 if (!clear_and_read_msaa(ours.p, resource_format, cast_list, cast_count, full, rect, partial, array,
                                          first_layer, layer_count, actual) ||
-                    !clear_and_read_msaa(host.p, resource_format, cast_list, cast_count, full, rect, partial, array,
-                                         first_layer, layer_count, expected))
+                    !clear_and_read_msaa(host.p, host_typeless ? DXGI_FORMAT_R8G8B8A8_TYPELESS : resource_format,
+                                         host_typeless ? nullptr : cast_list, host_typeless ? 0 : cast_count, full,
+                                         rect, partial, array, first_layer, layer_count, expected))
                     return false;
                 ++comparisons;
                 if (actual.size() != expected.size()) return false;
@@ -699,15 +716,15 @@ int main() {
             if (!compare_msaa(DXGI_FORMAT_R8G8B8A8_TYPELESS, nullptr, 0, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
                               DXGI_FORMAT_R8G8B8A8_UNORM, true, true, 1, 2))
                 return 1;
-            Ref<ID3D12Device10> host10;
-            if (SUCCEEDED(host->QueryInterface(IID_PPV_ARGS(&host10.p)))) {
-                if (!compare_msaa(DXGI_FORMAT_R8G8B8A8_UNORM, srgb_list, 2, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-                                  DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, false, false, 0, 1))
-                    return 1;
-                if (!compare_msaa(DXGI_FORMAT_R8G8B8A8_UNORM, srgb_list, 2, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-                                  DXGI_FORMAT_R8G8B8A8_UNORM, true, true, 1, 2))
-                    return 1;
-            }
+            if (!compare_msaa(DXGI_FORMAT_R8G8B8A8_UNORM, srgb_list, 2, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                              DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, false, false, 0, 1))
+                return 1;
+            if (!compare_msaa(DXGI_FORMAT_R8G8B8A8_UNORM, srgb_list, 2, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                              DXGI_FORMAT_R8G8B8A8_UNORM, true, true, 1, 2))
+                return 1;
+            if (!host_casts)
+                std::printf("typeless RTV: host has no relaxed format casting; the 2 castable 4x MSAA cases were "
+                            "compared with an RGBA8_TYPELESS resource on the host\n");
             // MSAA vs 1x view-dimension mismatches, out-of-range MSAA array slices, and unlisted castable formats.
             D3D12_RENDER_TARGET_VIEW_DESC bad_msaa{};
             bad_msaa.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;

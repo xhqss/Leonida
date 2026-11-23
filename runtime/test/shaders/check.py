@@ -6,8 +6,8 @@ The test programs are vk_compute_test, vk_store_test, vk_harness, vk_texture_tes
 (runtime/build by default). With
 the Visual Studio generator they are in runtime/build/RelWithDebInfo, Release and so on: that subfolder is found by
 itself (the newest complete one if there are several) and its name is printed.
-Each line is one shader: ok, or what came back instead. The wave32 test ps_bitmask_perm is only judged on lanes
-0-31, since a GPU with 64-wide subgroups puts half the pixels in lanes it wasn't written for.
+Each line is one shader: ok, or what came back instead. The wave32 test ps_bitmask_perm checks every pixel, including
+the second 32-lane half when a GPU runs fragment shaders in 64-wide subgroups.
 The two whole-wave mask checks are skipped when the device cannot provide a full 64-wide compute subgroup.
 The cs_w64x_* / ms_w64x_* cross-half tests (lanes 32-63 against lanes 0-31, see their .asm headers) are skipped there
 too. With LEONIDA_W64_EMULATE=1 they run without that requirement, on a device whose subgroups are narrower (NVIDIA),
@@ -85,14 +85,14 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
                 "cs_w32_lds_subdword", "cs_w32_lds_wide",
                 "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
                 "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
-                "cs_mask_vgpr_exec")
+                "cs_mask_vgpr_exec", "cs_w32_permlane_fi")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
 # otherwise pick a narrower size and return different words (#774).
 WAVE32_LANE_ENV = {"VKC_SUBGROUP_SIZE": "32"}
 WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_exec_const",
-                     "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_w32_andn2_exec", "cs_mask_vgpr_exec")
+                     "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_w32_andn2_exec", "cs_mask_vgpr_exec", "cs_w32_permlane_fi")
 CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_row", [0, 0, 1, 2, 3, 4, 5, 6]),
           ("cs_dpp_mask", [1, 0, 3, 2, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee]),
@@ -147,6 +147,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_w32_partial_scmp", [0, 1, 1, 0, 1, 1, 1, 1]),   # a 20-thread wave32: s_cmp mask, -1
             # SHADER-88: v_sin/v_cos reduce the angle in turns (a regression guard, tolerance 1e-3)
             ("cs_w32_sincos", [1, 1, 1, 1, 1, 1]),
+            # SHADER-74: v_permlane16/x16 with the source lane off in EXEC (FI / BOUND_CTRL)
+            ("cs_w32_permlane_fi", [1000, 0, 4, 1, 1000, 0, 52, 49]),
             ("cs_wqm_w64_half", [11, 14, 0, 1, 6, 8, 12, 2]),
             # SHADER-91: two s_barrier sites in wave-uniform branches meet like one barrier; wave 0 reads wave 3
             ("cs_barrier_divergent", [127, 126, 125, 124, 123, 122, 121, 120]),
@@ -215,6 +217,50 @@ FMT_SINT32_WORDS = [
     0x80000000, 0x7FFFFFFF, 0xFFFFFFFD, 17,
     0xFFFFFFFD, 0xFFFF8000, 0xFFFFFFFD, *[0xEEEEEEEE] * 13,
 ]
+# cs_fmt_all.asm: 32 typed loads of the SCALED, SINT, small-float and 10:10:10:2 formats (29 through a V# FORMAT, 3 through
+# tbuffer's own), their 16-byte inputs, and 20 typed stores; the words are tools/buffer_format_fuzz.py's MODEL, which the
+# Radeon 880M (gfx1150) and a real RDNA2 (gfx1036, @AwkGrep256, #2022) reproduced for every format here. Layout and rules in
+# the .asm header.
+FMT_ALL_WORDS = [
+    0x000000ff, 0x000000ff, 0x000000ff, 0x000000ff, 0xffffff80, 0xffffff80, 0xffffff80, 0xffffff80, 0x43480000,
+    0x43480000, 0x43480000, 0x43480000, 0xc2c80000, 0xc2c80000, 0xc2c80000, 0xc2c80000, 0xffff8000, 0xffff8000,
+    0xffff8000, 0xffff8000, 0x476a6000, 0x476a6000, 0x476a6000, 0x476a6000, 0xc47a0000, 0xc47a0000, 0xc47a0000,
+    0xc47a0000, 0x0000007f, 0xffffff80, 0x0000007f, 0xffffff80, 0x3f800000, 0x437f0000, 0x3f800000, 0x437f0000,
+    0x00000001, 0xffffffff, 0xffffff80, 0x0000007f, 0x00000000, 0x3f800000, 0x43000000, 0x437f0000, 0x00000000,
+    0x3f800000, 0xc3000000, 0xbf800000, 0x00007fff, 0xffff8000, 0x00007fff, 0xffff8000, 0x3f800000, 0x477fff00,
+    0x3f800000, 0x477fff00, 0xc7000000, 0x46fffe00, 0x3f800000, 0xbf800000, 0x3f800000, 0x40000000, 0x3f000000,
+    0x3f800000, 0x7f800000, 0x7f820000, 0x36000000, 0x7f800000, 0x477e0000, 0x387c0000, 0x7ffc0000, 0x477e0000,
+    0x3f800000, 0x40000000, 0x477e0000, 0x3f800000, 0x3f800000, 0xbf800000, 0x3f800000, 0xbf800000, 0xfffffffe,
+    0xfffffe00, 0x000001ff, 0xffffffff, 0xbf800000, 0x3f800000, 0xbf800000, 0x3f800000, 0x447fc000, 0x00000000,
+    0x44000000, 0x40400000, 0xc4000000, 0x43ff8000, 0xbf800000, 0xc0000000, 0xfffffe00, 0x000001ff, 0xffffffff,
+    0xfffffffe, 0x3f800000, 0x40c00000, 0x7ffe0000, 0x00000000, 0x00000001, 0xffffffff, 0xffffff80, 0x0000007f,
+    0x00007fff, 0xffff8000, 0x00000000, 0x00000000, 0x00000000, 0x3f800000, 0x3f800000, 0x00000000, 0xbf800000,
+    0x3f800000, 0xbf800000, 0xbf800000, 0x000007ff, 0x00000001, 0x000003ff, 0x000007ff, 0xffffffff, 0xfffffc00,
+    0xffffffff, 0xffffffff, 0x000000ff, 0x00000000, 0x00000000, 0x00000000, 0x00000080, 0x00000000, 0x00000000,
+    0x00000000, 0x000000c8, 0x00000000, 0x00000000, 0x00000000, 0x0000009c, 0x00000000, 0x00000000, 0x00000000,
+    0x00008000, 0x00000000, 0x00000000, 0x00000000, 0x0000ea60, 0x00000000, 0x00000000, 0x00000000, 0x0000fc18,
+    0x00000000, 0x00000000, 0x00000000, 0x0000807f, 0x00000000, 0x00000000, 0x00000000, 0x0000ff01, 0x00000000,
+    0x00000000, 0x00000000, 0x7f80ff01, 0x00000000, 0x00000000, 0x00000000, 0xff800100, 0x00000000, 0x00000000,
+    0x00000000, 0xff800100, 0x00000000, 0x00000000, 0x00000000, 0x80007fff, 0x00000000, 0x00000000, 0x00000000,
+    0xffff0001, 0x00000000, 0x00000000, 0x00000000, 0x7fff8000, 0xffff0001, 0x00000000, 0x00000000, 0x702003c0,
+    0x00000000, 0x00000000, 0x00000000, 0x007e0fc0, 0x00000000, 0x00000000, 0x00000000, 0xffc1ffbf, 0x00000000,
+    0x00000000, 0x00000000, 0xf7f001e0, 0x00000000, 0x00000000, 0x00000000, 0x805ff801, 0x00000000, 0x00000000,
+    0x00000000, 0xffdff802, 0x00000000, 0x00000000, 0x00000000, 0x6017fe00, 0x00000000, 0x00000000, 0x00000000,
+    0xe00003ff, 0x00000000, 0x00000000, 0x00000000, 0xbff7fe00, 0x00000000, 0x00000000, 0x00000000, 0xbff7fe00,
+    0x00000000, 0x00000000, 0x00000000, 0xfff181e0, 0x00000000, 0x00000000, 0x00000000, 0x7f80ff01, 0x00000000,
+    0x00000000, 0x00000000, 0x80007fff, 0x00000000, 0x00000000, 0x00000000, 0xfffff800, 0x00000000, 0x00000000,
+    0x00000000, 0x800ffe00, 0x00000000, 0x00000000, 0x00000000, 0xffc00fff, 0x00000000, 0x00000000, 0x00000000,
+    0xfff003ff, 0x00000000, 0x00000000, 0x00000000, 0xeeeeee7f, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeee80,
+    0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeff, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeff, 0xeeeeeeee,
+    0xeeeeeeee, 0xeeeeeeee, 0xeeee7fff, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0x80007fff, 0xeeeeeeee, 0xeeeeeeee,
+    0xeeeeeeee, 0xeeeebfff, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0x7fd00401, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee,
+    0xffe017ff, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0x37ff7bff, 0x80007c01, 0xeeeeeeee, 0xeeeeeeee, 0x00004ccd,
+    0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xc040817f, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0x702003c0, 0xeeeeeeee,
+    0xeeeeeeee, 0xeeeeeeee, 0xf7fe0000, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xf83efde0, 0xeeeeeeee, 0xeeeeeeee,
+    0xeeeeeeee, 0x265ff805, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xd00803ff, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee,
+    0x405801ff, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0x027ff017, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0x7fff8000,
+    0xffff7fff, 0xeeeeeeee, 0xeeeeeeee,
+]
 # cs_fmt_xy_xyz.asm (TEST-185): 12 xy/xyz loads, then the 9 store regions read back, as a Radeon 680M (gfx1035) gives
 # them natively, with the updated UINT saturation case checked on gfx1036. Layout and rules in the .asm header.
 FMT_XY_XYZ_WORDS = [
@@ -250,7 +296,9 @@ FMT_D16_XYZ_WORDS = [
 # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups make a 0x2800-byte heap that holds
 # both the right addresses and the 4096-lower ones; only group 0 thread 0 runs, so no wave64 requirement.
 GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4,
-                                                 0x0000009E, 0xFFFF8BAD, 0x57023FFC, 0xEEEEEEEE])]
+                                                 0x0000009E, 0xFFFF8BAD, 0x57023FFC, 0xEEEEEEEE]),
+                 # global/buffer atomics, 8/16-bit global stores and d16 loads with CPU-only checks until now
+                 ("cs_global_mem_ext", "40", [0x5, 0xC, 0x977, 0xFFF00000, 0xEDCB5678, 0xEF332211, 0x887766BE, 0xFF801234])]
 # cs_heap_init.asm: vk_compute_test's VKC_HEAP_INIT copies this file (zeros, then four words at 0x100) to the start
 # of the heap; the shader copies the four words to 0, and out[4..7] are the file's zeros, not the 0xEE fill.
 HEAP_INIT_WORDS = [0x1BADB002, 0xCAFEF00D, 0x80000001, 0x0000FFFF]
@@ -339,6 +387,8 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
               # v_cmpx_{eq,gt,le,lt,ngt,nle}_f32, f_i32, t_u32, {eq,gt,le}_i64, {ge,lt,ne}_u64 (.asm header)
               "ps_vcmpx_forms": (0xf05b2a48, 0xf05e8a12, 0xb174be18, 0x15550000),
+              # v_cmp_{eq,ne,lt,le,gt,ge,f,t}_{u32,i32}, e32 and e64, constants and literals (.asm header)
+              "ps_vcmp_int32": (0x963e52e8, 0x984dcee8, 0xb9458ee8, 0xb73612e8),
               "ps_med3_mods": (0x3f800000, 0x40400000, 0x40c00000, 0x3f400000),
               "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203),
               "ps_scc_logic32": (0x0fff0fff, 0x000f000f, 0xf00ff00f, 0x36),
@@ -364,6 +414,9 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_sff_imm": (2, 1, 20, 16),
               "ps_fnan_med3": (0x40a00000, 0xc0200000, 0xc0200000, 0x40600000),
               "ps_fnan_fract": (0x3f7fffff, 0x00003bff, 0xc0200000, 0xc0200000),
+              # v_med3 with a NaN in S2 or in two operands, by the same measured rule (derivations in the .asm headers)
+              "ps_fnan_med3_s2": (0x40a00000, 0x40a00000, 0xc0200000, 0x40e00000),
+              "ps_f16_fnan_med3": (0xaaaa4500, 0xaaaa4500, 0xaaaac100, 0xaaaa4700),
               # TEST-175: docs/design.md rules that were checked on the CPU only (derivations in the .asm headers)
               "ps_cmp_nlg": (0x40000037, 0x40000007, 0x40000001, 0x3f800000),
               # far branches: s_getpc/s_add|s_sub/s_addc|s_subb/s_setpc forward, backward loops, conditional (.asm header)
@@ -375,16 +428,26 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_vcmpx_f16": (0x68a12080, 0x6ce9b1a2, 0x6ba72c98, 0x6fefbdba),
               "ps_vcmpx_f16_e64": (0x64c11100, 0x6cf171c1, 0x67c71d18, 0x6ff77dd9),
               "ps_cvt_off": (0xbf000000, 0x3ee00000, 0xbe800000, 0x3f800000),
-              "ps_fmac_f16_mods": (0xaaaa3c00, 0xaaaa3e00, 0xaaaa0000, 0xaaaa4000),
+              "ps_fmac_f16_mods": (0xaaaa3c00, 0xaaaa3a00, 0xaaaa0000, 0xaaaa4400),
               "ps_vop3_const_mods": (0xc0000000, 0xbf800000, 0x3f800000, 0xaaaabc00),
+              "ps_cndmask_sign_mods": (0xff800001, 0x7f800001, 0x80000001, 0x7f800001),
               "ps_interp_f32_mods": (0x3f800000, 0x00000000, 0x3f400000, 0x3f800000),
               "ps_interp_mov_mods": (0x3f800000, 0x3fc00000, 0x40000000, 0x3f400000),
               # v_mad_u32_u16 / v_mad_i32_i16 and v_subrev_f16, which had CPU checks only (derivations in the .asm headers)
               "ps_valu16_mad": (0x00000002, 0x00030002, 0x00008000, 0x00000004),
+              # op_sel on S2 / D and clamp, measured on gfx1036 (EGEN-HW-MAD-U32-U16)
+              "ps_valu16_mad_sel": (0x00008003, 0xdb880000, 0xffffffff, 0x80000000),
               "ps_valu16_subrev": (0xaaaabc00, 0xaaaac000, 0xaaaa3c00, 0x42003800),
               # f32 VOPC ordered/unordered with a NaN, 64-bit integer VOPC (derivations in the .asm headers)
               "ps_vcmp_f32_nan": (0x0000376c, 0x0000fd5b, 0x0000d36c, 0x00000fe7),
               "ps_vcmp_64": (0x0000b3c4, 0x000091e6, 0x00006787, 0x00007c93),
+              # 32-bit integer VALU ops on the VINT_ENV heap: 24-bit sign extension, shifts of 32+, signed vs unsigned
+              # min/max (derivations in the .asm headers)
+              "ps_vint_logic3": (0xfffffffe, 0xbbb05070, 0x1d3b5977, 0x123f5f7e),
+              "ps_vint_bits": (0xfffffffe, 0x40000000, 0x1e6a2c48, 0x000001d5),
+              "ps_vint_mul24": (0x13345678, 0xfffffffd, 0x00007fff, 0x0000ffff),
+              "ps_vint_minmax": (0x7ffffffe, 0x80000001, 0x80000001, 0x7ffffffe),
+              "ps_vint_minmax3": (0xf0f0f0f0, 0xab800000, 0xf0f0f0f0, 0xab800000),
               # v_readlane_b32 across both halves of a wave64 (the .asm header derives the words)
               "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000be)}
 # Pixel shaders that are exact only when the pixel stage really ran 64 lanes wide. vk_harness says so when it chained
@@ -392,6 +455,11 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
 # not take the size gets "fragment subgroup size: N not available" or no line). A device that cannot
 # require 64 there (NVIDIA: 32 only; llvmpipe: 8) has no frame to judge: the test is skipped, not failed.
 WIDE_PIXEL_TESTS = {"ps_w64x_readlane": 64}
+# h0..h7 of the ps_vint_* fixtures: 24-bit fields with bit 23 set and garbage above, 33 (a shift of 32+), a
+# negative i32 that is a large u32, and plain bit patterns.
+VINT_ENV = {"VKH_SGPRS": "0x1000,0,32,0",
+            "VKH_HEAP": "0x1000=0xab800000,0x1004=0x12fffffe,0x1008=0x00000021,0x100c=0x80000001,"
+                        "0x1010=0x7ffffffe,0x1014=0xf0f0f0f0,0x1018=0x12345678,0x101c=0xffffffff"}
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
 # tests/semantic/test_value_semantics.py does for the interpreter.
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"},
@@ -402,19 +470,33 @@ PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x1
                                             "0x1028=0x1,0x102c=0,0x1030=0x7,0x1034=0x80000000,0x1038=0x7,0x103c=0,"
                                             "0x1040=0x1,0x1044=0x5,0x1048=0x80000000,0x104c=0x5,0x1050=0x7,0x1054=0x5,"
                                             "0x1058=0x7,0x105c=0x5"},
+             # 32-bit integer compares: operands from memory (derivations in the .asm header)
+             "ps_vcmp_int32": {"VKH_SGPRS": "0x1000,0,32,0",
+                               "VKH_HEAP": "0x1000=0x1,0x1004=0,0x1008=0x80000000,0x100c=0x12345678,0x1010=0x3,"
+                                           "0x1014=0x5,0x1018=0,0x101c=0"},
              # float NaN / fract rows measured on RDNA2 hardware (see the .asm headers)
              "ps_fnan_med3": {"VKH_SGPRS": "0x1000,0,32,0",
                               "VKH_HEAP": "0x1000=0x7fc10001,0x1004=0x40e00000,0x1008=0x40a00000,"
                                           "0x100c=0x7fc10001,0x1010=0x40600000,0x1014=0xc0200000"},
              "ps_fnan_fract": {"VKH_SGPRS": "0x1000,0,16,0",
                                "VKH_HEAP": "0x1000=0xaedbe6ff,0x1004=0x00008800,0x1008=0x7fc10001,0x100c=0xc0200000"},
+             "ps_fnan_med3_s2": {"VKH_SGPRS": "0x1000,0,16,0",
+                                 "VKH_HEAP": "0x1000=0x40a00000,0x1004=0x40e00000,0x1008=0x7fc10001,0x100c=0xc0200000"},
+             "ps_f16_fnan_med3": {"VKH_SGPRS": "0x1000,0,16,0",
+                                  "VKH_HEAP": "0x1000=0x00004500,0x1004=0x00004700,0x1008=0x00007e01,0x100c=0x0000c100"},
              # f32 VOPC with a NaN, 64-bit integer VOPC: inputs from memory (derivations in the .asm headers)
              "ps_vcmp_f32_nan": {"VKH_SGPRS": "0x1000,0,16,0",
                                  "VKH_HEAP": "0x1000=0x7fc10001,0x1004=0x3f800000,0x1008=0x40000000"},
              "ps_vcmp_64": {"VKH_SGPRS": "0x1000,0,64,0",
                             "VKH_HEAP": "0x1000=0x80000000,0x1004=0,0x1008=1,0x100c=0,0x1010=0xffffffff,"
                                         "0x1014=0xffffffff,0x1018=1,0x101c=0,0x1020=1,0x1024=0,0x1028=0x80000000,"
-                                        "0x102c=0,0x1030=7,0x1034=5,0x1038=7,0x103c=5"}}
+                                        "0x102c=0,0x1030=7,0x1034=5,0x1038=7,0x103c=5"},
+             # the ps_vint_* integer fixtures share one heap, h0..h7 (see their .asm headers)
+             "ps_vint_logic3": VINT_ENV,
+             "ps_vint_bits": VINT_ENV,
+             "ps_vint_mul24": VINT_ENV,
+             "ps_vint_minmax": VINT_ENV,
+             "ps_vint_minmax3": VINT_ENV}
 # ps_gather_wrap.asm (SHADER-36): image_gather4_l_o under each S# address mode, run by vk_texture_test (the 8x8 gradient
 # texture); the expected channels are derived in the .asm header.
 TEXTURE_CONSTANTS = {
@@ -423,15 +505,20 @@ TEXTURE_CONSTANTS = {
     "ps_array_resinfo": (8.0, 8.0, 12.0, 1.0),  # binding 3, index 1: two 6-face cubes, one mip
 }
 CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
+NAN_PAYLOAD_TEST = "ps_nan_payload"
 # One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
 # the standalone run. Keep every pixel fixture in this tuple.
-PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_texoff_implicit",
-                      "ps_texoff_forms",
+PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_persp_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff",
+                      "ps_texoff_implicit", "ps_texoff_forms",
                       "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high", "ps_ij_computed",
-                      "ps_mandelbrot"))
+                      "ps_mandelbrot", NAN_PAYLOAD_TEST))
 # Pixel fixtures drawn with another vertex shader than vs_ids.
-PIXEL_VERTEX = {"ps_interp_f16_high": "vs_f16_pack",
+PIXEL_VERTEX = {"ps_interp_f16_high": "vs_f16_pack", "ps_persp_bary": "vs_persp",
                 "ps_interp_f32_mods": "vs_interp_consts", "ps_interp_mov_mods": "vs_interp_consts"}
+# vs_persp's triangle (see vs_persp.asm): screen positions, clip w and attr0.xy of its three vertices.
+PERSP_SCREEN = ((5.0, 8.0), (57.0, 16.0), (21.0, 55.0))
+PERSP_W = (1.0, 2.0, 4.0)
+PERSP_ATTR = ((0.25, -0.5), (2.25, 0.75), (-1.0, 3.0))
 TEXOFF_ARGS = ("2", "92", "0", "0", "0")              # ps_texoff: T# pointer in s2, then the shader's literal S#
 TEXTURE_MIP_TEST = "ps_texture_mip0"
 SIGNED_MIP_TEST = "ps_sample_implicit_sint"
@@ -588,6 +675,14 @@ def fmt_int_narrow_test(tools, spirv, env=None):
 
 def fmt_sint32_test(tools, spirv, env=None):
     return dump_test(tools, spirv, "cs_fmt_sint32", FMT_SINT32_WORDS, len(FMT_SINT32_WORDS), env)
+
+
+def fmt_all_test(tools, spirv, env=None):
+    """cs_fmt_all: 28 loads, the inputs, 15 stores, and the untouched words between (316 words in all). Wave32, one
+    thread: the translator recorded 32 for it, so the run is pinned to a 32-wide subgroup like compute_test does."""
+    env = dict(os.environ if env is None else env)
+    env.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_fmt_all") or 32))
+    return dump_test(tools, spirv, "cs_fmt_all", FMT_ALL_WORDS, len(FMT_ALL_WORDS), env)
 
 
 def fmt_xy_xyz_test(tools, spirv, env=None):
@@ -802,8 +897,11 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
     code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, groups, mode, *args, **extra)
     if require_wave64 and code == 77:  # vk_compute_test: the device cannot run a 64-wide compute subgroup
         return None
-    if needs_32_lanes and (skip := wave32_lane_skip(out)):
-        return skip
+    if needs_32_lanes:
+        if code == UNSUPPORTED:
+            return Skip(f"SKIP ({out.strip() or 'unsupported device'})")
+        if code == 0 and (skip := wave32_lane_skip(out)):
+            return skip
     if sg and (skip := unpinned_subgroup_skip(out)):
         return skip
     if code != 0:
@@ -834,17 +932,19 @@ def shader_features(spirv, name):
         return set()
 
 
-def judge_fma_fused(words, khr):
-    """Judge cs_fma_fused's 8 words: (ok, detail). Under --fma khr every word must be exact fused; under --fma glsl
-    each of the 7 f32 words may be either fused or exact split (Vulkan allows splitting GLSL.std.450 Fma), while the
-    f16 round-to-odd word out[7] must always be exact 0x00007351."""
+def judge_fma_fused(words, khr, exact=False):
+    """Judge cs_fma_fused's 8 words: (ok, detail). Under --fma khr and --fma exact (SHADER-497: the single rounding
+    built from plain f32 ops) every word must be exact fused; under --fma glsl each of the 7 f32 words may be either
+    fused or exact split (Vulkan allows splitting GLSL.std.450 Fma), while the f16 round-to-odd word out[7] must
+    always be exact 0x00007351."""
     if not words or len(words) < 8:
         return False, "missing out[0..7] dump"
-    if khr:
+    if khr or exact:
+        label = "OpFmaKHR" if khr else "--fma exact"
         for i, (got, want) in enumerate(zip(words, FMA_FUSED)):
             if got != want:
-                return False, f"word {i}: got {got:#010x}, want fused {want:#010x} (OpFmaKHR)"
-        return True, "8/8 fused exact (OpFmaKHR)"
+                return False, f"word {i}: got {got:#010x}, want fused {want:#010x} ({label})"
+        return True, f"8/8 fused exact ({label})"
     if words[7] != FMA_FUSED[7]:
         return False, f"word 7 (f16): got {words[7]:#010x}, want {FMA_FUSED[7]:#010x}"
     n_split = 0
@@ -862,10 +962,12 @@ def judge_fma_fused(words, khr):
 
 
 def fma_fused_test(tools, spirv):
-    """Run cs_fma_fused and judge against FMA_FUSED (strict under --fma khr, fused-or-split f32 under --fma glsl)."""
+    """Run cs_fma_fused and judge against FMA_FUSED (strict under --fma khr and --fma exact, fused-or-split f32 under
+    --fma glsl)."""
     shader = os.path.join(spirv, "cs_fma_fused.spv")
     khr = ("shaderFmaFloat32" in shader_features(spirv, "cs_fma_fused")
            or os.environ.get("LEONIDA_FMA") == "khr")
+    exact = os.environ.get("LEONIDA_FMA") == "exact"
     code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, "1", "dump",
                     env=dict(os.environ, **FMA_FUSED_ENV))
     if code == UNSUPPORTED:
@@ -877,7 +979,7 @@ def fma_fused_test(tools, spirv):
     if not m:
         return failure(code, out, 2)
     words = [int(x) for x in m.group(1).split()]
-    ok, detail = judge_fma_fused(words, khr=khr)
+    ok, detail = judge_fma_fused(words, khr=khr, exact=exact)
     return "" if ok else detail
 
 
@@ -1078,6 +1180,44 @@ def sampler_test(tools, spirv):
             if problem:
                 return f"{name}: {problem}"
     return ""
+
+
+def bary_persp_problem(px):
+    """ps_persp_bary drawn with vs_persp: "" when every pixel matches the perspective-correct CPU reference, else what
+    differs. At a pixel centre with screen-space weights l0, l1, l2, the weights are p_k = (l_k / w_k) / sum(l_m / w_m);
+    mrt0 = (attr0.xy interpolated with p, p1, p2), and pixels outside the triangle keep the clear value (-1). Coverage
+    comes from edge functions at doubled coordinates, which are exact integers: no centre lies on an edge, so every
+    pixel is judged whatever the rasterization rule. The affine weights (l1, l2) must differ from (p1, p2) by more than
+    100 times the tolerance on every covered pixel, so a NoPerspective regression can't pass by accident."""
+    tol = 1e-5
+    (x0, y0), (x1, y1), (x2, y2) = (tuple(int(c) for c in v) for v in PERSP_SCREEN)
+    area2 = 2 * ((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0))   # twice the area, in doubled coordinates
+    covered, wrong, first, gap = 0, 0, "", math.inf
+    for i, pixel in enumerate(px):
+        x, y = 2 * (i % 64) + 1, 2 * (i // 64) + 1                  # the pixel centre, doubled
+        e1 = (x - 2 * x0) * (y2 - y0) - (x2 - x0) * (y - 2 * y0)
+        e2 = (x1 - x0) * (y - 2 * y0) - (x - 2 * x0) * (y1 - y0)
+        e = (area2 - e1 - e2, e1, e2)
+        if 0 in e:
+            return f"test geometry: pixel centre ({i % 64},{i // 64}) lies on an edge"
+        if min(e) < 0:
+            want = (-1.0, -1.0, -1.0, -1.0)
+        else:
+            l = [ek / area2 for ek in e]
+            p = [lk / wk for lk, wk in zip(l, PERSP_W)]
+            p = [pk / sum(p) for pk in p]
+            want = (sum(pk * a[0] for pk, a in zip(p, PERSP_ATTR)), sum(pk * a[1] for pk, a in zip(p, PERSP_ATTR)),
+                    p[1], p[2])
+            gap = min(gap, max(abs(p[1] - l[1]), abs(p[2] - l[2])))
+            covered += 1
+        if not all(math.isfinite(v) and abs(v - w) <= tol for v, w in zip(pixel, want)):
+            if not wrong:
+                got, exp = (tuple(round(v, 6) for v in t) for t in (pixel, want))
+                first = f"at ({i % 64},{i // 64}): got {got}, want {exp}"
+            wrong += 1
+    if gap <= 100 * tol:
+        return f"test geometry: perspective and affine weights only {gap:.3g} apart"
+    return f"{wrong} pixels off the perspective-correct reference ({covered} covered); {first}" if wrong else ""
 
 
 def pixels(tools, spirv, name, fmt, vertex="vs_ids"):
@@ -1305,13 +1445,16 @@ def texture_mip_test(tools: str, spirv: str, test: str = TEXTURE_MIP_TEST) -> st
 def ij_computed_problem(px):
     """ps_ij_computed.asm: (snapped 0.5, zeroed pair 0.0, v/2 from (i, j/2), 0.5 control) per pixel; "" when right.
     Shared with scripts/run_gpu_tests.py."""
-    n = len(px)
-    if not n:
-        return "no pixels"
-    w = int(n ** 0.5)
-    f32 = lambda b: struct.unpack("<f", struct.pack("<I", b))[0]      # noqa: E731
-    wrong = sum((a != 0x3F000000 or b != 0 or d != 0x3F000000) for a, b, _, d in px)
-    err = max(abs(f32(c) - (i // w + 0.5) / (2 * w)) for i, (_, _, c, _) in enumerate(px))
+    w = 64
+    if len(px) != w * w:
+        return f"{len(px)} pixels, expected {w * w}"
+    wrong, err = 0, 0.0
+    for i, (a, b, c, d) in enumerate(px):
+        v_over_two = struct.unpack("<f", struct.pack("<I", c))[0]
+        if not math.isfinite(v_over_two):
+            return f"non-finite computed I/J result at ({i % w},{i // w}): {v_over_two}"
+        wrong += a != 0x3F000000 or b != 0 or d != 0x3F000000
+        err = max(err, abs(v_over_two - (i // w + 0.5) / (2 * w)))
     return "" if not wrong and err < 1e-6 else f"{wrong} pixels without the computed-pair words, v/2 off by {err:.3g}"
 
 
@@ -1424,6 +1567,19 @@ def barycentric_problem(px: list[tuple[float, float, float, float]], abs_tol: fl
     return ""
 
 
+def nan_payload_problem(px, out):
+    """Check the exact words, except for the measured KosmicKrisp RGBA32F canonicalization (#3125)."""
+    if len(px) != 64 * 64:
+        return f"expected 4096 pixels, got {len(px)}"
+    want = (0x7fc12345, 0xffc54321, 0x3f800000, 0x3f000000)
+    canonicalizes = "driver: KosmicKrisp" in out.splitlines()
+    for i, p in enumerate(px):
+        if any(actual != expected and not (canonicalizes and c < 2 and actual == 0x7fc00000)
+               for c, (actual, expected) in enumerate(zip(p, want))):
+            return f"pixel ({i % 64},{i // 64}) has unexpected words: {[hex(x) for x in p]}"
+    return ""
+
+
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
     if name == "ps_ij_computed" and (BARY_FALLBACK or F16_HALVES):
@@ -1435,7 +1591,7 @@ def pixel_test(tools, spirv, name):
         return texoff_test(tools, spirv, name)
     if name == "ps_interp_f16_high" and BARY_FALLBACK and not F16_HALVES:   # with F16_HALVES it reads decoded halves
         return Skip("SKIP (per-vertex interpolants need VK_KHR_fragment_shader_barycentric)")
-    fmt = "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch", "ps_scc_mask32") else "<4I"
+    fmt = "<4f" if name in ("ps_bary", "ps_persp_bary") else "<2I2f" if name in ("ps_flat", "ps_uniform_branch", "ps_scc_mask32") else "<4I"
     px, out = pixels(tools, spirv, name, fmt, PIXEL_VERTEX.get(name, "vs_ids"))
     if isinstance(px, Skip):   # exit 77: the device cannot run this shader (e.g. no barycentrics)
         m = re.search(r"unsupported: .*", out)
@@ -1456,11 +1612,15 @@ def pixel_test(tools, spirv, name):
     if not px:
         return out if out.startswith("could not start") else "vk_harness failed or returned no pixels"
     n = len(px)
+    if name == NAN_PAYLOAD_TEST:
+        return nan_payload_problem(px, out)
     if name in PIXEL_BITS:
         wrong = sum(p != PIXEL_BITS[name] for p in px)
         return "" if not wrong else f"{wrong} of {n} pixels differ, e.g. {[hex(x) for x in next(p for p in px if p != PIXEL_BITS[name])]}"
     if name == "ps_bary":
         return barycentric_problem(px, 1e-6)
+    if name == "ps_persp_bary":
+        return bary_persp_problem(px)
     if name == "ps_flat":
         if any(not math.isfinite(v) for p in px for v in p[2:]):
             return "UVs contain non-finite values"
@@ -1475,9 +1635,8 @@ def pixel_test(tools, spirv, name):
     if name == "ps_bitmask_perm":
         if skip := bitmask_perm_narrow_skip(out, px):
             return skip
-        low = [p for p in px if p[0] < 32]
-        wrong = sum(not (a == lane ^ 9 and b == ((lane & 5) | 16) ^ 1) for lane, a, b, _ in low)
-        return "" if low and not wrong else f"{wrong} of {len(low)} pixels in lanes 0-31 wrong"
+        wrong = sum(not (a == lane ^ 9 and b == ((lane & 5) | 16) ^ 1) for lane, a, b, _ in px)
+        return "" if px and not wrong else f"{wrong} of {len(px)} pixels wrong"
     if name == "ps_wqm":                               # (wqm, own, wqm, own) per pixel, ps_wqm.asm
         w = int(n ** 0.5)
         wrong = sum(p != (int(i % w % 4 < 2 and i // w % 4 >= 2), int(i % w % 4 == 1 and i // w % 4 == 2)) * 2 for i, p in
@@ -1521,6 +1680,9 @@ def clip_test(tools, spirv, name):
 
 
 def main():
+    if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
+        print(__doc__)
+        return 0
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     spirv = os.path.join(sys.argv[1], "spirv")
@@ -1543,6 +1705,7 @@ def main():
     results.append(("cs_fmt_sint32", fmt_sint32_test(tools, spirv)))
     results.append(("cs_fmt_int_narrow", fmt_int_narrow_test(tools, spirv)))
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
+    results.append(("cs_fmt_all", fmt_all_test(tools, spirv)))
     results.append(("cs_tbuffer_store", tbuffer_store_test(tools, spirv)))
     results.append(("cs_fmt_d16_xyz", fmt_d16_xyz_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:

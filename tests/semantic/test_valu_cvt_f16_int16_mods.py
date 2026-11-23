@@ -52,10 +52,11 @@ class CvtF16Int16OutputMods(unittest.TestCase):
             "exp mrt0 v0, v1, v2, v3 done vm",
             "s_endpgm",
         ])
-        self.assertEqual(words[0] & 0xFFFF, 0x4600)  # 3 * 2 = 6.0
-        self.assertEqual(words[1] & 0xFFFF, 0xC400)  # -1 * 4 = -4.0
-        self.assertEqual(words[2] & 0xFFFF, 0x3E00)  # 3 / 2 = 1.5
-        self.assertEqual(words[3] & 0xFFFF, 0x3800)  # 1 / 2 = 0.5, inside [0, 1]
+        # Under default MODE (denorm16_64=3), RDNA2 silicon ignores omod on f16 destinations while clamp applies.
+        self.assertEqual(words[0] & 0xFFFF, 0x4200)  # 3.0 (omod ignored)
+        self.assertEqual(words[1] & 0xFFFF, 0xBC00)  # -1.0 (omod ignored)
+        self.assertEqual(words[2] & 0xFFFF, 0x4200)  # 3.0 (omod ignored)
+        self.assertEqual(words[3] & 0xFFFF, 0x3C00)  # 1.0 (clamped, omod ignored)
 
     def test_sdwa_clamp(self):
         words = run_ps([

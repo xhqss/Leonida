@@ -91,7 +91,14 @@ def inverse_bind(q, t):
             r[2][0], r[2][1], r[2][2], 0.0, last[0], last[1], last[2], 1.0]
 
 
-def skeleton_resource(shift_bind=0.0, singular_bind=False):
+# Both bind matrices have rows 0 and 1 equal (zero determinant) and the same recovered origin (0, 0, 1),
+# so only the determinant distinguishes them from bone 0's valid bind. The first has a zero middle
+# cofactor; the second keeps it non-zero so a sign flip in that term is caught.
+SINGULAR_ZERO_COFACTOR = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0, 1.0]
+SINGULAR_LIVE_COFACTOR = [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0, 1.0]
+
+
+def skeleton_resource(shift_bind=0.0, singular_bind=None):
     p = Page()
     directory = drawable_header(p, "synthetic_skeleton")
     p.b[directory + 8], p.b[directory + 9] = 1, 0
@@ -101,10 +108,8 @@ def skeleton_resource(shift_bind=0.0, singular_bind=False):
     records = p.alloc(bytes(0x50 * n))
     world = world_transforms()
     binds = [inverse_bind(q, (t[0] + shift_bind, t[1], t[2])) for q, t in world]
-    if singular_bind:
-        # Rows 0 and 1 are equal, so the determinant is zero, but the origin still resolves to (0, 0, 1),
-        # which is bone 0's composed translation. Only the determinant distinguishes this from a valid bind.
-        binds[0] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0, 1.0]
+    if singular_bind is not None:
+        binds[0] = singular_bind
     matrices = p.alloc(b"".join(struct.pack("<16f", *m) for m in binds))
     parents = p.alloc(b"".join(struct.pack("<H", 0xFFFF if x is None else x) for x in PARENTS))
     for i, name in enumerate(NAMES):
@@ -238,10 +243,12 @@ class SkeletonAndPartTest(unittest.TestCase):
         self.assertGreater(worst, 0.29)
 
     def test_a_singular_inverse_bind_is_refused_even_when_its_origin_matches(self):
-        sys_page = skeleton_resource(singular_bind=True)
-        # Before the fix the origin check passed and the degenerate matrix was exported as a joint.
-        with self.assertRaisesRegex(anim_glb.ExportError, "inverse bind matrix 0"):
-            anim_glb.read_skeleton(sys_page, anim_glb.drawable_at(sys_page, None))
+        for matrix in (SINGULAR_ZERO_COFACTOR, SINGULAR_LIVE_COFACTOR):
+            with self.subTest(matrix=matrix):
+                sys_page = skeleton_resource(singular_bind=matrix)
+                # Before the fix the origin check passed and the degenerate matrix was exported as a joint.
+                with self.assertRaisesRegex(anim_glb.ExportError, "inverse bind matrix 0"):
+                    anim_glb.read_skeleton(sys_page, anim_glb.drawable_at(sys_page, None))
 
     def test_part_binds_model_bones_to_joints_by_hash(self):
         joints, _ = anim_glb.read_skeleton(skeleton_resource(), 0)
@@ -355,6 +362,11 @@ class ClipChannelTest(unittest.TestCase):
         self.assertEqual(out_mid[("mover", "translation")], [(0.0, (20.0, 0.0, 0.0))])
         out_hi, _ = self.channels(0.095, 0.095, 1.0)
         self.assertEqual(out_hi[("mover", "translation")], [(0.0, (30.0, 0.0, 0.0))])
+        # Even when start == end sits slightly before a frame within 1e-4, timestamp stays 0.0.
+        self.anim["duration"] = 4 / 32
+        t = 2 / 32 - 2**-14
+        out_tol, _ = self.channels(t, t, 1 / 1024)
+        self.assertEqual(out_tol[("mover", "translation")], [(0.0, (20.0, 0.0, 0.0))])
 
     def test_select_clips_handles_non_hex_0x_names_and_bad_selectors(self):
         d = {

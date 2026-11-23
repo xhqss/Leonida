@@ -86,7 +86,8 @@ class EnsureSubmoduleTest(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, "-I", str(Path(__file__).resolve()),
              "EnsureSubmoduleTest.test_initializes_submodule_in_linked_worktree"],
-            cwd=self.root, env=hook_env, capture_output=True, text=True,
+            # errors="replace": git prints paths in UTF-8, which the Windows ANSI code page can't always decode.
+            cwd=self.root, env=hook_env, capture_output=True, text=True, errors="replace",
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

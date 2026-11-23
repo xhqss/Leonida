@@ -2,23 +2,33 @@
 
     python -m pytest tests/test_amd_swizzle.py
 """
-import pytest  # noqa: E402 (keeps the CI bash loop from running this file)
-
+import io
 import os
 import pathlib
 import sys
 import tempfile
+import types
+import unittest
 from pathlib import Path
+from unittest import mock
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+try:
+    import pytest  # noqa: E402 (keeps the CI bash loop from running this file)
+except ImportError:
+    pytest = None
+
+TOOLS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
 
 try:
     import amd_swizzle as A  # noqa: E402
+    HAVE_NUMPY = True
 except ModuleNotFoundError as e:
     if e.name != "numpy":
         raise
-    import pytest  # noqa: E811
-    pytest.skip("amd_swizzle needs numpy", allow_module_level=True)
+    A = None
+    HAVE_NUMPY = False
 
 
 def table(name, rows):
@@ -58,11 +68,130 @@ def test_rejects_code():
         raise AssertionError(f"accepted {cell!r}")
 
 
+def _load_amd_swizzle_for_cli():
+    if A is not None:
+        return A
+    fake_np = types.ModuleType("numpy")
+    fake_np.uint8 = int
+    fake_np.float32 = float
+    fake_np.int64 = int
+    fake_np.ndarray = object
+    with mock.patch.dict(sys.modules, {"numpy": fake_np}):
+        import amd_swizzle
+        return amd_swizzle
+
+
+class AmdSwizzleCliGuardTests(unittest.TestCase):
+    def setUp(self):
+        if not HAVE_NUMPY:
+            fake_np = types.ModuleType("numpy")
+            fake_np.uint8 = int
+            fake_np.float32 = float
+            fake_np.int64 = int
+            fake_np.ndarray = object
+            p = mock.patch.dict(sys.modules, {"numpy": fake_np})
+            p.start()
+            self.addCleanup(p.stop)
+        self.mod = _load_amd_swizzle_for_cli()
+
+    def test_missing_input_returns_2_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "does_not_exist.bin")
+            stderr = io.StringIO()
+            with mock.patch.object(sys, "stderr", stderr):
+                rc = self.mod.main([missing, "--width", "64", "--height", "64"])
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR:", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_bad_out_paths_rejected_before_reading_or_searching(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blob = os.path.join(tmp, "blob.bin")
+            with open(blob, "wb") as f:
+                f.write(b"\x01\x02\x03\x04" * 64)
+            existing_dir = os.path.join(tmp, "out_dir")
+            os.mkdir(existing_dir)
+            file_ancestor = os.path.join(tmp, "file_ancestor")
+            with open(file_ancestor, "w", encoding="utf-8") as f:
+                f.write("x")
+
+            bad_outs = [
+                "",
+                "   ",
+                "bad\x00out.png",
+                existing_dir,
+                os.path.join(tmp, "trailing") + os.sep,
+                os.path.join(file_ancestor, "sub", "out.png"),
+                blob,
+                os.path.join(tmp, ".", "blob.bin"),
+            ]
+            for bad in bad_outs:
+                with self.subTest(out=bad):
+                    stderr = io.StringIO()
+                    with mock.patch.object(self.mod, "load") as load_mock, \
+                         mock.patch.object(sys, "stderr", stderr):
+                        rc = self.mod.main([blob, "--width", "64", "--height", "64", "--out", bad])
+                    self.assertEqual(rc, 2)
+                    self.assertIn("ERROR:", stderr.getvalue())
+                    self.assertNotIn("Traceback", stderr.getvalue())
+                    load_mock.assert_not_called()
+
+    def _run_with_save_side_effect(self, tmp, out_name, side_effect):
+        blob = os.path.join(tmp, "blob.bin")
+        with open(blob, "wb") as f:
+            f.write(b"\x00" * 64)
+        out_path = os.path.join(tmp, "nested", out_name)
+
+        fake_lin = mock.MagicMock()
+        fake_lin.size = 64
+        fake_lin.tobytes.return_value = b"\x00" * 64
+        fake_img = mock.MagicMock()
+        fake_img.reshape.return_value = fake_img
+
+        fake_pil = types.ModuleType("PIL")
+        fake_pil_image = types.ModuleType("PIL.Image")
+        fake_opened = mock.MagicMock()
+        fake_opened.convert.return_value.save.side_effect = side_effect
+        fake_pil_image.open = mock.Mock(return_value=fake_opened)
+        fake_pil.Image = fake_pil_image
+
+        fake_tables = {"GFX10_SW_64K_S_PATINFO": [(0, 0, 0, 0, 0, "1 pipes 8 bpe")]}
+        with mock.patch.dict(sys.modules, {"PIL": fake_pil, "PIL.Image": fake_pil_image}), \
+             mock.patch.object(self.mod, "load", return_value=({}, fake_tables)), \
+             mock.patch.object(self.mod, "equation", return_value=[]), \
+             mock.patch.object(self.mod, "detile", return_value=fake_lin), \
+             mock.patch.object(self.mod, "feature", return_value=fake_img), \
+             mock.patch("tile_probe.score", return_value=1.0):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
+                rc = self.mod.main([blob, "--width", "8", "--height", "8", "--out", out_path])
+        return rc, stderr.getvalue()
+
+    def test_write_oserror_returns_2_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, err = self._run_with_save_side_effect(tmp, "best.png", PermissionError("denied"))
+        self.assertEqual(rc, 2)
+        self.assertIn("ERROR:", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_write_value_error_returns_2_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, err = self._run_with_save_side_effect(
+                tmp, "best.unknown", ValueError("unknown file extension: .unknown")
+            )
+        self.assertEqual(rc, 2)
+        self.assertIn("ERROR:", err)
+        self.assertIn("unknown file extension: .unknown", err)
+        self.assertNotIn("Traceback", err)
+
+
 if __name__ == "__main__":
-    for name, fn in list(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            fn()
-            print("ok", name)
+    if HAVE_NUMPY:
+        for name, fn in list(globals().items()):
+            if name.startswith("test_") and callable(fn):
+                fn()
+                print("ok", name)
+    unittest.main()
 
 
 def test_64k_block_extent_comes_from_the_element_count():
@@ -86,8 +215,8 @@ def test_out_cannot_overwrite_the_input(tmp_path):
     blob.write_bytes(bytes(range(256)) * 64)
     before = blob.read_bytes()
     p = cli(tmp_path, "--width", "256", "--height", "256", "--out", str(blob))
-    assert p.returncode == 1, p.stderr
-    assert "overwrite the input" in p.stderr
+    assert p.returncode == 2, p.stderr
+    assert "overwrite" in p.stderr
     assert "Traceback" not in p.stderr
     assert blob.read_bytes() == before
 
@@ -95,7 +224,7 @@ def test_out_cannot_overwrite_the_input(tmp_path):
 def test_out_directory_is_a_message_not_a_traceback(tmp_path):
     (tmp_path / "blob.bin").write_bytes(bytes(range(256)) * 64)
     p = cli(tmp_path, "--width", "256", "--height", "256", "--out", str(tmp_path))
-    assert p.returncode == 1, p.stderr
+    assert p.returncode == 2, p.stderr
     assert "is a directory" in p.stderr
     assert "Traceback" not in p.stderr
 

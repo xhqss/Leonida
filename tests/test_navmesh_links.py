@@ -40,7 +40,7 @@ def build_tile(
     sector=(260 << 9) | 250,
     n_verts=8,
     poly_sizes=(4, 4, 3),
-    poly_link_counts=(2, 0, 1),
+    poly_link_counts=(2, 0, 2),
     poly_hi9_flags=(1, 0, 64),
     edges=None,
     links=None,
@@ -48,6 +48,7 @@ def build_tile(
     two_streams=False,
     corrupt_edge_oob=False,
     corrupt_edge_sector=False,
+    corrupt_pool_vert_sum=False,
     corrupt_link_heading=False,
     corrupt_link_pad=False,
     corrupt_link_sector=False,
@@ -76,8 +77,8 @@ def build_tile(
                 (120, 220, 320, 420, 520, 620, 888, 2, sector - 1, sector, 0x0000, 0x0030, 254, 0),
             ]
         if link_indices is None:
-            # poly 0 gets links [0, 1], poly 1 gets [], poly 2 gets [2]
-            link_indices = [0, 1, 2]
+            # poly 0 gets links [0, 1], poly 1 gets [], poly 2 gets [0, 2]
+            link_indices = [0, 1, 0, 2]
 
     d4 = len(links)
     d8 = len(link_indices)
@@ -171,7 +172,8 @@ def build_tile(
     vpos = 0
     lpos = 0
     for i, nv in enumerate(poly_sizes):
-        struct.pack_into("<II", polys, 44 * i, sector, (vpos << 4) | nv)
+        packed_nv = (nv - 1) if (corrupt_pool_vert_sum and i == n_polys - 1) else nv
+        struct.pack_into("<II", polys, 44 * i, sector, (vpos << 4) | packed_nv)
         vpos += nv
         lcnt = poly_link_counts[i]
         lstart = lpos + 1 if (corrupt_chain_start and i == n_polys - 1) else lpos
@@ -237,17 +239,31 @@ class NavmeshLinksTest(unittest.TestCase):
         self.assertEqual(doc["edges"]["unlinked"], 8)
         self.assertEqual(doc["polygons"]["total"], 6)
         self.assertEqual(doc["polygons"]["max_links_per_poly"], 2)
+        self.assertEqual(doc["polygons"]["w20_hi9_flags"], {"1": 2, "0": 2, "64": 2})
         self.assertEqual(doc["special_links"]["link_tiles"], 1)
         self.assertEqual(doc["special_links"]["total"], 3)
-        self.assertEqual(doc["special_links"]["indices_total"], 3)
+        self.assertEqual(doc["special_links"]["indices_total"], 4)
         self.assertEqual(doc["special_links"]["intra_tile"], 1)
         self.assertEqual(doc["special_links"]["cross_tile_s0"], 1)
         self.assertEqual(doc["special_links"]["cross_tile_s1"], 1)
 
     def test_malformed_inputs_and_no_partial_counter_leak(self):
+        sector = (260 << 9) | 250
+        # Counterexample where polygon 1 lists a cross-tile link whose index-1 endpoint is in sector+1
+        # while its local endpoint (poly 2 in sector) does not list it.
+        unlisted_local_end = build_tile(
+            sector=sector,
+            links=[
+                (100, 200, 300, 400, 500, 600, 0, 2, sector, sector, 0x0200, 0x0050, 63, 0),
+                (110, 210, 310, 410, 510, 610, 1, 2, sector + 1, sector, 0x0400, 0x0040, 127, 0),
+            ],
+            link_indices=[0, 1, 0],
+            poly_link_counts=(1, 1, 1),
+        )[0]
         cases = [
             ("edges_valid", build_tile(corrupt_edge_oob=True)[0]),
             ("edges_valid", build_tile(corrupt_edge_sector=True)[0]),
+            ("edges_valid", build_tile(corrupt_pool_vert_sum=True)[0]),
             ("special_links_valid", build_tile(corrupt_link_heading=True)[0]),
             ("special_links_valid", build_tile(corrupt_link_pad=True)[0]),
             ("special_links_valid", build_tile(corrupt_link_sector=True)[0]),
@@ -255,6 +271,7 @@ class NavmeshLinksTest(unittest.TestCase):
             ("poly_link_chain", build_tile(corrupt_chain_start=True)[0]),
             ("poly_link_chain", build_tile(corrupt_chain_total=True)[0]),
             ("link_indices_endpoints", build_tile(corrupt_b0_endpoint=True)[0]),
+            ("link_indices_endpoints", unlisted_local_end),
         ]
         for failed_check, blob in cases:
             with self.subTest(failed_check=failed_check):
@@ -272,16 +289,23 @@ class NavmeshLinksTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             rpf = os.path.join(tmp, "nav.rpf")
             make_rpf(rpf, build_tile())
+            rpf_upper = os.path.join(tmp, "NAV.RPF")
             missing = os.path.join(tmp, "no_such.rpf")
             for argv in (
                 [missing],
                 [rpf, "--start", "-1"],
                 [rpf, "--limit", "0"],
+                [tmp, "--start", "16"],
+                [tmp, "--limit", "64"],
                 [rpf, "--out", tmp],
                 [rpf, "--out", rpf],
             ):
                 rc = nl.main(argv)
                 self.assertEqual(rc, 2, f"expected exit code 2 for {argv}")
+            if os.name == "nt" or sys.platform == "darwin":
+                self.assertEqual(nl.main([rpf, "--out", rpf_upper]), 2)
+                with open(rpf, "rb") as fh:
+                    self.assertEqual(fh.read(4), b"9FPR")
 
 
 if __name__ == "__main__":

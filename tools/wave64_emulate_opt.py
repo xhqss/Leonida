@@ -78,6 +78,13 @@ _SCC_UNCONDITIONAL_WRITES = _ALL_SAVEEXEC_WREXEC | frozenset({
     "s_bitcmp0_b32", "s_bitcmp1_b32", "s_bitcmp0_b64", "s_bitcmp1_b64",
 })
 
+# Scalar ops that reconstruct a whole mask word when their source holds a lane mask.
+_MASK_WORD_READERS = frozenset({
+    "s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b64",
+    "s_ff0_i32_b32", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b64",
+    "s_flbit_i32_b32", "s_flbit_i32",
+})
+
 # Mask ops that emit a cross-lane vote in --wave64-emulate when SCC is live.
 _MASK_SCC_VOTE_OPS = _ALL_SAVEEXEC_WREXEC | frozenset({
     "s_and_b64", "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_orn2_b64",
@@ -134,7 +141,7 @@ def reads_scc(ins):
     if op in _SCC_IMPLICIT_READS or op.startswith(("s_getreg", "s_setreg", "s_save_status")):
         return True
     for x in ins["args"]:
-        if x.get("k") == "special" and x.get("t") == "scc":
+        if x.get("k") == "special" and x.get("t") in ("scc", "src_scc"):
             return True
     return False
 
@@ -502,8 +509,7 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
             return False, empty_stats, 0, (), ()
 
         # 2. Cross-lane mask readers (`wave_mask`, `wave_equal`, live-SCC `scc_from_mask`).
-        if op in ("s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b64",
-                  "s_ff0_i32_b32", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b64"):
+        if op in _MASK_WORD_READERS:
             if len(a) > 1 and _holds_lane_mask(ins, a[1], lm):
                 return False, empty_stats, 0, (), ()
         elif op in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"):
@@ -648,6 +654,26 @@ def _map_tree_ids(tree, mapping):
             else:
                 child = []
                 dst.append((it[0], mapping[it[1]], child))
+                stack.append((it[2], child))
+    return out
+
+
+def _drop_tree_block(tree, b):
+    """Iterative copy of a cfg_structure tree without `("block", b)`, b being a sink with no successors: in
+    `structure` its only node is `("guard", b, [("block", b)])`, which is dropped whole."""
+    out = []
+    stack = [(tree, out)]
+    while stack:
+        src, dst = stack.pop()
+        for it in src:
+            if it[0] == "block":
+                if it[1] != b:
+                    dst.append(it)
+            elif it[0] == "guard" and it[2] == [("block", b)]:
+                continue
+            else:
+                child = []
+                dst.append((it[0], it[1], child))
                 stack.append((it[2], child))
     return out
 
@@ -879,11 +905,14 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
         else:
             order = [run] + sorted(region - {run})
             idx_of = {u: i for i, u in enumerate(order)}
-            sub_succ = [[idx_of[s] for s in succ[u] if s in idx_of] for u in order]
+            sub_end = len(order)
+            # An edge to `skip` (e.g. an s_cbranch_scc to the join) goes to an exit node `sub_end`, so the blocks
+            # after it in the region get a `%pc` guard; dropping the edge would run them on the exit path too.
+            sub_succ = [list(dict.fromkeys(idx_of.get(s, sub_end) for s in succ[u])) for u in order] + [[]]
             sub_tree = cfg_structure.structure(sub_succ)
             if sub_tree is None:
                 continue
-            sub_end = len(order)
+            sub_tree = _drop_tree_block(sub_tree, sub_end)
             sub_out_pcs = {}
             for i, u in enumerate(order):
                 uedges = raw_edges[u]
@@ -989,8 +1018,7 @@ def _insn_may_barrier(ins, lane_masks, scc_live):
         return True
     a = ins["args"]
     lm = lane_masks.get(id(ins), {})
-    if op in ("s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b64",
-              "s_ff0_i32_b32", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b64"):
+    if op in _MASK_WORD_READERS:
         return len(a) > 1 and _holds_lane_mask(ins, a[1], lm)
     if op in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"):
         return len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lm)

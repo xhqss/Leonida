@@ -56,6 +56,10 @@ def harvest(data: bytes, out: set, minlen: int):
                 out.add("")
 
 
+def _raise_scan_error(error):
+    raise error
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("carve", nargs="?")
@@ -93,6 +97,10 @@ def main():
         what = "is not a folder" if os.path.exists(a.carve) else "does not exist"
         print(f"ERROR: the carve folder {a.carve} {what}", file=sys.stderr)
         return 2
+    for extra in a.extra:
+        if not os.path.exists(extra):
+            print(f"ERROR: --extra input does not exist: {extra}", file=sys.stderr)
+            return 2
     # A folder with its own index.json is one archive's carve (<work>\carve\common, the folder the gamedata_*
     # tools take): harvest it as that archive. Otherwise each subfolder with an index.json is one archive.
     if os.path.isfile(os.path.join(a.carve, "index.json")):
@@ -169,9 +177,13 @@ def main():
               f"(first: {missing[0]}). Re-run the carve to get their strings.", file=sys.stderr)
     for x in a.extra:
         if os.path.isdir(x):
-            for root, _, files in os.walk(x):
-                for fn in files:
-                    strings.add(os.path.splitext(fn)[0])
+            try:
+                for _, _, files in os.walk(x, onerror=_raise_scan_error):
+                    for fn in files:
+                        strings.add(os.path.splitext(fn)[0])
+            except OSError as e:
+                print(f"ERROR: cannot scan --extra directory {e.filename or x}: {e.strerror or e}", file=sys.stderr)
+                return 2
         elif os.path.isfile(x):
             with open(x, "rb") as f:
                 harvest(f.read(), strings, a.min)

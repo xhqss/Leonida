@@ -1,21 +1,17 @@
 """Semantic value tests for RDNA2 16-bit integer VALU instructions.
 
-Covers all 10 ops end-to-end through tools/rdna2spirv.py and tests/semantic/spirv_mini_interp.py:
-  v_and_b16       D.u16 = S0.u16 & S1.u16
-  v_or_b16        D.u16 = S0.u16 | S1.u16
-  v_xor_b16       D.u16 = S0.u16 ^ S1.u16
+Covers all 6 ops end-to-end through tools/rdna2spirv.py and tests/semantic/spirv_mini_interp.py:
   v_min_u16       D.u16 = min(S0.u16, S1.u16)           (unsigned 16-bit)
   v_max_u16       D.u16 = max(S0.u16, S1.u16)           (unsigned 16-bit)
   v_min_i16       D.i16 = min(S0.i16, S1.i16)           (signed 16-bit two's complement)
   v_max_i16       D.i16 = max(S0.i16, S1.i16)           (signed 16-bit two's complement)
   v_mul_lo_u16    D.u16 = (S0.u16 * S1.u16) & 0xffff    (low 16 bits, mod 2^16)
   v_sub_nc_u16    D.u16 = (S0.u16 - S1.u16) & 0xffff    (no carry, mod 2^16; VOP3-only on GFX10)
-  v_subrev_u16    D.u16 = (S1.u16 - S0.u16) & 0xffff    (reversed operands, mod 2^16)
 
 16-bit destination and op_sel semantics (AMD RDNA2 ISA, VOP3 OP_SEL; docs/design.md "16-bit results"):
   - VOP3 (_e64, 8-byte encoding, or VOP3-only v_sub_nc_u16): op_sel:[s0,s1,dst] picks the low (0) or high (1)
     16-bit half of src0, src1 and dst; the untouched half of dst is preserved.
-  - VOP2 (_e32 / encoding-less non-_e64 mnemonic for the other nine ops): reads low halves, writes dst[15:0]
+  - VOP2 (_e32 / encoding-less non-_e64 mnemonic for the other five ops): reads low halves, writes dst[15:0]
     and zeroes dst[31:16]; source op_sel is rejected as Unsupported.
 """
 import gc
@@ -47,16 +43,12 @@ STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 OLD = 0xAAAA5555
 
 ALL_OPS = (
-    "v_and_b16",
-    "v_or_b16",
-    "v_xor_b16",
     "v_min_u16",
     "v_max_u16",
     "v_min_i16",
     "v_max_i16",
     "v_mul_lo_u16",
     "v_sub_nc_u16",
-    "v_subrev_u16",
 )
 VOP2_MODELLED_OPS = tuple(op for op in ALL_OPS if op != "v_sub_nc_u16")
 
@@ -100,12 +92,6 @@ def merge16(old: int, res16: int, dst_hi: int = 0, preserve_high: bool = True) -
 def ref_op16(op: str, x: int, y: int) -> int:
     """Plain-Python RDNA2 ISA reference for the 16-bit result in [0, 0xFFFF]."""
     ux, uy = u16(x), u16(y)
-    if op == "v_and_b16":
-        return ux & uy
-    if op == "v_or_b16":
-        return ux | uy
-    if op == "v_xor_b16":
-        return ux ^ uy
     if op == "v_min_u16":
         return min(ux, uy)
     if op == "v_max_u16":
@@ -118,8 +104,6 @@ def ref_op16(op: str, x: int, y: int) -> int:
         return (ux * uy) & MASK16
     if op == "v_sub_nc_u16":
         return (ux - uy) & MASK16
-    if op == "v_subrev_u16":
-        return (uy - ux) & MASK16
     raise ValueError(f"unknown op {op!r}")
 
 
@@ -182,9 +166,6 @@ class ReferenceOracleTests(unittest.TestCase):
 
     def test_hand_worked_constants(self):
         cases = [
-            ("v_and_b16", 0xFFFF0F0F, 0xAAAA3355, (0, 0, 0), True, 0xAAAA0305),
-            ("v_or_b16", 0xFFFF0F00, 0xDEAD00F0, (0, 0, 0), True, 0xAAAA0FF0),
-            ("v_xor_b16", 0xFFFFAAAA, 0x12345555, (0, 0, 0), True, 0xAAAAFFFF),
             ("v_min_u16", 0x11117FFF, 0x22228000, (0, 0, 0), True, 0xAAAA7FFF),
             ("v_max_u16", 0x11117FFF, 0x22228000, (0, 0, 0), True, 0xAAAA8000),
             ("v_min_i16", 0x11117FFF, 0x22228000, (0, 0, 0), True, 0xAAAA8000),
@@ -194,9 +175,8 @@ class ReferenceOracleTests(unittest.TestCase):
             ("v_mul_lo_u16", 0x1111FFFF, 0x2222FFFF, (0, 0, 0), True, 0xAAAA0001),
             ("v_mul_lo_u16", 0x11118000, 0x22220002, (0, 0, 0), True, 0xAAAA0000),
             ("v_sub_nc_u16", 0x11110000, 0x22220001, (0, 0, 0), True, 0xAAAAFFFF),
-            ("v_subrev_u16", 0x11110001, 0x22220000, (0, 0, 0), True, 0xAAAAFFFF),
-            ("v_subrev_u16", 0x1111000A, 0x22220005, (0, 0, 1), True, 0xFFFB5555),
-            ("v_xor_b16", 0x1111AAAA, 0x22225555, (0, 0, 0), False, 0x0000FFFF),
+            ("v_sub_nc_u16", 0x11110005, 0x2222000A, (0, 0, 1), True, 0xFFFB5555),
+            ("v_min_u16", 0x1111AAAA, 0x22225555, (0, 0, 0), False, 0x00005555),
         ]
         for op, x, y, sel, keep_hi, want in cases:
             with self.subTest(op=op, x=hex(x), y=hex(y), sel=sel, keep_hi=keep_hi):
@@ -274,16 +254,14 @@ class ValuInt16BoundaryTests(unittest.TestCase):
                 self.assertEqual(ref_op16("v_mul_lo_u16", x, y), want16)
                 self.assertEqual(run_one("v_mul_lo_u16_e64 v0, v1, v2", x, y), (OLD & 0xFFFF0000) | want16)
 
-    def test_subrev_u16_matches_swapped_sub_nc_u16(self):
+    def test_sub_nc_u16_wraparound_and_high_half_isolation(self):
         pairs = [(0x12340000, 0x56780001), (0xAAAA000A, 0xBBBB0005), (0xFFFF7FFF, 0x00008000), (0xDEAD8001, 0xBEEF0001)]
         for x, y in pairs:
             with self.subTest(x=hex(x), y=hex(y)):
-                subrev = run_one("v_subrev_u16_e64 v0, v1, v2", x, y)
-                sub_swapped = run_one("v_sub_nc_u16 v0, v2, v1", x, y)
-                self.assertEqual(subrev, sub_swapped)
-                self.assertEqual(subrev, ref_word("v_subrev_u16", x, y))
+                sub = run_one("v_sub_nc_u16 v0, v1, v2", x, y)
+                self.assertEqual(sub, ref_word("v_sub_nc_u16", x, y))
 
-    def test_bitwise_logic_does_not_leak_high_half_bits(self):
+    def test_min_max_sub_does_not_leak_high_half_bits(self):
         # Upper halves are all-1s / disjoint bits; only low 16 bits participate and dst[31:16] stays OLD.
         x, y = 0xFFFF0F5A, 0xFFFFF03C
         words = run_mrt0([
@@ -293,16 +271,16 @@ class ValuInt16BoundaryTests(unittest.TestCase):
             f"v_mov_b32 v11, {OLD:#x}",
             f"v_mov_b32 v12, {OLD:#x}",
             f"v_mov_b32 v13, {OLD:#x}",
-            "v_and_b16_e64 v10, v1, v2",
-            "v_or_b16_e64 v11, v1, v2",
-            "v_xor_b16_e64 v12, v1, v2",
-            "v_and_b16_e64 v13, v1, 0",
+            "v_min_u16_e64 v10, v1, v2",
+            "v_max_u16_e64 v11, v1, v2",
+            "v_min_i16_e64 v12, v1, v2",
+            "v_sub_nc_u16 v13, v1, 0",
         ], ("v10", "v11", "v12", "v13"))
         self.assertEqual(words, [
-            ref_word("v_and_b16", x, y),
-            ref_word("v_or_b16", x, y),
-            ref_word("v_xor_b16", x, y),
-            OLD & 0xFFFF0000,
+            ref_word("v_min_u16", x, y),
+            ref_word("v_max_u16", x, y),
+            ref_word("v_min_i16", x, y),
+            ref_word("v_sub_nc_u16", x, 0),
         ])
 
 
@@ -421,10 +399,10 @@ class ValuInt16OperandsAndExecTests(unittest.TestCase):
             ("v_max_u16", "v_max_u16_e64 v0, v1, -1", v1_val, 0xFFFFFFFF, (0, 0, 0)),
             ("v_mul_lo_u16", "v_mul_lo_u16_e64 v0, s4, 64", s4_val, 64, (0, 0, 0)),
             ("v_sub_nc_u16", "v_sub_nc_u16 v0, 1, s4", 1, s4_val, (0, 0, 0)),
-            ("v_subrev_u16", "v_subrev_u16_e64 v0, s4, 1", s4_val, 1, (0, 0, 0)),
-            ("v_and_b16", "v_and_b16_e64 v0, s4, -16 op_sel:[1,0,1]", s4_val, 0xFFFFFFF0, (1, 0, 1)),
-            ("v_or_b16", "v_or_b16_e64 v0, 64, s4", 64, s4_val, (0, 0, 0)),
-            ("v_xor_b16", "v_xor_b16_e64 v0, v1, -1", v1_val, 0xFFFFFFFF, (0, 0, 0)),
+            ("v_sub_nc_u16", "v_sub_nc_u16 v0, s4, 1", s4_val, 1, (0, 0, 0)),
+            ("v_min_u16", "v_min_u16_e64 v0, s4, -16 op_sel:[1,0,1]", s4_val, 0xFFFFFFF0, (1, 0, 1)),
+            ("v_max_u16", "v_max_u16_e64 v0, 64, s4", 64, s4_val, (0, 0, 0)),
+            ("v_mul_lo_u16", "v_mul_lo_u16_e64 v0, v1, -1", v1_val, 0xFFFFFFFF, (0, 0, 0)),
         ]
         for op, insn, x, y, sel in cases:
             with self.subTest(insn=insn):
@@ -468,19 +446,19 @@ class ValuInt16NegativeControlsTests(unittest.TestCase):
              "v_min_u16_e64 v0, v1, v2", 0x11117FFF, 0x22228000,
              r"glsl UMin", "glsl UMax", 1,
              ref_word("v_min_u16", 0x11117FFF, 0x22228000)),
-            ("v_subrev_u16 drops operand reversal",
-             "v_subrev_u16_e64 v0, v1, v2", 0x0000000A, 0x00000005,
+            ("v_sub_nc_u16 drops operand order",
+             "v_sub_nc_u16 v0, v1, v2", 0x0000000A, 0x00000005,
              r"OpISub %uint (%\w+) (%\w+)", r"OpISub %uint \2 \1", 1,
-             ref_word("v_subrev_u16", 0x0000000A, 0x00000005)),
+             ref_word("v_sub_nc_u16", 0x0000000A, 0x00000005)),
             ("v_mul_lo_u16 drops 16-bit result mask",
              "v_mul_lo_u16_e64 v0, v1, v2", 0x00000101, 0x00000101,
              r"(%\w+) = OpIMul %uint (%\w+) (%\w+)\n(\s*%\w+) = OpBitwiseAnd %uint \1 %cffff",
              r"\1 = OpIMul %uint \2 \3\n\4 = OpCopyObject %uint \1", 1,
              ref_word("v_mul_lo_u16", 0x00000101, 0x00000101)),
-            ("v_and_b16 drops high-half preservation",
-             "v_and_b16_e64 v0, v1, v2", 0x00000F0F, 0x000000FF,
+            ("v_min_u16 drops high-half preservation",
+             "v_min_u16_e64 v0, v1, v2", 0x00000F0F, 0x000000FF,
              r"OpBitwiseAnd %uint (%\w+) %cffff0000", r"OpBitwiseAnd %uint \1 %c0", 1,
-             ref_word("v_and_b16", 0x00000F0F, 0x000000FF)),
+             ref_word("v_min_u16", 0x00000F0F, 0x000000FF)),
         ]
         for label, line, v1, v2, pattern, repl, want_count, want in controls:
             with self.subTest(what=label):

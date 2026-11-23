@@ -10,7 +10,8 @@ not a regression test. `tests/test_semantic_translator_use.py` enforces this; th
 files whose subject is hand-written SPIR-V are listed there with a reason. The guard checks that a file reaches the
 translator, not that every assertion depends on it.
 
-What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
+What they check (`tools/rdna2spirv.py` on pixel, vertex, compute and other stages, wave32 and wave64, mostly one
+instruction family per file; the list below describes some of them, not every file):
 
 - `test_ps_semantics.py` translates `ps_sdwa`, `ps_ops`, `ps_ops2`, `ps_ops3`, `ps_ops4` and `ps_legacy_mul` and
   *executes* the SPIR-V with `spirv_mini_interp.py`, then compares every `mrt0` word with the expected value. Each
@@ -49,6 +50,10 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   whose format differs from the instruction's, or is 0) and asserts the 52 words `check.py` expects, measured natively on a
   Radeon 680M; also the default `BUF_FMT_8_UNORM` byte, a format without an encoder staying `Unsupported`, and the
   store's data VGPRs counting as reads.
+- `test_buffer_formats_all.py` runs `buffer_load_format_xyzw` (through the V# and through tbuffer) and `buffer_store_format_xyzw` of the 33 formats
+  the SCALED, SINT, 10_11_11 / 11_11_10 FLOAT, 2_10_10_10 and 10_10_10_2 families added, with edge values, NaN, infinity and denormals, against
+  `tools/buffer_format_fuzz.py`'s model, which the Radeon 880M reproduced for 1.33 million validated elements (docs/buffer_formats.md). Two stores of
+  older formats that differ from the hardware are pinned as expected failures.
 - `test_scalar_mem_smem.py` runs the code `Gen.scalar_load` emits with its own small evaluator (64-bit
   addresses, forward selection constructs) and asserts the SGPR values and the addresses read, including the
   measured SMEM truncation, `s_buffer_load` `NUM_RECORDS` bound and signed `s_load` immediate.
@@ -72,8 +77,9 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   evaluator, since the interpreter refuses 64-bit integers and PhysicalStorageBuffer) and asserts the address
   accessed for the signed 12-bit instruction offset (-4, -2048, 2047, 0) in both addressing modes.
 - `test_float_nan_fract.py` runs float min/max/min3/max3/med3 with a quiet NaN and `v_fract` next to 1.0 (f32 and
-  f16) with inputs from memory, and the GPU fixtures `ps_fnan_med3` and `ps_fnan_fract`; the expected words were
-  measured on an AMD Radeon RX 6800 (gfx1030). A NaN result is asserted as "a NaN", not by its bits.
+  f16) with inputs from memory, and the GPU fixtures `ps_fnan_med3`, `ps_fnan_fract`, `ps_fnan_med3_s2` and
+  `ps_f16_fnan_med3`; the expected words of the first two were measured on an AMD Radeon RX 6800 (gfx1030), those of
+  the other two follow the same measured med3 rule. A NaN result is asserted as "a NaN", not by its bits.
 - `test_rule_gpu_fixtures.py` runs the GPU fixtures for the `docs/design.md` rules that used to be CPU-only (TEST-175:
   `v_cmp(x)_nlg`, `v_cvt_off_f32_i4`, the `v_fmac_f16` / `v_interp_p2/mov_f32` output modifiers and VOP3 modifiers on
   constants) through the interpreter, and checks that the words each `.asm` header derives are the ones `check.py`
@@ -88,6 +94,11 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 - `test_image_bvh_tri.py` runs `image_bvh64_intersect_ray` on hand-built triangle nodes. It checks the vertex
   slots of each node type (TRI0–TRI3) and every selector of the barycentric remap byte at +60, against weights
   written by hand and a plain-Python solve (docs/design.md, Ray tracing row).
+- `test_image_bvh_tri_hw.py` runs both forms of the instruction on the triangle nodes and rays measured natively on
+  an RX 6800 (gfx1030) with `tools/bvh_tri_probe.py`'s kernels and compares the four words bit for bit: all 308
+  single-lane rows (slots, both windings, misses, remap byte, t max and t sign, zero area, NaN and inf in the node
+  and the ray, shared edges and vertices) and 84 lane results. The table is written from the raw outputs, not by
+  hand.
 - `test_interp.py` tests the interpreter against the SPIR-V / GLSL.std.450 definitions. The interpreter raises
   `UnsupportedConstruct` for anything it does not model instead of approximating it. It can seed Input variables,
   PushConstant words and a flat physical-address memory map for the tests above.
@@ -99,6 +110,9 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   undefined in SPIR-V (`UndefinedResult`); a "lane mod 32" model of issue #94 gives the words a 32-wide GPU
   shows (all 24 matched on an RTX 4070 SUPER, driver 610.88, without `--wave64-emulate`). Two SPIR-V sabotages (readlane lane & 31, bpermute without its half base) must change the
   64-wide result.
+- `test_wave32_pixel_subgroup64.py` translates wave32 pixel shaders with lane-specific inputs in each physical half
+  and runs them as one 64-lane subgroup and as two 32-lane subgroups. `v_readfirstlane`, `v_readlane`,
+  `v_writelane`, `ds_bpermute`, `ds_permute`, ballots, and both votes must produce the same per-half results.
 - `test_w64x_scalar_load_order.py` translates wave64 programs with `--wave64-emulate` and checks the emitted rounds:
   no case of the round loop's switch reads or writes buffer memory after a write, or writes after a read, so a
   `buffer_store` and a later `s_load` / `s_buffer_load` of the wave (and a scalar load and a later store) run in

@@ -740,6 +740,20 @@ class MainTest(unittest.TestCase):
                 self.assertIn("not an RPF9 archive", err)
         self.assertFalse(os.path.exists(self.out))
 
+    def test_magic_without_the_data_start_is_not_an_rpf9_archive(self):
+        # The data start is the u32 at +4: a file with the magic but under 8 bytes used to end in a
+        # struct.error traceback with exit 1, the code for an incomplete census.
+        bad = os.path.join(self.dir, "short.rpf")
+        for content in (b"9FPR", b"9FPR\x40", b"9FPR\x40\x00\x00"):
+            with self.subTest(size=len(content)):
+                with open(bad, "wb") as f:
+                    f.write(content)
+                code, out, err = self.run_main(bad, "--out", self.out)
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+                self.assertEqual(err.strip(), "not an RPF9 archive")
+        self.assertFalse(os.path.exists(self.out))
+
     def test_missing_or_folder_archive_is_one_line(self):
         for archive in (os.path.join(self.dir, "no_such.rpf"), self.dir):
             with self.subTest(archive=os.path.basename(archive)):

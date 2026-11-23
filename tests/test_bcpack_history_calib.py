@@ -679,6 +679,53 @@ class ReferenceInversionTest(unittest.TestCase):
                 )
             self.assertEqual(bcpack.decode(raw_bc1, 1, 8, history=rep_json), blk_bc1)
 
+    def test_reference_dds_does_not_confirm_tiled_padding(self):
+        # Only one BC6H block is in this 4x4 reference. The other 255 blocks
+        # of its 4 KiB tile are unknown, not exact zero-valued references.
+        lanes = [[0] * 512 for _ in range(16)]
+        lanes[1] = [15] * 512  # distance 255 -> initial entries 1..255
+        raw = encode_lanes(lanes, 6)
+        record = _pack_etpf(4, 4, 1, 0, 95, 4096, mode=2)
+        calibrator = calib.Bc6hCalibrator()
+        with tempfile.TemporaryDirectory() as temp:
+            pool = os.path.join(temp, "partial.ttpf")
+            reference = os.path.join(temp, "partial.dds")
+            _write_custom_rds5_pool(pool, [record], [(6, 4096, raw)])
+            _write_dx10_dds(reference, 95, 4, 4, [bytes(16)])
+            calib.apply_ref_dds(pool, 0, reference, {6: calibrator})
+        self.assertEqual(sum(calibrator.ref_ep_seen), 1)
+        self.assertEqual(sum(calibrator.ref_ix_seen), 1)
+        self.assertTrue(calibrator.ref_ep_seen[1])
+
+    def test_reference_dds_masks_scalar_and_bc7_padding(self):
+        for codec, dxgi in ((1, 71), (7, 98)):
+            with self.subTest(codec=codec):
+                if codec == 1:
+                    lanes = [[0] * 512 for _ in bcpack.LANE_WIDTHS[codec]]
+                    lanes[0] = [1] * 512  # -1 -> distance 255
+                    block = bytes(8)
+                    calibrator = calib.BcSimpleCalibrator(codec)
+                else:
+                    lanes = [[0] * 512 for _ in bcpack.LANE_WIDTHS[codec]]
+                    lanes[1] = [15] * 512
+                    tab = bptc.load_bc7()
+                    rank = tab["config"].index((6, 0, 0, 0))
+                    aa, bb = divmod(tab["rank_of"].index(rank), 16)
+                    lanes[15] = [aa, bb] * 256
+                    block = bytes([1 << 6]) + bytes(15)
+                    calibrator = calib.Bc7Calibrator()
+                raw = encode_lanes(lanes, codec)
+                record = _pack_etpf(4, 4, 1, 0, dxgi, 4096, mode=2)
+                with tempfile.TemporaryDirectory() as temp:
+                    pool = os.path.join(temp, "partial.ttpf")
+                    reference = os.path.join(temp, "partial.dds")
+                    _write_custom_rds5_pool(pool, [record], [(codec, 4096, raw)])
+                    _write_dx10_dds(reference, dxgi, 4, 4, [block])
+                    calib.apply_ref_dds(pool, 0, reference, {codec: calibrator})
+                self.assertEqual(calibrator.ref_blocks, 1)
+                if codec == 1:
+                    self.assertEqual(set(calibrator.confirmed), {1})
+
     def test_reference_dds_preserves_both_mips_in_one_tail_tile(self) -> None:
         width = height = 16
         fmt, codec = 71, 1
@@ -703,6 +750,15 @@ class ReferenceInversionTest(unittest.TestCase):
         self.assertEqual(calibrator.add_reference_chunk.call_count, 1)
         _, reference, _ = calibrator.add_reference_chunk.call_args.args
         self.assertEqual([ttpf.detile(layout, mip, reference) for mip in (first, second)], mips)
+        valid = calibrator.add_reference_chunk.call_args.kwargs["valid_blocks"]
+        expected = [False] * 256
+        for mip in (first, second):
+            for y in range(mip["blocks_h"]):
+                for x in range(mip["blocks_w"]):
+                    index = calib.tiled_offset(layout, mip, x, y) // 8
+                    if index < 256:
+                        expected[index] = True
+        self.assertEqual(valid, expected)
 
     def test_ref_dds_with_synthetic_ttpf_pool_and_ttpf_export(self):
         with tempfile.TemporaryDirectory() as tmp:

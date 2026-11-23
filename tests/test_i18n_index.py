@@ -1,9 +1,9 @@
-"""docs/i18n/README.md: one row per language, each pointing at a quickstart that exists.
+"""docs/i18n/README.md: one row per language, linked to a synced quickstart.
 
     python -I tests/test_i18n_index.py
 
-Reads only that one file; no game data. A synthetic table with a duplicate language code must be
-reported, so the check cannot pass by parsing nothing.
+Reads the index, docs/README.md, and linked quickstarts; no game data. Synthetic duplicate rows and
+sync markers are checked so these checks cannot pass by parsing nothing.
 """
 import os
 import re
@@ -18,6 +18,27 @@ ROW = re.compile(r"^\|\s*(?P<language>[^|]+?)\s*\|\s*(?P<file>[^|]+?)\s*\|\s*"
 LINK = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 CODE = re.compile(r"`([A-Za-z][A-Za-z0-9-]*)`")
 COMMIT = re.compile(r"^[0-9a-f]{7,40}$")
+SYNC_MARKER = re.compile(r"`([0-9a-f]{7,40})`")
+
+
+def sync_marker_matches(index_commit, quickstart_text):
+    """Whether the opening note has exactly the commit recorded in the index."""
+    lines = quickstart_text.splitlines()
+    heading = next((i for i, line in enumerate(lines) if line.startswith("# ")), None)
+    start = heading + 1 if heading is not None else 0
+    while start < len(lines) and not lines[start].strip():
+        start += 1
+    if start == len(lines):
+        return False
+
+    opening_note = []
+    for line in lines[start:]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            break
+        opening_note.append(line[1:].lstrip() if line.startswith(">") else line)
+
+    markers = SYNC_MARKER.findall("\n".join(opening_note))
+    return len(markers) == 1 and markers[0] == index_commit
 
 
 def parse(text):
@@ -73,6 +94,21 @@ class IndexTest(unittest.TestCase):
                 self.assertTrue(row["maintainer"].startswith("@"), row)
                 self.assertRegex(row["commit"], COMMIT.pattern, row)
 
+    def test_every_synced_commit_matches_its_quickstart_marker(self):
+        base = os.path.realpath(os.path.dirname(INDEX))
+        for row in self.read_rows():
+            path = os.path.realpath(os.path.join(base, row["file"]))
+            with self.subTest(language=row["code"]):
+                try:
+                    within_i18n = os.path.commonpath((base, path)) == base
+                except ValueError:
+                    within_i18n = False
+                self.assertTrue(within_i18n, f"{path} escapes the i18n directory")
+                with open(path, encoding="utf-8") as f:
+                    quickstart = f.read()
+                self.assertTrue(sync_marker_matches(row["commit"], quickstart),
+                                f"{path} sync marker does not match {row['commit']}")
+
     def test_docs_readme_names_every_language_once(self):
         codes = [row["code"] for row in self.read_rows()]
         with open(DOCS_README, encoding="utf-8") as f:
@@ -100,6 +136,23 @@ class IndexTest(unittest.TestCase):
                  "| 简体中文 | `zh-CN/quickstart.md` | `e7584c5` | `@a` |\n")
         with self.assertRaises(ValueError):
             parse(table)
+
+    def test_synced_commit_matches_quickstart_marker(self):
+        page = "> This guide is synced with commit `01234567`.\n"
+        self.assertTrue(sync_marker_matches("01234567", page))
+
+    def test_synced_commit_mismatch_is_detected(self):
+        page = "> This guide is synced with commit `01234567`.\n"
+        self.assertFalse(sync_marker_matches("89abcdef", page))
+
+    def test_hash_outside_opening_note_does_not_count_as_sync_marker(self):
+        page = ("> [!NOTE]\n"
+                "> This guide has no sync marker.\n"
+                "\n"
+                "Example output: `01234567`.\n"
+                "\n"
+                "## First section\n")
+        self.assertFalse(sync_marker_matches("01234567", page))
 
 
 if __name__ == "__main__":

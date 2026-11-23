@@ -15,6 +15,8 @@ valid FSSM blobs with the same code offset but different code sizes; the first i
 longer. `xdat_entries_all` preserves their order, `xdat_entries` keeps the previous last-wins mapping
 for compatibility, and `unpack()` defaults to the last payload (the one the existing corpus used) with
 `payload="first"` available for the XDAT-order/SCARAB choice. The CLI exposes `--payload`.
+`unpack_all()` returns every tag-0x0D payload in directory order, for callers that need both (a
+two-payload VS container holds its ES and VS hardware variants; `tools/pal_stages.py` reads them).
       PRIV part  = Xbox private metadata
 
 The FSSM blob is the precompiled RDNA2 program plus its metadata. It contains the s_endpgm (0xBF810000) that ends
@@ -89,22 +91,10 @@ def xdat_entries(dxil: bytes) -> dict:
     return {tag: payload for tag, payload in xdat_entries_all(dxil)}
 
 
-def unpack(dxbc: bytes, payload: str = "last"):
-    p = parts(dxbc)
-    dxil = p.get(b"DXIL", b"")
-    all_entries = xdat_entries_all(dxil)
-    ents = {tag: value for tag, value in all_entries}
-    blobs = [value for tag, value in all_entries if tag == 0x0D]
-    if not blobs:
-        return None, ents
-    if payload == "first":
-        blob = blobs[0]
-    elif payload == "last":
-        blob = blobs[-1]
-    else:
-        raise ValueError(f"payload must be 'first' or 'last', not {payload!r}")
+def _inflate_xbch(blob: bytes):
+    """Decompress one XBCH entry payload to its FSSM blob, or None when it is not XBCH."""
     if not blob or blob[:4] != b"XBCH":
-        return None, ents
+        return None
     stored = struct.unpack_from("<I", blob, 8)[0]
     unpacked = struct.unpack_from("<I", blob, 16)[0]
     if unpacked > MAX_FSSM_BYTES:
@@ -127,7 +117,37 @@ def unpack(dxbc: bytes, payload: str = "last"):
         raise ValueError("truncated FSSM magic or version")
     if data[:4] != b"FSSM":
         raise ValueError(f"invalid FSSM magic {data[:4]!r}")
-    return data, ents
+    return data
+
+
+def unpack_all(dxbc: bytes):
+    """Every tag-0x0D payload in directory order, decompressed to its FSSM blob."""
+    dxil = parts(dxbc).get(b"DXIL", b"")
+    out = []
+    for tag, value in xdat_entries_all(dxil):
+        if tag == 0x0D:
+            data = _inflate_xbch(value)
+            if data is None:
+                raise ValueError("a tag-0x0D XDAT entry is not an XBCH payload")
+            out.append(data)
+    return out
+
+
+def unpack(dxbc: bytes, payload: str = "last"):
+    p = parts(dxbc)
+    dxil = p.get(b"DXIL", b"")
+    all_entries = xdat_entries_all(dxil)
+    ents = {tag: value for tag, value in all_entries}
+    blobs = [value for tag, value in all_entries if tag == 0x0D]
+    if not blobs:
+        return None, ents
+    if payload == "first":
+        blob = blobs[0]
+    elif payload == "last":
+        blob = blobs[-1]
+    else:
+        raise ValueError(f"payload must be 'first' or 'last', not {payload!r}")
+    return _inflate_xbch(blob), ents
 
 
 def main(argv=None) -> int:
@@ -165,8 +185,12 @@ def main(argv=None) -> int:
         return 2
     rows, problems = [], Counter()
     for shader in shaders:
-        with open(shader, "rb") as f:
-            d = f.read()
+        try:
+            with open(shader, "rb") as f:
+                d = f.read()
+        except OSError as e:
+            print(f"ERROR: cannot read {shader}: {e.strerror or e}", file=sys.stderr)
+            return 2
         try:
             fssm, ents = unpack(d, payload=a.payload)
         except Exception as e:  # noqa: BLE001

@@ -40,7 +40,7 @@ methods are still open.
   to import or run nothing.
 - Runtime tests: `cmake -S runtime -B runtime/build`, `cmake --build runtime/build --config RelWithDebInfo`, then
   `ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure`. The CPU tests that need no game data are configured
-  on Windows. Tests that need the retail package read `LEONIDA_GAME_DIR` (and `LEONIDA_MOVIE` for the Bink
+  on Windows; Linux and macOS configure the portable subset (`gta6rt` and the shims are Windows-only). Tests that need the retail package read `LEONIDA_GAME_DIR` (and `LEONIDA_MOVIE` for the Bink
   decode test) in place and print `SKIP` when the variable is unset; never copy or commit those files.
 - Viewer streaming tests: `node --test tests/test_viewer_streaming.cjs` (Node.js 22+, CI tests 24 LTS; no packages,
   browser, network or game data). These execute the viewer streaming code with a synthetic loader and clock.
@@ -49,10 +49,10 @@ methods are still open.
 - Tool checks: `python -m compileall -q make_game.py tools tests`. The optional
   `vk_pipeline_check <spirv dir> [cache.bin] [--jobs N]` creates a module (and, for compute shaders, a
   pipeline) for every translated shader and reports failures plus the saved cache path.
-- GPU tests are small hand-written RDNA2 programs in `runtime/test/shaders`. `build.py` there turns them into
-  SPIR-V (it needs `llvm-mc`, so WSL or a Linux container), and `check.py` runs them on your GPU and compares
-  the results. A new test gets its expected values in the comment at its top and a check in `check.py`.
-  [docs/testing.md](docs/testing.md) has the setup per OS and the problems testers have run into.
+- GPU tests are small hand-written RDNA2 programs in `runtime/test/shaders`. `build.py` turns them into SPIR-V
+  using `llvm-mc` with the AMDGPU target (LLVM 21+). `check.py` runs them on your GPU and compares the results.
+  A new test gets its expected values in the comment at its top and a check in `check.py`.
+  [docs/testing.md](docs/testing.md) covers setup per OS, including native Windows options, and known problems.
 - Say what you tested and on which GPU in the pull request.
 - Run the translator tests with `python -m unittest discover -s tests/semantic -v` (see `tests/semantic/README.md`). A new
   translator rule should come with a small hand-written `.asm` fixture and its expected output words.

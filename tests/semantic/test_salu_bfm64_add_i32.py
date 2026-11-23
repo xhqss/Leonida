@@ -67,6 +67,10 @@ ADD_BOUNDARY_CASES = [
     (0x80000000, 0x7FFFFFFF, "opposite signs: INT32_MIN + INT32_MAX"),
     (0x7FFFFFFF, 0x80000000, "opposite signs: INT32_MAX + INT32_MIN"),
     (0x12345678, 0xEDCBA988, "opposite signs cancelling to zero"),
+    (0x40000000, 0x3FFFFFFF, "exactly INT32_MAX, no overflow"),
+    (0xC0000000, 0xC0000000, "exactly INT32_MIN from two negatives, no overflow"),
+    (0x80000001, 0xFFFFFFFF, "(INT32_MIN + 1) + (-1) = INT32_MIN, no overflow"),
+    (0x80000000, 1, "INT32_MIN + 1, no overflow"),
 ]
 
 
@@ -170,6 +174,31 @@ class BfmB64Tests(unittest.TestCase):
                 got_mixed, _ = run_bfm_b64([f"s_mov_b32 s2, {size:#x}"], "s2", o_lit, scc_in=0)
                 self.assertEqual(got_mixed, ref_bfm_b64(size, offset))
 
+    def test_vcc_and_null_destinations_wave64(self):
+        # D = vcc (read back as a lane mask by v_cndmask_b32_e32); D = null discards the mask and keeps SCC.
+        for size, offset in ((8, 28), (20, 48), (32, 0)):
+            for scc_in in (0, 1):
+                with self.subTest(size=size, offset=offset, scc_in=scc_in):
+                    spv = support.translate_lines("ps_salu_bfm64_vcc", [
+                        "s_mov_b64 exec, -1",
+                        "s_mov_b64 vcc, 0",
+                        f"s_bfm_b64 vcc, {size}, {offset}",
+                        f"s_mov_b32 s4, {scc_in}",
+                        "s_cmp_eq_u32 s4, 1",
+                        "s_bfm_b64 null, 63, 1",
+                        "s_cselect_b32 s5, 1, 0",
+                        "v_cndmask_b32_e32 v0, 0, 1, vcc",
+                        "v_mov_b32 v1, s5",
+                        "v_mov_b32 v2, 0",
+                        "v_mov_b32 v3, 0",
+                        "exp mrt0 v0, v1, v2, v3 done vm",
+                        "s_endpgm",
+                    ])
+                    outs = wi.run_wave(spv, wave=64)["outputs"]
+                    mask = sum(out["%out_mrt0"][0] << lane for lane, out in enumerate(outs))
+                    self.assertEqual(mask, ref_bfm_b64(size, offset))
+                    self.assertEqual({out["%out_mrt0"][1] for out in outs}, {scc_in})
+
     def test_seeded_wave64(self):
         rng = random.Random(0xBF64)
         for _ in range(20):
@@ -225,6 +254,27 @@ class AddI32Tests(unittest.TestCase):
             run_add_op("s_add_i32", ["s_mov_b32 s2, 0xffffffff"], "s2", "1", scc_in=1),
             (0, 0),
         )
+
+    def test_aliasing_m0_and_null_destination(self):
+        cases = [
+            # (lines, want (D, SCC)); D is s0 afterwards, SCC the last s_add_i32's.
+            (["s_mov_b32 s0, 0x40000000", "s_add_i32 s0, s0, s0"], (0x80000000, 1)),      # D == S0 == S1
+            (["s_mov_b32 s0, 0x80000000", "s_mov_b32 s1, -1", "s_add_i32 s0, s1, s0"], (0x7FFFFFFF, 1)),  # D == S1
+            (["s_mov_b32 s0, 0x80000000", "s_mov_b32 m0, -1", "s_add_i32 s0, s0, m0"], (0x7FFFFFFF, 1)),  # M0 source
+            # null D: the sum is dropped but SCC is still written (0 after an overflowing add left it 1).
+            (["s_mov_b32 s0, 5", "s_add_i32 s2, 0x7fffffff, 1", "s_add_i32 null, -1, 1"], (5, 0)),
+            (["s_mov_b32 s0, 5", "s_add_i32 s2, -1, 1", "s_add_i32 null, 0x80000000, -1"], (5, 1)),
+        ]
+        for body, want in cases:
+            with self.subTest(body=body[-1]):
+                spv = support.translate_lines("ps_salu_add_alias", body + [
+                    "s_cselect_b32 s1, 1, 0",
+                    "v_mov_b32 v0, s0",
+                    "v_mov_b32 v1, s1",
+                    "exp mrt0 v0, v1, v0, v0 done vm",
+                    "s_endpgm",
+                ])
+                self.assertEqual(tuple(si.run_fragment(spv)["%out_mrt0"][:2]), want)
 
     def test_seeded_random(self):
         rng = random.Random(0xADD32)

@@ -84,6 +84,30 @@ class TestChecks(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(C.main([paths[0]]), 2)
 
+    def test_json_must_not_overwrite_input_or_buffers(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        with tempfile.TemporaryDirectory() as d:
+            paths = [os.path.join(d, n) for n in ("in.bin", "vb.bin", "ib.bin", "r.json")]
+            for p, data in zip(paths, (src, VB, IB)):
+                with open(p, "wb") as f:
+                    f.write(data)
+            # --json names the dehydrated input itself
+            for target in (paths[0], paths[1], paths[2]):
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    rc = C.main([paths[0], "--geom", paths[1] + "," + paths[2], "--json", target])
+                self.assertEqual(rc, 2)
+                self.assertIn("must not overwrite", err.getvalue())
+            # a hard link to the input also counts
+            link = os.path.join(d, "link.json")
+            try:
+                os.link(paths[0], link)
+            except (OSError, NotImplementedError, AttributeError) as e:
+                self.skipTest(f"hard links unavailable: {e}")
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = C.main([paths[0], "--geom", paths[1] + "," + paths[2], "--json", link])
+            self.assertEqual(rc, 2)
+            self.assertIn("must not overwrite", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

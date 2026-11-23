@@ -159,7 +159,7 @@ class RigDictionaryTest(unittest.TestCase):
     def test_cli_writes_counts_only(self):
         out = os.path.join(self.tmp.name, "out.json")
         r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", self.rigs],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)
@@ -182,7 +182,7 @@ class ReportPathTests(unittest.TestCase):
         write_rpf(self.rpf, streams)
 
     def run_tool(self, *args):
-        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True, errors="replace")
 
     def test_out_must_not_overwrite_the_archive(self):
         with open(self.rpf, "rb") as f:

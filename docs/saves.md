@@ -81,7 +81,26 @@ The checksum at 0x160 matched none of these:
 It's left as **open**. Copy the header verbatim whenever the payload is unchanged.
 
 Payloads: settings (kind 2) are hash-keyed JSON text with tabs and CRLF **(confirmed)**. The profile record (kind 3)
-is 1,644 bytes, only the first 112 non-zero, starting `u32 10, u32 3`. It isn't decoded yet.
+is 1,644 bytes (first 112 bytes non-zero, starting `u32 10, u32 3`, followed by 1,532 bytes of zero padding) **(confirmed)**.
+
+## Profile record (kind 3, confirmed)
+
+```
+0x000 u32         version = 10                                         confirmed
+0x004 u32         kind = 3                                             confirmed
+0x008 u32         subversion / format tag                              likely
+0x00C u32         flags                                                likely
+0x010 u64         account / profile identifier                         likely
+0x018 u32[22]     profile settings & attributes (first 112 bytes non-zero)
+0x070 byte[1532]  zero padding (reserved area)                         confirmed
+```
+
+The profile record (kind 3) has a fixed 1,644-byte payload. Only the first 112 bytes (0x70) contain active profile
+fields, starting with format version 10 and kind 3; the remaining 1,532 bytes (0x5FC) are zero padding reserved for
+future profile expansion and cloud sync.
+
+`tools/saves.py info` reports the profile version, active bytes and verifies the zero-padding boundary;
+`tools/saves.py extract` writes `profile.json`.
 
 ## SLAYER1: packed copy (not decoded)
 

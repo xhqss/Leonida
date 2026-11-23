@@ -21,10 +21,14 @@
 // Contract (docs/design.md): push constants = s0..s31 (128 bytes), heap base lo/hi, code base lo/hi (144 bytes).
 // LEONIDA_PC_TAIL_UBO=1 (modules from rdna2spirv.py --pc-tail-ubo): s0..s31 only, the rest at set 1 (vk_pc_tail.h).
 // The output buffer is the "heap": Xbox VA 0 maps to its device address, and s[0:3] hold a V# with base 0.
+// LEONIDA_VK_VALIDATION=1 (env): run under VK_LAYER_KHRONOS_validation; a validation error fails the run (exit 1),
+// so scripts/run_gpu_tests.py reports it. The layer's own variables still apply, for example
+// VK_KHRONOS_VALIDATION_GPUAV_ENABLE=1 for GPU-assisted validation of what the translated shader does.
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
+#include "vk_validation.h"
 #include "cs_wave_probe_spv.h"
 
 #include <cctype>
@@ -36,6 +40,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <string>
 #include <vector>
 
 static PFN_vkGetInstanceProcAddr gipa;
@@ -104,7 +109,7 @@ static bool parse_user_sgprs(const char* s, uint32_t* pc) {
     return true;
 }
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
     const bool require_wave64 = argc == 5 && !std::strcmp(argv[4], "--require-wave64");
     if (argc != 4 && !require_wave64) {
         std::fprintf(stderr, "usage: vk_compute_test cs.spv groups expect [--require-wave64]\n");
@@ -121,7 +126,14 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "workgroup_yz expects a 2x3x4 dispatch\n");
         return 2;
     }
-    const uint32_t groups = workgroup_yz ? 2u : uint32_t(atoi(argv[2]));
+    uint32_t groups = 2;
+    if (!workgroup_yz) {
+        const char* count = argv[2];
+        if (!parse_u32(count, groups) || *count || !groups) {
+            std::fprintf(stderr, "groups: expected a positive 32-bit workgroup count, got \"%s\"\n", argv[2]);
+            return 2;
+        }
+    }
     const uint32_t groups_y = workgroup_yz ? 3u : 1u, groups_z = workgroup_yz ? 4u : 1u;
     const uint32_t yz_bins = (groups_y + 1) * (groups_z + 1);
     const uint32_t origins = workgroup_yz ? groups * groups_y * groups_z : 0;
@@ -136,6 +148,44 @@ int main(int argc, char** argv) {
             return 2;
         }
         heap_init.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    // VKC_HEAP_FILE=<path>[@<offset>]: copy a file into the heap so a shader can read a buffer (a BVH, its
+    // descriptor blocks and the records) without the test hard-coding it. The offset is a decimal or 0x hex byte
+    // offset (no octal, sign or spaces); addresses the shader sees are Xbox VAs, i.e. heap offsets, as for every
+    // other heap buffer here. Two overlaps to keep in mind: "bvh" mode writes its synthetic scene after this copy,
+    // so a file at 0x100..0x264 is overwritten there, and the output V# starts at heap offset 0, so a file at @0
+    // shares bytes with the dispatch's output.
+    const char* heap_file_env = std::getenv("VKC_HEAP_FILE");
+    std::string heap_file_path;
+    uint64_t heap_file_at = 0;
+    std::vector<char> heap_file;
+    if (heap_file_env) {
+        const std::string spec(heap_file_env);
+        const std::size_t at_sign = spec.rfind('@');
+        heap_file_path = spec.substr(0, at_sign);
+        if (at_sign != std::string::npos) {
+            const char* digits = spec.c_str() + at_sign + 1;
+            const bool hex = digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X');
+            const char* body = hex ? digits + 2 : digits;
+            const auto first = static_cast<unsigned char>(*body);
+            if (!(hex ? std::isxdigit(first) : std::isdigit(first))) {
+                std::fprintf(stderr, "VKC_HEAP_FILE: expected <path>[@<offset>], got \"%s\"\n", heap_file_env);
+                return 2;
+            }
+            char* end = nullptr;
+            const unsigned long long parsed = std::strtoull(body, &end, hex ? 16 : 10);
+            if (end == body || *end || parsed > (1ull << 32) || heap_file_path.empty()) {
+                std::fprintf(stderr, "VKC_HEAP_FILE: expected <path>[@<offset>], got \"%s\"\n", heap_file_env);
+                return 2;
+            }
+            heap_file_at = parsed;
+        }
+        std::ifstream hf(heap_file_path, std::ios::binary);
+        heap_file.assign(std::istreambuf_iterator<char>(hf), {});
+        if (heap_file.empty()) {
+            std::fprintf(stderr, "VKC_HEAP_FILE: cannot read %s\n", heap_file_path.c_str());
+            return 2;
+        }
     }
     uint32_t out_words = 0;
     if (out_words_env) {
@@ -160,7 +210,10 @@ int main(int argc, char** argv) {
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+    leonida::vk_test::OptInValidation validation;   // LEONIDA_VK_VALIDATION
+    if (!validation.prepare(gipa, ici)) return 1;
     CHECK(vkCreateInstance(&ici, nullptr, &inst));
+    CHECK(validation.attach(gipa, inst));
     LOADI(vkEnumeratePhysicalDevices); LOADI(vkGetPhysicalDeviceProperties); LOADI(vkCreateDevice);
     LOADI(vkGetPhysicalDeviceProperties2); LOADI(vkGetPhysicalDeviceFeatures2);
     LOADI(vkGetPhysicalDeviceQueueFamilyProperties); LOADI(vkGetDeviceProcAddr);
@@ -178,13 +231,20 @@ int main(int argc, char** argv) {
         return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
+    const uint32_t max_groups_x = props.limits.maxComputeWorkGroupCount[0];
+    if (groups > max_groups_x) {
+        std::fprintf(stderr, "groups: %u exceeds the X dispatch limit of %u on %s\n",
+                     groups, max_groups_x, props.deviceName);
+        return 2;
+    }
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
     VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     subgroup.pNext = &sgProps;
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     props2.pNext = &subgroup;
     vkGetPhysicalDeviceProperties2(pd, &props2);
-    std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
+    std::fprintf(stderr, "device: %s (subgroup %u..%u)%s\n", props.deviceName, sgProps.minSubgroupSize,
+                 sgProps.maxSubgroupSize, validation.enabled() ? " (validation on)" : "");
     uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn);
@@ -260,6 +320,11 @@ int main(int argc, char** argv) {
     // Output buffer = heap. Host-visible so the result can be read back directly.
     VkDeviceSize words = workgroup_yz ? yz_bins * (1 + origins) : VkDeviceSize(groups) * 64;
     if (out_words > words) words = out_words;
+    // The heap file may need more than the dispatch's own output words; round its end up to a word.
+    if (!heap_file.empty()) {
+        const VkDeviceSize need = VkDeviceSize(heap_file_at + heap_file.size() + 3) / 4;
+        if (need > words) words = need;
+    }
     // "bvh" writes its nodes at heap offsets 0x100 to 0x264 below, past the 256 bytes one group's 64 words give: the
     // shader then read them through the device address outside the buffer (VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819).
     const bool bvh = !std::strcmp(argv[3], "bvh");
@@ -291,6 +356,11 @@ int main(int argc, char** argv) {
             return 2;
         }
         if (!heap_init.empty()) std::memcpy(map, heap_init.data(), heap_init.size());
+    }
+    if (!heap_file.empty()) {
+        std::memcpy(static_cast<char*>(map) + heap_file_at, heap_file.data(), heap_file.size());
+        std::printf("heap file: %s at 0x%llx (%zu bytes)\n", heap_file_path.c_str(),
+                    static_cast<unsigned long long>(heap_file_at), heap_file.size());
     }
     if (!std::strcmp(argv[3], "bvh")) {
         // AMD-format BVH in the heap (runtime/test/shaders/cs_bvh.asm): box32 root at 0x100 whose children are a
@@ -581,4 +651,9 @@ int main(int argc, char** argv) {
     if (bad) std::printf(" (first at %u: got 0x%08x)", first_bad, out[first_bad]);
     std::printf("\nout[0..7] = %u %u %u %u %u %u %u %u\n", out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
     return bad ? 1 : 0;
+}
+
+int main(int argc, char** argv) {
+    // GPU-assisted validation reports what the shader did when the queue finishes, after the words were judged.
+    return leonida::vk_test::OptInValidation::exit_status(run(argc, argv));
 }

@@ -489,7 +489,11 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
     }
     EXPECT(kind_references.resolve_queries({b, occ, 6, 3, dst_id, 184}));
     EXPECT(kind_references.close());
-    const CommandList* overlap_lists[] = {&crossing_stats, &stats_references, &kind_overlap, &kind_references};
+    // The two statistics lists are recorded and closed only where the device has the feature, and execute()
+    // refuses a list that is not closed (list_open): MoltenVK has no pipelineStatisticsQuery.
+    std::vector<const CommandList*> overlap_lists;
+    if (d.pipeline_statistics_query) overlap_lists = {&crossing_stats, &stats_references};
+    overlap_lists.insert(overlap_lists.end(), {&kind_overlap, &kind_references});
     EXPECT(queue.execute(overlap_lists) == ReplayResult::success);
     EXPECT(!schedule.overflow && schedule.next == schedule.extents.size());
     EXPECT(gate.signal(1));
@@ -576,22 +580,29 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
 
 } // namespace
 
-// vk_overlapping_occlusion_test <vert.spv> <frag.spv> [--bisect [--gated] [--no-draw] [--no-resolve] [phase...]]
+// vk_overlapping_occlusion_test <vert.spv> <frag.spv> [--no-statistics]
+//                               [--bisect [--gated] [--no-draw] [--no-resolve] [phase...]]
+// --no-statistics runs the test as a device without pipelineStatisticsQuery does (MoltenVK): no statistics pool,
+// no statistics lists. It makes that path testable on a device that has the feature.
 int main(int argc, char** argv) {
     EXPECT(argc >= 3);
     Bisect bisect;
+    bool no_statistics = false;
     for (int i = 3; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--bisect") == 0) bisect.enabled = true;
+        if (std::strcmp(argv[i], "--no-statistics") == 0) no_statistics = true;
+        else if (std::strcmp(argv[i], "--bisect") == 0) bisect.enabled = true;
         else if (std::strcmp(argv[i], "--gated") == 0) bisect.gated = true;
         else if (std::strcmp(argv[i], "--no-draw") == 0) bisect.no_draw = true;
         else if (std::strcmp(argv[i], "--no-resolve") == 0) bisect.no_resolve = true;
         else bisect.phases.emplace_back(argv[i]);
     }
-    EXPECT(argc == 3 || bisect.enabled);
+    EXPECT(argc == 3 + (no_statistics ? 1 : 0) || bisect.enabled);
     vktest::Device device;
     const auto status = device.initialize();
     if (status == vktest::DeviceStatus::unavailable) return 77;
     EXPECT(status == vktest::DeviceStatus::ready);
+    if (no_statistics) device.pipeline_statistics_query = false;
+    std::printf("pipeline statistics: %s\n", device.pipeline_statistics_query ? "checked" : "not checked");
     const int result = run(device, argv[1], argv[2], bisect);
     EXPECT(device.validation_errors() == 0);
     return result;

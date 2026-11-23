@@ -11,6 +11,13 @@ copies and validation branches of the functions below. Addresses are RVAs (image
 the DLL is reproduced here except type names that its own exported symbols carry; check a claim by opening the
 function at its RVA in your own copy.
 
+**Errors are thrown, not returned.** Every rejection below in the build and prebuild-info exports stores
+`E_INVALIDARG` and throws it as an MSVC C++ exception through the `_CxxThrowException` thunk at `0x2302e`, and those
+exports return `void`: the `Dest` alignment check in `0x216a0` (branch at `0x217a3`, throw at `0x21876`), the
+`Inputs.Type` check in `0xcc00` (branch at `0xce0c`, throw at `0xd578`) and the postbuild-type check in `0xe6a0` (§4).
+Only `ValidateRehydrateAccelerationStructureBuildDesc` (`0x21a00`) returns `E_INVALIDARG` as an `HRESULT`. Checked
+with `llvm-objdump` on the 1.0.2.1 file (RT-155).
+
 | RVA | Function | What it shows |
 |---|---|---|
 | `0x216a0` | `BuildRaytracingAccelerationStructureBatched2X` (export) | Element stride `0x50`; `Dest` alignment check; postbuild loop |
@@ -28,9 +35,9 @@ and pointer at `+0x30`/`+0x38`, zeroes `+0x40..+0x50` and calls the batched expo
 
 | Offset | Size | Field | Evidence |
 |---|---|---|---|
-| `0x00` | 8 | `DestAccelerationStructureData` (GPU VA) | `0x216a0`: when postbuild info is requested, a nonzero low byte is rejected (`E_INVALIDARG`) as not 256-byte aligned |
+| `0x00` | 8 | `DestAccelerationStructureData` (GPU VA) | `0x216a0`: when postbuild info is requested, a nonzero low byte throws `E_INVALIDARG` (not 256-byte aligned) |
 | `0x08` | 24 | `Inputs` (public `D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS`) | `0x21880` copies a caller's `INPUTS` here (3 words) |
-| `0x08` | 4 | `Inputs.Type` | `0xcc00`: 0 and 1 accepted, anything else rejected (`E_INVALIDARG`) |
+| `0x08` | 4 | `Inputs.Type` | `0xcc00`: 0 and 1 accepted, anything else throws `E_INVALIDARG` |
 | `0x0c` | 4 | `Inputs.Flags` | `0xcc00` tests bits 0 (`ALLOW_UPDATE`), 2 (`PREFER_FAST_TRACE`), 4 (`MINIMIZE_MEMORY`), 5 (`PERFORM_UPDATE`) |
 | `0x10` | 16 | `Inputs.NumDescs`, `DescsLayout`, `InstanceDescs`/`pGeometryDescs` | passed as `&desc + 8` to the per-type counters |
 | `0x20` | 8 | `SourceAccelerationStructureData` | copied from the public desc by `0x21610` |
@@ -87,7 +94,7 @@ Default for type 0's `0x08` value when it is negative (or when there is no type-
 | 0 `COMPACTED_SIZE`, 3 `CURRENT_SIZE` | written by one handler |
 | 2 `SERIALIZATION` | written by another handler |
 | 1 `TOOLS_VISUALIZATION` and other values | ignored, no error |
-| `0x10` `D3D12XBOX_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_OFFLINE_STATISTICS` | rejected with `E_INVALIDARG` by `0xe6a0` before any work, for every build: the DLL only supports it for offline BVH builds |
+| `0x10` `D3D12XBOX_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_OFFLINE_STATISTICS` | thrown as `E_INVALIDARG` by `0xe6a0` before any work, for every build: the DLL only supports it for offline BVH builds |
 
 **The offline statistics layout is not recoverable from this DLL**: it never writes them. It would have to come from
 the offline builder that produces dehydrated BVHs, which is not in the package. A runtime that implements the builder

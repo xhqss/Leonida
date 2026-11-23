@@ -49,8 +49,29 @@ if (-not ((Test-Path $cmake) -and (Test-Path $ninja))) {
 
 $src = Join-Path $Temp "src"
 $out = Join-Path $Temp "build"
+function Remove-DirectoryRobust([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    # Strip read-only attributes on nested files and folders so Windows allows deletion
+    Get-ChildItem -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+            if ($_.Attributes -band [System.IO.FileAttributes]::ReadOnly) {
+                $_.Attributes = $_.Attributes -bxor [System.IO.FileAttributes]::ReadOnly
+            }
+        } catch {}
+    }
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+            return
+        } catch {
+            Start-Sleep -Milliseconds (100 * $attempt)
+        }
+    }
+    cmd.exe /c "rmdir /s /q `"$path`"" 2>$null
+}
+
 if (-not (Test-Path (Join-Path $src "llvm\CMakeLists.txt"))) {
-    if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+    if (Test-Path -LiteralPath $src) { Remove-DirectoryRobust $src }
     New-Item -ItemType Directory -Force $Temp | Out-Null
     # core.longpaths: some llvm/docs paths are about 150 characters, so with a -Temp of about 100 characters the
     # sparse checkout fails with "Filename too long" (Windows' 260-character limit). Set in the clone's config only.
@@ -125,10 +146,9 @@ New-Item -ItemType Directory -Force $Dest | Out-Null
 $final = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath((Join-Path $Dest "llvm-mc.exe"))
 Copy-Item -Force $exe $final
 if (-not $Keep) {
-    try {
-        Remove-Item -LiteralPath $Temp -Recurse -Force
-    } catch {
-        Write-Warning "Installed $final, but cleanup of '$Temp' failed: $($_.Exception.Message)"
+    Remove-DirectoryRobust $Temp
+    if (Test-Path -LiteralPath $Temp) {
+        Write-Warning "Installed $final, but cleanup of '$Temp' failed."
     }
 }
 if (-not $NoEnv) {

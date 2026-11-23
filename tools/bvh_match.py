@@ -40,10 +40,12 @@ import json
 import os
 import struct
 import sys
+from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bvh_geometry_check as C  # noqa: E402
 import bvh_rehydrate as R  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 INSTANCE_TRANSFORM_OFFSET = 0x50
 SKIP_SHADERS_ENV = "BVH_SKIP_SHADERS"
@@ -80,19 +82,38 @@ def embeddings(signature, counts, cap, ordered=True):
 
     ordered: the picked indices must increase (a prefix is the common case); otherwise any order is allowed.
     """
+    if cap <= 0 or len(signature) > len(counts):
+        return []
+
+    latest = [len(counts) - 1] * len(signature)
+    if ordered:
+        # Match the signature backwards once. An index later than latest[i] leaves
+        # too few matching geometries for the rest of the signature.
+        k = len(counts) - 1
+        for i in reversed(range(len(signature))):
+            while k >= 0 and counts[k] != signature[i]:
+                k -= 1
+            if k < 0:
+                return []
+            latest[i] = k
+            k -= 1
+    elif Counter(signature) - Counter(counts):
+        # In any order, each triangle count just needs enough distinct geometries.
+        return []
+
     out = []
 
     def walk(i, j, acc):
-        if len(out) >= cap:
-            return
         if i == len(signature):
             out.append(list(acc))
             return
-        for k in (range(j, len(counts)) if ordered else range(len(counts))):
-            if counts[k] == signature[i] and k not in acc:
+        for k in range(j, latest[i] + 1):
+            if counts[k] == signature[i] and (ordered or k not in acc):
                 acc.append(k)
-                walk(i + 1, k + 1, acc)
+                walk(i + 1, k + 1 if ordered else 0, acc)
                 acc.pop()
+                if len(out) == cap:
+                    return
 
     walk(0, 0, [])
     return out
@@ -197,6 +218,11 @@ def score(src, candidate, groups, transform, header_offset=0):
     return C.check(src, geometries, header_offset)
 
 
+def export_buffer_names(count):
+    """The (vertex, index) buffer names write_export gives each of `count` matched geometries."""
+    return [("g%d_f3.bin" % i, "g%d_tri.bin" % i) for i in range(count)]
+
+
 def write_export(directory, candidate, groups, transform):
     """Write the matched geometries as float3/uint32 buffers plus the export.json tools/bvh_rehydrate.py is given.
 
@@ -205,10 +231,11 @@ def write_export(directory, candidate, groups, transform):
     """
     os.makedirs(directory, exist_ok=True)
     rows = []
+    names = export_buffer_names(len(candidate["used"]))
     for k in candidate["used"]:
         mesh = candidate["kept"][k]
         geometry = build_geometry(groups[mesh[0]])
-        vb, ib = "g%d_f3.bin" % len(rows), "g%d_tri.bin" % len(rows)
+        vb, ib = names[len(rows)]
         with open(os.path.join(directory, vb), "wb") as f:
             f.write(geometry.vertices)
         with open(os.path.join(directory, ib), "wb") as f:
@@ -250,6 +277,17 @@ def main(argv=None):
                                                   "and an export.json for tools/bvh_rehydrate.py")
     ap.add_argument("--json", help="write the report here")
     a = ap.parse_args(argv)
+    if a.json:
+        # The report is written last, after the inputs have been read, so an aliased input would silently
+        # be replaced by it. Refuse the alias before any input is opened, as the other report tools do.
+        for what, other in (("the dehydrated input", a.dehydrated), ("the manifest", a.manifest),
+                            ("the --descriptor input", a.descriptor)):
+            if other and same_report_path(a.json, other):
+                print("error: --json would overwrite %s: %s" % (what, other), file=sys.stderr)
+                return 2
+        if a.write and same_report_path(a.json, os.path.join(a.write, "export.json")):
+            print("error: --json would overwrite --write's export.json: %s" % a.json, file=sys.stderr)
+            return 2
     try:
         with open(a.dehydrated, "rb") as f:
             src = f.read()
@@ -314,19 +352,31 @@ def main(argv=None):
             print("nothing written: no candidate is consistent")
         else:
             match = consistent[0][3]
+            if a.json:
+                # The report is written after the export, so it must not land on one of the buffers the
+                # export is about to write either. Their names depend on the match, hence the check here.
+                for vb, ib in export_buffer_names(len(match["used"])):
+                    for name in (vb, ib):
+                        if same_report_path(a.json, os.path.join(a.write, name)):
+                            print("error: --json would overwrite --write's %s: %s" % (name, a.json), file=sys.stderr)
+                            return 2
             rows = write_export(a.write, match, groups[os.path.join(models_dir, match["item"]["File"])], transform)
             print("wrote %d geometries to %s%s" % (len(rows), a.write,
                   "; pass the transform in export.json to bvh_rehydrate.py with --transform" if transform else ""))
     if a.json:
         match = consistent[0][3] if consistent else None
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"signature": signature, "consistent": bool(consistent), "scored": len(results),
-                       "matched": None if match is None else {
-                           "offset": match["item"]["Offset"], "model": match["model"],
-                           "geometry": [match["kept"][k][2] for k in match["used"]],
-                           "triangles": [match["kept"][k][3] for k in match["used"]],
-                           "name": match["item"]["Name"] if a.names else None}},
-                      f, indent=1)
+        try:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"signature": signature, "consistent": bool(consistent), "scored": len(results),
+                           "matched": None if match is None else {
+                               "offset": match["item"]["Offset"], "model": match["model"],
+                               "geometry": [match["kept"][k][2] for k in match["used"]],
+                               "triangles": [match["kept"][k][3] for k in match["used"]],
+                               "name": match["item"]["Name"] if a.names else None}},
+                          f, indent=1)
+        except OSError as e:
+            print("error: cannot write %s: %s" % (a.json, e.strerror or e), file=sys.stderr)
+            return 2
     return 0 if consistent else 1
 
 

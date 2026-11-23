@@ -15,6 +15,10 @@ manifest. The decoded ``model.json`` layout written by the local pack exporter i
     drawable.models[]         bone_palette[] (local bone count)
     meshes[]                  vertex_count, triangle_count, skinned, skin_influences, bones
 
+The local exporter does not write an index count, so the index column and total normally stay
+unknown. An input that supplies ``index_count`` (or ``indices``/``IndexCount``) is counted; the
+field is optional, not part of the decoded layout above.
+
 An ``rpf9dump models`` manifest (``Items[]`` with ``Verts``, ``Tris``, ``IsFragment``,
 ``HasBoneBindings`` and ``Materials[]``) and a simple ``models[]`` list of model paths or inline
 model objects are also accepted. An ``rpf9dump models`` manifest has only ``HasBoneBindings``, not
@@ -87,6 +91,8 @@ def _hash(value, digits: int):
         text = text[2:]
     if not text or len(text) > digits:
         return None
+    if any(ch not in "0123456789abcdefABCDEF" for ch in text):
+        return None
     try:
         number = int(text, 16)
     except ValueError:
@@ -121,9 +127,15 @@ def count(value):
 
 
 # -------------------------------------------------------------------- reading
+def _walk_error(exc: OSError):
+    # os.walk skips a directory it cannot list unless onerror raises; a census must not report an
+    # incomplete scan as complete. main() turns the OSError into one ERROR line and exit 2.
+    raise exc
+
+
 def model_json_files(directory: str):
-    """Every nested model.json, in a stable order."""
-    for base, dirs, files in os.walk(directory):
+    """Every nested model.json, in a stable order. An unlistable sub-folder raises OSError."""
+    for base, dirs, files in os.walk(directory, onerror=_walk_error):
         dirs.sort()
         for name in sorted(files):
             if name.lower() == MODEL_JSON:
@@ -870,7 +882,8 @@ def main(argv=None) -> int:
     try:
         sources = list(input_files(args.target))
     except (OSError, ValueError) as exc:
-        print(f"ERROR: cannot read {args.target}: {getattr(exc, 'strerror', None) or exc}",
+        print(f"ERROR: cannot read {getattr(exc, 'filename', None) or args.target}: "
+              f"{getattr(exc, 'strerror', None) or exc}",
               file=sys.stderr)
         return 2
     for flag, path in (("--json", args.json), ("--csv", args.csv)):
@@ -888,19 +901,26 @@ def main(argv=None) -> int:
     try:
         rows = list(load_rows(args.target))
     except OSError as exc:
-        print(f"ERROR: cannot read {args.target}: {getattr(exc, 'strerror', None) or exc}",
+        print(f"ERROR: cannot read {getattr(exc, 'filename', None) or args.target}: "
+              f"{getattr(exc, 'strerror', None) or exc}",
               file=sys.stderr)
         return 2
     rows.sort(key=lambda row: (row["name"].lower(), row["source"].lower()))
 
     summary = summarize(rows)
+    reports = []
+    for path, writer, values in ((args.csv, write_csv, (rows,)),
+                                 (args.json, write_json, (summary, rows))):
+        if path:
+            try:
+                writer(path, *values)
+            except OSError as exc:
+                print(f"ERROR: cannot write {path}: {exc.strerror or exc}", file=sys.stderr)
+                return 2
+            reports.append(path)
     print_report(summary, rows)
-    if args.csv:
-        write_csv(args.csv, rows)
-        print("wrote", args.csv)
-    if args.json:
-        write_json(args.json, summary, rows)
-        print("wrote", args.json)
+    for path in reports:
+        print("wrote", path)
     return 0
 
 

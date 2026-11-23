@@ -88,6 +88,65 @@ class FuzzerWorkIsolation(unittest.TestCase):
                 self.assertIn(str(runs[0]), output.getvalue())
                 self.assertIn("synthetic failure", output.getvalue())
 
+    def test_existing_file_as_work_reports_one_error(self):
+        for module, extra in ((lds_fuzz, []), (valu_fuzz, ["--family", "f16"])):
+            with self.subTest(fuzzer=module.__name__), tempfile.TemporaryDirectory() as tmp:
+                parent = Path(tmp) / "not-a-directory"
+                parent.write_bytes(b"caller data")
+                script = Path(__file__).resolve().parents[1] / "tools" / (module.__name__ + ".py")
+                cmd = [sys.executable, "-I", str(script), "--programs", "1", "--wave", "32", "--work", str(parent), *extra]
+                result = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("ERROR: cannot create work directory", result.stderr)
+                self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(parent.read_bytes(), b"caller data")
+
+    def test_work_error_closes_an_open_hardware_oracle(self):
+        from hw_oracle import runner
+
+        class Oracle:
+            device = "synthetic device"
+            arch = "gfx1030"
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        for module, extra in ((lds_fuzz, []), (valu_fuzz, ["--family", "f16"])):
+            with self.subTest(fuzzer=module.__name__), tempfile.TemporaryDirectory() as tmp:
+                parent = Path(tmp) / "not-a-directory"
+                parent.write_bytes(b"caller data")
+                oracle = Oracle()
+                argv = [module.__name__ + ".py", "--programs", "1", "--wave", "32", "--work", str(parent),
+                        "--oracle", "translator,hw", *extra]
+                stderr = io.StringIO()
+                stats = ({32: {"match": 1, "mismatch": 0, "rejected": 0}}, [])
+                with (patch.object(sys, "argv", argv), patch.object(runner, "open_oracle", return_value=oracle),
+                      patch.object(module, "run_hw", return_value=stats), contextlib.redirect_stdout(io.StringIO()),
+                      contextlib.redirect_stderr(stderr)):
+                    self.assertEqual(module.main(), 2)
+                self.assertTrue(oracle.closed)
+                self.assertIn("ERROR: cannot create work directory", stderr.getvalue())
+                self.assertEqual(parent.read_bytes(), b"caller data")
+
+    def test_child_creation_error_preserves_existing_files(self):
+        for module, extra in ((lds_fuzz, []), (valu_fuzz, ["--family", "f16"])):
+            with self.subTest(fuzzer=module.__name__), tempfile.TemporaryDirectory() as tmp:
+                parent = Path(tmp) / "work"
+                parent.mkdir()
+                sentinel = parent / "keep.txt"
+                sentinel.write_bytes(b"caller data")
+                argv = [module.__name__ + ".py", "--programs", "1", "--wave", "32", "--work", str(parent), *extra]
+                stderr = io.StringIO()
+                with (patch.object(sys, "argv", argv),
+                      patch.object(module.tempfile, "mkdtemp", side_effect=PermissionError("synthetic deny")),
+                      contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr)):
+                    self.assertEqual(module.main(), 2)
+                self.assertIn("ERROR: cannot create work directory", stderr.getvalue())
+                self.assertIn("synthetic deny", stderr.getvalue())
+                self.assertEqual(sentinel.read_bytes(), b"caller data")
+
     def test_model_only_does_not_create_a_work_folder(self):
         for module, extra in ((lds_fuzz, []), (valu_fuzz, ["--family", "f16"])):
             with self.subTest(fuzzer=module.__name__), tempfile.TemporaryDirectory() as tmp:

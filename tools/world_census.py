@@ -815,7 +815,7 @@ def main(argv=None):
     except SourceChanged as e:
         print(str(e), file=sys.stderr)
         return 1
-    if head[:4] != b"9FPR":
+    if len(head) < 8 or head[:4] != b"9FPR":  # the header ends with the u32 data start at +4
         print("not an RPF9 archive", file=sys.stderr)
         return 2
     data_start = struct.unpack_from("<I", head, 4)[0]

@@ -1,4 +1,4 @@
-"""scripts/first_look.ps1 rebuilds runtime\\build\\gta6rt.exe when it is older than the runtime sources.
+"""scripts/first_look.ps1 checks for a current and complete runtime before a dry run.
 
     python -I tests/test_first_look_rebuild.py
 
@@ -23,7 +23,15 @@ PE_INSPECT_STUB = (
     "report.write_text('{\"imports\":[],\"sections\":[]}', encoding='utf-8', newline='\\n')\n"
 )
 # The build script leaves a marker; the loader is replaced by an alias that echoes its arguments.
-BUILD_STUB = "Set-Content -Path (Join-Path $PSScriptRoot 'built.txt') -Value 'built'\n"
+BUILD_STUB = r"""
+Set-Content -LiteralPath (Join-Path $PSScriptRoot 'built.txt') -Value 'built'
+if ($env:LEONIDA_TEST_INCOMPLETE_RUNTIME -ne '1') {
+    $build = Join-Path (Split-Path $PSScriptRoot -Parent) 'runtime\build'
+    foreach ($name in 'gta6rt.exe', 'gta6rt_tls_host.dll') {
+        New-Item -ItemType File -Path (Join-Path $build $name) -Force | Out-Null
+    }
+}
+"""
 RUN = r"""
 $ErrorActionPreference = 'Stop'
 Set-Alias -Name (Join-Path $PWD 'runtime\build\gta6rt.exe') -Value Write-Output
@@ -33,7 +41,7 @@ Set-Alias -Name (Join-Path $PWD 'runtime\build\gta6rt.exe') -Value Write-Output
 
 @unittest.skipUnless(os.name == "nt", "Windows PowerShell diagnostics script")
 class FirstLookRebuildTest(unittest.TestCase):
-    def run_case(self, source_newer):
+    def run_case(self, source_newer=False, missing=(), incomplete_build=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             for folder in ("scripts", "tools", "runtime/build", "runtime/src"):
@@ -44,26 +52,52 @@ class FirstLookRebuildTest(unittest.TestCase):
             (root / "fixture.exe").write_bytes(b"MZ")
             loader = root / "runtime" / "build" / "gta6rt.exe"
             source = root / "runtime" / "src" / "pe_loader.cpp"
+            tls = loader.with_name("gta6rt_tls_host.dll")
             loader.write_bytes(b"")
+            tls.touch()
             source.write_text("// source\n", encoding="utf-8")
             now = time.time()
             older, newer = now - 3600, now
             os.utime(loader, (newer, newer) if not source_newer else (older, older))
             os.utime(source, (newer, newer) if source_newer else (older, older))
+            for name in missing:
+                loader.with_name(name).unlink()
             env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
             env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env["PATH"]
+            env["LEONIDA_TEST_INCOMPLETE_RUNTIME"] = "1" if incomplete_build else "0"
             run = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                                   "-Command", RUN], cwd=root, env=env, capture_output=True, text=True, timeout=60)
-            return (root / "scripts" / "built.txt").is_file(), run.stdout + run.stderr
+            dry_run = (root / "reports" / "exe" / "fixture" / "dryrun.txt").is_file()
+            return (root / "scripts" / "built.txt").is_file(), dry_run, run.returncode, run.stdout + run.stderr
 
     def test_a_loader_older_than_the_sources_is_rebuilt(self):
-        built, out = self.run_case(source_newer=True)
+        built, dry_run, code, out = self.run_case(source_newer=True)
         self.assertTrue(built, out)
+        self.assertTrue(dry_run, out)
+        self.assertEqual(code, 0, out)
         self.assertIn("rebuilding it first", out)
 
     def test_an_up_to_date_loader_is_used_as_it_is(self):
-        built, out = self.run_case(source_newer=False)
+        built, dry_run, code, out = self.run_case()
         self.assertFalse(built, out)
+        self.assertTrue(dry_run, out)
+        self.assertEqual(code, 0, out)
+
+    def test_a_missing_runtime_file_is_rebuilt(self):
+        for name in ("gta6rt.exe", "gta6rt_tls_host.dll"):
+            with self.subTest(name=name):
+                built, dry_run, code, out = self.run_case(missing=(name,))
+                self.assertTrue(built, out)
+                self.assertTrue(dry_run, out)
+                self.assertEqual(code, 0, out)
+
+    def test_an_incomplete_build_stops_before_the_dry_run(self):
+        built, dry_run, code, out = self.run_case(missing=("gta6rt_tls_host.dll",), incomplete_build=True)
+        self.assertTrue(built, out)
+        self.assertFalse(dry_run, out)
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("runtime build did not produce", out)
+        self.assertIn("gta6rt_tls_host.dll", out)
 
 
 if __name__ == "__main__":

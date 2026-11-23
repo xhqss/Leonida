@@ -507,16 +507,19 @@ class MeshletCentreTests(unittest.TestCase):
         self.assertEqual([mp.centre_step(e << 28 | 0x007FF7FF) for e in range(5)], [0.0625, 0.125, 0.25, 0.5, 1.0])
         self.assertEqual(mp.meshlet_centre(0x2080F7EF, 0x7FF), (-4.0, 4.0, 0.0))
 
-    def grid_page(self, steps):
-        """A 4x4 grid in one meshlet whose stored centre is the vertex-box centre moved by `steps` (x, y, z)."""
+    def grid_parts(self, steps, bias=BIAS):
+        """A 4x4 grid block and one meshlet over it whose stored centre is the vertex-box centre moved by `steps`."""
         packed = [(c * 4096, r * 4096, 3) for r in range(4) for c in range(4)]
-        blk = other_block(16, packed=packed, bias=self.BIAS, scale=self.SCALE)
+        blk = other_block(16, packed=packed, bias=bias, scale=self.SCALE)
         pos = mp.positions_4240(page(blk), mp.parse_page(page(blk))[0])
         centre = [(min(p[i] for p in pos) + max(p[i] for p in pos)) / 2 for i in range(3)]
         f = [round(c * 16) + 2047 + s for c, s in zip(centre, steps)]
         grp = bytearray(grid_group(4, 4))
         struct.pack_into("<2I", grp, 12 + 8, f[0] | f[1] << 12, f[2])
-        return page(blk, bytes(grp))
+        return blk, bytes(grp)
+
+    def grid_page(self, steps):
+        return page(*self.grid_parts(steps))
 
     def test_centre_agreement(self):
         data = self.grid_page((0, 0, 0))
@@ -528,6 +531,30 @@ class MeshletCentreTests(unittest.TestCase):
         checks = mp.summarise_page(data, "p", centres=True)["checks"]
         self.assertEqual((checks["centres_4240_axes_exact"], checks["centres_4240_axes_within_step"]), (1, 2))
         self.assertNotIn("centres_4240_meshlets", mp.summarise_page(data, "p")["checks"])
+
+    def test_block_chosen_by_centres(self):
+        """Two blocks with the group's vertex count: the one its stored centres fit, wherever it is."""
+        blk, grp = self.grid_parts((0, 0, 0))
+        moved = self.grid_parts((0, 0, 0), bias=(48.5, 2.25, 0.5))[0]                      # same grid, 50 m away
+        for data, by_centres in ((page(blk, moved, grp), 1), (page(moved, blk, grp), 0), (page(moved, grp, blk), 1)):
+            checks = mp.summarise_page(data, "p", centres=True)["checks"]
+            self.assertEqual((checks["centres_4240_axes_exact"], checks["groups_4240_several_blocks"],
+                              checks.get("groups_4240_block_by_centres", 0)), (3, 1, by_centres))
+        checks = mp.summarise_page(page(moved, moved, grp), "p", centres=True)["checks"]  # a tie keeps the nearest
+        self.assertEqual((checks["centres_4240_axes_exact"], checks.get("groups_4240_block_by_centres", 0)), (2, 0))
+        self.assertNotIn("groups_4240_several_blocks", mp.summarise_page(page(blk, grp), "p", centres=True)["checks"])
+
+    def test_non_finite_block_does_not_win(self):
+        """A block with NaN positions scores None: the finite block wins in either order, and with no finite block
+        the old choice stays (as before this rule)."""
+        blk, grp = self.grid_parts((0, 0, 0))
+        nan = bytearray(blk)
+        struct.pack_into("<f", nan, 0x60, float("nan"))                               # bias x
+        for data in (page(bytes(nan), blk, grp), page(blk, bytes(nan), grp)):
+            self.assertEqual(mp.summarise_page(data, "p", centres=True)["checks"]["centres_4240_axes_exact"], 3)
+        checks = mp.summarise_page(page(bytes(nan), bytes(nan), grp), "p", faces=True)["checks"]
+        self.assertEqual((checks["groups_4240_several_blocks"], checks.get("groups_4240_block_by_centres", 0)), (1, 0))
+        self.assertIsNone(mp.centre_distance(page(grp), mp.parse_page(page(grp))[0], [(math.nan, 0.0, 0.0)] * 16))
 
     def test_coarse_centre_agreement(self):
         # the grid page with its stored centre written at 2^e / 16 m steps and the exponent e in w2 bits 28-31
@@ -591,6 +618,33 @@ class MeshletCentreTests(unittest.TestCase):
             self.assertEqual((c["cones_4240_cones"], c["cones_4240_axis_within_25_degrees"], c["cones_4240_faces_inside"],
                               c["cones_4240_faces_inside_within_0_05"]), want, hex(cone))
 
+    def test_block4240_checks_streaming_and_summary_counts(self):
+        # Normal block with 16 vertices within 300m
+        packed = [(c * 4096, r * 4096, 3) for r in range(4) for c in range(4)]
+        blk16 = other_block(16, packed=packed, bias=(10.0, 20.0, 30.0), scale=(0.001, 0.001, 0.001))
+        data = page(blk16)
+        parsed = mp.parse_page(data)[0]
+        chk = mp.block4240_checks(data, parsed)
+        self.assertEqual(chk, {"positions_4240": 16, "positions_4240_finite": 16, "positions_4240_within_300m": 16})
+
+        # Beyond 300m range (bias at 500m)
+        blk_far = other_block(16, packed=packed, bias=(500.0, 20.0, 30.0), scale=(0.001, 0.001, 0.001))
+        data_far = page(blk_far)
+        chk_far = mp.block4240_checks(data_far, mp.parse_page(data_far)[0])
+        self.assertEqual(chk_far, {"positions_4240": 16, "positions_4240_finite": 16, "positions_4240_within_300m": 0})
+
+        # Non-finite (NaN bias)
+        blk_nan = other_block(16, packed=packed, bias=(float("nan"), 20.0, 30.0), scale=(0.001, 0.001, 0.001))
+        data_nan = page(blk_nan)
+        chk_nan = mp.block4240_checks(data_nan, mp.parse_page(data_nan)[0])
+        self.assertEqual(chk_nan, {"positions_4240": 16, "positions_4240_finite": 0, "positions_4240_within_300m": 0})
+
+        # summarise_page with multiple groups matching block4240
+        data_multi = page(blk16, group([(16, 5)]), group([(16, 8)]), group([(10, 2)]))
+        summary = mp.summarise_page(data_multi, "multi")
+        self.assertEqual(summary["groups_matching_4240_block_here"], 2)
+
+
     def test_cli_centres(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "p.bin")
@@ -609,7 +663,8 @@ class MeshletCentreTests(unittest.TestCase):
 class SlotTagTests(unittest.TestCase):
     def test_tag_stride(self):
         self.assertEqual([mp.tag_stride(x) for x in (0x63, 0x42, 0x26, 0x28, 0x21, 0x27)], [12, 8, 4, 4, 4, 4])
-        self.assertIsNone(mp.tag_stride(0x25))   # type 5 is not seen
+        self.assertEqual(mp.tag_stride(0x25), 4)  # joint indices
+        self.assertIsNone(mp.tag_stride(0x2f))   # unknown type
         self.assertIsNone(mp.tag_stride(0x02))   # stride 0
         self.assertEqual(mp.tag_stride(0x46), 8)  # RGBA8-type tag with an 8-byte stride: sized by the rule
 
@@ -621,9 +676,19 @@ class SlotTagTests(unittest.TestCase):
         self.assertEqual([c["kind"] for c in chunks], ["block4240", "group"])
         self.assertEqual(chunks[1]["offset"] - chunks[0]["offset"], 0x80 + 10 * (8 + 4 + 8 + 4))
         # a type that is not seen is still not a block: such a page is not a mesh page
-        bad = page(other_block(10, tags=((0, 0x42, 8), (2, 0x25, 4))), group([(10, 6)]))
+        bad = page(other_block(10, tags=((0, 0x42, 8), (2, 0x2f, 4))), group([(10, 6)]))
         self.assertFalse(mp.is_mesh_page(bad))
         self.assertIn("error", mp.summarise_page(bad, "x"))
+
+    def test_joint_index_stream_before_another_slot(self):
+        tags = ((0, 0x42, 8), (6, 0x26, 4), (8, 0x25, 4), (1, 0x26, 4))
+        vertices = other_block(5, tags=tags)
+        data = page(vertices, group([(5, 3)]))
+        self.assertTrue(mp.is_mesh_page(data))
+        block, meshlets = mp.parse_page(data)
+        self.assertEqual(block["vertices"], 5)
+        self.assertIn([8, 0x25, 0x80 + 5 * 12], block["slots"])
+        self.assertEqual((meshlets["kind"], meshlets["offset"]), ("group", (len(vertices) + 15) & ~15))
 
 
 class Normals4240Tests(unittest.TestCase):
@@ -843,6 +908,20 @@ class CliTests(unittest.TestCase):
             with open(source, "rb") as fh:
                 self.assertEqual(fh.read(), data)
 
+    def test_json_cannot_create_a_report_in_place_of_the_carve_manifest(self):
+        # <input>/index.json is the carve manifest's name even before a carve has written it.
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            with open(os.path.join(carve, "0000.bin"), "wb") as fh:
+                fh.write(page(block(4)))
+            manifest = os.path.join(carve, "index.json")
+            r = self.run_tool(carve, "--json", manifest, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertFalse(os.path.exists(manifest))
+
     def test_json_over_carve_dir_manifest_or_payload_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             carve = os.path.join(tmp, "carve")
@@ -871,7 +950,28 @@ class CliTests(unittest.TestCase):
             with open(bin_path, "rb") as fh:
                 self.assertEqual(fh.read(), bin_data)
 
-    def test_fresh_json_inside_carve_dir_is_allowed(self):
+    def test_json_hard_link_to_a_page_in_a_scanned_dir_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            source = os.path.join(carve, "page.bin")
+            data = page(block(4))
+            with open(source, "wb") as fh:
+                fh.write(data)
+            report = os.path.join(tmp, "report.json")
+            try:
+                os.link(source, report)
+            except (AttributeError, NotImplementedError, OSError) as exc:
+                self.skipTest(f"hard links unavailable: {exc}")
+
+            r = self.run_tool(carve, "--json", report, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            with open(source, "rb") as fh:
+                self.assertEqual(fh.read(), data)
+
+    def test_json_inside_carve_dir_can_be_written_and_replaced(self):
         with tempfile.TemporaryDirectory() as tmp:
             carve = os.path.join(tmp, "carve")
             os.mkdir(carve)
@@ -879,11 +979,12 @@ class CliTests(unittest.TestCase):
             with open(bin_path, "wb") as fh:
                 fh.write(page(block(4)))
             out = os.path.join(carve, "report.json")
-            r = self.run_tool(carve, "--json", out, "--quiet")
-            self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertTrue(os.path.isfile(out))
-            with open(out, "r", encoding="utf-8") as fh:
-                self.assertEqual(json.load(fh)["totals"]["pages"], 1)
+            for run in ("new report", "existing report"):
+                with self.subTest(run=run):
+                    r = self.run_tool(carve, "--json", out, "--quiet")
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    with open(out, "r", encoding="utf-8") as fh:
+                        self.assertEqual(json.load(fh)["totals"]["pages"], 1)
 
     def test_json_over_draw_system_inputs_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

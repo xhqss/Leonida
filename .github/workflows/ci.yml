@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 concurrency:
-  # Each non-PR run has its own group so a queued push or dispatch cannot replace it.
-  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  # Coalesce superseded pending pushes per branch without canceling an active main build.
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -45,13 +45,17 @@ jobs:
           }
           "docs-only=$($docsOnly.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           exit 0 # GitHub's pwsh wrapper would otherwise forward git diff's status.
-      # A docs-only diff still needs the tests that read those documents: the link checker walks every tracked
-      # Markdown file, and the i18n index checks docs/i18n/README.md. Both are standard library only.
+      # A docs-only diff still needs the tests that read those documents, because `check` is skipped for it: every
+      # tests/test_docs_*.py (links, the design.md contract rows, list items, the repository paths a document
+      # names) and the i18n index, which checks docs/i18n/README.md. All are standard library only and read only
+      # tracked files. tests/test_ci_registration.py fails when a tests/test_docs_*.py is not run here.
       - name: Check documentation when only documentation changed
         if: steps.paths.outputs.docs-only == 'true'
         run: |
-          python3 -I tests/test_docs_links.py
-          python3 -I tests/test_i18n_index.py
+          for t in tests/test_docs_*.py tests/test_i18n_index.py; do
+            echo "== $t"
+            python3 -I "$t" || exit 1
+          done
 
   check:
     needs: change-scope
@@ -128,7 +132,11 @@ jobs:
       - name: Install llvm-mc (LLVM 21) and spirv-tools
         shell: bash
         run: |
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg
+          # The signing key is checked against apt.llvm.org's published fingerprint before apt trusts it.
+          key=$(mktemp)
+          curl -fsSL -o "$key" https://apt.llvm.org/llvm-snapshot.gpg.key
+          python3 -I scripts/check_apt_key.py "$key" 6084F3CF814B57C1CF12EFD515CF4D18AF4F7421
+          sudo gpg --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg "$key"
           echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list > /dev/null
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends llvm-21 spirv-tools
@@ -185,6 +193,69 @@ jobs:
           LEONIDA_REQUIRE_SPIRV_TOOLS: ${{ runner.os == 'Linux' && '1' || '0' }}
         run: python -m unittest discover -s tests/semantic -v
 
+  # The Python suites on an Apple Silicon Mac: the standard-library loop of the check job, the translator semantic
+  # tests and the pytest files of the translator-tests job, with Homebrew's llvm-mc and SPIRV-Tools. macos-26, not
+  # macos-15: the Homebrew bottles cover Sequoia and later, but the runtime needs Xcode 26's libc++ (runtime.yml).
+  macos-python:
+    needs: change-scope
+    if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: tests/requirements.txt
+      - name: Python tools compile
+        run: python -m compileall -q make_game.py tools tests
+      - name: make_game.py help
+        run: python -I make_game.py --help
+      # Before anything is installed, as in the check job, so these files stay standard library only. The semantic
+      # suite runs alongside the loop, on another of the runner's three cores; together they take about 6 minutes.
+      - name: Translator semantic tests and tests (standard library only, no game data)
+        shell: bash
+        run: |
+          python -m unittest discover -s tests/semantic > "$RUNNER_TEMP/semantic.log" 2>&1 &
+          semantic=$!
+          while IFS= read -r t; do
+            if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
+              continue
+            fi
+            echo "== $t"
+            python -I "$t" || exit 1
+          done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)
+          status=0
+          wait "$semantic" || status=$?
+          echo "== tests/semantic"
+          cat "$RUNNER_TEMP/semantic.log"
+          exit "$status"
+      - name: Install llvm-mc and SPIRV-Tools
+        run: |
+          brew install llvm spirv-tools
+          pip install -r tests/requirements.txt
+          LLVM_MC="$(brew --prefix llvm)/bin/llvm-mc"  # keg-only: not on PATH
+          echo "LLVM_MC=$LLVM_MC" >> "$GITHUB_ENV"
+          "$LLVM_MC" --version | grep -E 'LLVM version|amdgcn'
+      - name: Translator tests (pytest)
+        shell: bash
+        run: |
+          pytest_files=()
+          while IFS= read -r t; do
+            if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
+              pytest_files+=("$t")
+            elif [[ "$t" == tests/test_tex_headers.py ]]; then
+              pytest_files+=("$t::TestTextureDescriptorParsing::test_stdlib_qword_scanner_edge_cases_and_parity")
+            fi
+          done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)
+          python -m pytest "${pytest_files[@]}" -q
+
   viewer-tests:
     needs: change-scope
     if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
@@ -197,3 +268,35 @@ jobs:
           node-version: "24"
       - name: Viewer chunk streaming (synthetic, no browser or game data)
         run: node --test tests/test_*.cjs
+
+  # The check job runs the standard-library loop on Windows, which has no SPIRV-Tools or numpy: the spirv-val checks
+  # (test_split_big_switch, test_image_load_typed...), the numpy paths and the POSIX-only tests skip there. This job
+  # runs the same loop on Linux with them installed, so those tests run somewhere.
+  stdlib-tests-linux:
+    needs: change-scope
+    if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: tests/requirements.txt
+      - name: Install SPIRV-Tools and numpy
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends spirv-tools
+          pip install -r tests/requirements.txt
+      - name: Tests (standard library only, Linux)
+        shell: bash
+        run: |
+          while IFS= read -r t; do
+            if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
+              continue
+            fi
+            echo "== $t"
+            python -I "$t" || exit 1
+          done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)

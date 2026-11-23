@@ -646,11 +646,14 @@ def main(argv=None):
             print(f"ERROR: --json path is a directory: {out_path}", file=sys.stderr)
             return 2
         parent = os.path.dirname(out_path)
-        if parent:
+        try:
             os.makedirs(parent, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"device": hw_device, "waves": list(waves), "cases": records}, f, indent=2)
-            f.write("\n")
+            with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"device": hw_device, "waves": list(waves), "cases": records}, f, indent=2)
+                f.write("\n")
+        except OSError as exc:
+            print(f"ERROR: cannot write {out_path}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
 
     if mismatches or wave_diffs or (args.strict and known_diffs):
         return 1

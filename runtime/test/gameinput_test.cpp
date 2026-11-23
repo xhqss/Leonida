@@ -13,12 +13,14 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <deque>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "gameinput.h"
@@ -242,6 +244,20 @@ GameInputMotionState motion_state(IGameInput* input, IGameInputDevice* dev, bool
     return ms;
 }
 
+struct MotionReadings {
+    IGameInputDevice* gyro;
+    IGameInputDevice* plain;
+    int gyro_calls, plain_calls;
+};
+void CALLBACK on_motion_reading(GameInputCallbackToken, void* context, IGameInputReading* reading, bool) {
+    auto* seen = static_cast<MotionReadings*>(context);
+    IGameInputDevice* dev = nullptr;
+    if (reading) reading->GetDevice(&dev);
+    if (dev == seen->gyro) ++seen->gyro_calls;
+    if (dev == seen->plain) ++seen->plain_calls;
+    if (dev) dev->Release();
+}
+
 // ---- raw HID (RT-175) -------------------------------------------------------------------------------------------
 
 using rt::gameinput::RawReportSize;
@@ -300,11 +316,16 @@ struct FakeRawHid {
     std::vector<std::vector<uint8_t>> writes, features_sent;
     std::vector<uint8_t> feature_reply;
     bool fail = false;
+    HANDLE in_open = nullptr, release_open = nullptr;
 };
 FakeRawHid g_raw;
 void* raw_open(const char*, uint16_t vendor, uint16_t product) {
     if (vendor != g_raw.vendor || product != g_raw.product) return nullptr;
     ++g_raw.opens;
+    if (g_raw.release_open) {
+        SetEvent(g_raw.in_open);
+        WaitForSingleObject(g_raw.release_open, 5000);
+    }
     return &g_raw;
 }
 void raw_close(void*) { ++g_raw.closes; }
@@ -344,6 +365,14 @@ std::vector<uint8_t> raw_bytes(IGameInputRawDeviceReport* r) {
     std::vector<uint8_t> v(r ? r->GetRawDataSize() : 0);
     if (r) r->GetRawData(v.size(), v.data());
     return v;
+}
+
+// RT-262: the poll thread takes a reference on a force-feedback effect only while it is alive.
+void test_add_ref_if_live() {
+    std::atomic<unsigned long> live{1}, dying{0};
+    check(rt::gameinput::add_ref_if_live(live) && live.load() == 2, "add_ref_if_live: a live count goes up by one");
+    check(!rt::gameinput::add_ref_if_live(dying) && dying.load() == 0,
+          "add_ref_if_live: a count of 0 stays 0, so an effect being destroyed isn't revived");
 }
 
 void test_raw_hid(IGameInput* input) {
@@ -457,6 +486,64 @@ void test_raw_hid(IGameInput* input) {
     rt::gameinput::set_hid_backend(nullptr);
 }
 
+void test_raw_report_during_reconnect(IGameInput* input) {
+    rt::gameinput::set_hid_backend(&kFakeRawHid);
+    Pad raw_pad;
+    attach(raw_pad, "Leonida virtual raw pad", g_raw.vendor, g_raw.product, false);
+    rt::gameinput::poll();
+    g_raw.inputs.push_back({0x01, 0x44, 0x55, 0x66});
+    rt::gameinput::poll();
+    IGameInputReading* held = nullptr;
+    check(input->GetCurrentReading(GameInputKindRawDeviceReport, nullptr, &held) == S_OK && held,
+          "raw hid reconnect: a reading with a raw report to hold");
+    detach(raw_pad);
+    rt::gameinput::poll();
+    if (!held) {
+        rt::gameinput::set_hid_backend(nullptr);
+        return;
+    }
+
+    g_raw.in_open = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_raw.release_open = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE read_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    attach(raw_pad, "Leonida virtual raw pad", g_raw.vendor, g_raw.product, false);
+    std::thread poller([] { rt::gameinput::poll(); });
+    const bool in_open = WaitForSingleObject(g_raw.in_open, 5000) == WAIT_OBJECT_0;
+    bool got = false;
+    void* report = nullptr;
+    std::thread reader([&] {
+        got = held->GetRawReport(&report);
+        SetEvent(read_done);
+    });
+    const bool waited = WaitForSingleObject(read_done, 200) == WAIT_TIMEOUT;
+    SetEvent(g_raw.release_open);
+    poller.join();
+    const bool finished = WaitForSingleObject(read_done, 5000) == WAIT_OBJECT_0;
+    reader.join();
+    check(in_open && waited, "raw hid reconnect: GetRawReport waits while open_raw rebuilds the report tables");
+    auto* rr = static_cast<IGameInputRawDeviceReport*>(report);
+    check(finished && got && rr && raw_bytes(rr) == std::vector<uint8_t>({0x44, 0x55, 0x66}),
+          "raw hid reconnect: then it gives the held reading's report");
+    if (rr) rr->Release();
+    IGameInputDevice* dev = nullptr;
+    held->GetDevice(&dev);
+    void* created = nullptr;
+    check(dev && (dev->GetDeviceStatus() & GameInputDeviceRawIoEnabled) &&
+              dev->CreateRawDeviceReport(2, GameInputRawOutputReport, &created) == S_OK && created,
+          "raw hid reconnect: and the reconnected pad has raw I/O again");
+    if (created) static_cast<IGameInputRawDeviceReport*>(created)->Release();
+    if (dev) dev->Release();
+    held->Release();
+
+    CloseHandle(read_done);
+    CloseHandle(g_raw.in_open);
+    CloseHandle(g_raw.release_open);
+    g_raw.in_open = g_raw.release_open = nullptr;
+    detach(raw_pad);
+    rt::gameinput::poll();
+    rt::gameinput::set_hid_backend(nullptr);
+}
+
 void test_motion(IGameInput* input) {
     const size_t events_before = g_device_events.size();  // other tests' events are still queued in the vector
     Pad gyro_pad, plain;
@@ -558,6 +645,19 @@ void test_motion(IGameInput* input) {
         next->Release();
     }
     if (first) first->Release();
+
+    MotionReadings seen{mdev, pdev, 0, 0};
+    GameInputCallbackToken motion_token = 0;
+    check(input->RegisterReadingCallback(nullptr, GameInputKindMotion, 0.0f, &seen, on_motion_reading, &motion_token) == S_OK,
+          "motion: RegisterReadingCallback(GameInputKindMotion)");
+    for (int i = 0; i < 4; ++i) {
+        SDL_SetJoystickVirtualButton(gyro_pad.js, SDL_GAMEPAD_BUTTON_SOUTH, i % 2 == 0);
+        SDL_SetJoystickVirtualButton(plain.js, SDL_GAMEPAD_BUTTON_SOUTH, i % 2 == 0);
+        rt::gameinput::poll();
+    }
+    input->UnregisterCallback(motion_token, 0);
+    check(seen.gyro_calls > 0 && seen.plain_calls == 0,
+          "motion: a Motion reading callback fires for the gyro pad's readings, not for the plain pad's");
 
     detach(gyro_pad);
     detach(plain);
@@ -1149,6 +1249,7 @@ struct FakeHaptic {
                         SDL_HAPTIC_SAWTOOTHUP | SDL_HAPTIC_SAWTOOTHDOWN | SDL_HAPTIC_RAMP | SDL_HAPTIC_SPRING |
                         SDL_HAPTIC_FRICTION | SDL_HAPTIC_DAMPER | SDL_HAPTIC_INERTIA;
     int max_effects = 8;
+    int create_result = 1;  // what create returns; negative is SDL refusing the effect
     int opens = 0, closes = 0, creates = 0, updates = 0, runs = 0, stops = 0, destroys = 0;
     int gain_calls = 0, last_gain = -1;
     uint32_t last_iterations = 0;
@@ -1168,8 +1269,12 @@ int fake_max_effects(void* h) { return static_cast<FakeHaptic*>(h)->max_effects;
 int fake_create(void* h, const void* e) {
     FakeHaptic* f = static_cast<FakeHaptic*>(h);
     ++f->creates;
+    if (f->create_result < 0) {
+        SDL_SetError("fake: refused");
+        return -1;
+    }
     f->last = *static_cast<const SDL_HapticEffect*>(e);
-    return 1;
+    return f->create_result;
 }
 bool fake_update(void* h, int, const void* e) {
     FakeHaptic* f = static_cast<FakeHaptic*>(h);
@@ -1265,12 +1370,31 @@ void test_force_feedback(IGameInput* input) {
     const int runs0 = g_fake.runs;
     rt::gameinput::poll();
     check(g_fake.creates == 1 && g_fake.runs == runs0 + 1, "force feedback: the poll thread creates and runs the effect");
+    rt::gameinput::OutputState sent{};
+    check(rt::gameinput::output_state(0, &sent) && sent.effect_id == 1 && sent.effect_ran && !sent.effect_error[0],
+          "force feedback: the output state reports the effect SDL created and is running");
     check(g_fake.last.type == SDL_HAPTIC_CONSTANT && g_fake.last.constant.level == 16384,
           "force feedback: a constant 0.5 becomes SDL_HAPTIC_CONSTANT level 16384");
     check(g_fake.last.constant.length == 60000 && g_fake.last_iterations == 0,
           "force feedback: no duration in GameInput is SDL's 60 s hold, run until stopped");
     rt::gameinput::poll();
     check(g_fake.runs == runs0 + 1, "force feedback: an unchanged effect is not re-sent every poll");
+
+    // SDL refusing an effect is visible, not swallowed: the output state carries the failure and SDL's error.
+    g_fake.create_result = -1;
+    IGameInputForceFeedbackEffect* refused = nullptr;
+    check(dev->CreateForceFeedbackEffect(0, &params, reinterpret_cast<void**>(&refused)) == S_OK && refused,
+          "force feedback: GameInput accepts an effect SDL will refuse");
+    if (refused) {
+        rt::gameinput::poll();
+        rt::gameinput::OutputState refused_out{};
+        check(rt::gameinput::output_state(0, &refused_out) && refused_out.effect_id < 0 && !refused_out.effect_ran &&
+                  std::strstr(refused_out.effect_error, "fake: refused"),
+              "force feedback: SDL refusing the effect is recorded with its error");
+        refused->Release();
+        rt::gameinput::poll();  // the released effect leaves the device
+    }
+    g_fake.create_result = 1;
 
     params.data.constant.magnitude.linearX = -1.0f;
     check(effect->SetParams(&params), "force feedback: SetParams");
@@ -1359,6 +1483,28 @@ void test_force_feedback(IGameInput* input) {
     check(effect->Release() == 0, "force feedback: the effect is freed once the title releases it");
     rt::gameinput::poll();
     check(g_fake.destroys == 1, "force feedback: its SDL effect is destroyed on the poll thread");
+
+    // RT-262: the title releases effects while the poll thread applies them. The poll thread used to AddRef an effect
+    // whose count had already reached 0 (its destructor waiting for the lock), use it after it was freed, and free it
+    // a second time with its own Release.
+    {
+        std::atomic<bool> stop{false};
+        std::thread poller([&] {
+            while (!stop.load()) rt::gameinput::poll();
+        });
+        int created = 0;
+        for (int i = 0; i < 20000; ++i) {
+            IGameInputForceFeedbackEffect* e = nullptr;
+            if (dev->CreateForceFeedbackEffect(0, &params, reinterpret_cast<void**>(&e)) == S_OK && e) {
+                ++created;
+                e->Release();
+            }
+        }
+        stop = true;
+        poller.join();
+        rt::gameinput::poll();
+        check(created == 20000, "force feedback: 20,000 effects created and released while the poll thread runs");
+    }
 
     detach(wheel);
     rt::gameinput::poll();
@@ -1470,6 +1616,7 @@ int main() {
     set_env("LEONIDA_DS_TRIGGERS", nullptr);
     set_env("LEONIDA_DS_LIGHTBAR", nullptr);
     set_env("LEONIDA_RUMBLE", nullptr);
+    test_add_ref_if_live();
 
     auto create = reinterpret_cast<GameInputCreateFn>(rt::shims::find("gameinput.dll", "GameInputCreate"));
     check(create != nullptr, "gameinput.dll!GameInputCreate is registered");
@@ -1974,6 +2121,7 @@ int main() {
     test_force_feedback(input);
     test_haptic_motors(input);
     test_raw_hid(input);
+    test_raw_report_during_reconnect(input);
     input->Release();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

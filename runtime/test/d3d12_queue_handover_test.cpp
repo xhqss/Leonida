@@ -17,6 +17,7 @@
 // compared byte for byte with the data written by the CPU: a consumer replayed against the layout from before its
 // producer ran reads a zero-filled texture and fails here (and with LEONIDA_VK_VALIDATION=1 under sync validation).
 // No game data.
+#include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 
 #include <dxgi1_4.h>
@@ -364,6 +365,7 @@ bool cpu_released_chain(Rig& rig, const Roles& roles, int seed) {
 
 // A CPU Signal that comes before the Wait (nothing is held), and one that comes after the batch was submitted.
 bool cpu_gate(Rig& rig, Type producer, Type consumer, bool signal_first, int seed) {
+    if (!rig.available[producer] || !rig.available[consumer]) return true;
     if (producer == consumer && rig.available[producer] < 2) return true;
     const int cslot = producer == consumer ? 1 : 0;
     std::string name = std::string("CPU Signal ") + (signal_first ? "before" : "after") + " the consumer's Wait, " +
@@ -413,6 +415,7 @@ std::string capture_stderr(const std::function<void()>& body) {
 // A batch waits for a fence nobody signals. The other queues keep working, the batch never runs, destroying the queue
 // does not hang and the layer says why. Layer only: the host runtime has nothing to report.
 bool never_signaled(Rig& rig, int seed) {
+    if (!rig.available[copy_q] || !rig.available[direct_q]) return true;
     arm("fence nobody signals");
     Case c(rig, seed);
     if (!c.make_resources()) return false;
@@ -463,31 +466,210 @@ bool fence_released(Rig& rig, int seed) {
     ID3D12CommandList* batch[] = {held};
     if (FAILED(victim->Wait(doomed.Get(), 9))) return c.fail("Wait", __LINE__);
     victim->ExecuteCommandLists(1, batch);
-    const std::string log = capture_stderr([&] { doomed.Reset(); victim.Reset(); });
-    if (log.find("fence was released while a queue still held work") == std::string::npos) {
+    // The queue holds the fence it waits on, as D3D12 does: the application's release does not free it under the held
+    // batch. The batch stays held (nothing ran) and is reported when the queue goes.
+    doomed.Reset();
+    Sleep(50);
+    const std::string log = capture_stderr([&] { victim.Reset(); });
+    if (log.find("queue destroyed with") == std::string::npos) {
         std::fprintf(stderr, "stderr was: \"%s\"\n", log.c_str());
-        return c.fail("no report for the dropped batch", __LINE__);
+        return c.fail("no report for the held batch", __LINE__);
     }
     ++cases_run;
     return true;
 }
 
+// Review item 4: a held Signal names a fence the application has released. The fence lives until the Signal has been
+// submitted (a queue behind it that waits for the fence proves it was signaled), with nothing used after free.
+bool held_signal_survives_release(Rig& rig, int seed) {
+    if (!rig.available[direct_q] || !rig.available[compute_q]) return true;
+    arm("held Signal of a released fence");
+    Case c(rig, seed);
+    if (!c.make_resources()) return false;
+    ComPtr<ID3D12Fence> gate, target;
+    if (FAILED(rig.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate))) ||
+        FAILED(rig.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&target))))
+        return false;
+    ID3D12CommandQueue* a = rig.queues[direct_q][0].Get();
+    ID3D12CommandQueue* b = rig.queues[compute_q][0].Get();
+    // a: Wait(gate), copy upload -> stage[0], Signal(target)  (held until the CPU signals the gate)
+    ID3D12GraphicsCommandList* produce = c.make_list(direct_q, nullptr, &c.stage[0], 3);
+    ID3D12GraphicsCommandList* consume = c.make_list(compute_q, &c.stage[0], nullptr, 3);
+    if (!produce || !consume) return c.fail("setup", __LINE__);
+    if (FAILED(a->Wait(gate.Get(), 1))) return c.fail("Wait", __LINE__);
+    ID3D12CommandList* pb[] = {produce};
+    a->ExecuteCommandLists(1, pb);
+    if (FAILED(a->Signal(target.Get(), 1))) return c.fail("Signal", __LINE__);
+    if (FAILED(b->Wait(target.Get(), 1))) return c.fail("Wait", __LINE__);
+    ID3D12CommandList* cb[] = {consume};
+    b->ExecuteCommandLists(1, cb);
+    if (FAILED(b->Signal(c.fence(2), 1))) return c.fail("Signal", __LINE__);
+    target.Reset();  // the application is done with it; both queues still name it
+    Sleep(20);
+    if (FAILED(gate->Signal(1))) return c.fail("CPU Signal", __LINE__);
+    ++cases_run;
+    return c.wait_fence(2, 1) && c.verify();
+}
+
+// Review item 3: Signal(F, 2) is held, Signal(F, 3) on another queue is not. When the held one is released the
+// timeline is already at 3 and must not be signaled lower; a wait for 2 passes and F reads 3. Layer only (D3D12 sets
+// the fence to the lower value).
+bool monotonic_shared_fence(Rig& rig, int seed) {
+    if (!rig.available[direct_q] || !rig.available[copy_q] || !rig.available[compute_q]) return true;
+    arm("held Signal below an unheld one");
+    Case c(rig, seed);
+    if (!c.make_resources()) return false;
+    ID3D12CommandQueue* a = rig.queues[direct_q][0].Get();
+    ID3D12CommandQueue* b = rig.queues[copy_q][0].Get();
+    ID3D12CommandQueue* w = rig.queues[compute_q][0].Get();
+    ID3D12Fence *gate = c.fence(0), *shared = c.fence(1);
+    ID3D12GraphicsCommandList* produce = c.make_list(copy_q, nullptr, &c.stage[0], 3);
+    ID3D12GraphicsCommandList* consume = c.make_list(compute_q, &c.stage[0], nullptr, 3);
+    if (!gate || !shared || !produce || !consume) return c.fail("setup", __LINE__);
+    if (FAILED(a->Wait(gate, 1)) || FAILED(a->Signal(shared, 2))) return c.fail("held Signal", __LINE__);  // held
+    ID3D12CommandList* pb[] = {produce};
+    b->ExecuteCommandLists(1, pb);
+    if (FAILED(b->Signal(shared, 3))) return c.fail("Signal", __LINE__);                                  // not held
+    if (c.wait_fence(1, 3) == false) return false;
+    if (FAILED(gate->Signal(1))) return c.fail("CPU Signal", __LINE__);                                  // releases a
+    // A queue that waits for 2 now: satisfied, and the data the copy queue wrote is what it reads.
+    if (FAILED(w->Wait(shared, 2))) return c.fail("Wait", __LINE__);
+    ID3D12CommandList* cb[] = {consume};
+    w->ExecuteCommandLists(1, cb);
+    if (FAILED(w->Signal(c.fence(2), 1))) return c.fail("Signal", __LINE__);
+    if (!c.wait_fence(2, 1) || !c.verify()) return false;
+    Sleep(50);
+    if (shared->GetCompletedValue() != 3) return c.fail("the fence went below 3", __LINE__);
+    ++cases_run;
+    return true;
+}
+
+// Review item 5: a queue destroyed with a held Signal wakes the CPU wait on that fence (with a report) instead of
+// leaving it hanging.
+bool teardown_wakes_cpu_waiters(Rig& rig, int seed) {
+    arm("teardown with a held Signal");
+    Case c(rig, seed);
+    if (!c.make_resources()) return false;
+    ComPtr<ID3D12CommandQueue> victim;
+    const D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    if (FAILED(rig.device->CreateCommandQueue(&desc, IID_PPV_ARGS(&victim)))) return true;
+    ID3D12Fence *never = c.fence(0), *target = c.fence(1);
+    if (FAILED(victim->Wait(never, 1)) || FAILED(victim->Signal(target, 1))) return c.fail("setup", __LINE__);
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (FAILED(target->SetEventOnCompletion(1, event))) return c.fail("SetEventOnCompletion", __LINE__);
+    const std::string log = capture_stderr([&] { victim.Reset(); });
+    const bool woke = WaitForSingleObject(event, 5000) == WAIT_OBJECT_0;
+    CloseHandle(event);
+    if (!woke) return c.fail("the CPU wait on the held Signal's fence was never woken", __LINE__);
+    if (log.find("CPU waits on the fences of its held Signals are completed") == std::string::npos) {
+        std::fprintf(stderr, "stderr was: \"%s\"\n", log.c_str());
+        return c.fail("no report", __LINE__);
+    }
+    ++cases_run;
+    return true;
+}
+
+// Two threads: one submits a consumer and a relay (both held, waiting for fences that are signaled by queues it does
+// not own), the other submits the producer and signals a CPU gate the producer waits on, at the same moment, many
+// times over. Everything is built up front; the threads only make queue calls.
+bool concurrent_signalling(Rig& rig, int iterations, int seed) {
+    if (!Roles::make(copy_q, compute_q, direct_q).fits(rig)) return true;  // needs one queue of each type
+    arm("two threads signalling and releasing", 120000);
+    struct Round {
+        std::unique_ptr<Case> c;
+        Case::Job jobs[3];
+        ID3D12GraphicsCommandList* lists[3];
+    };
+    std::vector<Round> rounds(iterations);
+    const Roles roles = Roles::make(copy_q, compute_q, direct_q);
+    for (int i = 0; i < iterations; ++i) {
+        Round& r = rounds[i];
+        r.c = std::make_unique<Case>(rig, seed + i);
+        Case& c = *r.c;
+        if (!c.make_resources()) return false;
+        const bool gated = i % 2 == 0;
+        r.jobs[0] = {roles.type[0], roles.slot[0], nullptr, &c.stage[0], 3, gated ? std::vector<std::pair<int, UINT64>>{{3, 1}} : std::vector<std::pair<int, UINT64>>{}, 0};
+        r.jobs[1] = {roles.type[1], roles.slot[1], &c.stage[0], &c.stage[1], 3, {{0, 1}}, 1};
+        r.jobs[2] = {roles.type[2], roles.slot[2], &c.stage[1], nullptr, 3, {{1, 1}}, 2};
+        for (int j = 0; j < 3; ++j) {
+            r.lists[j] = c.make_list(r.jobs[j].type, r.jobs[j].src, r.jobs[j].dst, r.jobs[j].mask);
+            if (!r.lists[j]) return false;
+        }
+        if (!c.fence(3)) return false;
+    }
+    std::atomic<int> turn{-1}, ready{0}, failed{0};
+    const auto fire = [&](Case& c, const Case::Job& job, ID3D12GraphicsCommandList* list) {
+        ID3D12CommandQueue* queue = rig.queues[job.type][job.slot].Get();
+        for (const auto& [f, v] : job.waits)
+            if (FAILED(queue->Wait(c.fences[f].Get(), v))) failed++;
+        ID3D12CommandList* batch[] = {list};
+        queue->ExecuteCommandLists(1, batch);
+        if (job.signal >= 0 && FAILED(queue->Signal(c.fences[job.signal].Get(), 1))) failed++;
+    };
+    std::thread consumer_side([&] {
+        for (int i = 0; i < iterations; ++i) {
+            ready++;
+            while (turn.load() < i) std::this_thread::yield();
+            fire(*rounds[i].c, rounds[i].jobs[2], rounds[i].lists[2]);
+            fire(*rounds[i].c, rounds[i].jobs[1], rounds[i].lists[1]);
+        }
+    });
+    std::thread producer_side([&] {
+        for (int i = 0; i < iterations; ++i) {
+            while (ready.load() <= i) std::this_thread::yield();
+            turn = i;
+            fire(*rounds[i].c, rounds[i].jobs[0], rounds[i].lists[0]);
+            if (i % 2 == 0 && FAILED(rounds[i].c->fences[3]->Signal(1))) failed++;
+        }
+    });
+    producer_side.join();
+    consumer_side.join();
+    if (failed) return rounds[0].c->fail("a queue call failed", __LINE__);
+    bool ok = true;
+    for (int i = 0; i < iterations; ++i) {
+        arm("two threads signalling and releasing", 20000);
+        ok &= rounds[i].c->wait_fence(2, 1) && rounds[i].c->verify();
+    }
+    cases_run += iterations;
+    return ok;
+}
+
+// Producer and consumer on two queues, in both submission orders: what fits when the device hands over only two
+// VkQueues (the D3D12 queues share them) and what M4's copy -> compute -> copy path does.
+bool pair_case(Rig& rig, Type a, Type b, bool consumer_first, int seed) {
+    const int sb = a == b ? 1 : 0;
+    if (!rig.available[a] || sb >= rig.available[b]) return true;
+    std::string name = std::string("pair ") + type_name[a] + "->" + type_name[b] +
+                       (consumer_first ? " consumer first" : " producer first");
+    arm(name.c_str());
+    Case c(rig, seed);
+    if (!c.make_resources()) return false;
+    const Case::Job produce{a, 0, nullptr, &c.stage[0], 3, {}, 0};
+    const Case::Job consume{b, sb, &c.stage[0], nullptr, 3, {{0, 1}}, 2};
+    if (consumer_first ? !(c.submit(consume) && c.submit(produce)) : !(c.submit(produce) && c.submit(consume)))
+        return false;
+    ++cases_run;
+    return c.wait_fence(2, 1) && c.verify();
+}
+
 bool run_all(ID3D12Device* device, bool layer) {
     Rig rig;
     rig.device = device;
-    for (int t = 0; t < 3; ++t)
-        for (int i = 0; i < pool_size; ++i) {
+    for (int i = 0; i < pool_size; ++i)  // one of each type first: a caller-owned device may hand over only a few
+        for (int t = 0; t < 3; ++t) {
+            if (rig.available[t] != i) continue;
             D3D12_COMMAND_QUEUE_DESC desc{};
             desc.Type = list_type[t];
-            if (FAILED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&rig.queues[t][i])))) break;
-            ++rig.available[t];
+            if (SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&rig.queues[t][i])))) ++rig.available[t];
         }
     std::printf("queues available per type (COPY/COMPUTE/DIRECT): %d/%d/%d\n", rig.available[0], rig.available[1],
                 rig.available[2]);
-    if (!rig.available[0] || !rig.available[1] || !rig.available[2]) return true;  // nothing to hand over between
 
     bool ok = true;
     int seed = 100, skipped = 0;
+    for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 3; ++b)
+            for (bool consumer_first : {true, false}) ok &= pair_case(rig, Type(a), Type(b), consumer_first, ++seed);
     std::array<int, 3> order{0, 1, 2};
     for (int a = 0; a < 3; ++a)
         for (int b = 0; b < 3; ++b)
@@ -511,12 +693,16 @@ bool run_all(ID3D12Device* device, bool layer) {
     for (int p = 0; p < 3; ++p)
         for (int q = 0; q < 3; ++q)
             for (bool first : {true, false}) ok &= cpu_gate(rig, Type(p), Type(q), first, ++seed);
+    ok &= concurrent_signalling(rig, 200, seed += 1000);
     if (layer) {
         // The layer hands out a limited number of VkQueues: give the spare ones back for the two cases below.
         for (auto& type_queues : rig.queues)
             for (int i = 1; i < pool_size; ++i) type_queues[i].Reset();
         ok &= never_signaled(rig, ++seed);
         ok &= fence_released(rig, ++seed);
+        ok &= held_signal_survives_release(rig, ++seed);
+        ok &= monotonic_shared_fence(rig, ++seed);
+        ok &= teardown_wakes_cpu_waiters(rig, ++seed);
     }
     if (skipped) std::printf("(%d type assignments need more queues than the device gave)\n", skipped);
     return ok;
@@ -539,7 +725,15 @@ ComPtr<ID3D12Device> native_device(std::wstring& name) {
 
 }  // namespace
 
-int main() {
+// Modes (argv[1]):
+//   (none)           the standalone device, which gives each D3D12 queue its own VkQueue; then the host runtime
+//   --two-queues     a caller-owned device with two VkQueues of the family handed over (VulkanDeviceInfo::command_queues):
+//                    the D3D12 queues of a type share them, so a Wait and the Signal it needs can land on one VkQueue
+//   --shared-queue   a caller-owned device that hands over its one VkQueue: every D3D12 queue shares it (the legacy
+//                    single-queue behaviour), where a Wait submitted ahead of its Signal would never progress on the GPU
+int main(int argc, char** argv) {
+    const bool two_queues = argc > 1 && std::strcmp(argv[1], "--two-queues") == 0;
+    const bool shared_queue = argc > 1 && std::strcmp(argv[1], "--shared-queue") == 0;
     std::thread([] {
         for (;;) {
             Sleep(100);
@@ -552,8 +746,32 @@ int main() {
         }
     }).detach();
 
+    vktest::Device vk;
     ComPtr<ID3D12Device> layer;
-    if (FAILED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&layer)))) {
+    if (two_queues || shared_queue) {
+        vk.queue_count_wanted = two_queues ? 2 : 1;
+        const auto status = vk.initialize();
+        if (status == vktest::DeviceStatus::unavailable) return 77;
+        if (status != vktest::DeviceStatus::ready) return 1;
+        if (two_queues && vk.queues.size() < 2) {
+            std::puts("the queue family has one queue: two-queue mode skipped");
+            return 77;
+        }
+        rt::d3d12::VulkanDeviceInfo info{};
+        info.get_instance_proc = vk.instance_proc;
+        info.instance = vk.instance;
+        info.physical = vk.physical;
+        info.device = vk.device;
+        info.queue = vk.queue;
+        info.queue_family = vk.family;
+        if (two_queues) info.command_queues = vk.queues;
+        if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&layer)))) {
+            std::puts("Vulkan device unavailable");
+            return 77;
+        }
+        std::printf("caller-owned device, %zu VkQueue(s) handed to the layer\n",
+                    two_queues ? vk.queues.size() : size_t(1));
+    } else if (FAILED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&layer)))) {
         std::puts("Vulkan standalone device unavailable");
         return 77;
     }
@@ -562,7 +780,13 @@ int main() {
     if (!run_all(layer.Get(), true)) return 1;
     const int layer_cases = cases_run;
     std::printf("Vulkan layer: %d cases passed, every one exact\n", layer_cases);
-
+    layer.Reset();
+    if (vk.validation_errors()) {
+        std::fprintf(stderr, "%u validation errors\n", vk.validation_errors());
+        return 1;
+    }
+    // Every mode ends with the same cases on the host runtime: the expected data is the CPU's pattern in all of
+    // them, so the host run shows the cases are valid D3D12 and the layer's modes are held to the same bar.
     std::wstring name;
     if (auto host = native_device(name)) {
         arm("host runtime", 300000);

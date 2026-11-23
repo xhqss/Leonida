@@ -3,12 +3,15 @@ lookup CLI, case-insensitivity, and collision handling.
 
     python -I tests/test_hashdict.py
 """
+import errno
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "hashdict.py")
@@ -332,6 +335,20 @@ class CarveAndExtraCLITest(unittest.TestCase):
             text=True,
         )
 
+    def test_missing_extra_input_leaves_existing_dictionary_untouched(self):
+        missing = os.path.join(self.dir, "missing.txt")
+        previous = {"00000001": "previous_name"}
+        with open(self.out_json, "w", encoding="utf-8", newline="\n") as output:
+            json.dump(previous, output)
+
+        result = self.run_tool(self.carve_dir, "--extra", self.extra_file, missing, "--out", self.out_json)
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--extra", result.stderr)
+        self.assertIn(missing, result.stderr)
+        with open(self.out_json, encoding="utf-8") as output:
+            self.assertEqual(json.load(output), previous)
+
     def test_build_dictionary_and_roundtrip_lookup(self):
         p = self.run_tool(
             self.carve_dir,
@@ -358,6 +375,32 @@ class CarveAndExtraCLITest(unittest.TestCase):
         p_lookup = self.run_tool("--lookup", self.out_json, lookup_hash)
         self.assertEqual(p_lookup.returncode, 0, p_lookup.stderr)
         self.assertIn(f"{lookup_hash} model_prop", p_lookup.stdout)
+
+    def test_unreadable_extra_subdirectory_preserves_existing_dictionary(self):
+        blocked = os.path.join(self.extra_dir, "blocked")
+        os.mkdir(blocked)
+        previous = {"12345678": "keep"}
+        with open(self.out_json, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(previous, f)
+        scandir = os.scandir
+
+        def scan(path):
+            if path == blocked:
+                raise PermissionError(errno.EACCES, "synthetic access denied", path)
+            return scandir(path)
+
+        command = [TOOL, self.carve_dir, "--extra", self.extra_dir, "--out", self.out_json]
+        with (mock.patch.object(os, "scandir", side_effect=scan),
+              mock.patch.object(sys, "argv", command),
+              mock.patch.object(sys, "stdout", new_callable=io.StringIO),
+              mock.patch.object(sys, "stderr", new_callable=io.StringIO) as stderr):
+            result = hashdict.main()
+
+        self.assertEqual(result, 2, stderr.getvalue())
+        self.assertIn("--extra", stderr.getvalue())
+        self.assertIn(blocked, stderr.getvalue())
+        with open(self.out_json, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), previous)
 
     def test_one_archive_folder_is_harvested_as_that_archive(self):
         # <work>/carve/common (its own index.json, as the gamedata_* tools take it) used to give an empty

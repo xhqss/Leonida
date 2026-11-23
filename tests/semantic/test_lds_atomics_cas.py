@@ -269,6 +269,39 @@ class LdsCasAtomics(unittest.TestCase):
                 self.assertEqual(rdna2spirv.translate.last_gen.lds_bound, 128)
                 self.assertEqual((mem.get(OUT), mem.get(OUT + 4)), (0 if rtn else 0xDEAD, init_val))
 
+    def test_inactive_lane_oob_access_leaves_vdst_alone(self):
+        # Under exec_lo = 0 the out-of-range path must not run either: _rtn_ keeps vdst (no zero for an inactive
+        # lane) and LDS[0] is untouched, with lds_bound=128 as in test_oob_access_drops_write_and_returns_zero.
+        for op, rtn, init_val, data_val, _ in self.CAS_BOUNDS_CASES:
+            if not rtn:
+                continue
+            with self.subTest(op=op):
+                body = [
+                    "v_mov_b32_e32 v0, 0",
+                    f"v_mov_b32_e32 v1, {init_val:#x}",
+                    "ds_write_b32 v0, v1",
+                    "s_waitcnt lgkmcnt(0)",
+                    "v_mov_b32_e32 v8, 0xfc00",
+                    "ds_read_b32 v9, v8 offset:1024",
+                    "v_mov_b32_e32 v2, 512",
+                    f"v_mov_b32_e32 v3, {data_val:#x}",
+                    "v_mov_b32_e32 v5, 0xdead",
+                    "s_mov_b32 s4, exec_lo",
+                    "s_mov_b32 exec_lo, 0",
+                    f"{op} v5, v2, v3",
+                    "s_mov_b32 exec_lo, s4",
+                    "s_waitcnt lgkmcnt(0)",
+                    "ds_read_b32 v4, v0",
+                    "s_waitcnt lgkmcnt(0)",
+                    f"v_mov_b32_e32 v6, {OUT:#x}",
+                    "global_store_dword v6, v5, s[0:1]",
+                    f"v_mov_b32_e32 v7, {OUT + 4:#x}",
+                    "global_store_dword v7, v4, s[0:1]",
+                ]
+                mem = run_cs(body, lds_units=1)
+                self.assertEqual(rdna2spirv.translate.last_gen.lds_bound, 128)
+                self.assertEqual((mem.get(OUT), mem.get(OUT + 4)), (0xDEAD, init_val))
+
     def test_non_power_of_two_bound_addresses_valid_slot(self):
         # With LDS_SIZE=3 (1536 B = 384 dwords) and lds_bound=384, wrapping with (384 - 1) = 0x17f
         # would clear bit 7 (dword 128 -> dword 0); bounds checking must hit LDS[128] and preserve LDS[0].

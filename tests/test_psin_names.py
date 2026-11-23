@@ -184,6 +184,29 @@ class TestCli(unittest.TestCase):
                     with open(bin_file, "rb") as f:
                         self.assertEqual(f.read(), original)
 
+    def test_rejects_external_hard_link_to_a_carved_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "carved")
+            os.mkdir(src)
+            payload = os.path.join(src, "0001.bin")
+            names = os.path.join(tmp, "names.txt")
+            original = sample()
+            with open(payload, "wb") as f:
+                f.write(original)
+            with open(names, "w", encoding="utf-8", newline="\n") as f:
+                f.write("prop_crate_01\n")
+            refs = os.path.join(tmp, "refs.tsv")
+            try:
+                os.link(payload, refs)
+            except (OSError, NotImplementedError) as e:
+                self.skipTest(f"hard links unavailable: {e}")
+
+            result = self.run_tool(src, "--names", names, "--refs", refs)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("--refs must not overwrite an input", result.stderr)
+            with open(payload, "rb") as f:
+                self.assertEqual(f.read(), original)
+
     def test_refs_unwritable_parent_dir_returns_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "one.bin")

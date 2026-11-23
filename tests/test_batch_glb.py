@@ -55,12 +55,59 @@ class TestBatchGlb(unittest.TestCase):
                 with self.subTest(source=source, output=output):
                     result = subprocess.run(
                         [sys.executable, "-I", os.path.join(TOOLS, "batch_glb.py"), source, output],
-                        capture_output=True, text=True, check=False,
+                        capture_output=True, text=True, errors="replace", check=False,
                     )
                     self.assertEqual(result.returncode, 1)
                     self.assertTrue(result.stderr.startswith("ERROR: "), result.stderr)
                     self.assertIn(error, result.stderr)
                     self.assertEqual(len(result.stderr.splitlines()), 1)
+
+    def test_cli_rejects_invalid_jobs_and_max_tex_size(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            for flag, value, error in [
+                ("--jobs", "0", "argument --jobs"),
+                ("--jobs", "-1", "argument --jobs"),
+                ("--max-tex-size", "-1", "argument --max-tex-size"),
+            ]:
+                with self.subTest(flag=flag, value=value):
+                    result = subprocess.run(
+                        [
+                            sys.executable, "-I",
+                            os.path.join(TOOLS, "batch_glb.py"),
+                            root, os.path.join(root, "out"),
+                            flag, value,
+                        ],
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn(error, result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+    def test_cli_accepts_valid_jobs_and_max_tex_size(self) -> None:
+        with tempfile.TemporaryDirectory() as in_dir, tempfile.TemporaryDirectory() as out_dir:
+            obj_path = os.path.join(in_dir, "test_model.obj")
+            with open(obj_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(
+                    "o test\n"
+                    "v 0.0 0.0 0.0\n"
+                    "v 1.0 0.0 0.0\n"
+                    "v 0.0 1.0 0.0\n"
+                    "f 1 2 3\n"
+                )
+
+            # zero texture size (unconstrained) and a positive jobs limit are valid
+            result = subprocess.run(
+                [
+                    sys.executable, "-I",
+                    os.path.join(TOOLS, "batch_glb.py"),
+                    in_dir, out_dir,
+                    "--jobs", "1",
+                    "--max-tex-size", "0",
+                ],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("converted 1/1 models", result.stdout)
 
     def test_batch_convert_synthetic(self) -> None:
         with tempfile.TemporaryDirectory() as in_dir, tempfile.TemporaryDirectory() as out_dir:

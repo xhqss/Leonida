@@ -87,6 +87,21 @@ class PipelinePreflightTest(PreflightEnv, unittest.TestCase):
         with mock.patch.object(make_game, "pipeline_check_exe", return_value="/bin/vk_pipeline_check"):
             make_game.preflight(["pipelines"], self.work)
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX execute permissions")
+    def test_non_executable_linux_checker_without_cmake_fails_preflight(self):
+        self.write_shader_index()
+        checker_dir = os.path.join(self.root, "runtime", "build", "linux")
+        os.makedirs(checker_dir)
+        checker = os.path.join(checker_dir, "vk_pipeline_check")
+        with open(checker, "wb"):
+            pass
+        os.chmod(checker, 0o644)
+        with mock.patch.object(make_game, "ROOT", self.root), \
+                mock.patch("shutil.which", return_value=None), \
+                mock.patch.object(make_game, "build_pipeline_check") as build:
+            self.assert_preflight_fails(["pipelines"], "CMake 3.24 or newer")
+        build.assert_not_called()
+
     def test_runtime_stage_builds_the_checker_so_it_is_not_required(self):
         # On Windows runtime produces vk_pipeline_check.exe when the Vulkan SDK is installed.
         self.write_shader_index()

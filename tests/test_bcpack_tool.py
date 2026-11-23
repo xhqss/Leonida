@@ -79,6 +79,55 @@ class TestBcpackTool(unittest.TestCase):
 
             self.assertEqual(decoded, self.original_blocks)
 
+    def test_decode_refuses_same_input_output_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "same.bcpack")
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            with self.assertRaises(ValueError) as ctx:
+                bcpack_tool.decode_file(
+                    in_file, in_file, codec=1, out_size=len(self.original_blocks)
+                )
+            self.assertIn(in_file, str(ctx.exception))
+            with open(in_file, "rb") as f:
+                self.assertEqual(f.read(), self.compressed_stream)
+
+    def test_decode_refuses_symlink_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "same.bcpack")
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            link_file = os.path.join(tmp_dir, "link.bcpack")
+            try:
+                os.symlink(in_file, link_file)
+            except (OSError, NotImplementedError, AttributeError) as e:
+                self.skipTest(f"symlinks unavailable: {e}")
+            with self.assertRaises(ValueError) as ctx:
+                bcpack_tool.decode_file(
+                    in_file, link_file, codec=1, out_size=len(self.original_blocks)
+                )
+            self.assertIn(link_file, str(ctx.exception))
+            with open(in_file, "rb") as f:
+                self.assertEqual(f.read(), self.compressed_stream)
+
+    def test_decode_refuses_hardlink_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "same.bcpack")
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            link_file = os.path.join(tmp_dir, "link.bcpack")
+            try:
+                os.link(in_file, link_file)
+            except (OSError, NotImplementedError, AttributeError) as e:
+                self.skipTest(f"hard links unavailable: {e}")
+            with self.assertRaises(ValueError) as ctx:
+                bcpack_tool.decode_file(
+                    in_file, link_file, codec=1, out_size=len(self.original_blocks)
+                )
+            self.assertIn(link_file, str(ctx.exception))
+            with open(in_file, "rb") as f:
+                self.assertEqual(f.read(), self.compressed_stream)
+
     def test_cli_subcommands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             in_file = os.path.join(tmp_dir, "sample.bcpack")
@@ -238,6 +287,19 @@ class TestCliErrorPaths(unittest.TestCase):
             )
             self._assert_one_error_line(rc, err, "hist.json")
             self.assertFalse(os.path.exists(out_file))
+
+    def test_decode_same_input_output_cli_exits_2(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "same.bcpack")
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            rc, err, _ = self._cli(
+                ["decode", in_file, in_file, "--codec", "1", "--size", "32"],
+                tmp_dir, "decode_same_io",
+            )
+            self._assert_one_error_line(rc, err, "same.bcpack")
+            with open(in_file, "rb") as f:
+                self.assertEqual(f.read(), self.compressed_stream)
 
     def test_success_path_still_exits_zero(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

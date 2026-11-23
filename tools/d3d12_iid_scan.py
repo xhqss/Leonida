@@ -30,6 +30,9 @@ import struct
 import sys
 import uuid
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 MIDL = re.compile(r'MIDL_INTERFACE\("([0-9a-fA-F-]{36})"\)\s*\n\s*(ID3D12\w+)')
 
 # The creators whose result interfaces docs/d3d12_command_objects.md section 2.1 asks about.
@@ -138,18 +141,33 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--header", help="d3d12.h to read the IIDs from (default: newest Windows SDK)")
     ap.add_argument("--json", help="also write the result here")
     args = ap.parse_args(argv)
+    if args.json:
+        # The report is written last, after every input has been read, so an aliased input would
+        # silently be replaced by it. Refuse the alias before anything is opened.
+        for what, other in (("--header", args.header), *(("an input image", p) for p in args.images)):
+            if other and same_report_path(args.json, other):
+                print(f"ERROR: --json would overwrite {what}: {other}", file=sys.stderr)
+                return 2
     header = args.header or default_header()
     if not header or not os.path.isfile(header):
         print("ERROR: d3d12.h not found; pass --header", file=sys.stderr)
         return 2
-    iids = read_iids(header)
+    try:
+        iids = read_iids(header)
+    except OSError as e:
+        print(f"ERROR: cannot read {header}: {e.strerror or e}", file=sys.stderr)
+        return 2
     if not iids:
         print(f"ERROR: no ID3D12 MIDL_INTERFACE declarations in {header}", file=sys.stderr)
         return 2
     print(f"{len(iids)} ID3D12 IIDs from {header}")
     results = []
     for path in args.images:
-        r = scan(path, iids)
+        try:
+            r = scan(path, iids)
+        except OSError as e:  # a missing, locked or folder image used to end the run in a traceback
+            print(f"ERROR: cannot read {path}: {e.strerror or e}", file=sys.stderr)
+            return 2
         results.append(r)
         absent = [n for n, present in r["focus"].items() if not present]
         print(f"== {r['image']}: {len(r['found'])} found")
@@ -161,9 +179,13 @@ def main(argv: list[str] | None = None) -> int:
                 print("  WARNING: these d3d12_xs.dll imports may be IID data, so an absent IID proves nothing for "
                       "this image: " + ", ".join(r["possible_iid_imports"]))
     if args.json:
-        with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"header": os.path.basename(header), "iids": len(iids), "images": results}, f, indent=2)
-            f.write("\n")
+        try:
+            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"header": os.path.basename(header), "iids": len(iids), "images": results}, f, indent=2)
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: cannot write {args.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
     return 0
 
 

@@ -192,6 +192,20 @@ def batch_convert(
     }
 
 
+def _positive_jobs(value: str) -> int:
+    jobs = int(value)
+    if jobs <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer (got {value!r})")
+    return jobs
+
+
+def _non_negative_int(value: str) -> int:
+    num = int(value)
+    if num < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0 (got {value!r})")
+    return num
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Batch convert Wavefront OBJ models to binary glTF 2.0 (.glb)."
@@ -200,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("out_dir", help="Output directory for .glb files")
     parser.add_argument(
         "--jobs",
-        type=int,
+        type=_positive_jobs,
         default=None,
         help="Number of parallel worker threads (default: CPU count)",
     )
@@ -218,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--max-tex-size",
-        type=int,
+        type=_non_negative_int,
         default=0,
         help="Max texture dimension in pixels when decoding DDS (0 = unconstrained)",
     )

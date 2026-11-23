@@ -39,7 +39,8 @@ class HarnessErrorExit(unittest.TestCase):
             mock.patch.object(sd.rdna2spirv, "translate", side_effect=sd.rdna2spirv.Unsupported("test opcode")),
             contextlib.redirect_stdout(out),
         ):
-            self.assertEqual(sd.main(["--programs", "1"]), 0)
+            # exit 2: a run where every program was skipped is not a success (#4448)
+            self.assertEqual(sd.main(["--programs", "1"]), 2)
         self.assertIn("1 skipped, 0 harness errors", out.getvalue())
         self.assertIn("translator unsupported: test opcode", out.getvalue())
 
@@ -55,9 +56,24 @@ class HarnessErrorExit(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(sd, "run_fragment", side_effect=UnsupportedConstruct("test construct")):
             with contextlib.redirect_stdout(out):
-                self.assertEqual(sd.main(["--programs", "1"]), 0)
+                sd.main(["--programs", "1"])
         self.assertIn("1 skipped, 0 harness errors", out.getvalue())
         self.assertIn("test construct", out.getvalue())
+
+    def test_a_run_where_every_program_was_skipped_is_not_a_success(self):
+        out = io.StringIO()
+        with mock.patch.object(sd, "run_fragment", side_effect=UnsupportedConstruct("test construct")):
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(sd.main(["--programs", "2"]), 2)
+        self.assertIn("no program ran: every one was skipped", out.getvalue())
+
+    def test_some_skips_next_to_passes_still_exit_0(self):
+        out = io.StringIO()
+        calls = iter([("match", ""), ("skip", "unsupported form")])
+        with mock.patch.object(sd, "run_one", lambda *_a: next(calls)):
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(sd.main(["--programs", "2"]), 0)
+        self.assertIn("1 pass, 0 mismatch, 1 skipped", out.getvalue())
 
     def test_mismatch_still_exits_1(self):
         with mock.patch.object(sd, "run_one", lambda *_a: ("mismatch", "lane word 0")), mock.patch("sys.stdout"):
@@ -101,7 +117,7 @@ class ArgumentValidation(unittest.TestCase):
 
     def test_a_valid_limit_still_runs_that_many_programs(self):
         out = io.StringIO()
-        with mock.patch.object(sd, "run_one", lambda *_a: ("pass", "")), contextlib.redirect_stdout(out):
+        with mock.patch.object(sd, "run_one", lambda *_a: ("match", "")), contextlib.redirect_stdout(out):
             self.assertEqual(sd.main(["--programs", "5", "--limit", "1"]), 0)
         self.assertIn("1 programs", out.getvalue())
 

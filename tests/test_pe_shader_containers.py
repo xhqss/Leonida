@@ -243,6 +243,20 @@ class ReportPathTests(unittest.TestCase):
         with open(blocker, "rb") as f:
             self.assertEqual(f.read(), b"keep me")
 
+    def test_extract_index_must_not_overwrite_an_image(self):
+        with open(self.image, "rb") as f:
+            before = f.read()
+        index = os.path.join(self.dir, "index.json")
+        with open(index, "wb") as f:
+            f.write(before)
+        code, stdout, err = self.run_main([self.image, index, "--extract", self.dir])
+        self.assertEqual(code, 2)
+        self.assertIn("would overwrite the input image", err)
+        self.assertEqual(stdout, "")
+        self.assertCountEqual(os.listdir(self.dir), ["shader.dll", "index.json"])
+        with open(index, "rb") as f:
+            self.assertEqual(f.read(), before)
+
     def test_json_must_not_overwrite_the_extract_index(self):
         extract = os.path.join(self.dir, "out")
         index = os.path.join(extract, "index.json")

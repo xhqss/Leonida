@@ -111,6 +111,20 @@ class BufferSwizzleProbeTests(unittest.TestCase):
                     rc_dir = probe.main(["--oracle", "both", "--group", "oob_mode3_soffset", "--json", tmp])
             self.assertEqual(rc_dir, 2)
 
+    def test_report_failure_names_the_output(self):
+        group = "offset_wrap"
+        result = {32: {case.name: [1, 2, 3, 4] for case in probe.build_cases() if case.group == group}}
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp) / "blocker"
+            blocker.write_bytes(b"keep")
+            report = str(blocker / "report.json")
+            with unittest.mock.patch.object(probe, "run_translator", return_value=result), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                rc = probe.main(["--group", group, "--wave", "32", "--json", report])
+            self.assertEqual(rc, 2)
+            self.assertIn(f"cannot write {report}", err.getvalue())
+            self.assertEqual(blocker.read_bytes(), b"keep")
+
     def test_unexpected_mismatch_and_wave_diff_fail(self):
         bad_hw = ("device=mock arch=gfx1036", {
             32: {"voff_inst_wrap_and_soff_nowrap": [1, 2, 3, 4]},

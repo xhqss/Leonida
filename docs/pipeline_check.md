@@ -6,6 +6,11 @@ constant contract. It is a driver-level check: it proves the modules and pipelin
 the Vulkan implementation, not that the shader results are correct. Value-level checks are in
 `docs/shader_validation.md`.
 
+Timing and memory figures in this page were measured with `MESA_SHADER_CACHE_DISABLE=true`. Without it, RADV's
+on-disk shader cache (`~/.cache/mesa_shader_cache`, about 1.1 GB after a full corpus run) turns a repeated module
+into a cache hit: 0.1 s and ~114 MB instead of a real compilation. That is what a resume run wants, but not what a
+measurement should report.
+
 The checker exits nonzero if a module fails to load, a pipeline fails to compile, or the requested final
 cache save fails. It still finishes checking the other entries and attempts the final save so the next run
 can reuse successful pipelines. Before creating a Vulkan shader module, it checks that the file has a
@@ -114,6 +119,65 @@ In strict mode, exit 1 means at least one result other than `exact` or `partitio
 Invalid inputs or an unavailable Vulkan probe exit 2. This checks width fidelity from metadata.
 Vulkan pipeline creation and drawing still need their own tests. See [Wave64 graphics in the
 translator contract](design.md) for how the tiers are assigned.
+## Test Mesa pipeline compilation without a physical GPU
+
+On Linux, Mesa's DRM shims expose GPU profiles to its Vulkan drivers. This lets `vk_pipeline_check`
+measure shader compile time and reproduce compiler failures on a machine without that hardware.
+Readback and dispatch correctness still require a Vulkan device that executes commands.
+See the [Mesa DRM shim guide](https://docs.mesa3d.org/ci/drm-shim.html).
+
+From the Leonida root, build the checker and translate a synthetic fixture. The fixture build needs
+`spirv-as`, `spirv-val` and LLVM 21 or later with the AMDGPU target. Set `LLVM_MC` if the assembler
+has a versioned name.
+
+```sh
+cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build runtime/build --target vk_pipeline_check
+fixtures=$(mktemp -d)
+python3 -I runtime/test/shaders/build.py "$fixtures" cs_buf_fmt8
+```
+
+### AMD RADV
+
+Build Mesa with `-Dvulkan-drivers=amd -Dtools=drm-shim`. Set `mesa_build` to that build directory
+and `radv_icd` to the absolute path of the matching RADV Vulkan ICD manifest.
+
+```sh
+AMDGPU_GPU_ID=gfx1201 \
+LD_PRELOAD="$mesa_build/src/amd/drm-shim/libamdgpu_noop_drm_shim.so" \
+VK_DRIVER_FILES="$radv_icd" MESA_SHADER_CACHE_DISABLE=true \
+  runtime/build/vk_pipeline_check "$fixtures/spirv" --jobs 1 --slow 0
+```
+
+The checker should select a device whose name includes `RADV GFX1201` and report one compute pipeline
+compiled. For comparisons, use the same Mesa version, GPU profile and translation flags each time.
+Run each comparison in a fresh process and leave the pipeline cache filename out.
+
+Mesa 25.0.7 also supports a null device directly through the installed RADV ICD. On Debian 13
+this runs the same compile check with the distro driver.
+
+```sh
+RADV_FORCE_FAMILY=GFX1201 VK_DRIVER_FILES=/usr/share/vulkan/icd.d/radeon_icd.json \
+MESA_SHADER_CACHE_DISABLE=true runtime/build/vk_pipeline_check "$fixtures/spirv" --jobs 1 --slow 0
+```
+
+### Intel ANV
+
+Build the Intel shim with `-Dtools=drm-shim,intel` and use an ANV ICD from the same Mesa version.
+When using a prebuilt driver, the shim can be built with `-Dvulkan-drivers= -Dgallium-drivers=`.
+Set `intel_icd` to the absolute path of its ANV manifest and `intel_shim_build` to the shim's
+Mesa build directory.
+
+```sh
+INTEL_STUB_GPU_PLATFORM=bmg \
+LD_PRELOAD="$intel_shim_build/src/intel/tools/libintel_noop_drm_shim.so" \
+VK_DRIVER_FILES="$intel_icd" MESA_SHADER_CACHE_DISABLE=true \
+  runtime/build/vk_pipeline_check "$fixtures/spirv" --jobs 1 --slow 0
+```
+
+The example selects a Battlemage profile. Use `dg2` for an Alchemist profile or `adl` for Alder Lake.
+On Mesa 26.1.6 all three compiled the example, including when it was rebuilt with
+`LEONIDA_PC_TAIL_UBO=1` to move the push-constant tail to a uniform buffer.
 
 ## Corpus
 
@@ -243,20 +307,26 @@ writes/clears its in-flight report even when validation fails. Exit 1 without a 
 of repeating failed setup for the remaining batches; diagnostic probes use the same distinction. Each process
 starts with a cleared report path, so an earlier process's report cannot hide an initialization failure.
 
+An abnormal diagnostic-probe exit confirms a module crash only when that probe's fresh in-flight report names
+the selected module. A missing, empty or unrelated report makes the result inconclusive and stops the stage
+without blaming that module. The native report is periodic for small modules, so even a real fast crash can
+leave no evidence; this conservative fallback does not guess its cause or add an unconfirmed crash-list entry.
+
 The batch size limits the index range, **not total memory usage**. Concurrent heavy modules, loading a large
 saved cache or compiling one large shader can still exceed a process's available memory; a range that
 cannot complete even alone fails with a diagnostic rather than being counted as checked.
 
 `tests/test_make_game_pipeline_batches.py` runs the real build-stage orchestration against scripted child processes:
 bounded coverage and cache checkpoints, collective memory-crash recovery, a genuinely crashing module, validation
-failures, interruptions, setup failures and compatibility with older checkers. It needs no game files or GPU.
+failures, interruptions, setup failures, inconclusive probes and compatibility with older checkers. It needs no
+game files or GPU.
 
 ## Crash isolation (`--isolate`)
 
 A driver that dies while compiling one module (for example the RADV `SIGFPE` in
 [#1721](https://github.com/ItsNotRexed/Leonida/issues/1721)) ends the whole process, so the rest of the corpus
-used to need that module excluded by hand with `--start/--count`. With `--isolate` (POSIX only; on Windows it
-prints an error and exits with 2) the tool runs the check in child processes instead:
+used to need that module excluded by hand with `--start/--count`. With `--isolate` the tool runs the check in
+child processes on native Windows and POSIX:
 
 ```sh
 vk_pipeline_check <spirv dir> cache.bin --isolate [--isolate-batch 256] [--jobs N ...]
@@ -272,6 +342,7 @@ vk_pipeline_check <spirv dir> cache.bin --isolate [--isolate-batch 256] [--jobs 
   that needs several threads at once), the batch is reported as `MODULE CRASH [a, b) not reproduced ...` and
   counts as a failure. A child that fails before it starts work (no device, bad arguments) stops the run
   with exit status 1.
+- Windows reports exception exit codes in hexadecimal, for example `driver exited with status 0xc0000005`.
 - The pipeline cache: children run one after another and each seeds from and saves to the same `cache.bin`,
   like the chunked runs above; the save is atomic, a crashed child saves nothing, so the file stays valid and
   holds everything the finished children compiled. The parent prints its size at the end.
@@ -282,8 +353,9 @@ vk_pipeline_check <spirv dir> cache.bin --isolate [--isolate-batch 256] [--jobs 
   There is no timeout: a hung compile still hangs.
 
 Test hook, not for normal use: `VK_PIPELINE_CHECK_SIMULATE_CRASH=<module name substring>[:SIGNAL]` makes the
-process raise `SIGNAL` (default `SIGFPE`; `SEGV`, `ABRT`, `KILL`, ... also accepted) just before the pipeline of a
-matching module is created. `tests/test_vk_pipeline_check_isolate.py` uses it with five hand-assembled compute
+process simulate a crash just before creating a matching module's pipeline. The default is `SIGFPE`.
+On Windows, `SIGFPE` and `SIGSEGV` use the corresponding exception exit codes.
+`tests/test_vk_pipeline_check_isolate.py` uses it with five hand-written compute
 shaders to check `--isolate` without a crashing driver; it skips when the tool isn't built or there is no
 Vulkan device.
 

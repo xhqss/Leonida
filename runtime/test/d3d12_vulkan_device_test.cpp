@@ -3,8 +3,9 @@
 // start handles read in the Xbox shape (RAX), a texture from slot 76 with the Xbox layout word, committed
 // resources, views, command lists, a queue, a fence and query heaps. Results are read back through D3D12 itself
 // (CopyTextureRegion into a readback heap, then Map). GetCopyableFootprints, GetResourceAllocationInfo,
-// GetResourceTiling, copies (d3d12_copy_compare.h), CheckFeatureSupport's error paths and the HRESULTs of invalid
-// arguments to resource, heap, queue and fence creation and Map are compared with the host PC runtime's
+// GetResourceTiling, copies (d3d12_copy_compare.h), CheckFeatureSupport's error paths, fence semantics and the
+// HRESULTs of invalid arguments to resource, heap, queue and fence creation and Map are compared with the host PC
+// runtime's
 // (LEONIDA_D3D49_VERBOSE=1 prints every argument case). WriteToSubresource/ReadFromSubresource run on
 // devices of their own, once per copy path. No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run
 // under VK_LAYER_KHRONOS_validation; any validation error fails the test.
@@ -532,6 +533,10 @@ int compare_footprints(ID3D12Device* ours) {
         {texture_desc(16, 16, DXGI_FORMAT_R8G8_TYPELESS, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R8G8_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R8G8_SINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
+        // Mip counts past 32 (and past 64 for the width): D3D12 accepts any count, every mip past the chain is 1x1.
+        {texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 40), 40},
+        {line_desc(16, 70, 1, DXGI_FORMAT_R8G8B8A8_UNORM), 70},
+        {volume_desc(40), 40},
     };
     for (const auto& c : footprint_validity_cases()) cases.push_back({c.first, 1});
     int mismatches = 0;
@@ -622,6 +627,56 @@ int compare_allocation_info(ID3D12Device* ours) {
         {"buffer width 0", buffer_desc(0), 0},
         {"buffer height 2", bad_buffer, 0},
         {"buffer with a format", typed_buffer, 0},
+        // Resource flag handling (D3D-467).
+        {"buffer render target", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+             return d;
+         }(), 0},
+        {"buffer render target UAV", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+             return d;
+         }(), 0},
+        {"buffer cross adapter", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+             return d;
+         }(), 0},
+        {"buffer depth stencil (invalid)", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+             return d;
+         }(), 0},
+        {"buffer simultaneous access (invalid)", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+             return d;
+         }(), 0},
+        {"buffer video decode reference only (invalid)", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY;
+             return d;
+         }(), 0},
+        {"buffer flag 0x1000 (invalid)", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAGS(0x1000);
+             return d;
+         }(), 0},
+        {"tex2d deny shader resource alone (invalid)", [&] {
+             auto d = texture_desc(16, 16, rgba8, D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+             return d;
+         }(), 0},
+        {"tex2d single sample quality 1", [&] {
+             auto d = texture_desc(16, 16, rgba8, none);
+             d.SampleDesc.Quality = 1;
+             return d;
+         }(), 16 * 16 * 4},
+        {"tex2d single sample quality center pattern", [&] {
+             auto d = texture_desc(16, 16, rgba8, none);
+             d.SampleDesc.Quality = 0xffffffff;
+             return d;
+         }(), 16 * 16 * 4},
         {"256x256 full chain", texture_desc(256, 256, rgba8, none, 0), 256 * 256 * 4},
         {"16x16 small", with(texture_desc(16, 16, rgba8, none), k4), 16 * 16 * 4},
         {"16x16 small render target", with(texture_desc(16, 16, rgba8, rt), k4), 16 * 16 * 4},
@@ -1427,6 +1482,8 @@ int compare_depth_multisample_quality_levels(ID3D12Device* ours, VkSampleCountFl
         DXGI_FORMAT_D16_UNORM,
         DXGI_FORMAT_D24_UNORM_S8_UINT,
         DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+        DXGI_FORMAT_R24G8_TYPELESS,
+        DXGI_FORMAT_R32G8X24_TYPELESS,
     };
     constexpr UINT sample_counts[] = {2, 4, 8, 16, 32};
     unsigned compared = 0, skipped = 0;
@@ -1752,6 +1809,13 @@ bool within_06_ulp(std::uint8_t a, std::uint8_t b, double ideal) {
     return std::abs(double(a) - ideal) <= 0.6 && std::abs(double(b) - ideal) <= 0.6;
 }
 
+// The code nearest to `ideal`, a tie going to the even one: what the layer writes for a normalised clear (#521's
+// quantize_unorm), whichever way the GPU's own driver rounds the tie.
+double nearest_even_code(double ideal) {
+    const double r = std::floor(ideal + 0.5);
+    return r - ideal == 0.5 && std::fmod(r, 2.0) != 0.0 ? r - 1.0 : r;
+}
+
 bool create_host_device_for_physical(VkInstance instance, VkPhysicalDevice physical,
                                      PFN_vkGetInstanceProcAddr instance_proc, Ref<ID3D12Device>& host,
                                      std::string& adapter_name) {
@@ -1920,9 +1984,7 @@ int compare_format_support(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInfo
         if ((h1 & D3D12_FORMAT_SUPPORT1_MIP) && (o1 & (dims | D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL)) &&
             !(o1 & D3D12_FORMAT_SUPPORT1_MIP))
             fail(f, "no MIP where the host has mips", o1, o2, h1, h2);
-        // A8_UNORM reads through a swizzled R8 view, and gathers through that swizzle aren't verified: no gather.
-        if (f != DXGI_FORMAT_A8_UNORM &&
-            bool(o1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != bool(o1 & D3D12_FORMAT_SUPPORT1_SHADER_GATHER))
+        if (bool(o1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != bool(o1 & D3D12_FORMAT_SUPPORT1_SHADER_GATHER))
             fail(f, "gather and sample disagree", o1, o2, h1, h2);
         if (bool(o2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != bool(o2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD))
             fail(f, "typed UAV load and store disagree", o1, o2, h1, h2);
@@ -3066,15 +3128,17 @@ bool host_ray_tracing(ID3D12Device* host) {
 }
 
 // Windows 10's runtime (no ID3D12Device10) still checks a buffer's initial state and refuses a HARDWARE_PROTECTED
-// heap, where newer runtimes and the layer accept them (measured on Windows 10 22H2 build 19045.5737). For a case
-// marked windows10_refuses only that pair is excused: the layer's S_OK against the host's E_INVALIDARG, on a host
-// without ID3D12Device10. Any other difference, and any difference on a newer host, is still a mismatch.
+// heap, where newer runtimes and the layer accept them (measured on Windows 10 22H2 build 19045.5737). Windows 11
+// 23H2's runtime (D3D12Core 10.0.22621.5415: ID3D12Device10 but no ID3D12Device11) still refuses the
+// HARDWARE_PROTECTED heap. For a case marked windows10_refuses only that pair is excused: the layer's S_OK against
+// the host's E_INVALIDARG, on a host without ID3D12Device11. Any other difference, and any difference on a newer
+// host, is still a mismatch.
 bool windows10_refusal(const char* name, ID3D12Device* host, HRESULT ours, HRESULT theirs) {
     if (ours != S_OK || theirs != E_INVALIDARG) return false;
-    Ref<ID3D12Device10> newer;
+    Ref<ID3D12Device11> newer;
     if (SUCCEEDED(host->QueryInterface(IID_PPV_ARGS(&newer.p)))) return false;
-    std::printf("invalid arguments %s: Windows 10's runtime refuses it (ours 0x%08lx, host 0x%08lx)\n", name, ours,
-                theirs);
+    std::printf("invalid arguments %s: an older host runtime (Windows 10, Windows 11 23H2) refuses it (ours 0x%08lx, "
+                "host 0x%08lx)\n", name, ours, theirs);
     return true;
 }
 
@@ -3090,6 +3154,14 @@ int compare_invalid_arguments(ID3D12Device* ours) {
     };
     const auto device10 = [](ID3D12Device* d) {
         Ref<ID3D12Device10> newer;
+        return SUCCEEDED(d->QueryInterface(IID_PPV_ARGS(&newer.p)));
+    };
+    // Windows 11 23H2's in-box runtime (D3D12Core 10.0.22621.5415) has ID3D12Device10 but not ID3D12Device11, and
+    // still answers five of the device10 cases as Windows 10 does (HARDWARE_PROTECTED and flag 0x400 refused, 2049
+    // shader-visible samplers refused, a type -1 list created). Those five are compared only on a host with
+    // ID3D12Device11, which newer runtimes have (d3d12_sampler2_test compares against one).
+    const auto device11 = [](ID3D12Device* d) {
+        Ref<ID3D12Device11> newer;
         return SUCCEEDED(d->QueryInterface(IID_PPV_ARGS(&newer.p)));
     };
     static const Case cases[] = {
@@ -3625,12 +3697,38 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"committed: heap flag HARDWARE_PROTECTED on a texture", [](ID3D12Device* d) {
              return with_heap_flags(d, rgba8(), D3D12_HEAP_FLAG_HARDWARE_PROTECTED);
-         }, +device10},
+         }, +device11},
         {"committed: heap flag ALLOW_WRITE_WATCH on a buffer", [](ID3D12Device* d) {
              return with_heap_flags(d, buffer_desc(256), D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH);
          }},
         {"committed: heap flag ALLOW_SHADER_ATOMICS on a buffer", [](ID3D12Device* d) {
              return with_heap_flags(d, buffer_desc(256), D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+         }},
+        {"committed: heap flag ALLOW_SHADER_ATOMICS on a UAV buffer", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+             return with_heap_flags(d, desc, D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+         }},
+        {"committed: heap flag ALLOW_SHADER_ATOMICS on a UAV texture", [](ID3D12Device* d) {
+             return with_heap_flags(d, texture_desc(16, 16, DXGI_FORMAT_R32_FLOAT,
+                                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                                    D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+         }},
+        {"committed: heap flag ALLOW_SHADER_ATOMICS on a render-target UAV", [](ID3D12Device* d) {
+             return with_heap_flags(d, rgba8(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                                    D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+         }},
+        {"committed: heap flag ALLOW_SHADER_ATOMICS on a texture without UAV", [](ID3D12Device* d) {
+             return with_heap_flags(d, rgba8(), D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+         }},
+        {"committed: heap flag ALLOW_SHADER_ATOMICS on a render target without UAV", [](ID3D12Device* d) {
+             return with_heap_flags(d, rgba8(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+                                    D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+         }},
+        {"committed: heap flag ALLOW_SHADER_ATOMICS on an upload buffer", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_UPLOAD}, buffer_desc(256), D3D12_RESOURCE_STATE_GENERIC_READ,
+                              D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
          }},
         {"committed: heap flag CREATE_NOT_RESIDENT on a texture", [](ID3D12Device* d) {
              return with_heap_flags(d, rgba8(), D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT);
@@ -3713,10 +3811,10 @@ int compare_invalid_arguments(ID3D12Device* ours) {
              auto desc = buffer_desc(256);
              desc.Flags = D3D12_RESOURCE_FLAGS(0x400);
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc);
-         }, +device10},
+         }, +device11},
         {"committed: resource flag 0x400 on a texture", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(D3D12_RESOURCE_FLAGS(0x400)));
-         }, +device10},
+         }, +device11},
         // A null output is a capability check; with invalid arguments too, the host's answer says which comes first.
         {"committed: heap type 99, null output", [](ID3D12Device* d) {
              const H heap{D3D12_HEAP_TYPE(99)};
@@ -3799,7 +3897,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"descriptor heap: shader-visible 2049 samplers", [](ID3D12Device* d) {
              return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2049,
                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE});
-         }, +device10},
+         }, +device11},
         {"descriptor heap: shader-visible 2048 samplers", [](ID3D12Device* d) {
              return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2048,
                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE});
@@ -4010,11 +4108,12 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"command list1: type copy", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(3)); }},
         {"command list1: type 7", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(7)); }},
         {"command list1: type 99", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(99)); }},
-        // NONE (-1): Windows 10's runtime (19045, no ID3D12Device10) creates the list and Windows 11's refuses it
-        // (measured on #2297), so it is compared only on a host with ID3D12Device10.
+        // NONE (-1): Windows 10's runtime (19045, no ID3D12Device10) creates the list and newer Windows 11 runtimes
+        // refuse it (measured on #2297); Windows 11 23H2 (22621.5415, ID3D12Device10 but no ID3D12Device11) still
+        // creates it, so it is compared only on a host with ID3D12Device11.
         {"command list1: type -1", [](ID3D12Device* d) {
              return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(-1));
-         }, +device10},
+         }, +device11},
         {"command list1: node mask 1", [](ID3D12Device* d) {
              return command_list1(d, 1, D3D12_COMMAND_LIST_TYPE_DIRECT);
          }},
@@ -4297,7 +4396,8 @@ int compare_heap_neighbours(ID3D12Device* ours) {
              return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS));
          }},
         // The D3D12_HEAP_FLAGS documentation calls it unsupported, but the host accepts it (RTX 4070 SUPER and
-        // UHD 770, @CowBoYdu76). Windows 10's runtime refuses it, as it refuses the committed case above.
+        // UHD 770, @CowBoYdu76). Windows 10's and Windows 11 23H2's runtimes refuse it, as they refuse the committed
+        // case above.
         {"heap: HARDWARE_PROTECTED", [](ID3D12Device* d) {
              return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_HARDWARE_PROTECTED));
          }, true},
@@ -4310,6 +4410,67 @@ int compare_heap_neighbours(ID3D12Device* ours) {
         ++mismatches;
         std::fprintf(stderr, "invalid arguments %s: ours 0x%08lx, host 0x%08lx\n", c.name, a, b);
     }
+    return mismatches;
+}
+
+// ID3D12Heap::GetDesc reads back as the host's for heaps of each type with each node-mask pair, on a device with the
+// GPU address arena: a node mask of 0 reads back as the one node (1), as the layer's resources, descriptor heaps and
+// queues already answer (d3d12_node_mask_test). Returns the number of mismatches, or -1 without a host.
+int compare_heap_descs(ID3D12Device* ours) {
+    Ref<ID3D12Device> host;
+    if (!create_host_device(host)) return -1;
+    struct HeapCase {
+        D3D12_HEAP_PROPERTIES properties;
+        UINT64 alignment;  // 0: the default
+    };
+    const HeapCase heaps[] = {
+        {{D3D12_HEAP_TYPE_DEFAULT}, 0},
+        {{D3D12_HEAP_TYPE_DEFAULT}, D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT},
+        {{D3D12_HEAP_TYPE_UPLOAD}, 0},
+        {{D3D12_HEAP_TYPE_READBACK}, 0},
+        {{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE, D3D12_MEMORY_POOL_L0}, 0},
+    };
+    const UINT masks[][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 1}};
+    int mismatches = 0;
+    for (const HeapCase& heap : heaps) {
+        for (const auto& mask : masks) {
+            D3D12_HEAP_PROPERTIES props = heap.properties;
+            props.CreationNodeMask = mask[0];
+            props.VisibleNodeMask = mask[1];
+            const D3D12_HEAP_DESC desc = heap_desc_of(heap.alignment, props, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                                                      heap.alignment ? heap.alignment : 64 * 1024);
+            Ref<ID3D12Heap> a, e;
+            const HRESULT ha = ours->CreateHeap(&desc, IID_PPV_ARGS(&a.p));
+            const HRESULT he = host->CreateHeap(&desc, IID_PPV_ARGS(&e.p));
+            if (FAILED(he) || !e.p) continue;  // nothing to compare
+            if (FAILED(ha) || !a.p) {
+                ++mismatches;
+                std::fprintf(stderr, "heap GetDesc type %d align %llu masks %u/%u: the layer refused it (0x%08lx)\n",
+                             int(props.Type), heap.alignment, mask[0], mask[1], ha);
+                continue;
+            }
+            const D3D12_HEAP_DESC x = a->GetDesc(), y = e->GetDesc();
+            if (x.SizeInBytes == y.SizeInBytes && x.Alignment == y.Alignment && x.Flags == y.Flags &&
+                x.Properties.Type == y.Properties.Type &&
+                x.Properties.CPUPageProperty == y.Properties.CPUPageProperty &&
+                x.Properties.MemoryPoolPreference == y.Properties.MemoryPoolPreference &&
+                x.Properties.CreationNodeMask == y.Properties.CreationNodeMask &&
+                x.Properties.VisibleNodeMask == y.Properties.VisibleNodeMask)
+                continue;
+            ++mismatches;
+            std::fprintf(stderr,
+                         "heap GetDesc type %d align %llu masks %u/%u: ours size %llu align %llu flags 0x%x cpu %d "
+                         "pool %d masks %u/%u, host size %llu align %llu flags 0x%x cpu %d pool %d masks %u/%u\n",
+                         int(props.Type), heap.alignment, mask[0], mask[1], x.SizeInBytes, x.Alignment,
+                         unsigned(x.Flags), int(x.Properties.CPUPageProperty),
+                         int(x.Properties.MemoryPoolPreference), x.Properties.CreationNodeMask,
+                         x.Properties.VisibleNodeMask, y.SizeInBytes, y.Alignment, unsigned(y.Flags),
+                         int(y.Properties.CPUPageProperty), int(y.Properties.MemoryPoolPreference),
+                         y.Properties.CreationNodeMask, y.Properties.VisibleNodeMask);
+        }
+    }
+    std::printf("ID3D12Heap::GetDesc against the host: %zu heaps, %d differ\n", std::size(heaps) * std::size(masks),
+                mismatches);
     return mismatches;
 }
 
@@ -4804,6 +4965,54 @@ int compare_check_feature_support(ID3D12Device* ours) {
         std::uint8_t buf[256] = {};
         check("undefined feature", f, buf, sizeof(buf));
     }
+    return mismatches;
+}
+
+// Fences and queues must follow the host runtime's semantics: Signal raises the completed value and a null event set
+// for a reached value blocks until then. Runs the same sequence on ours and the host and compares the completed value
+// and the HRESULT at each step. A signal of an already-passed (lower) value is a documented deviation: the shim drops
+// it and stays monotonic because a Vulkan timeline cannot go back, so that case is checked against the documented
+// behaviour rather than the host. Returns the number of mismatches, or -1 when the host has no D3D12 device.
+int compare_fences(ID3D12Device* ours) {
+    Ref<ID3D12Device> host;
+    if (!create_host_device(host)) return -1;
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    Ref<ID3D12CommandQueue> oq, hq;
+    Ref<ID3D12Fence> of, hf;
+    if (FAILED(ours->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&oq.p))) ||
+        FAILED(host->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&hq.p))) ||
+        FAILED(ours->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&of.p))) ||
+        FAILED(host->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&hf.p))))
+        return -1;
+    int mismatches = 0;
+    const auto check = [&](const char* what, UINT64 a, UINT64 b) {
+        if (a != b && mismatches++ < 24)
+            std::fprintf(stderr, "fence %s: ours %llu host %llu\n", what, static_cast<unsigned long long>(a),
+                         static_cast<unsigned long long>(b));
+    };
+    const auto check_hr = [&](const char* what, HRESULT a, HRESULT b) {
+        if (a != b && mismatches++ < 24)
+            std::fprintf(stderr, "fence %s: ours 0x%08x host 0x%08x\n", what, static_cast<unsigned>(a),
+                         static_cast<unsigned>(b));
+    };
+    // A signal raises the completed value; a null event blocks until it is reached.
+    check_hr("signal 5", oq->Signal(of.p, 5), hq->Signal(hf.p, 5));
+    check_hr("block to 5", of->SetEventOnCompletion(5, nullptr), hf->SetEventOnCompletion(5, nullptr));
+    check("completed at 5", of->GetCompletedValue(), hf->GetCompletedValue());
+    // A higher signal raises it again.
+    check_hr("signal 9", oq->Signal(of.p, 9), hq->Signal(hf.p, 9));
+    check_hr("block to 9", of->SetEventOnCompletion(9, nullptr), hf->SetEventOnCompletion(9, nullptr));
+    check("completed at 9", of->GetCompletedValue(), hf->GetCompletedValue());
+    // An event for an already-reached value returns at once.
+    check_hr("event at reached 9", of->SetEventOnCompletion(9, nullptr), hf->SetEventOnCompletion(9, nullptr));
+    // A signal of an already-passed (lower) value: the host is free to lower the fence on some drivers, but a Vulkan
+    // timeline only increases. The shim deliberately drops it and keeps the higher value (see Fence::claim in
+    // d3d12_com.cpp), so this is checked against the documented behaviour, not the host.
+    check_hr("signal 3 (lower)", oq->Signal(of.p, 3), S_OK);
+    if (of->GetCompletedValue() != 9 && mismatches++ < 24)
+        std::fprintf(stderr, "fence lower signal: ours %llu, want 9\n",
+                     static_cast<unsigned long long>(of->GetCompletedValue()));
     return mismatches;
 }
 
@@ -5326,6 +5535,10 @@ int main() {
         if (feature_error_mismatches < 0)
             std::printf("CheckFeatureSupport error paths: no host D3D12 device to compare with, skipped\n");
         EXPECT(feature_error_mismatches <= 0);
+        const int fence_mismatches = compare_fences(device.p);
+        if (fence_mismatches < 0)
+            std::printf("Fences: no host D3D12 device to compare with, skipped\n");
+        EXPECT(fence_mismatches <= 0);
 
         // D3D-236: CreateCommandQueue with D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME requires
         // SeIncreaseBasePriorityPrivilege enabled in the token, matching the Windows D3D12 runtime.
@@ -5588,7 +5801,7 @@ int main() {
                E_INVALIDARG && !refused_buffer.p);
 
         Ref<ID3D12Resource> rt_resource, packed565, ds, untouched, upload, readback, volume, line, line_array,
-            line_refused;
+            line_refused, line_target;
         D3D12_RESOURCE_DESC xbox_rt =
             texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
         xbox_rt.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
@@ -5621,10 +5834,11 @@ int main() {
         refused_line.Height = 2;
         EXPECT(create(default_heap, refused_line, D3D12_RESOURCE_STATE_COMMON, line_refused) == E_INVALIDARG &&
                !line_refused.p);
-        refused_line = line_shape;
-        refused_line.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        EXPECT(create(default_heap, refused_line, D3D12_RESOURCE_STATE_COMMON, line_refused) == E_INVALIDARG &&
-               !line_refused.p);
+        // A 1D render target is created, as the PC runtime does (d3d12_texture1d_target_test compares them).
+        auto line_target_shape = line_shape;
+        line_target_shape.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        EXPECT(SUCCEEDED(create(default_heap, line_target_shape, D3D12_RESOURCE_STATE_RENDER_TARGET, line_target)) &&
+               rt::d3d12::vulkan_image(line_target.p));
         EXPECT(rt_resource->GetDesc().Width == size && rt_resource->GetDesc().Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
         EXPECT(rt::d3d12::vulkan_image(rt_resource.p) && !rt::d3d12::vulkan_image(upload.p));
 
@@ -5639,6 +5853,21 @@ int main() {
         D3D12_HEAP_PROPERTIES heap_properties{};
         EXPECT(SUCCEEDED(upload->GetHeapProperties(&heap_properties, nullptr)) &&
                heap_properties.Type == D3D12_HEAP_TYPE_UPLOAD);
+        {
+            // D3D-469: the flag stays on the heap, next to the DENY flags a committed buffer gets (0x4c0 on the host).
+            const D3D12_HEAP_PROPERTIES atomics_heap{D3D12_HEAP_TYPE_DEFAULT};
+            auto atomics_desc = buffer_desc(256);
+            atomics_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            Ref<ID3D12Resource> atomics;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&atomics_heap, D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS,
+                                                             &atomics_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&atomics.p))));
+            D3D12_HEAP_PROPERTIES atomics_got{};
+            D3D12_HEAP_FLAGS atomics_flags = D3D12_HEAP_FLAG_NONE;
+            EXPECT(SUCCEEDED(atomics->GetHeapProperties(&atomics_got, &atomics_flags)));
+            EXPECT(UINT(atomics_flags) == (UINT(D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS) |
+                                           UINT(D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS)));
+        }
 
         // D3D-96: upload buffers are in VRAM exactly when the GPU has Resizable BAR (and LEONIDA_UPLOAD_SYSMEM is not
         // set), host-visible either way. The copies below read this buffer on the GPU, so both placements are checked.
@@ -6757,7 +6986,7 @@ int main() {
         upload->Unmap(0, nullptr);
         readback->Unmap(0, nullptr);
         for (auto* r : {&rt_resource, &packed565, &ds, &untouched, &upload, &readback, &source, &whole, &part, &bc,
-                        &line, &line_array}) r->reset();
+                        &line, &line_array, &line_target}) r->reset();
         list7.reset();
         list.reset();
         allocator.reset();
@@ -7049,6 +7278,10 @@ int main() {
             if (heap_mismatches < 0)
                 std::printf("CreateHeap valid neighbours: no host D3D12 device to compare with, skipped\n");
             EXPECT(heap_mismatches <= 0);
+            const int heap_desc_mismatches = compare_heap_descs(standalone.p);
+            if (heap_desc_mismatches < 0)
+                std::printf("ID3D12Heap::GetDesc: no host D3D12 device to compare with, skipped\n");
+            EXPECT(heap_desc_mismatches <= 0);
             const int placed_mismatches = compare_placed_reserved(standalone.p);
             if (placed_mismatches < 0)
                 std::printf("CreatePlacedResource/CreateReservedResource arguments: no host D3D12 device to compare "
@@ -7745,6 +7978,9 @@ int main() {
             // WARP and NVIDIA's Vulkan driver give 188, Intel's Vulkan driver 187 (UHD 770 101.7092), both within
             // 0.6 ULP. On the layer's own adapter (same LUID) the comparison stays exact; against another adapter
             // or WARP a byte may differ when both sides are within 0.6 ULP of the ideal value.
+            // The plain clear's normalised values are rounded by the layer itself (nearest even, WARP's and AMD's
+            // code), so on its own NVIDIA adapter the tie byte may be the step above the driver's: accepted only
+            // when it is exactly that nearest-even code and within 0.6 ULP.
             const FLOAT clear_value[4] = {0.25f, 0.5f, 0.75f, 1.0f};  // placed_cast_scenario's clear colour
             const auto within_tolerance = [&](std::uint8_t ours_byte, std::uint8_t host_byte, double ideal) {
                 return !same_adapter && within_06_ulp(ours_byte, host_byte, ideal);
@@ -7757,7 +7993,9 @@ int main() {
                     const double plain_ideal = c * 255.0;
                     const double srgb_ideal = (i % 4 == 3 ? c : ideal_srgb(c)) * 255.0;  // alpha stays linear
                     if (ours[b] != host[b]) {
-                        if (within_tolerance(ours[b], host[b], plain_ideal))
+                        const bool layer_tie = double(ours[b]) == nearest_even_code(plain_ideal) &&
+                                               within_06_ulp(ours[b], host[b], plain_ideal);
+                        if (within_tolerance(ours[b], host[b], plain_ideal) || layer_tie)
                             ++plain_within;
                         else if (differences++ < 8)
                             std::fprintf(stderr, "placed plain clear row %u byte %u: ours %02x, host %02x\n", row, i,
@@ -7844,6 +8082,6 @@ int main() {
     }
     std::printf("Vulkan device behind the Xbox-ABI proxy: clears, zero-filled first use, uploads, texture, buffer and "
                 "BC copies, a resolve, reserved resources, queries, GetCopyableFootprints, GetResourceTiling and "
-                "CheckFeatureSupport error paths all matched\n");
+                "CheckFeatureSupport error paths and fence semantics all matched\n");
     return 0;
 }

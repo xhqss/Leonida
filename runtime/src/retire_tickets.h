@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <deque>
+#include <utility>
+#include <vector>
 
 namespace leonida {
 
@@ -26,6 +28,15 @@ public:
             pending_.pop_front();
         }
         return completed_;
+    }
+
+    // The (semaphore, value) of every submission up to `ticket` that has not been seen complete: what a caller
+    // that must have them done (and may not hold the lock that guards this object while it waits) waits for.
+    std::vector<std::pair<Semaphore, std::uint64_t>> pending_through(std::uint64_t ticket) const {
+        std::vector<std::pair<Semaphore, std::uint64_t>> out;
+        for (const Entry& entry : pending_)
+            if (entry.ticket <= ticket && !entry.idle) out.emplace_back(entry.semaphore, entry.value);
+        return out;
     }
 
     // Call only after the owning queue's wait-idle succeeded. Merely requesting idle does not

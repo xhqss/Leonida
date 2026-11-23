@@ -140,9 +140,32 @@ def detile(data, eq, bpe, wb, hb, block_bytes=65536):
     return raw[idx.reshape(-1)]
 
 
-def main():
+def validate_out_path(out, blob, same_report_path):
+    """Return an error string if `out` cannot be used as an --out image path, or None."""
+    if not out or not out.strip():
+        return "--out path must not be empty"
+    if "\x00" in out:
+        return "--out path contains a NUL byte"
+    if out.endswith(os.sep) or (os.altsep and out.endswith(os.altsep)) or os.path.isdir(out):
+        return f"--out path is a directory: {out}"
+    cur = os.path.dirname(os.path.abspath(out))
+    while cur:
+        if os.path.isdir(cur):
+            break
+        if os.path.lexists(cur):
+            return f"--out parent is not a directory: {cur}"
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    if same_report_path(out, blob) or (os.path.exists(out) and os.path.exists(blob) and os.path.samefile(out, blob)):
+        return f"--out must not overwrite the input {blob}"
+    return None
+
+
+def main(argv=None):
     sys.path.insert(0, os.path.dirname(__file__))
-    from tile_probe import check_preview_path, score
+    from tile_probe import same_report_path, score
     from swizzle_search import render  # noqa: F401
     ap = argparse.ArgumentParser()
     ap.add_argument("blob")
@@ -152,12 +175,19 @@ def main():
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--modes", default="_64K_")
     ap.add_argument("--out")
-    a = ap.parse_args()
-    if a.out:
-        check_preview_path(a.out, a.blob)
+    a = ap.parse_args(argv)
+    if a.out is not None:
+        err = validate_out_path(a.out, a.blob, same_report_path)
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
+            return 2
+    try:
+        with open(a.blob, "rb") as f:
+            data = f.read()[a.offset:]
+    except OSError as e:
+        print(f"ERROR: {a.blob}: {e.strerror or e}", file=sys.stderr)
+        return 2
     nibbles, tables = load()
-    with open(a.blob, "rb") as f:
-        data = f.read()[a.offset:]
     # BC formats cover 4x4 pixels per element; uncompressed 1/2/4 bpe formats have one pixel per element.
     block = 4 if a.bpe in (8, 16) else 1
     wb = (a.width + block - 1) // block
@@ -214,8 +244,17 @@ def main():
                 struct.pack_into("<II4s", hdr, 76, 32, 4, b"DX10")
                 body = bytes(hdr) + struct.pack("<IIIII", 98, 3, 0, 1, 0)
             preview = Image.open(io.BytesIO(body + lin.tobytes())).convert("RGB")
-        preview.save(a.out)
+        try:
+            out_dir = os.path.dirname(os.path.abspath(a.out))
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            preview.save(a.out)
+        except (OSError, ValueError) as e:
+            msg = getattr(e, "strerror", None) or str(e)
+            print(f"ERROR: {a.out}: {msg}", file=sys.stderr)
+            return 2
         print("best ->", a.out)
+    return 0
 
 
 if __name__ == "__main__":

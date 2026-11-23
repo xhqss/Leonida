@@ -135,7 +135,7 @@ public:
     // Only the key's own slot changes (it becomes empty): no other entry moves. Every lookup, here and in the
     // shaders (rdna2spirv.py desc_probe), compares all kDescriptorProbes slots and never stops at an empty one, so
     // a hole breaks no probe chain and inserts reuse it. Keeping the other entries in place is what lets the GPU
-    // copy of the table take an erase while shaders still probe it (BindlessSet::flush_needs_idle).
+    // copy of the table take an erase while shaders still probe it (BindlessSet::flush_replaces_table).
     bool erase(const std::uint32_t key[8]) {
         std::lock_guard lock(mutex_);
         return erase_locked(key);

@@ -108,6 +108,9 @@ Leonida's rule is `u32[0xC0] + 0x28` to the last `s_endpgm` (also `docs/design.m
 The 1.0.2.1 scan tested 88 aligned little-endian words in each of the 26,503 indexed FSSM blobs as possible
 packed `PGM_RSRC1` registers carrying `FLOAT_MODE`, `DX10_CLAMP` and `IEEE`. It covered 78 word starts at
 FSSM offsets `0x00` through `0x134` and 10 at `code_off + 0x00` through `code_off + 0x24`, inclusive.
+Local Python scripts walked the exported DXBC `index.json`, opened the matching `fssm/<stem>.fssm` for each row,
+and read each candidate with `struct.unpack_from("<I", ...)`. For the standalone check, the scripts intersected
+the sets of header offsets containing `0xC0` across all rows.
 
 The VGPR allocation field provides an independent check on that interpretation. Of 2,689 compute shaders, 1,675
 had zero reported invalid words and at least one explicit VGPR in the instruction listing. For each of these,
@@ -118,6 +121,34 @@ the low six bits of the candidate word plus one, multiplied by 8 for wave32 or 4
 Of the 88 positions, 63 gave too little capacity for at least one qualifying compute shader. Each of the other 25
 exceeded the minimum whole-granule allocation in all 1,675. Over-allocation is possible, and the mode fields could
 be stored separately or supplied by pipeline state. The initial float mode remains unresolved.
+
+#### Standalone FLOAT_MODE candidate at +0x104
+
+@465d6a0eac proposed that FSSM stores the eight mode bits in their own word. Across all 26,503 indexed
+1.0.2.1 headers, `+0x104` is the only aligned word below `+0x138` that always equals `0x000000C0`.
+Reading it as packed RSRC1 gives too few VGPRs in 1,578 of the 1,675 qualifying compute shaders.
+A standalone mode field makes no VGPR allocation prediction. The contributor also reports the same value in
+52 BVH-builder DLL shaders, outside this replay.
+
+The adjacent words provide two cross-checks. The low byte at `+0x100` matches the stage in every row
+(GS 3, VS 4, PS 5, CS 6, MS 7). The VS word is `0x00020004`; the GS word is `0x00020203`.
+Only the 2,236 VS have zero in bits 15:8 and match the full `0x000200NN` pattern.
+The corresponding byte is 1 for PS, 3 for CS and 6 for MS. The word at `+0x108` is always zero. For every one of the 2,689 CS,
+rounding the byte count at `+0x10C` up to 512-byte blocks predicts the independently decoded
+`COMPUTE_PGM_RSRC2.LDS_SIZE` at `+0x138[23:15]`, including all 485 nonzero allocations. Five MS also
+have a nonzero count. This varying LDS measurement locates stage state near the candidate.
+
+Under the AMD FLOAT_MODE layout, `0xC0` selects round-to-nearest for both precision groups, flushes f32
+denormals on input and output, and preserves f16/f64 denormals on both. All 29 [FSPX programs](fspx.md)
+have the same mode byte in an inferred packed RSRC1 whose VGPR allocation varies. That supports a plausible
+compiler default across formats. The 102,365 reported f32 output modifiers agree with f32 flushing.
+The absence of f16 output modifiers leaves f16 preservation open, and explicit rounding updates give no
+initial value. IEEE and DX10_CLAMP lie outside the proposed byte.
+
+A fixed header-layout value also fits the census: `0xC0` is the offset of the established `code_off` field.
+Whether `+0x104` refers to that field is itself unverified. A loader read mapping `+0x104` to the mode bits,
+or an FSSM with the same layout and an independently known different mode correctly predicted there, would
+distinguish the readings. SHADER-190 remains open.
 
 ## 3. ISA, RDNA2 classification and the "XBSC" notes
 

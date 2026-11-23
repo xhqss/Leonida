@@ -39,10 +39,8 @@ class RcpIflagModsTest(unittest.TestCase):
 
         # Verify source modifier chain feeding OpFDiv.
         if neg or abs_:
-            self.assertRegex(defs[src], r"^OpBitcast %float %\w+$")
-            src = defs[src].split()[-1]
-            self.assertRegex(defs[src], r"^OpBitcast %uint %\w+$")
-            src = defs[src].split()[-1]
+            # The modified float, as the id itself: a bitcast to uint and back is the original id (Gen.tof/tou).
+            self.assertNotRegex(defs[src], r"^OpBitcast ")
             if neg:
                 self.assertRegex(defs[src], r"^OpFNegate %float %\w+$")
                 src = defs[src].split()[-1]

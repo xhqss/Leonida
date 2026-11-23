@@ -443,6 +443,172 @@ void test_multiple_tls_modules(const fs::path& dll, const fs::path& temp) {
     }
 }
 
+// Threads that already exist when load() runs: a thread of the caller's and a worker of the process thread pool,
+// which is where the task queue (third_party/xtaskqueue, ThreadPool_win32.cpp) runs a title's callbacks. Windows
+// gives such threads the new module's TLS block when it loads a DLL itself, and no DLL_THREAD_ATTACH; load() has to
+// do the same, or mapped code on them reads the helper DLL's one-byte block.
+struct PoolProbe {
+    int(__cdecl* get)() = nullptr;
+    void(__cdecl* set)(int) = nullptr;
+    HANDLE done = nullptr;
+    LONG value = -1;
+    DWORD thread = 0;
+};
+
+void CALLBACK pool_probe(PTP_CALLBACK_INSTANCE, void* context) {
+    auto* probe = static_cast<PoolProbe*>(context);
+    probe->thread = GetCurrentThreadId();
+    if (probe->get) {
+        probe->value = probe->get();
+        probe->set(4000);
+    }
+    SetEvent(probe->done);
+}
+
+struct ParkedThread {
+    HANDLE up = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    HANDLE never = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+};
+
+DWORD WINAPI park(void* context) {
+    auto* parked = static_cast<ParkedThread*>(context);
+    SetEvent(parked->up);
+    WaitForSingleObject(parked->never, INFINITE);
+    return 0;
+}
+
+// TerminateThread ends a thread with no DLL_THREAD_DETACH and frees its TEB. A thread that load() gave a block and
+// that is then terminated must not be touched by ~Loader, and a thread that is already dead must be passed by.
+void test_terminated_thread(const fs::path& dll) {
+    ParkedThread parked;
+    const HANDLE victim = CreateThread(nullptr, 0, &park, &parked, 0, nullptr);
+    check(victim != nullptr && WaitForSingleObject(parked.up, 10000) == WAIT_OBJECT_0, "a parked thread is running");
+    if (!victim) return;
+    {
+        rt::Loader loader(dll.parent_path());
+        rt::Module& m = loader.load(dll);
+        check(find_export<int(__cdecl*)()>(m, "tiny_tls_get")() == 7, "load() with a parked thread running");
+        TerminateThread(victim, 0);
+        WaitForSingleObject(victim, INFINITE);
+    }
+    check(true, "~Loader passes by a thread that was terminated while it held a block");
+    {
+        // The dead thread is still a kernel object (its handle is open) while this load() looks at the threads.
+        rt::Loader loader(dll.parent_path());
+        rt::Module& m = loader.load(dll);
+        check(find_export<int(__cdecl*)()>(m, "tiny_tls_get")() == 7, "load() passes by a thread that has ended");
+    }
+    CloseHandle(victim);
+    CloseHandle(parked.up);
+    CloseHandle(parked.never);
+}
+
+void test_existing_threads(const fs::path& dll) {
+    // A pool worker exists from here on: the callback has run on one, and the pool keeps its workers for a while.
+    PoolProbe warm;
+    warm.done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    check(TrySubmitThreadpoolCallback(&pool_probe, &warm, nullptr) != 0 &&
+              WaitForSingleObject(warm.done, 10000) == WAIT_OBJECT_0,
+          "a thread-pool worker exists before load()");
+
+    struct Step {
+        HANDLE go = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    };
+    Step first, second, last;
+    HANDLE started = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    int(__cdecl* get)() = nullptr;
+    void(__cdecl* set)(int) = nullptr;
+    int seen_first = -1, seen_after_write = -1, seen_second = -1;
+    void* block_first = nullptr;
+    DWORD early_id = 0;
+    uint32_t index = rt::kNoTlsIndex;
+    std::thread early([&] {
+        early_id = GetCurrentThreadId();
+        SetEvent(started);
+        WaitForSingleObject(first.go, INFINITE);  // the first Loader has mapped the fixture
+        block_first = module_tls_slots()[index];
+        seen_first = get();
+        set(55);
+        seen_after_write = get();
+        SetEvent(first.done);
+        WaitForSingleObject(second.go, INFINITE);  // that Loader is gone and a second one has mapped it again
+        seen_second = get();
+        SetEvent(second.done);
+        WaitForSingleObject(last.go, INFINITE);  // ends while the second module is initialised
+    });
+    WaitForSingleObject(started, INFINITE);
+
+    MEMORY_BASIC_INFORMATION info{};
+    {
+        rt::Loader loader(dll.parent_path());
+        rt::Module& m = loader.load(dll);
+        index = m.tls_index;
+        get = find_export<int(__cdecl*)()>(m, "tiny_tls_get");
+        set = find_export<void(__cdecl*)(int)>(m, "tiny_tls_set");
+        set(42);
+
+        SetEvent(first.go);
+        WaitForSingleObject(first.done, INFINITE);
+        check(seen_first == 7, "a thread that existed before load() reads the template value 7");
+        check(seen_after_write == 55 && get() == 42, "its write stays in its own block");
+        check(block_first != nullptr && block_first != m.tls_block && block_first != m.tls_saved_block,
+              "it has a block of its own, not the loading thread's or the helper DLL's");
+        void* seen_block = nullptr;
+        std::thread([&] { seen_block = module_tls_slots()[index]; }).join();
+        check(seen_block != block_first, "a thread started after load() still gets its own block");
+
+        // Every callback sees the template value, or the 4000 an earlier callback left on the same worker.
+        bool pool_ok = true, on_warm_worker = false;
+        for (int i = 0; i < 16; ++i) {
+            PoolProbe probe;
+            probe.get = get;
+            probe.set = set;
+            probe.done = warm.done;
+            if (!TrySubmitThreadpoolCallback(&pool_probe, &probe, nullptr) ||
+                WaitForSingleObject(probe.done, 10000) != WAIT_OBJECT_0) {
+                pool_ok = false;
+                break;
+            }
+            pool_ok = pool_ok && (probe.value == 7 || probe.value == 4000);
+            on_warm_worker = on_warm_worker || probe.thread == warm.thread;
+        }
+        check(pool_ok, "thread-pool callbacks read the template value on workers that predate load()");
+        std::puts(on_warm_worker ? "     (one of them ran on the worker that existed before load())"
+                                 : "     (the pool did not reuse the earlier worker this time)");
+        check(VirtualQuery(block_first, &info, sizeof(info)) != 0 && info.State == MEM_COMMIT,
+              "the block is live while the Loader is");
+    }
+    check(module_tls_slots()[index] != nullptr, "the loading thread has the helper DLL's block back");
+    check(VirtualQuery(block_first, &info, sizeof(info)) == 0 || info.State == MEM_FREE,
+          "~Loader frees the block it gave the earlier thread, which is still running");
+
+    {
+        // The same thread, a second mapping: a fresh copy of the template, not the 55 it wrote into the first.
+        rt::Loader loader(dll.parent_path());
+        rt::Module& m = loader.load(dll);
+        index = m.tls_index;
+        get = find_export<int(__cdecl*)()>(m, "tiny_tls_get");
+        set = find_export<void(__cdecl*)(int)>(m, "tiny_tls_set");
+        auto watch = find_export<void(__cdecl*)(DWORD)>(m, "tiny_tls_watch_thread");
+        auto thread_attach = find_export<int(__cdecl*)()>(m, "tiny_tls_thread_attach_count");
+        auto thread_detach = find_export<int(__cdecl*)()>(m, "tiny_tls_thread_detach_count");
+        watch(early_id);
+        loader.initialise();
+        SetEvent(second.go);
+        WaitForSingleObject(second.done, INFINITE);
+        check(seen_second == 7, "the same thread reads the template value again after a second load()");
+        SetEvent(last.go);
+        early.join();
+        // As for a DLL Windows loads itself: no DLL_THREAD_ATTACH for a thread that was already running, and
+        // DLL_THREAD_DETACH when it ends.
+        check(thread_attach() == 0, "a thread that existed before load() gets no DLL_THREAD_ATTACH");
+        check(thread_detach() == 1, "it gets DLL_THREAD_DETACH once when it ends");
+    }
+    for (HANDLE h : {first.go, first.done, second.go, second.done, last.go, last.done, started, warm.done})
+        CloseHandle(h);
+}
+
 // A worker thread that outlives Loader #1 keeps an orphaned g_thread_tls_slots[slot] record until it exits.
 // Even if Loader #2 reuses the same TLS slot (and even the same Module* address), the generation token must
 // prevent Loader #2 from mistaking the orphaned entry for its own on install_tls_for_thread or DLL_THREAD_DETACH.
@@ -489,38 +655,43 @@ void test_orphan_slot_generation_reuse(const fs::path& dll) {
     CloseHandle(go);
     CloseHandle(ready);
 
-    check(td() == 0, "orphaned worker exit does not dispatch DLL_THREAD_DETACH to the new generation's module");
+    // The worker was running when loader2 mapped the module, so load() gave it its own copy and, as Windows does for a
+    // DLL loaded while a thread runs, the module gets DLL_THREAD_DETACH once when that thread ends
+    // (test_existing_threads). A second one would mean the orphaned loader1 record was taken for loader2's.
+    check(td() == 1, "orphaned worker exit dispatches DLL_THREAD_DETACH to the new generation's module once, for "
+                     "its own copy, not again for the orphaned record");
 }
 
-// Spawns cmd.exe to obtain one guaranteed-dead PID and one guaranteed-live one for the purge-ownership checks.
+// A copy of this executable started suspended gives one guaranteed-dead PID (once ended) and one guaranteed-live one
+// for the purge-ownership checks. The child never runs and, detached, gets no console: a console child would start a
+// conhost, and Wine's headless conhost can outlive it holding the test runner's output pipe, hanging ctest.
 struct ChildProcess {
     HANDLE process = nullptr;
     DWORD pid = 0;
-    explicit ChildProcess(const wchar_t* args) {
+    ChildProcess() {
+        wchar_t self[MAX_PATH];
+        const DWORD length = GetModuleFileNameW(nullptr, self, MAX_PATH);
+        if (length == 0 || length == MAX_PATH) throw std::runtime_error("GetModuleFileNameW for the test failed");
         STARTUPINFOW si{};
         si.cb = sizeof(si);
         PROCESS_INFORMATION pi{};
-        std::wstring cmd = std::wstring(L"cmd.exe ") + args;
-        if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si,
-                            &pi))
-            throw std::runtime_error("CreateProcessW for cmd.exe failed");
+        if (!CreateProcessW(self, nullptr, nullptr, nullptr, FALSE, CREATE_SUSPENDED | DETACHED_PROCESS, nullptr,
+                            nullptr, &si, &pi))
+            throw std::runtime_error("CreateProcessW for the suspended child failed");
         CloseHandle(pi.hThread);
         process = pi.hProcess;
         pid = pi.dwProcessId;
     }
     ChildProcess(const ChildProcess&) = delete;
     ChildProcess& operator=(const ChildProcess&) = delete;
-    void wait_exit() {
+    void end() {
+        TerminateProcess(process, 0);
         WaitForSingleObject(process, INFINITE);
         CloseHandle(process);
         process = nullptr;
     }
     ~ChildProcess() {
-        if (process) {
-            TerminateProcess(process, 0);
-            WaitForSingleObject(process, INFINITE);
-            CloseHandle(process);
-        }
+        if (process) end();
     }
 };
 
@@ -544,9 +715,9 @@ std::vector<fs::path> own_clone_files() {
 // test, because the sweep fires once per process.
 void test_purge_ownership_scoping(const fs::path& dll, const fs::path& temp) {
     std::printf("\n-- startup purge deletes only ownerless clones --\n");
-    ChildProcess dead(L"/c exit 0");
-    dead.wait_exit();
-    ChildProcess live(L"/c timeout /t 30 /nobreak > nul");
+    ChildProcess dead;
+    dead.end();
+    ChildProcess live;
 
     const fs::path clone_root = fs::temp_directory_path();
     // An own-PID name stands in for a leftover of a dead run whose PID this process reused: the sweep runs before
@@ -614,6 +785,8 @@ int main(int argc, char** argv) {
 
         TempDir temp;
         test_purge_ownership_scoping(tls_dll, temp.path);  // first: the sweep fires once per process
+        test_existing_threads(tls_dll);
+        test_terminated_thread(tls_dll);
         test_tls(tls_dll);
         test_thread_events(tls_dll);
         test_thread_outlives_loader(tls_dll);

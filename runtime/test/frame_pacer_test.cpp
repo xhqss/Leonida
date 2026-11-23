@@ -486,6 +486,32 @@ int main() {
         EXPECT(pacer.immediate_presents() == 0);
     }
 
+    // Presents made after SetFrameIntervalX but before the origin event is scheduled are unpaced (PresentX does not
+    // hold them for a vblank), so they are shown at once and are not frames in flight: however many there were, the
+    // first wait returns at the first origin.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(pacer.set_frame_interval(period, 1, 0) == pacer_hr::ok);
+        EXPECT(!pacer.registered());
+        for (int i = 0; i < 1000; ++i) pacer.note_untokened_present();  // blank presents of a loading screen
+        pacer.commit_present_token(0, 1);                               // and one with the null token
+        EXPECT(pacer.frames_in_flight() == 0);
+        EXPECT(pacer.schedule_frame_event(frame_event_origin, 0, 0) == pacer_hr::ok);
+        auto wait = wait_async(pacer, infinite_timeout_ms);
+        EXPECT(blocked(wait));
+        clock.advance_us(period);
+        if (wait.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+            pacer.suspend();  // lets the waiter go, so that the failure below ends the test and does not hang it
+            EXPECT(!"the first wait returns one period after the event is armed");
+        }
+        Result r = wait.get();
+        EXPECT(r.hr == pacer_hr::ok && r.token == 1);
+        // Once the event is armed, a present is a frame in flight again.
+        pacer.note_untokened_present();
+        EXPECT(pacer.frames_in_flight() == 1);
+    }
+
     // Real clock: five 10 ms vblanks take about 50 ms.
     {
         SteadyFrameClock clock;

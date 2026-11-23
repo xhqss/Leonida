@@ -582,6 +582,32 @@ class HalfNanRuleTests(unittest.TestCase):
         self.assertEqual(si.float_to_half(bits_to_f32(0x477FE000)), 0x7BFF)      # 65504, max finite
         self.assertEqual(si.float_to_half(bits_to_f32(0x477FF000)), 0x7C00)      # 65520 RNE tie -> inf
 
+    def test_float_to_half_rounds_ties_to_even(self):
+        # float_to_half rounds by hand, so its tie rule needs direct cases. The v_cvt_f16_f32 tie tests above do
+        # not reach it: the translator lowers that opcode with its own integer RNE. The helper backs PackHalf2x16
+        # and OpQuantizeToF16. Round-half-up in either path (normal or subnormal) fails at least one row here.
+        cases = [
+            # Normal path: the dropped 13 bits are exactly 0x1000.
+            (0x3F801000, 0x3C00),   # 1 + 2^-11, between 0x3C00 and 0x3C01 -> even 0x3C00
+            (0xBF801000, 0xBC00),   # negative of the above
+            (0x3F803000, 0x3C02),   # 1 + 3 * 2^-11, between 0x3C01 and 0x3C02 -> even 0x3C02
+            (0x3F800FFF, 0x3C00),   # just below the first tie
+            (0x3F801001, 0x3C01),   # just above the first tie
+            (0x3FFFF000, 0x4000),   # tie above 0x3FFF -> even, mantissa carry into the exponent (2.0)
+            (0x477FD000, 0x7BFE),   # 65488, between 65472 and 65504 -> even 0x7BFE
+            (0x477FEFFF, 0x7BFF),   # largest f32 below 65520 stays at max finite 65504
+            (0xC77FF000, 0xFC00),   # -65520 tie -> -inf
+            # Subnormal path: n = value / 2^-24 has a fraction of exactly one half.
+            (0x33000000, 0x0000),   # 0.5 -> even 0
+            (0xB3000000, 0x8000),   # -0.5 -> -0
+            (0x33C00000, 0x0002),   # 1.5 -> even 2
+            (0x34200000, 0x0002),   # 2.5 -> even 2
+            (0x387FE000, 0x0400),   # 1023.5 -> even 1024, the smallest normal
+        ]
+        for bits, want in cases:
+            with self.subTest(bits=hex(bits)):
+                self.assertEqual(si.float_to_half(bits_to_f32(bits)), want)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -114,7 +114,9 @@ class ImageAtomics32Tests(unittest.TestCase):
                             self.assertNotIn(tok, spv)
                         # Verify glc writes back to v2 while non-glc does not overwrite v2 after the atomic.
                         after_tp = spv[tp_m.start():]
-                        vgpr2_stores = re.findall(r"OpAccessChain %_ptr_Function_uint %vgpr %c2\b", after_tp)
+                        # an inline chain to v2, or a store through its pointer hoisted into %entry (#4440)
+                        vgpr2_stores = re.findall(r"OpAccessChain %_ptr_Function_uint %vgpr %c2\b|OpStore %reg_v2\b",
+                                                  after_tp)
                         if glc:
                             self.assertGreaterEqual(len(vgpr2_stores), 1)
                         else:

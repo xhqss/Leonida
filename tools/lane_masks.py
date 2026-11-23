@@ -49,7 +49,8 @@ DS_HAS_DST = ("ds_read", "ds_swizzle", "ds_permute", "ds_bpermute",
               "ds_append", "ds_consume", "ds_ordered_count", "ds_nop")
 VGPR_REL_DST = ("v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32", "v_swaprel_b32")
 SGPR_REL_DST = ("s_movreld_b32", "s_movreld_b64", "s_movrelsd_2_b32")
-VECTOR_BITWISE = ("v_mov_b32", "v_or3_b32", "v_or_b32", "v_and_b32", "v_xor_b32", "v_xor3_b32", "v_not_b32")
+VECTOR_BITWISE = ("v_mov_b32", "v_or3_b32", "v_or_b32", "v_and_b32", "v_and_or_b32",
+                  "v_xor_b32", "v_xor3_b32", "v_xnor_b32", "v_bfi_b32", "v_not_b32")
 
 
 def base_op(op):

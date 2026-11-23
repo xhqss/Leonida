@@ -319,11 +319,15 @@ class AnimMoveTest(unittest.TestCase):
         with open(os.path.join(carved, "00030000.bin"), "wb") as f:
             f.write(two[MAX_CHUNK:])
 
-        out = os.path.join(self.tmp.name, "move.json")
-        r = subprocess.run([sys.executable, "-I", TOOL, carved, out], capture_output=True, text=True)
-        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(carved, "00025000.CSV"), "wb") as f:
+            f.write(b"offset,bytes")
+        out = os.path.join(carved, "move.json")
+        for _ in range(2):
+            r = subprocess.run([sys.executable, "-I", TOOL, carved, out], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)
+        self.assertEqual(doc["summary"]["streams"], 3)
         self.assertEqual(doc["summary"]["counts"]["move_resources"], 2)
         self.assertEqual(doc["summary"]["counts"]["multi_stream_resources"], 1)
         self.assertEqual([row["streams"] for row in doc["move_resources"]], [1, 2])

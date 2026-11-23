@@ -543,6 +543,25 @@ class PublishTest(unittest.TestCase):
         self.tool.write_outputs([], {"streams": 0}, self.out, None)
         self.assertEqual(os.stat(self.out).st_mode & 0o777, 0o640)
 
+    def test_failed_replace_of_read_only_report_removes_writable_temp(self):
+        os.chmod(self.out, 0o444)
+        self.addCleanup(lambda: os.path.exists(self.out) and os.chmod(self.out, 0o600))
+        made_writable = []
+        real_chmod = os.chmod
+
+        def chmod(path, mode, *args, **kwargs):
+            if isinstance(path, str) and os.path.basename(path).startswith(".navmesh_index-") and mode == 0o600:
+                made_writable.append(path)
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with mock.patch.object(self.tool.os, "replace", side_effect=OSError("replace denied")), \
+                mock.patch.object(self.tool.os, "chmod", chmod):
+            with self.assertRaises(OSError):
+                self.tool.write_outputs([], {"streams": 0}, self.out, None)
+        self.assertEqual(len(made_writable), 1)
+        self.assertEqual(self.read(self.out), self.OLD_JSON)
+        self.assertEqual([n for n in os.listdir(self.dir) if n.startswith(".navmesh_index-")], [])
+
 
 class OutputPathTest(unittest.TestCase):
     """A report path that is already a folder is a usage error, not a PermissionError traceback."""

@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+import zlib
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -67,6 +68,28 @@ class CommandLine(unittest.TestCase):
             with redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(sm.main([missing, missing]), 2)
         self.assertIn("anim_skel_match:", err.getvalue())
+
+    def test_json_must_not_replace_either_input_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            anim = Path(tmp) / "anim.rpf"
+            packs = Path(tmp) / "packs.rpf"
+            anim_data = zlib.compress(b"SKEL_Synthetic\x00")
+            packs_data = b"\x00"
+            args = [str(anim), str(packs), "--stream", "0", "--json"]
+            for target in (anim, packs):
+                anim.write_bytes(anim_data)
+                packs.write_bytes(packs_data)
+                with self.subTest(target=target.name), redirect_stderr(io.StringIO()) as err, \
+                        redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(sm.main([*args, str(target)]), 2)
+                    self.assertIn("must not overwrite", err.getvalue())
+                    self.assertEqual(out.getvalue(), "")
+                    self.assertEqual(anim.read_bytes(), anim_data)
+                    self.assertEqual(packs.read_bytes(), packs_data)
+            report = Path(tmp) / "report.json"
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(sm.main([*args, str(report)]), 0)
+            self.assertTrue(report.is_file())
 
     def test_offsets_parse_as_hex_or_decimal(self):
         self.assertEqual(sm.parse_offset("0x101a32160"), 0x101A32160)

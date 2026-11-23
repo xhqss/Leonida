@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include "ApiRefState.h"
+#include "referenced_ptr.h"
 #include "AtomicVector.h"
+#include <map>
 #include "LocklessQueue.h"
 #include "StaticArray.h"
 #include "ThreadPool.h"
@@ -14,6 +17,14 @@
 #endif
 
 SYSTEM_HANDLE_DEFINE_HELPERS(XTaskQueueHandle, XSystemHandleType::TaskQueue);
+
+namespace TaskQueueInternal
+{
+    // Private capability identifier; keep the shared ApiId enum unchanged.
+    constexpr ApiId kPinnableContextApiId =
+        static_cast<ApiId>(0x50494E31);
+    constexpr ApiId kWaitPublicationApiId = static_cast<ApiId>(0x57505432);
+}
 
 namespace ApiRefs
 {
@@ -49,29 +60,38 @@ public:
     uint32_t __stdcall AddRef()
     {
         ApiRefs::GlobalAddRef();
-        return m_refs++;
+        return m_refState.AddRef();
+    }
+
+    bool TryAddRef() noexcept
+    {
+        // Account globally before publishing the local reference.
+        ApiRefs::GlobalAddRef();
+
+        if (m_refState.TryAddRef())
+        {
+            return true;
+        }
+
+        ApiRefs::GlobalRelease();
+        return false;
     }
 
     uint32_t __stdcall Release()
     {
-        uint32_t refs = --m_refs;
+        const auto result = m_refState.Release();
 
-        // Note: rundown may addref/release as it
-        // progresses, so we guard against redundant
-        // deletes with m_deleting.
-
-        if (refs == 0 && m_deleting.test_and_set() == false)
+        if (result.startRundown)
         {
-            // Hold an extra global ref during destruction to prevent
-            // cascading child releases from bringing g_globalApiRefs
-            // to zero while DLL code is still on the stack.
+            // Keep the global reference count nonzero during teardown.
             ApiRefs::GlobalAddRef();
             RundownObject();
             delete this;
             ApiRefs::GlobalRelease();
         }
+
         ApiRefs::GlobalRelease();
-        return refs;
+        return result.remaining;
     }
 
     HRESULT __stdcall QueryApi(ApiId id, void** ptr)
@@ -109,10 +129,7 @@ protected:
     }
 
 private:
-    std::atomic<uint32_t> m_refs{ 0 };
-    // Explicitly clear: before C++20 a default-constructed atomic_flag has an
-    // unspecified value, and a set flag would make Release() skip deletion.
-    std::atomic_flag m_deleting = ATOMIC_FLAG_INIT;
+    ApiRefState m_refState;
 };
 
 static uint32_t const SUBMIT_CALLBACK_MAX = 32;
@@ -146,34 +163,39 @@ private:
 };
 
 #define PORT_WAIT_MAX 60
-#define PORT_EVENT_MAX (PORT_WAIT_MAX + 1)
+#define PORT_EVENT_MAX (PORT_WAIT_MAX + 2)
 #define QUEUE_WAIT_MAX (PORT_WAIT_MAX * 2)
 
 class QueueWaitRegistry
 {
 public:
 
-    HRESULT Register(
-        _In_ XTaskQueuePort port,
-        _In_ const XTaskQueueRegistrationToken& portToken,
-        _Out_ XTaskQueueRegistrationToken* token);
-
-    std::pair<XTaskQueuePort, XTaskQueueRegistrationToken> Unregister(
-        _In_ const XTaskQueueRegistrationToken& token);
-
-private:
-
+    void AddRef() noexcept { ++m_refs; }
+    void Release() noexcept { if (--m_refs == 0) delete this; }
+    bool Reserve();
+    void CancelReservation();
+    void Publish(XTaskQueuePort port, XTaskQueueRegistrationToken portToken,
+        XTaskQueueRegistrationToken* token, bool retiredByPort);
     struct WaitRegistration
     {
         uint64_t Token;
         uint64_t PortToken;
         XTaskQueuePort Port;
+        bool retiredByPort;
     };
 
+    WaitRegistration Lookup(XTaskQueueRegistrationToken token);
+    void Remove(XTaskQueueRegistrationToken token);
+
+private:
+    std::atomic<uint32_t> m_refs{0};
     std::atomic<uint64_t> m_nextToken{ 0 };
+    uint32_t m_reserved = 0;
     StaticArray<WaitRegistration, QUEUE_WAIT_MAX> m_callbacks;
     DefaultUnnamedMutex m_lock;
 };
+
+class TaskQueuePortContextImpl;
 
 class TaskQueuePortImpl: public Api<ApiId::TaskQueuePort, ITaskQueuePort>
 {
@@ -199,6 +221,11 @@ public:
         _In_opt_ void* callbackContext,
         _In_ XTaskQueueCallback* callback,
         _Out_ XTaskQueueRegistrationToken* token);
+
+    // Local capability for publishing the public token before the wait is armed.
+    HRESULT RegisterWaitWithToken(ITaskQueuePortContext* portContext, HANDLE waitHandle,
+        void* callbackContext, XTaskQueueCallback* callback, XTaskQueueRegistrationToken* token,
+        QueueWaitRegistry* registry);
 
     void __stdcall UnregisterWaitHandle(
         _In_ XTaskQueueRegistrationToken token);
@@ -242,6 +269,12 @@ public:
 
 private:
 
+    void* QueryApiImpl(ApiId id) override
+    {
+        if (id == TaskQueueInternal::kWaitPublicationApiId) return this;
+        return Api<ApiId::TaskQueuePort, ITaskQueuePort>::QueryApiImpl(id);
+    }
+
     struct WaitRegistration;
 
     struct QueueEntry
@@ -263,22 +296,130 @@ private:
     };
 
 #ifdef _WIN32
+    struct WaitHandleOwner
+    {
+        HANDLE handle = nullptr;
+        ~WaitHandleOwner() { if (handle) CloseHandle(handle); }
+    };
+
     struct WaitRegistration
     {
-        uint64_t token;
-        HANDLE waitHandle;
-        PTP_WAIT threadpoolWait;
-        TaskQueuePortImpl* port;
-        QueueEntry queueEntry;
-        std::atomic_flag appended;
-        std::atomic<uint32_t> refs;
-        bool deleted;
+        enum class State { Active, Canceled, Removed };
+        std::atomic<uint32_t> refs{0};
+        void AddRef() noexcept { ++refs; }
+        void Release() noexcept { if (--refs == 0) delete this; }
+        ~WaitRegistration();
+
+        uint64_t token = 0;
+        referenced_ptr<QueueWaitRegistry> publicRegistry;
+        XTaskQueueRegistrationToken publicToken{};
+        std::shared_ptr<WaitHandleOwner> handleOwner;
+        std::once_flag drainOnce;
+        PTP_WAIT threadpoolWait = nullptr;
+        TaskQueuePortImpl* port = nullptr;
+        TaskQueuePortContextImpl* pinnable = nullptr;
+        QueueEntry queueEntry{};
+
+        // Protected by port->m_lock. Detach retires Active registrations
+        // before the embedded context can disappear.
+        State state = State::Active;
+        referenced_ptr<ITaskQueuePortContext> queuedContext;
+        bool appended = false;
+        bool running = false;
+        bool enteredUserCode = false;
+        bool drained = false;
+        uint64_t cancelNode = 0;
     };
+    struct WaitSnapshot
+    {
+        std::shared_ptr<WaitHandleOwner> epoch;
+        StaticArray<HANDLE, PORT_EVENT_MAX> events;
+        StaticArray<std::shared_ptr<WaitHandleOwner>, PORT_WAIT_MAX> owners;
+        StaticArray<referenced_ptr<WaitRegistration>, PORT_WAIT_MAX> registrations;
+    };
+    void InvalidateWaitEpochLocked();
+    void FinishRetirementLocked(WaitRegistration* reg);
+    void CaptureWaitSnapshot(WaitSnapshot& snapshot);
+    friend struct WaitRegistrationTestAccess;
+
+    struct WaitCallbackFrame
+    {
+        explicit WaitCallbackFrame(WaitRegistration* registration);
+        ~WaitCallbackFrame();
+        WaitRegistration* reg;
+        WaitCallbackFrame* next;
+        WaitCallbackFrame** link;
+        static DefaultUnnamedMutex lock;
+        static WaitCallbackFrame* head;
+        static bool ConfirmEntry();
+    };
+
+    void DrainRetiredWait(const referenced_ptr<WaitRegistration>& reg);
 #endif
 
     XTaskQueuePortObject m_header = { };
     XTaskQueueDispatchMode m_dispatchMode = XTaskQueueDispatchMode::Manual;
-    AtomicVector<ITaskQueuePortContext*> m_attachedContexts;
+    struct AttachedContextRegistration
+    {
+        ITaskQueuePortContext* context;
+        TaskQueuePortContextImpl* pinnable;
+    };
+
+    DefaultUnnamedMutex m_attachedContextsLock;
+    std::map<uint64_t, AttachedContextRegistration> m_attachedContexts;
+
+    uint64_t m_nextAttachedContextId = 1;
+
+    bool TryAcquireNextAttachedContext(
+        uint64_t& cursor,
+        uint64_t upperBound,
+        ITaskQueuePortContext** result);
+
+    template<typename Callback>
+    void VisitAttachedContexts(Callback callback)
+    {
+        // Keep the port alive even if a callback closes its owning queue.
+        if (!TryAddRef())
+        {
+            return;
+        }
+
+        struct PortGuard
+        {
+            TaskQueuePortImpl* port;
+            ~PortGuard() { port->Release(); }
+        } portGuard{ this };
+
+        uint64_t upperBound;
+        {
+            std::lock_guard<std::mutex> lock(m_attachedContextsLock);
+            upperBound = m_nextAttachedContextId - 1;
+        }
+
+        uint64_t cursor = 0;
+
+        for (;;)
+        {
+            ITaskQueuePortContext* context = nullptr;
+
+            if (!TryAcquireNextAttachedContext(
+                    cursor, upperBound, &context))
+            {
+                break;
+            }
+
+            struct ContextGuard
+            {
+                ITaskQueuePortContext* context;
+                ~ContextGuard() { context->Release(); }
+            } contextGuard{ context };
+
+            // Never invoke external code while holding the registry mutex.
+            callback(context);
+        }
+
+        // Only safely pinnable contexts can be visited.
+    }
     std::atomic<uint32_t> m_processingSerializedTbCallback{ 0 };
     std::atomic<uint32_t> m_processingCallback{ 0 };
     DefaultUnnamedConditionVariable m_processingCallbackCv;
@@ -295,14 +436,19 @@ private:
     std::atomic<bool> m_suspended = { false };
 
 #ifdef _WIN32
-    StaticArray<WaitRegistration*, PORT_WAIT_MAX> m_waits;
-    StaticArray<HANDLE, PORT_EVENT_MAX> m_events;
+    std::map<uint64_t, referenced_ptr<WaitRegistration>> m_waits;
+    DefaultUnnamedConditionVariable m_waitFinished;
+    HANDLE m_queueEvent = nullptr;
+    std::shared_ptr<WaitHandleOwner> m_waitEpoch;
+    std::atomic<size_t> m_readyEntries{0};
+    uint32_t m_activeWaits = 0;
     uint64_t m_nextWaitToken = 0;
 #else
     bool m_signaled = false;
     DefaultUnnamedConditionVariableAny m_event;
 #endif
 
+    bool ReadyQueueEmpty();
     HRESULT VerifyNotTerminated(_In_ ITaskQueuePortContext* portContext);
 
     bool IsCallCanceled(_In_ const QueueEntry& entry);
@@ -356,17 +502,11 @@ private:
     void ProcessThreadPoolCallback(_In_ OS::ThreadPoolActionStatus& status);
 
 #ifdef _WIN32
-    HRESULT InitializeWaitRegistration(
-        _In_ WaitRegistration* waitReg);
-
-    bool AppendWaitRegistrationEntry(
-        _In_ WaitRegistration* waitReg);
-
-    bool ReleaseWaitRegistration(
-        _In_ WaitRegistration* waitReg);
-
-    void ProcessWaitCallback(
-        _In_ WaitRegistration* waitReg);
+    bool PublishWaitEntryLocked(WaitRegistration* reg, uint64_t node);
+    void RetireWaitLocked(WaitRegistration* reg, WaitRegistration::State state);
+    bool DispatchWaitEntry(const QueueEntry& entry, OS::ThreadPoolActionStatus& status,
+        referenced_ptr<ITaskQueuePortContext>& context);
+    void ProcessWaitCallback(WaitRegistration* reg);
 
     static void CALLBACK WaitCallback(
         _In_ PTP_CALLBACK_INSTANCE instance,
@@ -376,17 +516,20 @@ private:
 #endif
 };
 
+class TaskQueueImpl;
+
 class TaskQueuePortContextImpl : public ITaskQueuePortContext
 {
 public:
     
     TaskQueuePortContextImpl(
-        _In_ ITaskQueue* queue,
+        _In_ TaskQueueImpl* queue,
         _In_ XTaskQueuePort type,
         _In_ SubmitCallback* submitCallback);
 
     uint32_t __stdcall AddRef() override;
     uint32_t __stdcall Release() override;
+    bool TryPin() noexcept;
     HRESULT __stdcall QueryApi(_In_ ApiId id, _Out_ void** ptr) override;
 
     XTaskQueuePort __stdcall GetType() override;
@@ -411,7 +554,7 @@ public:
 
 private:
 
-    ITaskQueue* m_queue = nullptr;
+    TaskQueueImpl* m_queue = nullptr;
     XTaskQueuePort m_type = XTaskQueuePort::Work;
     SubmitCallback* m_submitCallback = nullptr;
     std::atomic<TaskQueuePortStatus> m_status = { TaskQueuePortStatus::Active };
@@ -506,7 +649,7 @@ private:
 
     XTaskQueueObject m_header = { };
     SubmitCallback m_callbackSubmitted;
-    QueueWaitRegistry m_waitRegistry;
+    referenced_ptr<QueueWaitRegistry> m_waitRegistry{new (std::nothrow) QueueWaitRegistry};
     TerminationData m_termination;
     TaskQueuePortContextImpl m_work;
     TaskQueuePortContextImpl m_completion;

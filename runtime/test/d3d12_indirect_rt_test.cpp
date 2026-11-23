@@ -681,6 +681,7 @@ int main() {
 
         ID3D12Resource* blas_buf = nullptr;
         ID3D12Resource* tlas_buf = nullptr;
+        ID3D12Resource* tlas_ptr_buf = nullptr;
         ID3D12Resource* scratch_buf = nullptr;
         ID3D12Resource* inst_buf = nullptr;
         if (FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &blas_desc,
@@ -689,6 +690,9 @@ int main() {
             FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &tlas_desc,
                                                 D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
                                                 IID_PPV_ARGS(&tlas_buf))) ||
+            FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &tlas_desc,
+                                                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
+                                                IID_PPV_ARGS(&tlas_ptr_buf))) ||
             FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &scratch_desc,
                                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                                                 IID_PPV_ARGS(&scratch_buf))) ||
@@ -709,6 +713,28 @@ int main() {
 
         tlas_in.InstanceDescs = inst_buf->GetGPUVirtualAddress();
 
+        // The same instance desc, named through an ARRAY_OF_POINTERS list. The list holds a console VA; the KHR
+        // path must stage a copy whose entry is a Vulkan device address before building.
+        auto inst_ptr_desc = make_buf_desc(256);
+        ID3D12Resource* inst_ptr_buf = nullptr;
+        if (FAILED(dev->CreateCommittedResource(&up_hp, D3D12_HEAP_FLAG_NONE, &inst_ptr_desc,
+                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                IID_PPV_ARGS(&inst_ptr_buf))))
+            return fail("CreateCommittedResource(instance pointer list)");
+        const UINT64 inst_va = inst_buf->GetGPUVirtualAddress();
+        inst_ptr_buf->Map(0, nullptr, &p);
+        std::memcpy(p, &inst_va, sizeof(inst_va));
+        inst_ptr_buf->Unmap(0, nullptr);
+
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlas_ptr_in = tlas_in;
+        tlas_ptr_in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS;
+        tlas_ptr_in.InstanceDescs = inst_ptr_buf->GetGPUVirtualAddress();
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO tlas_ptr_info{};
+        dev->GetRaytracingAccelerationStructurePrebuildInfo(&tlas_ptr_in, &tlas_ptr_info);
+        if (tlas_ptr_info.ResultDataMaxSizeInBytes != tlas_info.ResultDataMaxSizeInBytes ||
+            tlas_ptr_info.ScratchDataSizeInBytes != tlas_info.ScratchDataSizeInBytes)
+            return fail("prebuild info differs between ARRAY and ARRAY_OF_POINTERS");
+
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC blas_build{};
         blas_build.DestAccelerationStructureData = blas_buf->GetGPUVirtualAddress();
         blas_build.Inputs = blas_in;
@@ -719,6 +745,11 @@ int main() {
         tlas_build.Inputs = tlas_in;
         tlas_build.ScratchAccelerationStructureData = scratch_buf->GetGPUVirtualAddress();
 
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC tlas_ptr_build{};
+        tlas_ptr_build.DestAccelerationStructureData = tlas_ptr_buf->GetGPUVirtualAddress();
+        tlas_ptr_build.Inputs = tlas_ptr_in;
+        tlas_ptr_build.ScratchAccelerationStructureData = scratch_buf->GetGPUVirtualAddress();
+
         D3D12_RESOURCE_BARRIER uav_b{};
         uav_b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
 
@@ -727,6 +758,8 @@ int main() {
         cl->BuildRaytracingAccelerationStructure(&blas_build, 0, nullptr);
         cl->ResourceBarrier(1, &uav_b);
         cl->BuildRaytracingAccelerationStructure(&tlas_build, 0, nullptr);
+        cl->ResourceBarrier(1, &uav_b);
+        cl->BuildRaytracingAccelerationStructure(&tlas_ptr_build, 0, nullptr);
         cl->ResourceBarrier(1, &uav_b);
         if (FAILED(cl->Close())) return fail("RT build Close");
 
@@ -737,7 +770,9 @@ int main() {
 
         VkAccelerationStructureKHR tlas_vk =
             rt::d3d12::vulkan_acceleration_structure(dev, tlas_buf->GetGPUVirtualAddress());
-        if (!tlas_vk) return fail("vulkan_acceleration_structure(TLAS)");
+        VkAccelerationStructureKHR tlas_ptr_vk =
+            rt::d3d12::vulkan_acceleration_structure(dev, tlas_ptr_buf->GetGPUVirtualAddress());
+        if (!tlas_vk || !tlas_ptr_vk) return fail("vulkan_acceleration_structure(TLAS)");
 
 #if defined(LEONIDA_TEST_CS_RAYQUERY_SPV)
         std::vector<std::uint32_t> rq_words;
@@ -852,6 +887,42 @@ int main() {
         const std::uint32_t hit = res[0];
         const std::uint32_t miss = res[1];
         out_buf->Unmap(0, nullptr);
+        if (hit != 1u || miss != 0u) {
+            std::fprintf(stderr, "FAIL: RayQueryKHR ARRAY expected hit=1 miss=0, got hit=%u miss=%u\n", hit, miss);
+            return 1;
+        }
+
+        // The second TLAS was built from an ARRAY_OF_POINTERS list. Run the same query against it: without the
+        // address translation the pointer bytes are read as an instance desc with mask 0, and the ray misses.
+        as_write.pAccelerationStructures = &tlas_ptr_vk;
+        vkUpdateDescriptorSets(vk_dev, 1, writes, 0, nullptr);
+        VkCommandBuffer cb2 = VK_NULL_HANDLE;
+        vkAllocateCommandBuffers(vk_dev, &cbai, &cb2);
+        vkBeginCommandBuffer(cb2, &bi);
+        vkCmdBindPipeline(cb2, VK_PIPELINE_BIND_POINT_COMPUTE, pso);
+        vkCmdBindDescriptorSets(cb2, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &dset, 0, nullptr);
+        vkCmdDispatch(cb2, 1, 1, 1);
+        vkCmdPipelineBarrier(cb2, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0,
+                             nullptr, 0, nullptr);
+        vkEndCommandBuffer(cb2);
+        VkSubmitInfo si2{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si2.commandBufferCount = 1;
+        si2.pCommandBuffers = &cb2;
+        vkQueueSubmit(vk_queue, 1, &si2, VK_NULL_HANDLE);
+        vkQueueWaitIdle(vk_queue);
+
+        out_buf->Map(0, nullptr, &p);
+        const auto* res2 = static_cast<const std::uint32_t*>(p);
+        const std::uint32_t hit2 = res2[0];
+        const std::uint32_t miss2 = res2[1];
+        out_buf->Unmap(0, nullptr);
+        if (hit2 != 1u || miss2 != 0u) {
+            std::fprintf(stderr,
+                         "FAIL: RayQueryKHR ARRAY_OF_POINTERS expected hit=1 miss=0, got hit=%u miss=%u\n", hit2,
+                         miss2);
+            return 1;
+        }
+        std::printf("  [PASS] BLAS + TLAS (ARRAY and ARRAY_OF_POINTERS) + RayQueryKHR (hit=%u, miss=%u)\n", hit, miss);
 
         vkDestroyCommandPool(vk_dev, pool, nullptr);
         vkDestroyPipeline(vk_dev, pso, nullptr);
@@ -859,15 +930,83 @@ int main() {
         vkDestroyDescriptorPool(vk_dev, dpool, nullptr);
         vkDestroyDescriptorSetLayout(vk_dev, dsl, nullptr);
         out_buf->Release();
-
-        if (hit != 1u || miss != 0u) {
-            std::fprintf(stderr, "FAIL: RayQueryKHR expected hit=1 miss=0, got hit=%u miss=%u\n", hit, miss);
-            return 1;
-        }
-        std::printf("  [PASS] BLAS + TLAS BuildRaytracingAccelerationStructure + RayQueryKHR (hit=%u, miss=%u)\n", hit,
-                    miss);
 #endif
+        // A null entry in the pointer list is refused while the list is prepared, before anything is submitted.
+        auto bad_ptr_desc = make_buf_desc(256);
+        ID3D12Resource* bad_ptr_buf = nullptr;
+        if (FAILED(dev->CreateCommittedResource(&up_hp, D3D12_HEAP_FLAG_NONE, &bad_ptr_desc,
+                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                IID_PPV_ARGS(&bad_ptr_buf))))
+            return fail("CreateCommittedResource(null instance pointer list)");
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS bad_in = tlas_ptr_in;
+        bad_in.InstanceDescs = bad_ptr_buf->GetGPUVirtualAddress();
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC bad_build{};
+        bad_build.DestAccelerationStructureData = tlas_ptr_buf->GetGPUVirtualAddress();
+        bad_build.Inputs = bad_in;
+        bad_build.ScratchAccelerationStructureData = scratch_buf->GetGPUVirtualAddress();
+        alloc->Reset();
+        cl->Reset(alloc, nullptr);
+        cl->BuildRaytracingAccelerationStructure(&bad_build, 0, nullptr);
+        if (FAILED(cl->Close())) return fail("null pointer build Close");
+        queue->ExecuteCommandLists(1, lists);
+        if (rt::d3d12::last_execute_result(queue) != leonida::ReplayResult::invalid_copy)
+            return fail("null instance pointer must be refused before submission");
+        std::printf("  [PASS] ARRAY_OF_POINTERS null entry refused before submission\n");
+        bad_ptr_buf->Release();
+
+        // A pointer list placed in a DEFAULT heap is GPU-written, so its mapped arena bytes may still hold an
+        // earlier pointer when the CPU prepares a build. Seed those bytes with a valid pointer in one submission,
+        // then overwrite them on the GPU in the next and build. The shim must refuse the second list instead of
+        // translating the stale bytes into a TLAS built from the wrong instances.
+        D3D12_HEAP_DESC placed_heap_desc{};
+        placed_heap_desc.SizeInBytes = 64 * 1024;
+        placed_heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        placed_heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        ID3D12Heap* placed_heap = nullptr;
+        if (FAILED(dev->CreateHeap(&placed_heap_desc, IID_PPV_ARGS(&placed_heap))))
+            return fail("CreateHeap(DEFAULT pointer list heap)");
+        auto stale_ptr_desc = make_buf_desc(256);
+        ID3D12Resource* stale_ptr_buf = nullptr;
+        if (FAILED(dev->CreatePlacedResource(placed_heap, 0, &stale_ptr_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&stale_ptr_buf))))
+            return fail("CreatePlacedResource(DEFAULT pointer list)");
+        // The second submission's GPU overwrite. Its bytes are still the seeded pointer when prepare() runs.
+        auto zero_ptr_desc = make_buf_desc(256);
+        ID3D12Resource* zero_ptr_buf = nullptr;
+        if (FAILED(dev->CreateCommittedResource(&up_hp, D3D12_HEAP_FLAG_NONE, &zero_ptr_desc,
+                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                IID_PPV_ARGS(&zero_ptr_buf))))
+            return fail("CreateCommittedResource(zero pointer list)");
+
+        alloc->Reset();
+        cl->Reset(alloc, nullptr);
+        cl->CopyBufferRegion(stale_ptr_buf, 0, inst_ptr_buf, 0, sizeof(UINT64));
+        if (FAILED(cl->Close())) return fail("seed placed pointer list Close");
+        queue->ExecuteCommandLists(1, lists);
+        queue->Signal(fence, 2);
+        if (!wait_fence(fence, 2)) return fail("wait_fence(seed placed pointer list)");
+
+        alloc->Reset();
+        cl->Reset(alloc, nullptr);
+        cl->CopyBufferRegion(stale_ptr_buf, 0, zero_ptr_buf, 0, sizeof(UINT64));
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC stale_build{};
+        stale_build.DestAccelerationStructureData = tlas_ptr_buf->GetGPUVirtualAddress();
+        stale_build.Inputs = tlas_ptr_in;
+        stale_build.Inputs.InstanceDescs = stale_ptr_buf->GetGPUVirtualAddress();
+        stale_build.ScratchAccelerationStructureData = scratch_buf->GetGPUVirtualAddress();
+        cl->BuildRaytracingAccelerationStructure(&stale_build, 0, nullptr);
+        if (FAILED(cl->Close())) return fail("stale placed pointer build Close");
+        queue->ExecuteCommandLists(1, lists);
+        if (rt::d3d12::last_execute_result(queue) != leonida::ReplayResult::unsupported)
+            return fail("GPU-written placed pointer list must be refused as unsupported before submission");
+        std::printf("  [PASS] ARRAY_OF_POINTERS GPU-written placed pointer list unsupported before submission\n");
+        zero_ptr_buf->Release();
+        stale_ptr_buf->Release();
+        placed_heap->Release();
+
+        inst_ptr_buf->Release();
         inst_buf->Release();
+        tlas_ptr_buf->Release();
         scratch_buf->Release();
         tlas_buf->Release();
         blas_buf->Release();

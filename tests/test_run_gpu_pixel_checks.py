@@ -86,6 +86,25 @@ class PixelChecks(unittest.TestCase):
         frame[2071][1] = half_word(0.0)
         self.assertIn("halves off", rgt.interp_f16_high_problem(frame))
 
+    def test_computed_ij_requires_a_full_finite_frame(self):
+        def words(v_over_two):
+            return struct.unpack("<4I", struct.pack("<4f", 0.5, 0.0, v_over_two, 0.5))
+
+        frame = [words((y + 0.5) / 128) for y in range(64) for _ in range(64)]
+        self.assertEqual(rgt.ij_computed_problem(frame), "")
+        for wrong_size in ([], [words(0.25)], frame[:-1], frame + frame[:1]):
+            with self.subTest(pixels=len(wrong_size)):
+                self.assertTrue(rgt.ij_computed_problem(wrong_size))
+
+        for pixel in (0, 1337):
+            for channel in range(4):
+                with self.subTest(pixel=pixel, channel=channel):
+                    corrupted = frame.copy()
+                    bad_pixel = list(corrupted[pixel])
+                    bad_pixel[channel] = 0x7FC00000
+                    corrupted[pixel] = tuple(bad_pixel)
+                    self.assertTrue(rgt.ij_computed_problem(corrupted))
+
     def test_nan_frame_fails(self):
         nan = self.raw(struct.pack("<4f", NAN, NAN, NAN, NAN) * 4096)
         self.assertFalse(rgt.check_bary(nan)[0])

@@ -129,24 +129,25 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     if (!riid) return result(method, E_POINTER);
 
     const bool tracing = rt::d3d12_trace::enabled();
-    if (!tracing) {
+    if (!tracing)
         std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice adapter=%p params=%p riid=%08lx-%04x-%04x\n",
                      adapter, params, static_cast<unsigned long>(riid->Data1), riid->Data2, riid->Data3);
-        if (params) {
-            const uint32_t* words = static_cast<const uint32_t*>(params);
-            char line[24 * 11 + 1];
-            line[0] = '\0';
-            size_t used = 0;
-            for (int i = 0; i < 24 && used < sizeof(line); ++i) {
-                int n = std::snprintf(line + used, sizeof(line) - used, "%s%08x", i ? " " : "",
-                                      static_cast<unsigned>(words[i]));
-                if (n < 0) break;
-                used += static_cast<size_t>(n);
-            }
-            std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice params[24] =%s\n", line);
-        } else {
-            std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice params = null\n");
+    // The 24 words are the title's device parameters (docs/boot.md, question 1). Unlike the pointers above they are the
+    // same on every run, so they are printed with --trace-d3d12 as well, and one traced run shows them.
+    if (params) {
+        const uint32_t* words = static_cast<const uint32_t*>(params);
+        char line[24 * 11 + 1];
+        line[0] = '\0';
+        size_t used = 0;
+        for (int i = 0; i < 24 && used < sizeof(line); ++i) {
+            int n = std::snprintf(line + used, sizeof(line) - used, "%s%08x", i ? " " : "",
+                                  static_cast<unsigned>(words[i]));
+            if (n < 0) break;
+            used += static_cast<size_t>(n);
         }
+        std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice params[24] =%s\n", line);
+    } else {
+        std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice params = null\n");
     }
 
     static std::atomic<bool> proxy_logged{false};

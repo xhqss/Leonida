@@ -46,9 +46,16 @@ TARGET_ENV_VERSION = {
 }
 
 _ID_KINDS = frozenset(("IdRef", "IdResult", "IdResultType", "IdScope", "IdMemorySemantics"))
+_ID_RE = re.compile(r"%[A-Za-z0-9_]+")
 _EXT_SETS = {
     "GLSL.std.450": GLSL_STD_450,
 }
+
+# OpTypeForwardPointer takes an ID reference. Its matching OpTypePointer defines the type.
+_TYPE_DEFINITIONS = frozenset(
+    name for name, (_, _, has_result, _) in INSTRUCTIONS.items()
+    if has_result and name.startswith("OpType")
+)
 
 # Precompute fixed-arity pure-Id instructions (e.g. OpIAdd, OpFMul, OpSelect, OpStore, OpBranch)
 # so the hot loop encodes ~80% of shader lines without per-operand dispatch overhead.
@@ -146,6 +153,36 @@ def _parse_int(tok: str, lineno: int) -> int:
         raise SpirvAsmError(f"line {lineno}: invalid integer literal {tok!r}") from exc
 
 
+def _int_literal(tok: str, width: int, signed: bool, lineno: int) -> int:
+    """The bits of integer literal `tok` for a `width`-bit integer type, refused where spirv-as refuses it.
+
+    As SPIRV-Tools reads it: an unsigned type takes 0..2^width-1 and no minus sign (not even -0); a signed type
+    takes -2^(width-1)..2^(width-1)-1, or a hex literal 0..2^width-1 read as the bit pattern (0xFFFF for a 16-bit
+    signed type is -1). Only a bare hex literal is a bit pattern: with a sign (+0xFFFF) it is a value and must fit the
+    signed range, as SPIRV-Tools reads it. A type narrower than 32 bits fills its word as the spec says: zero-extended when unsigned,
+    sign-extended when signed (0x8000 for a 16-bit signed type is 0xFFFF8000). Returns the value as an unsigned
+    number of max(width, 32) bits.
+    """
+    val = _parse_int(tok, lineno)
+    kind = "signed" if signed else "unsigned"
+    if not signed:
+        if tok.startswith("-"):
+            raise SpirvAsmError(f"line {lineno}: cannot put a negative number in an unsigned literal: {tok}")
+        if val >> width:
+            raise SpirvAsmError(f"line {lineno}: integer {tok} does not fit in a {width}-bit {kind} integer")
+    elif re.match(r"0[xX]", tok) and val >> width == 0:
+        if val >> (width - 1):
+            val -= 1 << width
+    elif not -(1 << (width - 1)) <= val < 1 << (width - 1):
+        raise SpirvAsmError(f"line {lineno}: integer {tok} does not fit in a {width}-bit {kind} integer")
+    return val & ((1 << max(width, 32)) - 1)
+
+
+def _u32_literal(tok: str, lineno: int) -> int:
+    """A LiteralInteger operand, or a numeric enum/mask value: one unsigned 32-bit word."""
+    return _int_literal(tok, 32, False, lineno)
+
+
 _HEX_FLOAT_RE = re.compile(r"^([+-]?)0[xX]([0-9a-fA-F]*)(?:\.([0-9a-fA-F]*))?[pP]([+-]?\d+)$")
 _FLOAT_SPEC = {
     16: (5, 10, 15, "<e", "<H"),
@@ -206,23 +243,15 @@ def _parse_float_bits(tok: str, width: int, lineno: int) -> int:
         return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits)
 
 
-def _encode_integer(val: int, width: int, signedness: int) -> list[int]:
-    # A hexadecimal bit pattern for a signed narrow value still needs a sign-extended word.
-    if signedness and 0 < width < 32 and (1 << (width - 1)) <= val < (1 << width):
-        val -= 1 << width
-    if width == 64:
-        return [val & 0xFFFFFFFF, (val >> 32) & 0xFFFFFFFF]
-    return [val & 0xFFFFFFFF]
-
-
 def _encode_context_number(tok: str, type_info, lineno: int) -> list[int]:
     if type_info is None:
         raise SpirvAsmError(f"line {lineno}: OpConstant references unknown scalar type")
     kind, width = type_info[0], type_info[1]
     if kind == "int":
-        if width <= 32 or width == 64:
-            return _encode_integer(_parse_int(tok, lineno), width, type_info[2])
-        raise SpirvAsmError(f"line {lineno}: unsupported integer constant width {width}")
+        if width > 32 and width != 64:
+            raise SpirvAsmError(f"line {lineno}: unsupported integer constant width {width}")
+        val = _int_literal(tok, width, bool(type_info[2]), lineno)
+        return [val] if width <= 32 else [val & 0xFFFFFFFF, val >> 32]
     if kind == "float":
         bits = _parse_float_bits(tok, width, lineno)
         if width <= 32:
@@ -241,8 +270,11 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
 
     sym_to_id: dict[str, int] = {}
     next_id = 1
+    defined_types: set[str] = set()
     type_info: dict[int, tuple] = {}       # type_id -> ('int', width, signedness) | ('float', width)
     id_to_type: dict[int, int] = {}        # result_id -> result_type_id
+    # Only OpSwitch needs a value's result type, to choose the case literal width.
+    track_switch_types = "OpSwitch" in text
     ext_imports: dict[int, dict[str, int]] = {}  # ext_set_id -> {name: opcode}
 
     def get_id(tok: str, lineno: int) -> int:
@@ -251,6 +283,8 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             raise SpirvAsmError(f"line {lineno}: expected %id, got {tok!r}")
         vid = sym_to_id.get(tok)
         if vid is None:
+            if not _ID_RE.fullmatch(tok):
+                raise SpirvAsmError(f"line {lineno}: invalid ID {tok!r}")
             vid = next_id
             next_id += 1
             sym_to_id[tok] = vid
@@ -260,12 +294,12 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
 
     def encode_operand(kind: str, toks: list[str], idx: int, lineno: int,
                        res_type_id: int | None, cur_ext_table: dict[str, int] | None,
-                       switch_type: tuple[int, int], out: list[int]) -> int:
+                       switch_type: tuple | None, out: list[int]) -> int:
         if kind in _ID_KINDS:
             out.append(get_id(toks[idx], lineno))
             return idx + 1
         if kind == "LiteralInteger":
-            out.append(_parse_int(toks[idx], lineno) & 0xFFFFFFFF)
+            out.append(_u32_literal(toks[idx], lineno))
             return idx + 1
         if kind == "LiteralFloat":
             out.append(_parse_float_bits(toks[idx], 32, lineno))
@@ -281,10 +315,21 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             if cur_ext_table is not None and tok in cur_ext_table:
                 out.append(cur_ext_table[tok])
             else:
-                out.append(_parse_int(tok, lineno) & 0xFFFFFFFF)
+                out.append(_u32_literal(tok, lineno))
             return idx + 1
         if kind == "PairLiteralIntegerIdRef":
-            out.extend(_encode_integer(_parse_int(toks[idx], lineno), *switch_type))
+            tok = toks[idx]
+            if switch_type is not None:
+                width, signed = switch_type
+            else:
+                # Selector of unknown type: one word, read as signed only when the literal is negative.
+                width, signed = 32, tok.startswith("-")
+            val = _int_literal(tok, width, signed, lineno)
+            if width == 64:
+                out.append(val & 0xFFFFFFFF)
+                out.append(val >> 32)
+            else:
+                out.append(val)
             if idx + 1 >= len(toks):
                 raise SpirvAsmError(f"line {lineno}: missing label in {kind}")
             out.append(get_id(toks[idx + 1], lineno))
@@ -299,7 +344,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             if idx + 1 >= len(toks):
                 raise SpirvAsmError(f"line {lineno}: missing literal in {kind}")
             out.append(get_id(toks[idx], lineno))
-            out.append(_parse_int(toks[idx + 1], lineno) & 0xFFFFFFFF)
+            out.append(_u32_literal(toks[idx + 1], lineno))
             return idx + 2
         if kind == "LiteralSpecConstantOpInteger":
             opname = toks[idx]
@@ -329,7 +374,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             if entry is None:
                 # Allow raw numeric value fallback (e.g. hex enum value)
                 if tok[:1].isdigit() or tok.startswith(("0x", "0X")):
-                    out.append(_parse_int(tok, lineno) & 0xFFFFFFFF)
+                    out.append(_u32_literal(tok, lineno))
                     return idx + 1
                 raise SpirvAsmError(f"line {lineno}: unknown {kind} value {tok!r}")
             val, params = entry
@@ -350,7 +395,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
                 entry = benum.get(part)
                 if entry is None:
                     if part[:1].isdigit() or part.startswith(("0x", "0X")):
-                        mask |= _parse_int(part, lineno) & 0xFFFFFFFF
+                        mask |= _u32_literal(part, lineno)
                         continue
                     raise SpirvAsmError(f"line {lineno}: unknown {kind} flag {part!r} in {tok!r}")
                 bval, params = entry
@@ -383,6 +428,11 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             opname = toks[0]
             arg_idx = 1
 
+        if res_tok is not None and opname in _TYPE_DEFINITIONS:
+            if res_tok in defined_types:
+                raise SpirvAsmError(f"line {lineno}: type ID {res_tok} is already defined")
+            defined_types.add(res_tok)
+
         fast = _PURE_ID_INSNS.get(opname)
         if fast is not None:
             opcode, has_rt, has_res, min_args, has_var = fast
@@ -403,7 +453,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             if has_res:
                 rid = get_id(res_tok, lineno)
                 out.append(rid)
-                if rt_id is not None:
+                if track_switch_types and rt_id is not None:
                     id_to_type[rid] = rt_id
             for k in range(arg_idx, len(toks)):
                 out.append(get_id(toks[k], lineno))
@@ -435,7 +485,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
                 raise SpirvAsmError(f"line {lineno}: {opname} requires '%id =' result")
             res_id = get_id(res_tok, lineno)
             out.append(res_id)
-            if res_type_id is not None:
+            if track_switch_types and res_type_id is not None:
                 id_to_type[res_id] = res_type_id
         elif res_tok is not None:
             raise SpirvAsmError(f"line {lineno}: {opname} does not produce a result id")
@@ -451,14 +501,14 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
                 ext_imports[res_id] = _EXT_SETS[ext_name]
 
         cur_ext_table = None
-        switch_type = (32, 0)
+        switch_type = None                 # (width, signed) of the OpSwitch selector's integer type
         if opname == "OpExtInst" and arg_idx < len(toks):
             cur_ext_table = ext_imports.get(get_id(toks[arg_idx], lineno))
         elif opname == "OpSwitch" and arg_idx < len(toks):
             sel_id = get_id(toks[arg_idx], lineno)
             sel_ti = type_info.get(id_to_type.get(sel_id))
-            if sel_ti and sel_ti[0] == "int":
-                switch_type = (sel_ti[1], sel_ti[2])
+            if sel_ti and sel_ti[0] == "int" and (sel_ti[1] <= 32 or sel_ti[1] == 64):
+                switch_type = (sel_ti[1], bool(sel_ti[2]))
 
         for kind, quant in op_specs:
             if quant == "*":

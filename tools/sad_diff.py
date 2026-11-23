@@ -597,6 +597,9 @@ def main():
     if failure:
         _report(failure)
         return 1
+    if not total_pass:   # nothing was compared: every program was skipped
+        print("no program ran: every one was skipped")
+        return 2
     return 0
 
 

@@ -62,6 +62,7 @@ TRI_VERTS = {TRI0: (0, 1, 2), TRI1: (1, 3, 2), TRI2: (2, 3, 4), TRI3: (2, 4, 0)}
 
 FLT_MAX = struct.unpack("<f", struct.pack("<I", 0x7F7FFFFF))[0]
 HALF_MAX = 65504.0
+HALF_MIN_NORMAL = 2.0 ** -14
 INF = math.inf
 
 
@@ -107,11 +108,21 @@ def _half_step(bits, up):
 
 def half_round(x, up):
     """Round a float to a half that is >= x (up) or <= x, so a quantised box still contains the exact one. Values
-    beyond the half range become +-inf, which the decoder clamps to +-FLT_MAX: still conservative."""
+    beyond the half range become +-inf on their outward side (the decoder clamps them to +-FLT_MAX: still
+    conservative) and +-HALF_MAX on their inward side, so an empty box stays empty. No denormal half
+    is produced: a value below the smallest normal half (2^-14) in magnitude becomes 0 or +-2^-14, whichever is on its
+    side, because a decoder that flushes half denormals to zero would otherwise shrink the box. The GPU builder
+    (runtime/src/xdxr_build.comp half_directed) computes the same bits."""
     if x > HALF_MAX:
         return 0x7C00 if up else _half_bits(HALF_MAX)
     if x < -HALF_MAX:
         return _half_bits(-HALF_MAX) if up else 0xFC00
+    if abs(x) < HALF_MIN_NORMAL:
+        if x == 0:
+            return _half_bits(x)                    # keeps the sign of a zero
+        if x > 0:
+            return _half_bits(HALF_MIN_NORMAL) if up else 0x0000
+        return 0x8000 if up else _half_bits(-HALF_MIN_NORMAL)
     b = _half_bits(x)
     v = _half_value(b)
     if (up and v < x) or (not up and v > x):
@@ -551,13 +562,15 @@ def _inverse_dir(d):
     return [1.0 / c if c != 0.0 else math.copysign(FLT_MAX, c) for c in d]
 
 
-def _trace_blas(mem, bvh_va, org, d, tmax, hit, inst):
+def _trace_blas(mem, bvh_va, org, d, tmax, hit, inst, stats=None):
     inv = _inverse_dir(d)
     stack = [mem.u32(bvh_va + 48)[0]]
     while stack:
         p = stack.pop()
         if p == INVALID:
             continue
+        if stats is not None:
+            stats["steps"] += 1
         r = intersect_node(mem, bvh_va, p, org, d, inv, hit["t"] if hit else tmax)
         if r is None:
             continue
@@ -577,13 +590,14 @@ def _trace_blas(mem, bvh_va, org, d, tmax, hit, inst):
     return hit
 
 
-def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF, bias=0):
+def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF, bias=0, stats=None):
     """Closest hit of a ray in a TLAS or BLAS at ``bvh_va``: a dict with t, instance (None for a BLAS), geometry,
     primitive, bary and front, or None. ``bias`` is added to the BLAS addresses instance records hold (application
-    address to the address in ``mem``)."""
+    address to the address in ``mem``). With ``stats`` (a dict), its "steps" counts the traversal steps: one per node
+    or triangle tested, the work of one image_bvh_intersect_ray."""
     flags = mem.u32(bvh_va)[0]
     if flags & FLAG_BOTTOM_LEVEL:
-        return _trace_blas(mem, bvh_va, org, d, tmax, None, None)
+        return _trace_blas(mem, bvh_va, org, d, tmax, None, None, stats)
     hit = None
     inv = _inverse_dir(d)
     stack = [mem.u32(bvh_va + 48)[0]]
@@ -605,8 +619,10 @@ def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF, bias=0):
                 raise ValueError(f"instance root {root:#x} is not the BLAS header's root")
             index = mem.u32(rec + 112)[0]
             # the object-space ray keeps the world t: the direction is transformed, not normalised
-            hit = _trace_blas(mem, blas_va, lo, ld, tmax, hit, index)
+            hit = _trace_blas(mem, blas_va, lo, ld, tmax, hit, index, stats)
             continue
+        if stats is not None:
+            stats["steps"] += 1
         r = intersect_node(mem, bvh_va, p, org, d, inv, hit["t"] if hit else tmax)
         if r:
             stack.extend(reversed([k for k in r if k != INVALID]))
@@ -728,6 +744,81 @@ def validate(data, expect_bottom=None):
     return errs
 
 
+def box16_rounding(data):
+    """Checks that every BOX16 child box of a bottom-level BVH holds exactly encode_box16 of the exact box of the
+    triangles under that child: the bits, not just containment. The exact box comes from the leaves' own vertices, so
+    this needs nothing but the buffer. A triangle with a NaN vertex has an empty box, as in the builder. Returns a list
+    of problems (empty = every BOX16 word matches)."""
+    errs = []
+    root = struct.unpack_from("<I", data, 48)[0]
+    empty = ([INF] * 3, [-INF] * 3)
+    memo = {}
+
+    def exact(p):
+        if p in memo:
+            return memo[p]
+        kind, off = ptr_type(p), ptr_offset(p)
+        if kind <= TRI3:
+            pts = [struct.unpack_from("<3f", data, off + 12 * s) for s in TRI_VERTS[kind]]
+            box = empty if any(math.isnan(c) for q in pts for c in q) else _bounds(pts)
+        else:
+            kids = struct.unpack_from("<4I", data, off)
+            boxes = [exact(k) for k in kids if k != INVALID]
+            boxes = [b for b in boxes if all(b[0][c] <= b[1][c] for c in range(3))]
+            box = _union(boxes) if boxes else empty
+            if kind == BOX16:
+                for i, k in enumerate(kids):
+                    want = encode_box16(*(exact(k) if k != INVALID else empty))
+                    got = struct.unpack_from("<3I", data, off + 16 + 12 * i)
+                    if tuple(got) != tuple(want):
+                        errs.append(f"BOX16 {p:#x} child {i}: {[hex(w) for w in got]}, expected "
+                                    f"{[hex(w) for w in want]}")
+        memo[p] = box
+        return box
+
+    if root != INVALID:
+        exact(root)
+    return errs
+
+
+def node_census(data):
+    """Reachable pointers of a valid BVH by node type: {type: count}, the root included."""
+    count = {}
+    stack = [struct.unpack_from("<I", data, 48)[0]]
+    while stack:
+        p = stack.pop()
+        if p == INVALID:
+            continue
+        kind = ptr_type(p)
+        count[kind] = count.get(kind, 0) + 1
+        if kind in (BOX16, BOX32):
+            stack.extend(struct.unpack_from("<4I", data, ptr_offset(p)))
+    return count
+
+
+def pair_rotations(data):
+    """The (TRI0 remap byte, TRI1 remap byte) of every paired leaf reachable in a valid bottom-level BVH: which of
+    the three rotations each triangle of a pair was stored in."""
+    seen = set()
+    stack = [struct.unpack_from("<I", data, 48)[0]]
+    while stack:
+        p = stack.pop()
+        if p == INVALID:
+            continue
+        kind = ptr_type(p)
+        if kind == TRI1:
+            remap = struct.unpack_from("<I", data, ptr_offset(p) + 60)[0]
+            seen.add((remap & 0xFF, (remap >> 8) & 0xFF))
+        elif kind in (BOX16, BOX32):
+            stack.extend(struct.unpack_from("<4I", data, ptr_offset(p)))
+    return seen
+
+
+def count_pairs(data):
+    """TRI1 pointers reachable from the root of a valid bottom-level BVH: the triangles paired into another's leaf."""
+    return node_census(data).get(TRI1, 0)
+
+
 # ---- checking a GPU build (runtime/test/vk_xdxr_build_test.cpp) ----
 def _case_names(directory):
     """Find cases using a literal directory and the usual JSON filename pattern."""
@@ -737,15 +828,47 @@ def _case_names(directory):
     return sorted(os.path.splitext(os.path.basename(path))[0] for path in glob.glob(pattern))
 
 
+class CaseError(Exception):
+    """A <case>.json / <case>.bin pair that is missing, unreadable or not a case description."""
+
+
 def _load_case(directory, name):
+    """desc, data for one <name>.json and <name>.bin pair. CaseError names the .json at fault: any *.json in the
+    directory counts as a case (check-build is run on a build folder that may hold other reports), so a stray or
+    half-written file there must say which one it is, not end in a traceback."""
     import json
-    with open(f"{directory}/{name}.json", encoding="utf-8") as fh:
-        desc = json.load(fh)
-    with open(f"{directory}/{name}.bin", "rb") as fh:
-        data = fh.read()
+    js = f"{directory}/{name}.json"
     fix = lambda x: math.nan if x == "nan" else x                                   # noqa: E731
-    if desc["kind"] == "blas":
-        desc["triangles"] = [[[fix(c) for c in v] for v in t[:3]] + t[3:] for t in desc["triangles"]]
+    try:
+        with open(js, encoding="utf-8") as fh:
+            desc = json.load(fh)
+        with open(f"{directory}/{name}.bin", "rb") as fh:
+            data = fh.read()
+        kind = desc["kind"]
+        if kind == "blas":
+            desc["triangles"] = [[[fix(c) for c in v] for v in t[:3]] + t[3:] for t in desc["triangles"]]
+        elif kind != "tlas":
+            raise CaseError(f"{js}: kind {kind!r} is neither 'blas' nor 'tlas'")
+        # Check the keys check_build needs while the filename is still in scope: a KeyError there would name only the
+        # directory and the missing key, and in a folder of several cases the user cannot tell which file to fix.
+        for key in ("address",) + (("blas", "instances") if kind == "tlas" else ()):
+            if key not in desc:
+                raise CaseError(f"{js}: the case has no {key!r} key")
+        if kind == "tlas":
+            if not isinstance(desc["blas"], list) or not all(isinstance(b, str) and b for b in desc["blas"]):
+                raise CaseError(f"{js}: 'blas' is not a list of case names")
+            if not isinstance(desc["instances"], list):
+                raise CaseError(f"{js}: 'instances' is not a list")
+            for i, inst in enumerate(desc["instances"]):
+                if not isinstance(inst, dict):
+                    raise CaseError(f"{js}: instance {i} is not an object")
+                for key in ("transform", "blas", "mask"):
+                    if key not in inst:
+                        raise CaseError(f"{js}: instance {i} has no {key!r} key")
+    except KeyError as error:
+        raise CaseError(f"{js}: the case has no {error} key") from None
+    except (OSError, ValueError, TypeError, IndexError) as error:
+        raise CaseError(f"{js}: {error}") from None
     return desc, data
 
 
@@ -756,6 +879,20 @@ def check_build(directory, rays=300, seed=1):
         return [f"no cases in {directory}"]
     problems = []
     cases = {n: _load_case(directory, n) for n in names}
+    for n, (desc, _) in cases.items():
+        if desc["kind"] != "tlas":
+            continue
+        js = f"{directory}/{n}.json"
+        for b in desc["blas"]:
+            if b not in cases:
+                raise CaseError(f"{js}: BLAS {b!r} is not a case in this folder")
+            if cases[b][0]["kind"] != "blas":
+                raise CaseError(f"{js}: {b!r} is a {cases[b][0]['kind']}, not a blas")
+        for i, inst in enumerate(desc["instances"]):
+            index = inst["blas"]
+            # -1 is an instance with no BLAS (vk_xdxr_build_test's "no BLAS" case), which the model skips
+            if not isinstance(index, int) or not -1 <= index < len(desc["blas"]):
+                raise CaseError(f"{js}: instance {i} names BLAS index {index!r}, not -1..{len(desc['blas']) - 1}")
     rng = random.Random(seed)
     for n, (desc, data) in cases.items():
         # An in-place update leaves two dumps at one address (before and after): the case being checked comes first,
@@ -766,6 +903,24 @@ def check_build(directory, rays=300, seed=1):
             if other != n:
                 mem.place(odesc["address"], odata)
         errs = validate(data, expect_bottom=desc["kind"] == "blas")
+        if desc["kind"] == "blas" and not errs:
+            errs += box16_rounding(data)
+        pairs = count_pairs(data) if desc["kind"] == "blas" and not errs else 0
+        if desc.get("pairs") is True and not pairs:
+            errs.append("built with pairing, but no TRI1 node is reachable")
+        if desc.get("pairs") is False and pairs:
+            errs.append(f"{pairs} TRI1 nodes, but none of its triangles may pair")
+        if desc.get("all_rotations") and not errs:   # every (first, sibling) rotation of a pair is exercised
+            rotations = pair_rotations(data)
+            if len(rotations) < 9:
+                errs.append(f"paired leaves use {len(rotations)} of the 9 (TRI0, TRI1) rotations: "
+                            f"{sorted(rotations)}")
+        if "box16" in desc and not errs:          # the node type the build was asked for, so no check runs vacuously
+            census = node_census(data)
+            want, other = (BOX16, BOX32) if desc["box16"] else (BOX32, BOX16)
+            if census.get(other) or not census.get(want):
+                errs.append(f"inner nodes {census.get(BOX16, 0)} BOX16 and {census.get(BOX32, 0)} BOX32, expected "
+                            f"only {'BOX16' if desc['box16'] else 'BOX32'}")
         problems += [f"{n}: {e}" for e in errs]
         if desc["kind"] == "blas":
             tris = desc["triangles"]
@@ -780,13 +935,14 @@ def check_build(directory, rays=300, seed=1):
                 src = blas[inst["blas"]]["triangles"] if inst["blas"] >= 0 else []
                 scene.append((rows, inst["mask"], [t[:3] for t in src]))
                 inst_ids.append([(t[3], t[4]) for t in src])      # list position -> (geometry, primitive)
+        stats = {"steps": 0}
         bad = hits = 0
         case_rays = min(rays, desc.get("rays", rays))      # a large case may ask for fewer (brute force is slow)
         for _ in range(case_rays):
             o = [rng.uniform(-12, 12) for _ in range(3)]
             target = [rng.uniform(-6, 6) for _ in range(3)]
             d = [target[c] - o[c] for c in range(3)]
-            got = trace(mem, desc["address"], o, d, bias=desc.get("bias", 0))
+            got = trace(mem, desc["address"], o, d, bias=desc.get("bias", 0), stats=stats)
             want = brute_force(scene, o, d)
             hits += got is not None
             if (got is None) != (want is None):
@@ -797,13 +953,19 @@ def check_build(directory, rays=300, seed=1):
             if ids is not None:
                 same = (got["geometry"], got["primitive"]) == ids[want["primitive"]]
                 same = same and math.isclose(got["t"], want["t"], rel_tol=1e-6, abs_tol=1e-9)
+                # D3D12's barycentrics: a paired (TRI1) or rotated TRI0 triangle must still return them through its
+                # remap byte, not its slot order
+                same = same and all(math.isclose(g, w, rel_tol=1e-5, abs_tol=1e-6)
+                                    for g, w in zip(got["bary"], want["bary"]))
             else:
                 # the instance's world-to-object matrix is a float32 inverse; allow for its rounding in t
                 want_id = inst_ids[want["instance"]][want["primitive"]]
                 same = (got["instance"], (got["geometry"], got["primitive"])) == (want["instance"], want_id)
                 same = same and math.isclose(got["t"], want["t"], rel_tol=1e-4)
             bad += not same
-        print(f"{n}: {len(data)} bytes, {len(errs)} validation errors, {bad}/{case_rays} rays differ ({hits} hits)")
+        paired = f", {pairs} TRI1" if pairs else ""
+        print(f"{n}: {len(data)} bytes{paired}, {len(errs)} validation errors, {bad}/{case_rays} rays differ "
+              f"({hits} hits), {stats['steps'] / max(case_rays, 1):.1f} steps per ray")
         if bad:
             problems.append(f"{n}: {bad} of {case_rays} rays differ from brute force")
         if desc["kind"] == "blas" and len(desc["triangles"]) > 4 and hits == 0:
@@ -841,6 +1003,7 @@ def selftest(seed=1, rays=400, verbose=False):
     for name, tris, b16, pair in cases:
         data, info = build_blas(tris, box16=b16, pair=pair)
         errs = validate(data, expect_bottom=True)
+        errs += box16_rounding(data)
         mem = Memory()
         mem.place(0x10000, data)
         bad = 0
@@ -881,7 +1044,14 @@ def main(argv=None):
         if not _case_names(a.dir):
             print(f"no cases in {a.dir}: skipped (the build step skipped or did not run)")
             return 77                                   # ctest SKIP_RETURN_CODE
-        problems = check_build(a.dir, a.rays)
+        try:
+            problems = check_build(a.dir, a.rays)
+        except CaseError as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 2
+        except (KeyError, ValueError, IndexError, TypeError) as error:
+            print(f"ERROR: a case in {a.dir} does not describe a build: {error}", file=sys.stderr)
+            return 2
         for e in problems:
             print(e)
         print("all cases match" if not problems else f"{len(problems)} problems")

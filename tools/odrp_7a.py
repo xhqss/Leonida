@@ -976,6 +976,10 @@ def _carve_stored_map(folder):
         return {}
 
 
+def _is_carved_file(path):
+    return path.lower().endswith(".bin") and os.path.isfile(path)
+
+
 def scan_dir(path, max_inflate=MAX_INFLATE):
     """Scan a directory of carved `.bin` files in bounded memory."""
     t0 = time.time()
@@ -984,10 +988,7 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
     skipped = 0
     for idx, name in enumerate(sorted(os.listdir(path))):
         full = os.path.join(path, name)
-        if not os.path.isfile(full):
-            continue
-        low = name.lower()
-        if low.endswith((".json", ".csv", ".bk2")) or not low.endswith(".bin"):
+        if not _is_carved_file(full):
             continue
         fsize = os.path.getsize(full)
         if fsize > max_inflate:
@@ -1207,7 +1208,7 @@ def main(argv=None):
         if os.path.isfile(args.out):
             for name in os.listdir(args.source):
                 cand = os.path.join(args.source, name)
-                if os.path.isfile(cand) and _same_path(cand, args.out):
+                if _is_carved_file(cand) and _same_path(cand, args.out):
                     ap.error(f"output would overwrite an input file: {args.out}")
     elif os.path.isfile(args.source):
         is_rpf = _is_rpf_file(args.source)

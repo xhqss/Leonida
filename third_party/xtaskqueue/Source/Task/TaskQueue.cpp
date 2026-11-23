@@ -296,46 +296,53 @@ void SubmitCallback::Invoke(_In_ XTaskQueuePort port)
 // QueueWaitRegistry
 //
 
-HRESULT QueueWaitRegistry::Register(
-    _In_ XTaskQueuePort port,
-    _In_ const XTaskQueueRegistrationToken& portToken,
-    _Out_ XTaskQueueRegistrationToken* token)
+bool QueueWaitRegistry::Reserve()
 {
-    RETURN_HR_IF(E_OUTOFMEMORY, m_callbacks.capacity() == 0);
-
     std::lock_guard<std::mutex> lock(m_lock);
-
-    WaitRegistration reg = { };
-    reg.Port = port;
-    reg.Token = ++m_nextToken;
-    reg.PortToken = portToken.token;
-    token->token = reg.Token;
-    m_callbacks.append(reg);
-
-    return S_OK;
+    if (m_reserved == m_callbacks.capacity()) return false;
+    ++m_reserved;
+    return true;
 }
 
-std::pair<XTaskQueuePort, XTaskQueueRegistrationToken> QueueWaitRegistry::Unregister(
-    _In_ const XTaskQueueRegistrationToken& token)
+void QueueWaitRegistry::CancelReservation()
 {
-    XTaskQueuePort port = XTaskQueuePort::Work;
-    XTaskQueueRegistrationToken portToken;
-    portToken.token = 0;
-
     std::lock_guard<std::mutex> lock(m_lock);
+    --m_reserved;
+}
 
-    for(uint32_t idx = 0; idx < m_callbacks.count(); idx++)
+void QueueWaitRegistry::Publish(XTaskQueuePort port, XTaskQueueRegistrationToken portToken,
+    XTaskQueueRegistrationToken* token, bool retiredByPort)
+{
+    std::lock_guard<std::mutex> lock(m_lock);
+    --m_reserved;
+    WaitRegistration reg{++m_nextToken, portToken.token, port, retiredByPort};
+    m_callbacks.append(reg);
+    token->token = reg.Token;
+}
+
+QueueWaitRegistry::WaitRegistration QueueWaitRegistry::Lookup(
+    XTaskQueueRegistrationToken token)
+{
+    std::lock_guard<std::mutex> lock(m_lock);
+    for (uint32_t i = 0; i < m_callbacks.count(); ++i)
     {
-        if (m_callbacks[idx].Token == token.token)
+        if (m_callbacks[i].Token == token.token)
+            return m_callbacks[i];
+    }
+    return {};
+}
+
+void QueueWaitRegistry::Remove(XTaskQueueRegistrationToken token)
+{
+    std::lock_guard<std::mutex> lock(m_lock);
+    for (uint32_t i = 0; i < m_callbacks.count(); ++i)
+    {
+        if (m_callbacks[i].Token == token.token)
         {
-            port = m_callbacks[idx].Port;
-            portToken.token = m_callbacks[idx].PortToken;
-            m_callbacks.removeAt(idx);
-            break;
+            m_callbacks.removeAt(i);
+            return;
         }
     }
-
-    return std::pair<XTaskQueuePort, XTaskQueueRegistrationToken>(port, portToken);
 }
 
 //
@@ -359,43 +366,18 @@ TaskQueuePortImpl::~TaskQueuePortImpl()
     EraseQueue(m_pendingList.get());
 
 #ifdef _WIN32
-    StaticArray<WaitRegistration*, PORT_WAIT_MAX> waits;
-
-    // We have no control over when these event callbacks
-    // fire, so we must guard during destruction.
+    // The last port release precludes new pins. Finish any native
+    // callbacks that entered before TryAddRef began refusing them.
+    while (!m_waits.empty())
     {
-        std::lock_guard<std::mutex> lock(m_lock);
-        waits = m_waits;
-        m_waits.clear();
+        UnregisterWaitHandle({m_waits.begin()->first});
     }
-
-    if (waits.count() != 0)
-    {
-        for (uint32_t idx = 0; idx < waits.count(); idx++)
-        {
-            if (waits[idx]->threadpoolWait != nullptr)
-            {
-                SetThreadpoolWait(waits[idx]->threadpoolWait, nullptr, nullptr);
-                WaitForThreadpoolWaitCallbacks(waits[idx]->threadpoolWait, TRUE);
-                CloseThreadpoolWait(waits[idx]->threadpoolWait);
-            }
-
-            // Note: queue entries that are parked on the wait registration
-            // don't take a reference on the port context, so don't release here.
-            delete waits[idx];
-        }
-    }
-
 #endif
 
     m_threadPool.Terminate();
 
 #ifdef _WIN32
-    if (m_events.count() != 0)
-    {
-        // Other events in here are owned by the caller.
-        CloseHandle(m_events[0]);
-    }
+    if (m_queueEvent) CloseHandle(m_queueEvent);
 #endif
 
     // Destroy these lists in order, since the pending lsit shares
@@ -450,7 +432,7 @@ HRESULT TaskQueuePortImpl::Initialize(
 #ifdef _WIN32
     HANDLE evt = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     RETURN_LAST_ERROR_IF_NULL(evt);
-    m_events.append(evt);
+    m_queueEvent = evt;
 #endif
 
     switch (mode)
@@ -550,50 +532,66 @@ HRESULT __stdcall TaskQueuePortImpl::RegisterWaitHandle(
     _In_ XTaskQueueCallback* callback,
     _Out_ XTaskQueueRegistrationToken* token)
 {
+    return RegisterWaitWithToken(portContext, waitHandle, callbackContext, callback, token, nullptr);
+}
+
+HRESULT TaskQueuePortImpl::RegisterWaitWithToken(ITaskQueuePortContext* portContext,
+    HANDLE waitHandle, void* callbackContext, XTaskQueueCallback* callback,
+    XTaskQueueRegistrationToken* token, QueueWaitRegistry* registry)
+{
     RETURN_HR_IF(E_INVALIDARG, callback == nullptr || waitHandle == nullptr || token == nullptr);
     RETURN_HR_IF(E_POINTER, token == nullptr);
     RETURN_IF_FAILED(VerifyNotTerminated(portContext));
 
 #ifdef _WIN32
-    std::unique_ptr<WaitRegistration> waitReg(new (std::nothrow) WaitRegistration);
-    RETURN_IF_NULL_ALLOC(waitReg);
+    referenced_ptr<WaitRegistration> reg(new (std::nothrow) WaitRegistration);
+    RETURN_IF_NULL_ALLOC(reg.get());
 
-    // Entries in waitReg get a port context, but it is not
-    // addref'd because a web registration does not keep the
-    // queue alive.  When a wait registration queue entry is
-    // added to the queue the port context will be addref'd.
-    waitReg->queueEntry.portContext = portContext;
-    waitReg->queueEntry.callback = callback;
-    waitReg->queueEntry.callbackContext = callbackContext;
-    waitReg->queueEntry.waitRegistration = waitReg.get();
-    waitReg->queueEntry.id = m_nextId++;
+    void* capability = nullptr;
+    RETURN_IF_FAILED(portContext->QueryApi(TaskQueueInternal::kPinnableContextApiId, &capability));
+    referenced_ptr<TaskQueuePortContextImpl> pin;
+    *pin.address_of() = static_cast<TaskQueuePortContextImpl*>(capability);
+    RETURN_HR_IF(E_NOINTERFACE, !pin);
 
-    waitReg->waitHandle = waitHandle;
-    waitReg->token = ++m_nextWaitToken;
-    waitReg->port = this;
-    waitReg->threadpoolWait = nullptr;
-    waitReg->appended.clear();
-    waitReg->refs = 1;
-    waitReg->deleted = false;
+    reg->port = this;
+    reg->pinnable = pin.get();
+    reg->queueEntry = {portContext, callbackContext, callback, reg.get(), 0, m_nextId++};
+    try
+    {
+        reg->handleOwner = std::make_shared<WaitHandleOwner>();
+    }
+    CATCH_RETURN();
+    RETURN_IF_WIN32_BOOL_FALSE(DuplicateHandle(GetCurrentProcess(), waitHandle, GetCurrentProcess(),
+        &reg->handleOwner->handle, 0, FALSE, DUPLICATE_SAME_ACCESS));
+    reg->threadpoolWait = CreateThreadpoolWait(WaitCallback, reg.get(), nullptr);
+    RETURN_LAST_ERROR_IF_NULL(reg->threadpoolWait);
 
+    try
     {
         std::lock_guard<std::mutex> lock(m_lock);
-        RETURN_HR_IF(E_OUTOFMEMORY, m_events.capacity() == 0);
-        RETURN_HR_IF(E_OUTOFMEMORY, m_waits.capacity() == 0);
-
-        RETURN_IF_FAILED(InitializeWaitRegistration(waitReg.get()));
-
-        m_events.append(waitHandle);
-        m_waits.append(waitReg.get());
-
-        token->token = waitReg->token;
-        waitReg.release();
+        RETURN_IF_FAILED(VerifyNotTerminated(portContext));
+        RETURN_HR_IF(E_OUTOFMEMORY, m_activeWaits == PORT_WAIT_MAX || m_nextWaitToken == UINT64_MAX);
+        reg->token = ++m_nextWaitToken;
+        m_waits.emplace(reg->token, reg);
+        // Termination must be able to deliver cancellation even under OOM.
+        if (!m_queueList->reserve_node(reg->cancelNode))
+        {
+            m_waits.erase(reg->token);
+            return E_OUTOFMEMORY;
+        }
+        ++m_activeWaits;
+        // Lookup never holds the registry lock while entering the port.
+        if (registry)
+        {
+            registry->Publish(portContext->GetType(), {reg->token}, token, true);
+            reg->publicRegistry = referenced_ptr<QueueWaitRegistry>(registry);
+            reg->publicToken = *token;
+        }
+        else token->token = reg->token;
+        SetThreadpoolWait(reg->threadpoolWait, reg->handleOwner->handle, nullptr);
+        InvalidateWaitEpochLocked();
     }
-
-    // The queue may be waiting on our handle array, but
-    // we've just changed the array so the wait needs to
-    // fetch it again.
-    SignalQueue();
+    CATCH_RETURN();
 
     return S_OK;
 #else
@@ -605,48 +603,27 @@ void __stdcall TaskQueuePortImpl::UnregisterWaitHandle(
     _In_ XTaskQueueRegistrationToken token)
 {
 #ifdef _WIN32
-    WaitRegistration* toDelete = nullptr;
-
+    referenced_ptr<WaitRegistration> reg;
+    referenced_ptr<ITaskQueuePortContext> suppressedContext;
+    const bool reentrant = WaitCallbackFrame::ConfirmEntry();
     {
         std::lock_guard<std::mutex> lock(m_lock);
-        for(uint32_t idx = 0; idx < m_waits.count(); idx++)
-        {
-            if (m_waits[idx]->token == token.token)
-            {
-                toDelete = m_waits[idx];
-                toDelete->deleted = true;
-                m_waits.removeAt(idx);
-                break;
-            }
-        }
-
-        if (toDelete != nullptr)
-        {
-            // Remove the handle from our event list
-            for (uint32_t idx = 1; idx < m_events.count(); idx++)
-            {
-                if (m_events[idx] == toDelete->waitHandle)
-                {
-                    m_events.removeAt(idx);
-                    break;
-                }
-            }
-        }
+        auto it = m_waits.find(token.token);
+        if (it == m_waits.end()) return;
+        reg = it->second;
+        RetireWaitLocked(reg.get(), WaitRegistration::State::Removed);
+        suppressedContext = std::move(reg->queuedContext);
+        if (suppressedContext) --m_readyEntries;
     }
 
-    if (toDelete != nullptr)
+    DrainRetiredWait(reg);
     {
-        SetThreadpoolWait(toDelete->threadpoolWait, nullptr, nullptr);
-        WaitForThreadpoolWaitCallbacks(toDelete->threadpoolWait, TRUE);
-        CloseThreadpoolWait(toDelete->threadpoolWait);
-        ReleaseWaitRegistration(toDelete);
+        std::unique_lock<std::mutex> lock(m_lock);
+        m_waitFinished.wait(lock, [&] {
+            return !reg->running || (reentrant && reg->enteredUserCode);
+        });
+        FinishRetirementLocked(reg.get());
     }
-
-    // The queue may be waiting on our handle array, but
-    // we've just changed the array so the wait needs to
-    // fetch it again.
-    SignalQueue();
-
 #else
     UNREFERENCED_PARAMETER(token);
 #endif
@@ -727,19 +704,94 @@ void __stdcall TaskQueuePortImpl::Terminate(
 }
 
 HRESULT __stdcall TaskQueuePortImpl::Attach(
-    _In_ ITaskQueuePortContext* portContext)
+    _In_ ITaskQueuePortContext* portContext) try
 {
-    return m_attachedContexts.Add(portContext);
-}
+    // Discover the private capability while the caller still owns
+    // the context. QueryApi returns an owned reference on success.
+    void* capability = nullptr;
+    HRESULT queryResult = portContext->QueryApi(
+        TaskQueueInternal::kPinnableContextApiId,
+        &capability);
+
+    if (SUCCEEDED(queryResult) && capability != nullptr)
+    {
+        auto* pinnable =
+            static_cast<TaskQueuePortContextImpl*>(capability);
+
+        struct CapabilityGuard
+        {
+            TaskQueuePortContextImpl* context;
+            ~CapabilityGuard() { context->Release(); }
+        } capabilityGuard{ pinnable };
+
+        std::lock_guard<std::mutex> lock(m_attachedContextsLock);
+
+        if (m_nextAttachedContextId == UINT64_MAX)
+        {
+            return E_OUTOFMEMORY;
+        }
+
+        m_attachedContexts.emplace(
+            m_nextAttachedContextId,
+            AttachedContextRegistration{ portContext, pinnable });
+
+        ++m_nextAttachedContextId;
+        return S_OK;
+    }
+
+    // Without safe pinning, invoking callbacks outside the lock is unsafe.
+    return E_NOINTERFACE;
+} CATCH_RETURN();
 
 void __stdcall TaskQueuePortImpl::Detach(
     _In_ ITaskQueuePortContext* portContext)
 {
-    CancelPendingEntries(portContext, false);
-    m_attachedContexts.Remove([portContext](ITaskQueuePortContext* compare)
     {
-        return portContext == compare;
-    });
+        std::lock_guard<std::mutex> lock(m_attachedContextsLock);
+
+        for (auto it = m_attachedContexts.begin();
+             it != m_attachedContexts.end(); ++it)
+        {
+            if (it->second.context == portContext)
+            {
+                m_attachedContexts.erase(it);
+                break;
+            }
+        }
+    }
+
+    // Cancellation may release references and run reentrant teardown.
+    CancelPendingEntries(portContext, false);
+}
+
+bool TaskQueuePortImpl::TryAcquireNextAttachedContext(
+    uint64_t& cursor,
+    uint64_t upperBound,
+    ITaskQueuePortContext** result)
+{
+    *result = nullptr;
+
+    std::lock_guard<std::mutex> lock(m_attachedContextsLock);
+
+    auto it = m_attachedContexts.upper_bound(cursor);
+
+    while (it != m_attachedContexts.end() &&
+           it->first <= upperBound)
+    {
+        cursor = it->first;
+
+        // A successful pin keeps the containing queue alive until
+        // the caller releases the context outside the registry lock.
+        if (it->second.pinnable->TryPin())
+        {
+            *result = it->second.context;
+            return true;
+        }
+
+        ++it;
+    }
+
+    return false;
 }
 
 bool __stdcall TaskQueuePortImpl::Dispatch(
@@ -784,44 +836,41 @@ bool TaskQueuePortImpl::DrainOneItem(
     QueueEntry entry;
     bool popped = false;
 
-    if (m_queueList->pop_front(entry))
+    while (m_queueList->pop_front(entry))
     {
-        popped = true;
-
-        if (entry.portContext->GetType() == XTaskQueuePort::Work)
-        {
-            status.MayRunLong();
-        }
-
-        entry.callback(entry.callbackContext, IsCallCanceled(entry));
-        m_processingCallback--;
-        m_processingCallbackCv.notify_all();
+        referenced_ptr<ITaskQueuePortContext> context;
 
 #ifdef _WIN32
-        // If this entry has a wait registration, it needs
-        // to be reinitialized as we mark it to only execute
-        // once. When the queue entry was aded the wait registration
-        // was addref'd, so release it. If not destroyed it
-        // should be reinitialized.
-        if (entry.waitRegistration != nullptr)
+        if (entry.waitRegistration)
         {
-            std::lock_guard<std::mutex> lock(m_lock);            
-            if (!ReleaseWaitRegistration(entry.waitRegistration))
+            if (!DispatchWaitEntry(entry, status, context)) continue;
+        }
+        else
+#endif
+        {
+#ifdef _WIN32
+            --m_readyEntries;
+#endif
+            *context.address_of() = entry.portContext; // Adopt the queue entry's reference.
+            if (entry.portContext->GetType() == XTaskQueuePort::Work)
             {
-                InitializeWaitRegistration(entry.waitRegistration);
-            }            
+                status.MayRunLong();
+            }
+            entry.callback(entry.callbackContext, IsCallCanceled(entry));
         }
 
-#endif
-        entry.portContext->Release();
+        m_processingCallback--;
+        m_processingCallbackCv.notify_all();
+        popped = true;
+        break; // context releases after the processing count falls.
     }
-    else
+    if (!popped)
     {
         m_processingCallback--;
         m_processingCallbackCv.notify_all();
     }
 
-    if (m_queueList->empty() && m_processingCallback.load() == 0)
+    if (ReadyQueueEmpty() && m_processingCallback.load() == 0)
     {
         SignalTerminations();
         SignalQueue();
@@ -838,69 +887,44 @@ bool TaskQueuePortImpl::Wait(
     _In_ uint32_t timeout)
 {
 #ifdef _WIN32
-    while (m_suspended || (m_queueList->empty() && TerminationListEmpty()))
+    const ULONGLONG start = GetTickCount64();
+    bool attempted = false;
+    for (;;)
     {
-        if (portContext->GetStatus() == TaskQueuePortStatus::Terminated)
+        WaitSnapshot snapshot;
+        CaptureWaitSnapshot(snapshot);
+        // A mutation before capture is visible here. A later mutation signals
+        // the epoch in this snapshot, including before the kernel wait starts.
+        if (portContext->GetStatus() == TaskQueuePortStatus::Terminated) return false;
+        if (!m_suspended && ((!ReadyQueueEmpty() && !m_queueList->empty()) || !TerminationListEmpty())) return true;
+
+        DWORD remaining = INFINITE;
+        if (timeout != INFINITE)
         {
+            const auto elapsed = GetTickCount64() - start;
+            if (attempted && timeout != 0 && elapsed >= timeout) return false;
+            remaining = elapsed < timeout ? timeout - static_cast<DWORD>(elapsed) : 0;
+        }
+        // Retirement and termination cannot fail due to event allocation.
+        const DWORD interval = snapshot.epoch ? remaining : (std::min)(remaining, DWORD{16});
+        attempted = true;
+        DWORD result = WaitForMultipleObjects(snapshot.events.count(), snapshot.events.data(), FALSE, interval);
+        if (result == WAIT_TIMEOUT)
+        {
+            if (interval == remaining) return false;
+            continue;
+        }
+        if (result >= WAIT_OBJECT_0 + snapshot.events.count())
+        {
+            if (result == WAIT_FAILED) { FAIL_FAST_IF_FAILED(HRESULT_FROM_WIN32(GetLastError())); }
             return false;
         }
-
-        StaticArray<HANDLE, PORT_EVENT_MAX> events;
-        StaticArray<WaitRegistration*, PORT_WAIT_MAX> waits;
-
-        {
-            std::lock_guard<std::mutex> lock(m_lock);
-            events = m_events;
-            waits = m_waits;
-
-            for (uint32_t idx = 0; idx < waits.count(); idx++)
-            {
-                waits[idx]->refs++;
-            }
-        }
-
-        // We are using event 0 like a condition variable.  It's
-        // auto reset, so if nothing is in the queue we continue
-        // waiting.
-
-        DWORD waitResult = WaitForMultipleObjects(events.count(), events.data(), FALSE, timeout);
-
-        // The below block handles events starting at index 1 for registered
-        // wait handles.
-
-        if (waitResult > WAIT_OBJECT_0 && waitResult < WAIT_OBJECT_0 + events.count())
-        {
-            // One of our waiters was signaled.  Find it, and then process it.
-            for (uint32_t idx = 0; idx < waits.count(); idx++)
-            {
-                if (waits[idx]->waitHandle == events[waitResult - WAIT_OBJECT_0])
-                {
-                    if (!AppendWaitRegistrationEntry(waits[idx]))
-                    {
-                        // If we fail adding to the queue, re-initialize our wait
-                        LOG_IF_FAILED(InitializeWaitRegistration(waits[idx]));
-                    }
-                    break;
-                }
-            }
-
-            for (uint32_t idx = 0; idx < waits.count(); idx++)
-            {
-                ReleaseWaitRegistration(waits[idx]);
-            }
-        }
-        else if (waitResult == WAIT_TIMEOUT)
-        {
-            return false;
-        }
-        else if (waitResult == WAIT_FAILED)
-        {
-            FAIL_FAST_IF_FAILED(HRESULT_FROM_WIN32(GetLastError()));
-        }
+        if (result > WAIT_OBJECT_0 && result <= WAIT_OBJECT_0 + snapshot.registrations.count())
+            ProcessWaitCallback(snapshot.registrations[result - WAIT_OBJECT_0 - 1].get());
     }
 
 #else
-    while (m_suspended || (m_queueList->empty() && TerminationListEmpty()))
+    while (m_suspended || (ReadyQueueEmpty() && TerminationListEmpty()))
     {
         if (portContext->GetStatus() == TaskQueuePortStatus::Terminated)
         {
@@ -922,10 +946,19 @@ bool TaskQueuePortImpl::Wait(
     return true;
 }
 
+bool TaskQueuePortImpl::ReadyQueueEmpty()
+{
+#ifdef _WIN32
+    return m_readyEntries.load() == 0;
+#else
+    return m_queueList->empty();
+#endif
+}
+
 bool __stdcall TaskQueuePortImpl::IsEmpty()
 {
     bool empty =
-        (m_queueList->empty()) &&
+        (ReadyQueueEmpty()) &&
         (m_pendingList->empty()) &&
         (m_processingCallback == 0);
 
@@ -1006,7 +1039,13 @@ void __stdcall TaskQueuePortImpl::ResumeTermination(
 
 void __stdcall TaskQueuePortImpl::SuspendPort()
 {
+#ifdef _WIN32
+    std::lock_guard<std::mutex> lock(m_lock);
+#endif
     m_suspended = true;
+#ifdef _WIN32
+    InvalidateWaitEpochLocked();
+#endif
 }
 
 void __stdcall TaskQueuePortImpl::ResumePort()
@@ -1017,9 +1056,9 @@ void __stdcall TaskQueuePortImpl::ResumePort()
     // free nature of the queue establishing a count
     // takes some effort.
 
-    uint32_t notifyCount = 0;
     uint64_t address;
-
+    size_t notifyCount = 0;
+#ifndef _WIN32
     QueueEntry queueEntry;
     LocklessQueue<QueueEntry> retainEntries(*(m_pendingList.get()));
 
@@ -1033,6 +1072,7 @@ void __stdcall TaskQueuePortImpl::ResumePort()
     {
         m_queueList->push_back(std::move(queueEntry), address);
     }
+#endif
 
     {
         std::lock_guard<std::mutex> lock(m_terminationLock);
@@ -1051,7 +1091,16 @@ void __stdcall TaskQueuePortImpl::ResumePort()
         }
     }
 
+#ifdef _WIN32
+    {
+        std::lock_guard<std::mutex> lock(m_lock);
+        m_suspended = false;
+        InvalidateWaitEpochLocked();
+        notifyCount += m_readyEntries.load();
+    }
+#else
     m_suspended = false;
+#endif
 
     while (notifyCount)
     {
@@ -1082,6 +1131,11 @@ bool TaskQueuePortImpl::AppendEntry(
     _In_ const QueueEntry& entry,
     _In_opt_ uint64_t node)
 {
+#ifdef _WIN32
+    if (node == 0 && !m_queueList->reserve_node(node)) return false;
+    ++m_readyEntries;
+    m_queueList->push_back(entry, node);
+#else
     if (node != 0)
     {
         m_queueList->push_back(entry, node);
@@ -1090,6 +1144,8 @@ bool TaskQueuePortImpl::AppendEntry(
     {
         return false;
     }
+
+#endif
 
     SignalQueue();
     NotifyItemQueued();
@@ -1166,61 +1222,43 @@ void TaskQueuePortImpl::CancelPendingEntries(
     
 #ifdef _WIN32
     
-    // Abort this port context's registered waits and promote their entries too.
-    // Wait registration is not lock free.
-
-    StaticArray<WaitRegistration*, PORT_WAIT_MAX> waits;
-
+    StaticArray<referenced_ptr<WaitRegistration>, PORT_WAIT_MAX> retired;
+    referenced_ptr<ITaskQueuePortContext> discarded[PORT_WAIT_MAX];
+    uint32_t notifications = 0;
     {
-        std::unique_lock<std::mutex> lock(m_lock);
-
-        // Take only this port context's registrations. The port can be shared by
-        // other queues (e.g. composites), and their registrations must stay in
-        // m_waits so they can still be unregistered (#1047). The canceled handles
-        // also leave m_events so a manual Wait stops waiting on them.
-        for (uint32_t index = m_waits.count(); index > 0; index--)
+        std::lock_guard<std::mutex> lock(m_lock);
+        for (auto it = m_waits.begin(); it != m_waits.end();)
         {
-            uint32_t idx = index - 1;
-            WaitRegistration* waitReg = m_waits[idx];
-            if (waitReg->queueEntry.portContext != portContext)
+            auto& reg = it->second;
+            if (reg->queueEntry.portContext != portContext ||
+                reg->state != WaitRegistration::State::Active)
             {
+                ++it;
                 continue;
             }
 
-            waits.append(waitReg);
-            m_waits.removeAt(idx);
-
-            for (uint32_t eventIdx = 1; eventIdx < m_events.count(); eventIdx++)
+            retired.append(reg);
+            if (appendToQueue && !reg->appended)
             {
-                if (m_events[eventIdx] == waitReg->waitHandle)
-                {
-                    m_events.removeAt(eventIdx);
-                    break;
-                }
+                uint64_t node = reg->cancelNode;
+                reg->cancelNode = 0;
+                if (PublishWaitEntryLocked(reg.get(), node)) ++notifications;
             }
+            RetireWaitLocked(reg.get(), appendToQueue ?
+                WaitRegistration::State::Canceled : WaitRegistration::State::Removed);
+            if (!appendToQueue && reg->queuedContext)
+            {
+                discarded[retired.count() - 1] = std::move(reg->queuedContext);
+                --m_readyEntries;
+            }
+            ++it; // Keep the token discoverable through native drainage.
         }
     }
 
-    for (uint32_t idx = 0; idx < waits.count(); idx++)
-    {
-        CloseThreadpoolWait(waits[idx]->threadpoolWait);
-        waits[idx]->queueEntry.waitRegistration = nullptr;
-
-        if (appendToQueue)
-        {
-            AppendWaitRegistrationEntry(waits[idx]);
-        }
-
-        delete waits[idx];
-    }
-
-    if (waits.count() != 0)
-    {
-        // A manual Wait may be blocked on the old handle array; make it fetch
-        // the updated one.
-        SignalQueue();
-    }
-
+    for (uint32_t i = 0; i < retired.count(); ++i)
+        DrainRetiredWait(retired[i]);
+    if (retired.count()) SignalQueue();
+    for (uint32_t i = 0; i < notifications; ++i) NotifyItemQueued();
 #endif
 }
 
@@ -1328,6 +1366,13 @@ void TaskQueuePortImpl::EraseQueue(
         
         while(queue->pop_front(entry))
         {
+#ifdef _WIN32
+            if (entry.waitRegistration)
+            {
+                entry.waitRegistration->Release();
+                continue;
+            }
+#endif
             entry.portContext->Release();
         }
     }
@@ -1588,7 +1633,7 @@ void TaskQueuePortImpl::PromoteReadyPendingCallbacks(
             {
                 if (nextItem.enqueueTime != dueTime)
                 {
-                    m_attachedContexts.Visit([&](ITaskQueuePortContext* portContext)
+                    VisitAttachedContexts([&](ITaskQueuePortContext* portContext)
                     {
                         auto hooks = portContext->GetQueue()->GetTestHooks();
                         if (hooks != nullptr)
@@ -1643,7 +1688,7 @@ void TaskQueuePortImpl::PromoteReadyPendingCallbacks(
         // No future entries remain in the pending list.
         uint64_t noDueTime = UINT64_MAX;
 
-        m_attachedContexts.Visit([&](ITaskQueuePortContext* portContext)
+        VisitAttachedContexts([&](ITaskQueuePortContext* portContext)
         {
             auto hooks = portContext->GetQueue()->GetTestHooks();
             if (hooks != nullptr)
@@ -1667,7 +1712,7 @@ void TaskQueuePortImpl::PromoteReadyPendingCallbacks(
             // See VerifyDelayedCallbackTimerRaceOnManualQueue for full
             // analysis. The test hook here allows unit tests to verify
             // there is no race.
-            m_attachedContexts.Visit([&](ITaskQueuePortContext* portContext)
+            VisitAttachedContexts([&](ITaskQueuePortContext* portContext)
             {
                 auto hooks = portContext->GetQueue()->GetTestHooks();
                 if (hooks != nullptr)                {
@@ -1770,7 +1815,7 @@ void TaskQueuePortImpl::SignalQueue()
     if (!m_suspended)
     {
 #ifdef _WIN32
-        SetEvent(m_events[0]);
+        SetEvent(m_queueEvent);
 #else
         std::unique_lock<std::mutex> lock(m_lock);
         m_signaled = true;
@@ -1808,7 +1853,7 @@ void TaskQueuePortImpl::NotifyItemQueued()
             break;
         }
 
-        m_attachedContexts.Visit([](ITaskQueuePortContext* portContext)
+        VisitAttachedContexts([](ITaskQueuePortContext* portContext)
         {
             portContext->ItemQueued();
         });
@@ -1844,6 +1889,14 @@ void TaskQueuePortImpl::SignalTerminations()
             return false;
         });
     }
+
+#ifdef _WIN32
+    if (!entries_to_process.empty())
+    {
+        std::lock_guard<std::mutex> lock(m_lock);
+        InvalidateWaitEpochLocked();
+    }
+#endif
 
     // Now process callbacks outside the remove_if iteration
     // This prevents races when callbacks invoke nested operations like Terminate()
@@ -1899,91 +1952,228 @@ bool TaskQueuePortImpl::TerminationListEmpty()
 }
 
 #ifdef _WIN32
+void TaskQueuePortImpl::InvalidateWaitEpochLocked()
+{
+    // Never reset or reuse a signaled event. A late waiter on the previous
+    // snapshot still observes it even if a new epoch already exists.
+    if (m_waitEpoch)
+    {
+        SetEvent(m_waitEpoch->handle);
+        m_waitEpoch.reset();
+    }
+}
+
+void TaskQueuePortImpl::CaptureWaitSnapshot(WaitSnapshot& snapshot)
+{
+    snapshot.events.append(m_queueEvent);
+    std::lock_guard<std::mutex> lock(m_lock);
+    static_assert(PORT_EVENT_MAX <= MAXIMUM_WAIT_OBJECTS);
+    if (!m_waitEpoch)
+    {
+        try
+        {
+            auto epoch = std::make_shared<WaitHandleOwner>();
+            epoch->handle = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (epoch->handle) m_waitEpoch = std::move(epoch);
+        }
+        catch (const std::bad_alloc&)
+        {
+            // Wait() uses bounded polling until an epoch can be allocated.
+        }
+    }
+    snapshot.epoch = m_waitEpoch;
+    for (const auto& item : m_waits)
+    {
+        if (!m_suspended && item.second->state == WaitRegistration::State::Active)
+        {
+            snapshot.registrations.append(item.second);
+            snapshot.owners.append(item.second->handleOwner);
+            snapshot.events.append(item.second->handleOwner->handle);
+        }
+    }
+    if (snapshot.epoch) snapshot.events.append(snapshot.epoch->handle);
+}
+
 void CALLBACK TaskQueuePortImpl::WaitCallback(
     _In_ PTP_CALLBACK_INSTANCE instance,
     _Inout_opt_ void* context,
     _Inout_ PTP_WAIT wait,
     _In_ TP_WAIT_RESULT waitResult)
 {
-    UNREFERENCED_PARAMETER(instance);
     UNREFERENCED_PARAMETER(wait);
+    if (waitResult != WAIT_OBJECT_0 || !context) return;
 
-    if (waitResult == WAIT_OBJECT_0 && context != nullptr)
-    {
-        WaitRegistration* waitReg = static_cast<WaitRegistration*>(context);
-        waitReg->port->ProcessWaitCallback(waitReg);
-    }
+    // Retirement holds the registration through WaitForThreadpoolWaitCallbacks.
+    // Acquire independent owners before allowing a reentrant close to finish.
+    referenced_ptr<TaskQueuePortImpl> port;
+    referenced_ptr<WaitRegistration> reg(static_cast<WaitRegistration*>(context));
+    if (!reg->port->TryAddRef()) return;
+    *port.address_of() = reg->port;
+    DisassociateCurrentThreadFromCallback(instance);
+    port->ProcessWaitCallback(reg.get());
 }
 
-HRESULT TaskQueuePortImpl::InitializeWaitRegistration(
-    _In_ WaitRegistration* waitReg)
+TaskQueuePortImpl::WaitRegistration::~WaitRegistration()
 {
-    waitReg->appended.clear();
-
-    if (waitReg->threadpoolWait == nullptr)
-    {
-        waitReg->threadpoolWait = CreateThreadpoolWait(WaitCallback, waitReg, nullptr);
-        RETURN_LAST_ERROR_IF_NULL(waitReg->threadpoolWait);
-    }
-
-    SetThreadpoolWait(waitReg->threadpoolWait, waitReg->waitHandle, nullptr);
-
-    return S_OK;
+    ASSERT(cancelNode == 0);
+    if (threadpoolWait) CloseThreadpoolWait(threadpoolWait); // Unarmed registration failure.
 }
 
-// Appends the queue entry of the wait registration to the queue
-// if it has not already been done. This can addref the queue
-// entry. Returns true if it appended or found nothing to do.
-// Returns false if it needed to append but failed. On failure this
-// correctly releases the queue entry.
-bool TaskQueuePortImpl::AppendWaitRegistrationEntry(
-    _In_ WaitRegistration* waitReg)
+DefaultUnnamedMutex TaskQueuePortImpl::WaitCallbackFrame::lock;
+TaskQueuePortImpl::WaitCallbackFrame* TaskQueuePortImpl::WaitCallbackFrame::head = nullptr;
+
+TaskQueuePortImpl::WaitCallbackFrame::WaitCallbackFrame(WaitRegistration* registration) : reg(registration)
 {
-    // Prepare the queue entry for insert
-    QueueEntry entry = waitReg->queueEntry;
-    bool success = true;
+    std::lock_guard<std::mutex> guard(lock);
+    link = &head;
+    next = head;
+    if (next) next->link = &next;
+    head = this;
+}
 
-    if (waitReg->appended.test_and_set() == false)
+TaskQueuePortImpl::WaitCallbackFrame::~WaitCallbackFrame()
+{
+    std::lock_guard<std::mutex> guard(lock);
+    *link = next;
+    if (next) next->link = link;
+}
+
+bool TaskQueuePortImpl::WaitCallbackFrame::ConfirmEntry()
+{
+    // Only the indirect user call is inside a frame. Synchronous reentry from
+    // that call witnesses physical entry, including its enclosing callbacks.
+    ULONG_PTR low, high;
+    GetCurrentThreadStackLimits(&low, &high);
+    // A fiber can suspend its callback and resume on a different thread.
+    // Identify the currently executing stack rather than reusing a thread ID.
+    std::lock_guard<std::mutex> guard(lock);
+    bool reentrant = false;
+    for (auto* frame = head; frame; frame = frame->next)
     {
-        entry.portContext->AddRef();
-        waitReg->refs++;
+        const auto address = reinterpret_cast<ULONG_PTR>(frame);
+        if (address < low || address >= high) continue;
+        reentrant = true;
+        auto* reg = frame->reg;
+        std::lock_guard<std::mutex> lock(reg->port->m_lock);
+        reg->enteredUserCode = true;
+        reg->port->m_waitFinished.notify_all();
+    }
+    return reentrant;
+}
 
-        success = AppendEntry(entry, 0);
-        if (!success)
+void TaskQueuePortImpl::DrainRetiredWait(const referenced_ptr<WaitRegistration>& reg)
+{
+    // Every participant owns a reference. The first caller drains outside the
+    // port lock; associated callbacks have no dependency on user code here.
+    std::call_once(reg->drainOnce, [&] {
+        WaitForThreadpoolWaitCallbacks(reg->threadpoolWait, TRUE);
+        CloseThreadpoolWait(reg->threadpoolWait);
+        std::lock_guard<std::mutex> lock(m_lock);
+        reg->threadpoolWait = nullptr;
+        reg->handleOwner.reset();
+        reg->drained = true;
+        FinishRetirementLocked(reg.get());
+        m_waitFinished.notify_all();
+    });
+}
+
+void TaskQueuePortImpl::FinishRetirementLocked(WaitRegistration* reg)
+{
+    if (!reg->drained || reg->queuedContext || reg->running) return;
+    // The registration owns the token table independently of the queue.
+    // Public lookup drops the table lock before entering the port.
+    if (reg->publicRegistry)
+    {
+        reg->publicRegistry->Remove(reg->publicToken);
+        reg->publicRegistry.reset();
+    }
+    m_waits.erase(reg->token);
+}
+
+void TaskQueuePortImpl::RetireWaitLocked(WaitRegistration* reg, WaitRegistration::State state)
+{
+    const bool wasActive = reg->state == WaitRegistration::State::Active;
+    reg->state = state;
+    if (wasActive)
+    {
+        SetThreadpoolWait(reg->threadpoolWait, nullptr, nullptr);
+        --m_activeWaits;
+        if (reg->cancelNode)
         {
-            entry.portContext->Release();
-            waitReg->refs--;
+            m_queueList->free_node(reg->cancelNode);
+            reg->cancelNode = 0;
         }
+        InvalidateWaitEpochLocked();
     }
-
-    return success;
 }
 
-bool TaskQueuePortImpl::ReleaseWaitRegistration(
-    _In_ WaitRegistration* waitReg)
+bool TaskQueuePortImpl::PublishWaitEntryLocked(WaitRegistration* reg, uint64_t node)
 {
-    bool deleted = waitReg->deleted;
-
-    if (--waitReg->refs == 0)
+    // The node is already reserved. Keep its context pin revocable until
+    // dispatch claims it, so unregister can release an undispatched queue.
+    ASSERT(node != 0);
+    if (!reg->pinnable->TryPin())
     {
-        delete waitReg;
-        return true;
+        m_queueList->free_node(node);
+        return false;
     }
-
-    // We return true for the final release if the reg
-    // is being deleted. This prevents a race during
-    // reinit.
-    return deleted;
+    *reg->queuedContext.address_of() = reg->queueEntry.portContext; // Adopt TryPin.
+    reg->AddRef();
+    reg->appended = true;
+    ++m_readyEntries;
+    m_queueList->push_back(reg->queueEntry, node);
+    return true;
 }
 
-// Called from thread pool when a wait is satisfied
-void TaskQueuePortImpl::ProcessWaitCallback(
-    _In_ WaitRegistration* waitReg)
+void TaskQueuePortImpl::ProcessWaitCallback(WaitRegistration* reg)
 {
-    if (!AppendWaitRegistrationEntry(waitReg))
     {
-        LOG_IF_FAILED(InitializeWaitRegistration(waitReg));
+        std::lock_guard<std::mutex> lock(m_lock);
+        if (reg->state != WaitRegistration::State::Active || reg->appended) return;
+        uint64_t node = 0;
+        if (!m_queueList->reserve_node(node))
+        {
+            SetThreadpoolWait(reg->threadpoolWait, reg->handleOwner->handle, nullptr);
+            return;
+        }
+        if (!PublishWaitEntryLocked(reg, node)) return;
     }
+    SignalQueue();
+    NotifyItemQueued();
+}
+
+bool TaskQueuePortImpl::DispatchWaitEntry(const QueueEntry& entry, OS::ThreadPoolActionStatus& status,
+    referenced_ptr<ITaskQueuePortContext>& context)
+{
+    referenced_ptr<WaitRegistration> reg;
+    *reg.address_of() = entry.waitRegistration; // Adopt the popped entry's ref.
+    {
+        std::lock_guard<std::mutex> lock(m_lock);
+        if (reg->state == WaitRegistration::State::Removed) return false;
+        context = std::move(reg->queuedContext);
+        --m_readyEntries;
+        reg->running = true;
+        reg->enteredUserCode = false;
+    }
+
+    if (context->GetType() == XTaskQueuePort::Work) status.MayRunLong();
+    const bool canceled = IsCallCanceled(entry);
+    {
+        WaitCallbackFrame frame(reg.get());
+        entry.callback(entry.callbackContext, canceled);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_lock);
+        reg->running = false;
+        reg->appended = false;
+        if (reg->state == WaitRegistration::State::Active)
+            SetThreadpoolWait(reg->threadpoolWait, reg->handleOwner->handle, nullptr);
+        else
+            FinishRetirementLocked(reg.get());
+    }
+    m_waitFinished.notify_all();
+    return true;
 }
 
 #endif
@@ -1993,7 +2183,7 @@ void TaskQueuePortImpl::ProcessWaitCallback(
 //
 
 TaskQueuePortContextImpl::TaskQueuePortContextImpl(
-    _In_ ITaskQueue* queue,
+    _In_ TaskQueueImpl* queue,
     _In_ XTaskQueuePort type,
     _In_ SubmitCallback* submitCallback) :
     m_queue(queue),
@@ -2002,6 +2192,10 @@ TaskQueuePortContextImpl::TaskQueuePortContextImpl(
 {
 }
     
+bool TaskQueuePortContextImpl::TryPin() noexcept
+{
+    return m_queue->TryAddRef();
+}
 uint32_t __stdcall TaskQueuePortContextImpl::AddRef()
 {
     return m_queue->AddRef();
@@ -2017,6 +2211,17 @@ HRESULT __stdcall TaskQueuePortContextImpl::QueryApi(_In_ ApiId id, _Out_ void**
     if (ptr == nullptr)
     {
         return E_POINTER;
+    }
+
+    *ptr = nullptr;
+
+    if (id == TaskQueueInternal::kPinnableContextApiId)
+    {
+        // This concrete implementation can safely identify itself.
+        // The caller owns one reference, just like other QueryApi results.
+        *ptr = static_cast<TaskQueuePortContextImpl*>(this);
+        AddRef();
+        return S_OK;
     }
 
     if (id == ApiId::Identity || id == ApiId::TaskQueuePortContext)
@@ -2122,6 +2327,7 @@ HRESULT TaskQueueImpl::Initialize(
     _In_ XTaskQueueDispatchMode workMode,
     _In_ XTaskQueueDispatchMode completionMode)
 {
+    RETURN_IF_NULL_ALLOC(m_waitRegistry.get());
     referenced_ptr<TaskQueuePortImpl> work(new (std::nothrow) TaskQueuePortImpl);
     RETURN_IF_NULL_ALLOC(work);
     RETURN_IF_FAILED(work->Initialize(workMode));
@@ -2150,6 +2356,7 @@ HRESULT TaskQueueImpl::Initialize(
     _In_ XTaskQueuePortHandle workPort,
     _In_ XTaskQueuePortHandle completionPort)
 {
+    RETURN_IF_NULL_ALLOC(m_waitRegistry.get());
     RETURN_HR_IF(E_GAMERUNTIME_INVALID_HANDLE, workPort== nullptr || workPort->m_signature != TASK_QUEUE_PORT_SIGNATURE || workPort->m_runtimeIteration != GetCurrentRuntimeIteration());
     RETURN_HR_IF(E_GAMERUNTIME_INVALID_HANDLE, completionPort == nullptr || completionPort->m_signature != TASK_QUEUE_PORT_SIGNATURE || completionPort->m_runtimeIteration != GetCurrentRuntimeIteration());
 
@@ -2206,33 +2413,42 @@ HRESULT __stdcall TaskQueueImpl::RegisterWaitHandle(
     referenced_ptr<ITaskQueuePortContext> portContext;
 
     RETURN_IF_FAILED(GetPortContext(port, portContext.address_of()));
-    RETURN_IF_FAILED(portContext->GetPort()->RegisterWaitHandle(
-        portContext.get(),
-        waitHandle,
-        callbackContext,
-        callback,
-        &portToken));
-
-    HRESULT hr = m_waitRegistry.Register(port, portToken, token);
+    RETURN_HR_IF(E_OUTOFMEMORY, !m_waitRegistry->Reserve());
+    HRESULT hr;
+    void* capability = nullptr;
+    if (SUCCEEDED(portContext->GetPort()->QueryApi(TaskQueueInternal::kWaitPublicationApiId, &capability)))
+    {
+        referenced_ptr<TaskQueuePortImpl> localPort;
+        *localPort.address_of() = static_cast<TaskQueuePortImpl*>(capability);
+        hr = localPort->RegisterWaitWithToken(portContext.get(), waitHandle, callbackContext,
+            callback, token, m_waitRegistry.get());
+    }
+    else
+    {
+        // Older port implementations use the original immutable interface.
+        hr = portContext->GetPort()->RegisterWaitHandle(
+            portContext.get(), waitHandle, callbackContext, callback, &portToken);
+        if (SUCCEEDED(hr)) m_waitRegistry->Publish(port, portToken, token, false);
+    }
     if (FAILED(hr))
     {
-        portContext->GetPort()->UnregisterWaitHandle(portToken);
+        m_waitRegistry->CancelReservation();
+        return hr;
     }
-    RETURN_IF_FAILED(hr);
-
     return S_OK;
 }
 
 void __stdcall TaskQueueImpl::UnregisterWaitHandle(
     _In_ XTaskQueueRegistrationToken token)
 {
-    std::pair<XTaskQueuePort, XTaskQueueRegistrationToken> pair = m_waitRegistry.Unregister(token);
-    if (pair.second.token != 0)
+    const auto registration = m_waitRegistry->Lookup(token);
+    if (registration.PortToken != 0)
     {
         referenced_ptr<ITaskQueuePortContext> portContext;
-        if (SUCCEEDED(GetPortContext(pair.first, portContext.address_of())))
+        if (SUCCEEDED(GetPortContext(registration.Port, portContext.address_of())))
         {
-            portContext->GetPort()->UnregisterWaitHandle(pair.second);
+            portContext->GetPort()->UnregisterWaitHandle({registration.PortToken});
+            if (!registration.retiredByPort) m_waitRegistry->Remove(token);
         }
     }
 }

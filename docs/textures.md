@@ -423,7 +423,7 @@ The RDS5 index is readable without game code:
 | chunk table | 0x18, 8 bytes per entry, `(count − 1) * 8` bytes |
 | ETPF index | `align(0x18 + (count − 1) * 8, 0x100)`; version 634 (`0x27A`) |
 | texture records | a 16-byte ETPF header, then `area` bytes of records (at least 16 × textures) |
-| asset keys | one u64 per record after the descriptor array; IDs are 32 bytes each |
+| asset keys | one u64 per record after the descriptor array; the array continues into the ID region when it is longer than the record area leaves room for (the area is at least 16 × textures), so a reader must load it across that boundary. IDs are 32 bytes each. In the 57 pools of this install, 15 have a straddling array and 28,666 of the 357,115 keys sit past the record area |
 
 Chunk entry `(u64 value)`:
 
@@ -555,8 +555,11 @@ semantics, not as a claim that they are globally unique across every shader.
 hash, role and texture name, resolves only the five measured character slots, and reports any
 other hash as `unknown 0x...`. A garment-shader material (`d5ed50f4`, `ea8d09d0`, `39ddb9ca`)
 with no `0xC8E8C282` binding is flagged `garment-no-albedo`, so a renderer keeps that part clay
-instead of painting `speculartex` as colour. `--json` and `--csv` write the same rows to a
-report, which may not overwrite an input:
+instead of painting `speculartex` as colour. The `texture` column retains the display value,
+including the eight-digit `Name` hash from `rpf9dump models`. The appended `asset_key` column
+holds the 16-digit `Id64` for matching against a texture pool's `AssetKey`. An absent or malformed
+ID appears as `-` in the terminal, an empty CSV cell and JSON `null`. Report paths must be
+distinct from the inputs:
 
     python -I tools/character_textures.py <model.json|dir> [--json FILE] [--csv FILE]
 
@@ -982,8 +985,33 @@ with per-instance data, the shape of a per-tile or per-cell map. One of the othe
 
 **The 121 other streams** start with no known magic (`RDS5`, `0DRP`, `TTPF`, `RSC8`, `PSIN`, `RBF0`, DDS) in
 their first 4 KiB, and the large ones are high-entropy (7.3 to 7.7 bits per byte over the first 64 KiB, except
-one at 4.1). They are left as opaque raw data here; matching them to the `data/ttdb` texture pools is the
-obvious next check.
+one at 4.1). They are left as opaque raw data here.
+
+**They are not copies of the texture pools.** Each of the 121 streams was compared with every chunk of all 57
+`.ttpf` pools in the package (1,026,833 chunks: 918,223 zlib, 102,725 BCPack BC1, 5,167 BC7, 718 other BCPack
+codecs, 5 raw), as stored and, for zlib chunks, inflated: the SHA-1 of the whole stream against the SHA-1 of each
+chunk, and the stream's first 64 bytes against each chunk's first 64 bytes (85 of the 121 streams start with more
+than four distinct byte values; the other 36 start with near-constant bytes and only take the whole-content test).
+
+| Result | Streams |
+|---|---:|
+| Identical to a pool chunk (stored zlib bytes and inflated content) | 1 (4 KiB, a shared `data/ttdb` pool) |
+| Same first 212,464 to 582,338 bytes as a 4 MiB `data/ttdb` chunk, then different | 3 (6, 12 and 32 MiB) |
+| Same first 1,010 to 2,800 bytes as hundreds of chunks (a common leading pattern, not a copy) | 3 |
+| No match | 114 |
+
+Sizes of the 121: 62 below 64 KiB, 16 of exactly 64 KiB, 32 from 64 KiB to 16 MiB, 11 of 16 MiB or more. So,
+apart from one 4 KiB stream, the opaque data of `textures.rpf` is not pool texture data, and three of the large
+streams share a long identical start with a pool chunk and then diverge.
+
+Following them past the divergence with an in-order alignment (extend identical runs; on a mismatch, resync on a
+64-byte piece of the chunk taken up to 64 KiB ahead, found within the next 256 KiB of the stream): in the 6 MiB and
+32 MiB streams, five different 4 MiB `data/ttdb` chunks each reappear in order for 65.8% to 97.5% of their bytes,
+in short runs broken by 164 to 1,007 gaps, while the stream advances about 1.4 to 1.5 times the chunk's length; in
+the 12 MiB stream only 8.6%. That five different chunks align this well with the same two streams says the chunks
+are alike among themselves, so repetitive content may account for part of it: this measures shared runs, not a
+copy, and what the streams are remains open. Method: the carve's
+inflated streams and `tools/ttpf_mips.py`'s `Pool` chunk table; counts only.
 
 **Measured keying and format codes (ASSET-274):**
 All 1,315 system streams are RAGE `pgDictionary<grcTexture>` pages containing descriptor pointers and a 32-bit

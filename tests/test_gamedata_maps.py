@@ -269,7 +269,7 @@ class GamedataMapsTest(unittest.TestCase):
         out = os.path.join(blocker, "maps.json")
         result = subprocess.run(
             [sys.executable, "-I", TOOL, self.carve, "--json", out],
-            capture_output=True, text=True,
+            capture_output=True, text=True, errors="replace",
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn(f"cannot write {out}", result.stderr)

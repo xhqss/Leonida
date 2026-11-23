@@ -55,9 +55,16 @@ class Reference(unittest.TestCase):
                              "src0_sel:DWORD src1_sel:DWORD")[0], 0x3F800000)
         self.assertEqual(run("v_cvt_f16_u16_sdwa v1, -2.0 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_1")[0],
                          0x7A00)
-        # v_cmp_class_f16's mask is an f16 operand too: BYTE_3 of 0.5 (0x3800) is 0, so no class matches
+        # v_cmp_class_f16's mask is an f16 operand too: 0.5 is 0x00003800 (BYTE_3=0, BYTE_1=0x38),
+        # 1.0 is 0x00003C00 (WORD_1=0), and -2.0 is 0x0000C000 (BYTE_3=0), not f32 0x3F000000/0x3F800000/0xC0000000
         self.assertEqual(run("v_cmp_class_f16_sdwa vcc_lo, v2, 0.5 src0_sel:WORD_0 src1_sel:BYTE_3",
                              v={2: 0xBC00}, vcc=1)[3], 0)
+        self.assertEqual(run("v_cmp_class_f16_sdwa vcc_lo, v2, 0.5 src0_sel:WORD_0 src1_sel:BYTE_1",
+                             v={2: 0xBC00})[3], 1)                                   # 0x38 has bit 3 (-normal)
+        self.assertEqual(run("v_cmp_class_f16_sdwa vcc_lo, 2.0, 1.0 src0_sel:DWORD src1_sel:WORD_1",
+                             vcc=1)[3], 0)
+        self.assertEqual(run("v_cmp_class_f16_sdwa vcc_lo, v2, -2.0 src0_sel:DWORD src1_sel:BYTE_3",
+                             v={2: 0x0001}, vcc=1)[3], 0)                             # f32 BYTE_3=0xC0 falsely sets bit 7
         self.assertEqual(run("v_cmp_class_f16_sdwa vcc_lo, v2, 0x8 src0_sel:WORD_0 src1_sel:DWORD",
                              v={2: 0xBC00})[3], 1)                                   # -1.0 is -normal (bit 3)
 
@@ -260,6 +267,21 @@ class Cli(unittest.TestCase):
         self.assertEqual(rc, 77)
         self.assertIn("no SDWA", out)
         self.assertTrue(NoSdwa.closed)
+
+
+class EverythingSkipped(unittest.TestCase):
+    def test_a_run_where_every_program_was_skipped_is_not_a_success(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        def refuse(lines, *args):
+            raise d.Skip("unsupported form")
+        out = io.StringIO()
+        with mock.patch.object(d, "translated", refuse), contextlib.redirect_stdout(out):
+            rc = d.main(["--programs", "3", "--seed", "1"])
+        self.assertEqual(rc, 2, out.getvalue())
+        self.assertIn("no program ran: every one was skipped", out.getvalue())
 
 
 if __name__ == "__main__":

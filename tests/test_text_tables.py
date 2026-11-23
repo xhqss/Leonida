@@ -352,6 +352,18 @@ class TestCli(unittest.TestCase):
             self.assertFalse([f for f in os.listdir(tmp) if f.startswith(".text_tables-")],
                              "staging and backup files must not be left behind")
 
+    def test_report_cannot_replace_the_carve_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "carve")
+            os.mkdir(source)
+            index = write(os.path.join(source, "index.json"), b'{"files": []}')
+            with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as code:
+                T.main([source, "--tables", index])
+            self.assertEqual(code.exception.code, 2)
+            self.assertIn("must not overwrite an input", err.getvalue())
+            with open(index, "rb") as f:
+                self.assertEqual(f.read(), b'{"files": []}')
+
     def test_two_outputs_naming_one_file_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "src")
@@ -366,8 +378,13 @@ class TestCli(unittest.TestCase):
             self.assertFalse(os.path.exists(out), "no report may be written before the check")
 
     def test_missing_input(self):
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(T.main(["/nonexistent"]), 2)
+        # "/nonexistent" is a drive-root path on Windows (C:\nonexistent), which really exists on some hosts.
+        # Use a path inside a fresh temp directory so the input is guaranteed to be missing on every platform.
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing-input")
+            self.assertFalse(os.path.exists(missing))
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(T.main([missing]), 2)
 
     def test_missing_parent_and_hardlinked_outputs_rejected_upfront(self):
         with tempfile.TemporaryDirectory() as tmp:

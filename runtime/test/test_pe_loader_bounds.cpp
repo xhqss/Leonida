@@ -889,6 +889,44 @@ void test_headers_and_reloc_tail_bounds() {
             check_condition(threw, "Trailing 4 bytes after valid relocation block are rejected cleanly");
         }
     }
+
+    {
+        auto bytes = make_base_image(0x2000, 0x400);
+        IMAGE_FIRST_SECTION(nt_header_of(bytes))->VirtualAddress = 0;
+        std::memcpy(bytes.data() + 0x200, bytes.data(), 0x200);
+        reinterpret_cast<IMAGE_DOS_HEADER*>(bytes.data() + 0x200)->e_lfanew = 0x7FFF0000;
+        expect_loader_rejection("Section below SizeOfHeaders is rejected", bytes, "section 0 overlaps the headers");
+    }
+
+    {
+        auto bytes = make_base_image(0x2000, 0x400);
+        auto* nt = nt_header_of(bytes);
+        nt->OptionalHeader.ImageBase = 0;
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1000, 0x0A};
+        auto* block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(bytes.data() + 0x200);
+        block->VirtualAddress = 0;
+        block->SizeOfBlock = 0x0A;
+        reinterpret_cast<uint16_t*>(block + 1)[0] = static_cast<uint16_t>(IMAGE_REL_BASED_DIR64 << 12 | 0x3C);
+        expect_loader_rejection("Relocation inside the headers is rejected", bytes, "a relocation lands in the headers");
+    }
+
+    {
+        auto bytes = make_base_image(0x400, 0x400);
+        auto* nt = nt_header_of(bytes);
+        nt->OptionalHeader.SectionAlignment = 0x200;
+        nt->OptionalHeader.FileAlignment = 0x200;
+        nt->OptionalHeader.AddressOfEntryPoint = 0x200;
+        IMAGE_FIRST_SECTION(nt)->VirtualAddress = 0x200;
+        expect_loader_success("Section starting exactly at SizeOfHeaders maps successfully", bytes);
+
+        nt->OptionalHeader.ImageBase = 0;
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x300, 0x0A};
+        auto* block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(bytes.data() + 0x300);
+        block->VirtualAddress = 0;
+        block->SizeOfBlock = 0x0A;
+        reinterpret_cast<uint16_t*>(block + 1)[0] = static_cast<uint16_t>(IMAGE_REL_BASED_DIR64 << 12 | 0x200);
+        expect_loader_success("DIR64 relocation at exactly SizeOfHeaders is accepted", bytes);
+    }
 }
 
 }  // namespace

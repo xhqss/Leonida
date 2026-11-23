@@ -182,11 +182,13 @@ def test_lookup_result_is_broadcast_before_use():
     for ln in lines:
         if "OpGroupNonUniformBroadcastFirst" in ln:
             bcast[ln.split()[0]] = ln.split()[-1]
+        elif "OpGroupNonUniformShuffle" in ln:
+            # a wave32 pixel shader in a 64-lane subgroup takes its own half's first lane with a shuffle (SHADER-731,
+            # #4225; docs/design.md "Execution model")
+            bcast[ln.split()[0]] = ln.split()[-2]
     assert results and sorted(bcast.values()) == sorted(results), (results, bcast)
     assert "OpCapability GroupNonUniform" in lines
-    assert "OpCapability GroupNonUniformBallot" in lines
-    assert "OpCapability GroupNonUniformShuffle" not in lines
-    assert "%sg_lane = OpVariable %_ptr_Input_uint Input" not in lines
+    assert "OpCapability GroupNonUniformBallot" in lines or "OpCapability GroupNonUniformShuffle" in lines
     for ln in lines:
         if ln.split()[1:2] == ["="] and "OpAccessChain" in ln and ("%images" in ln or "%samplers" in ln):
             assert not results & set(ln.split()), ln

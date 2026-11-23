@@ -154,6 +154,7 @@ class PipelinesCrashRetryTest(unittest.TestCase):
     def test_a_named_module_is_skipped_and_the_rest_checked(self):
         def script(args, n):
             if self.is_probe(args):
+                self.inflight_is("b_mod")
                 return ABORT   # it must reproduce alone before it is added to the crash list
             if n == 1:
                 self.inflight_is("b_mod")
@@ -178,6 +179,8 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         def script(args, n):
             if self.is_probe(args):   # the global index is name-sorted, so a_mod=0, b_mod=1, c_mod=2
                 self.assertEqual(args[args.index("--count") + 1], "1")
+                if args[args.index("--start") + 1] == "2":
+                    self.inflight_is("c_mod")
                 return ABORT if args[args.index("--start") + 1] == "2" else 0
             if n == 1:
                 self.inflight_is("a_mod", "c_mod")
@@ -215,6 +218,7 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         names = iter(all_names)
         def script(args, n):
             if self.is_probe(args):
+                self.inflight_is(sorted(all_names)[int(args[args.index("--start") + 1])])
                 return ABORT
             self.inflight_is(next(names))
             return ABORT

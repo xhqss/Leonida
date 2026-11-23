@@ -522,7 +522,7 @@ class TestCli(unittest.TestCase):
             path, data = self._archive(tmp)
             other = os.path.join(tmp, ".", "synthetic.rpf")
             r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", other],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("would overwrite the input", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
@@ -534,7 +534,7 @@ class TestCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path, _ = self._archive(tmp)
             r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", tmp],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("is a directory", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
@@ -545,7 +545,7 @@ class TestCli(unittest.TestCase):
             path, _ = self._archive(tmp)
             out = os.path.join(tmp, "reports", "sub", "out.json")
             r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 0, r.stderr)
             with open(out, encoding="utf-8") as fh:
                 report = json.load(fh)
@@ -560,7 +560,7 @@ class TestCli(unittest.TestCase):
                 fh.write("a file, not a folder")
             out = os.path.join(blocker, "out.json")
             r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("cannot write", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
@@ -572,7 +572,7 @@ class TestCli(unittest.TestCase):
             for sample in ("0", "-1"):
                 with self.subTest(sample=sample):
                     r = subprocess.run([sys.executable, "-I", TOOL, path, "--sample", sample],
-                                       capture_output=True, text=True)
+                                       capture_output=True, text=True, errors="replace")
                     self.assertEqual(r.returncode, 2, r.stderr)
                     self.assertIn("--sample must be at least 1", r.stderr)
                     self.assertNotIn("Traceback", r.stderr)
@@ -594,13 +594,13 @@ class TestCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             missing = os.path.join(tmp, "missing.rpf")
             r = subprocess.run([sys.executable, "-I", TOOL, missing],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("not a file", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
 
             r2 = subprocess.run([sys.executable, "-I", TOOL, tmp],
-                                capture_output=True, text=True)
+                                capture_output=True, text=True, errors="replace")
             self.assertEqual(r2.returncode, 2, r2.stderr)
             self.assertIn("not a file", r2.stderr)
             self.assertNotIn("Traceback", r2.stderr)

@@ -33,7 +33,7 @@ class BadFeatureScanIndexTest(unittest.TestCase):
         argv = [sys.executable, "-I", str(TOOL), str(shaders)]
         if out:
             argv += ["--out", str(out)]
-        return subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=60)
+        return subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, errors="replace", timeout=60)
 
     def assert_clean(self, result):
         self.assertNotIn("Traceback", result.stderr, result.stderr)

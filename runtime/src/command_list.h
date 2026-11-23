@@ -339,6 +339,7 @@ struct CopyTexture {
     CopyLocation src;
     bool has_box;
     CopyBox box;
+    bool tile_footprint = false;  // RGBA8 CopyTiles: rows in a linear 64 KiB tile, at any byte offset
 };
 
 // CopyResource: every subresource, or the whole buffer.
@@ -623,6 +624,9 @@ struct BuildAccelerationStructure {
     std::uint64_t scratch_va = 0;
     std::uint64_t instances_va = 0;
     std::uint32_t instance_count = 0;
+    // D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS: instances_va is an array of instance_count GPU virtual addresses, one
+    // per 64-byte D3D12_RAYTRACING_INSTANCE_DESC; otherwise the descs themselves, consecutively.
+    bool instance_pointers = false;
     std::vector<RtTriangleGeometry> triangles;
 };
 
@@ -699,15 +703,18 @@ public:
     }
 
     bool copy_texture(const CopyTexture& copy) {
-        if (!valid(copy.dst) || !valid(copy.src) || (copy.dst.footprint && copy.src.footprint)) return false;
+        const auto alignment = copy.tile_footprint ? 1u : texture_data_placement_alignment;
+        if (!valid(copy.dst, alignment) || !valid(copy.src, alignment) || (copy.dst.footprint && copy.src.footprint))
+            return false;
         if (copy.has_box && (copy.box.right <= copy.box.left || copy.box.bottom <= copy.box.top ||
                              copy.box.back <= copy.box.front))
-            return false;
+            return !closed_;  // D3D12 accepts empty/inverted source boxes; emit no zero-extent Vulkan region.
         return append(copy);
     }
 
     bool copy_resource(const CopyResource& copy) {
-        if (!copy.dst || !copy.src || copy.dst == copy.src) return false;
+        if (!copy.dst || !copy.src) return false;
+        if (copy.dst == copy.src) return !closed_;  // A self-copy is a legal no-op, not a failed command list.
         return append(copy);
     }
 
@@ -900,11 +907,11 @@ private:
     static bool valid(const TargetView& target) { return target.resource && target.layer_count; }
 
     // A placed footprint needs aligned offsets and pitches and a non-empty size.
-    static bool valid(const CopyLocation& location) {
+    static bool valid(const CopyLocation& location, std::uint32_t alignment) {
         if (!location.resource) return false;
         if (!location.footprint) return true;
         return location.width && location.height && location.depth && location.row_pitch &&
-               location.offset % texture_data_placement_alignment == 0 &&
+               location.offset % alignment == 0 &&
                location.row_pitch % texture_data_pitch_alignment == 0;
     }
 

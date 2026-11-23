@@ -28,6 +28,7 @@ Output: <out>/<bank>/<stream id>.ogg (or .wav). Directory input preserves each b
 For 16-bit PCM copies of the Ogg Opus files, run tools/audio_wav.py on the output (make_game.py does it with --wav).
 """
 import argparse
+import functools
 import os
 import struct
 import sys
@@ -35,8 +36,9 @@ import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from file_mode import published_mode  # noqa: E402
+from file_mode import new_file_mode, published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
+from report_paths import path_key  # noqa: E402
 
 # ---- Ogg ----
 _CRC = []
@@ -139,6 +141,11 @@ def write_ogg_opus(path: str, packets: list, channels: int, serial: int, length:
     return written
 
 
+@functools.cache
+def folder_file_mode(directory: str) -> int:
+    return new_file_mode(directory)
+
+
 def write_file(path: str, data: bytes) -> None:
     """Write under a private temporary name and rename into place: a stopped run or a full disk never leaves a
     short file under the final name, where a later run would keep it. The staging file is created in the
@@ -152,14 +159,18 @@ def write_file(path: str, data: bytes) -> None:
             tmp_path = f.name
             f.write(data)
         # NamedTemporaryFile creates 0600; give the staged file the mode of the file it replaces, or a new file's.
-        os.chmod(tmp_path, published_mode(out_path))
+        os.chmod(tmp_path, published_mode(out_path) if os.path.exists(out_path) else folder_file_mode(parent))
         os.replace(tmp_path, out_path)
     except BaseException:
-        try:
-            if tmp_path is not None:
+        if tmp_path is not None:
+            try:
+                os.chmod(tmp_path, 0o600)  # it may already carry a read-only mode, which Windows won't unlink
+            except OSError:
+                pass
+            try:
                 os.remove(tmp_path)
-        except OSError:
-            pass
+            except OSError:
+                pass
         raise
 
 
@@ -246,7 +257,8 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
     collect_packets=False keeps the packet lists empty for metadata-only callers (awc_manifest.py).
     The chunk size is the stride between blocks. The last block may be shorter, but each channel table and
     subblock run must fit in its own block. A declared repeat must match whole packets from the same channel's
-    previous data. Reject malformed descriptors without hiding other bank streams."""
+    previous data. Channel rates outside 1000..192000 and non-Opus codecs are rejected as AwcRecovery.cs does.
+    Reject malformed descriptors without hiding other bank streams."""
     (m_at, m_size), (d_at, d_size) = mus, data
     if m_size < 12:
         return []
@@ -262,7 +274,11 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
         cid = struct.unpack_from("<I", d, base)[0] & 0x1FFFFFFF
         samples, = struct.unpack_from("<I", d, base + 4)
         rate, = struct.unpack_from("<H", d, base + 10)
-        info.append([cid, samples, rate, d[base + 12], [], 0])
+        codec = d[base + 12]
+        # The field is u16 (max 65535), so the 192000 half of the reference bound cannot fire here.
+        if not (1000 <= rate <= 192000) or codec != 0x0B:
+            return []
+        info.append([cid, samples, rate, codec, [], 0])
     previous = [[] for _ in range(channels)]
     for b in range(blocks):
         offset = b * chunk
@@ -279,8 +295,6 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
         for c, (count, skip) in enumerate(recs):
             start = at + header + before * 2048
             before += count
-            if info[c][3] != 0x0B:
-                continue
             packets = opus_packets(d, start, count * 2048)
             repeated = repeated_prefix_packets(packets, previous[c], skip) if skip else 0
             if repeated is None:
@@ -322,12 +336,16 @@ def export_stems(ids):
     return out
 
 
+def bank_output_dir(path, out_dir):
+    name = os.path.splitext(os.path.basename(path))[0]
+    return os.path.join(out_dir, name)
+
+
 def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
     with open(path, "rb") as f:
         d = f.read()
     streams, music = parse_awc(d)
-    name = os.path.splitext(os.path.basename(path))[0]
-    od = os.path.join(out_dir, name)
+    od = bank_output_dir(path, out_dir)
     os.makedirs(od, exist_ok=True)
     counts = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
     for mus, data in music:
@@ -358,7 +376,7 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
             write_wav(os.path.join(od, stem + ".wav"), d[at:at + size], s["rate"], s["channels"], True)
             counts["pcm"] += 1
             continue
-        if s["codec"] == 0 and s["channels"] in (1, 2):
+        if s["codec"] == 0 and s["channels"] in (1, 2) and size == s["samples"] * s["channels"] * 2:
             write_wav(os.path.join(od, stem + ".wav"), d[at:at + size], s["rate"], s["channels"])
             counts["pcm"] += 1
             continue
@@ -405,6 +423,13 @@ def main(argv=None) -> int:
         banks = [(a.src, a.out)]
     if a.limit is not None:
         banks = banks[:a.limit]
+    destinations = {}
+    for bank, parent in banks:
+        target = bank_output_dir(bank, parent)
+        key = path_key(target)
+        if key in destinations:
+            ap.error(f"{destinations[key]} and {bank} would both export to {target}")
+        destinations[key] = bank
     tot = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
     jobs = max(1, a.jobs)
 

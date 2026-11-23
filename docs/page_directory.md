@@ -95,6 +95,28 @@ What the samples did not show:
 The per-archive tables further down (common sizes, common hashes, payload classes) are still the 64 MiB and 256 MiB
 slices where they say navmesh or animation; the `data.rpf` columns were complete from the start.
 
+### `levels.rpf` in full
+
+`levels.rpf` was counted whole with a temp-only streaming runner that calls the same `scan_rpf`, `parse_page` and
+`resource_of` functions and accumulates the summary one page at a time (the stock tool keeps every page; this
+archive reached 17.4 GB RSS and had to be stopped). The runner reproduces the stock `data.rpf` row exactly
+(28,509 / 15,768 / 60,880 / 158), so the counts are the same fields:
+
+| | `levels.rpf` |
+|---|---:|
+| zlib streams | 1,116,073 |
+| `0DRP` pages, all version 122, all complete | 188,449 |
+| `q38` records | 465,611 |
+| pages with one continuation stream (none has more) | 3,281 |
+| `+0x20` | 1-44 |
+| first `q38` payload at +0x60 | **52,776 of 188,449** |
+
+The page total agrees with the existing levels census (188,449). The +0x60 rule is the one place where this
+archive differs from the other three: only 52,776 of its pages put the first `q38` payload at +0x60. The rest are
+counted and parsed, but this check does not establish the +0x60 key claim for them; their first target or table
+sits elsewhere. This was a count run (17.7 min), so it does not fill the payload-class, span or q28-declared
+tables below; those keep their labelled sample scopes.
+
 ## Fixed header (0x60 bytes)
 
 The core sample is 15,768 `data.rpf` pages plus 1,132 navmesh and 12,398 animation pages = **29,298 pages**.
@@ -110,7 +132,7 @@ sample; the meaning column separates decoded fields from unresolved ones.
 | +0x10 | 4 | `30 44 52 50` | `0DRP` |
 | +0x14 | 4 | 122 in all 29,298 | version |
 | +0x18 | 8 | zero in all pages | unused |
-| +0x20 | 4 | 1-89 in `data.rpf`, 2-3 in navmesh, 1-38 in anim (whole archives: 1-6 and 1-41) | presumed page count; **unit unresolved** |
+| +0x20 | 4 | 1-89 in `data.rpf`, 2-3 in navmesh, 1-38 in anim (whole archives: 1-6, 1-41; 1-44 in `levels.rpf`) | presumed page count; **unit unresolved** |
 | +0x24 | 4 | zero in all pages | high half of the +0x20 qword |
 | +0x28 | 8 | `0x5000xxxx`, 8-byte aligned | pointer to the `q28` table |
 | +0x30 | 8 | zero or `0x5000xxxx` | pointer to the `q30` table |
@@ -374,12 +396,12 @@ boundaries by itself.
 
 This is the cross-check the navmesh report asked for: the `0x50000000` base is shared by directory pages and typed
 data pages, but only the directory page carries the offset/size table. The typed prefix is not a `q38` payload
-magic; 0 of 60,880 `data.rpf` records, 0 of 6,645 navmesh records and 0 of 269,320 animation records started with
-`0x00010015` at +0x14.
+magic; 0 of 60,880 `data.rpf` records and 0 of the 6,645 navmesh and 269,320 animation records in their sampled
+windows started with `0x00010015` at +0x14.
 
 ## Distribution of the +0x20 count
 
-| Value | `data.rpf` | `navmeshes.rpf` | `anim.rpf` |
+| Value | `data.rpf` | `navmeshes.rpf` (64 MiB) | `anim.rpf` (256 MiB) |
 |---:|---:|---:|---:|
 | 1 | 1,247 | 0 | 480 |
 | 2 | 14,485 | 147 | 5,240 |
@@ -438,8 +460,8 @@ path or resource type is present in a `0DRP` page.
    **open**.
 6. **Full-corpus runs.** The tool is bounded by `--limit`; run it on a whole archive before quoting a count for
    that archive. `data.rpf`, `navmeshes.rpf` and `anim.rpf` are read whole in *Whole-archive pass*; `levels.rpf`
-   is still the 64 MiB sample here (its full pass is `docs/world_census.md`), and the common-size, common-hash and
-   payload-class tables are still slices for navmesh and animation.
+   is read whole in *`levels.rpf` in full*, and its map contents are in `docs/world_census.md`. The common-size,
+   common-hash and payload-class tables are still slices for navmesh and animation.
 7. **`q28` tables past the `q38` boundary.** 1,581 pages declare a `q28` table that ends beyond the streams the
    `q38` records need. Reading the following stream for it would settle whether a resource can be longer than its
    `q38` records say.
@@ -479,6 +501,7 @@ Validation on the package used here:
 | `anim.rpf` first 256 MiB | 24,232 | 12,398 | 269,320 | 12,398 | 7,865 | 25 s |
 | `navmeshes.rpf` full | 90,295 | 9,603 | 54,898 | 9,603 | 2,170 | 2.8 min |
 | `anim.rpf` full | 130,470 | 22,823 | 527,439 | 22,823 | 11,760 | 2.5 min |
+| `levels.rpf` full (streaming runner) | 1,116,073 | 188,449 | 465,611 | 188,449 | 3,281 | 17.7 min |
 
 The summary also counts the `q28` side: `q28_declared` (the sum of `n28`), `q28_records` (read), `q28_null_targets`
 and `q28_tables_unread`.

@@ -134,7 +134,7 @@ def _check_random_graphs():
                         opts = _ns[b]
                         if not opts:
                             return S.END
-                        return opts[random.Random(f"{_seed}/{ob}/{k}").randrange(len(opts))]
+                        return opts[branch_index(_seed, ob, k, len(opts))]
 
                     got = [orig[b] for b in S.run(stree, split_choose, 200)]
                     assert got == want, f"split graph {succ} seed {seed}: tree ran {got}, graph runs {want}"

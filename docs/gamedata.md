@@ -54,7 +54,7 @@ their content.
 ## Type split
 
 Stream-level split, using the requested classes. `other` is 2 `MHIU` payloads (38 streams), 1 `PAMH` and 1
-`SPS1Z`; there are no `RBF0`, `PSIN` or Bink 2 streams in this archive.
+`SPS1`; there are no `RBF0`, `PSIN` or Bink 2 streams in this archive.
 
 | Type | Streams | Stored B | Inflated B | Logical payloads |
 |---|---:|---:|---:|---:|
@@ -63,7 +63,7 @@ Stream-level split, using the requested classes. `other` is 2 `MHIU` payloads (3
 | `PSIN` | 0 | 0 | 0 | 0 |
 | text / INI-like | 4 | 30,162 | 142,036 | 3 |
 | binary | 66 | 1,396,087 | 4,312,136 | 2 |
-| other (`MHIU`/`PAMH`/`SPS1Z`) | 40 | 456,483 | 2,492,026 | 4 |
+| other (`MHIU`/`PAMH`/`SPS1`) | 40 | 456,483 | 2,492,026 | 4 |
 | **total** | **954** | **5,647,255** | **50,231,123** | **276** |
 
 By inflated bytes: 86.2% XML, 8.6% binary, 5.0% `other`, 0.3% text. XML is only 66.7% of stored bytes,
@@ -72,7 +72,7 @@ root element. Non-XML grouping follows the 64 KiB block rule; none of the nine n
 that is an exact multiple of 64 KiB, so their counts are unambiguous too.
 
 The four non-XML structured payloads are the only readable binary metadata here: two `MHIU` blobs (about
-1.19 MB and 1.21 MB inflated), one `PAMH` blob (48.6 KB) and one `SPS1Z` shader-parameter table (43.8 KB).
+1.19 MB and 1.21 MB inflated), one `PAMH` blob (48.6 KB) and one `SPS1` shader-preset table (43,791 B).
 The two large opaque blobs (1.04 MB and 3.27 MB) have no recognised header and are left as binary. No model,
 texture or audio signature is present in `common.rpf`; the two opaque blobs are not identified.
 
@@ -140,7 +140,7 @@ the payload end happened to fit the byte count, but it is not the format.
 | magic | 0x00 | 4 bytes | `PAMH` (little-endian `HMAP`) |
 | version | 0x04 | 2 x `u8` | 1.2 in `common.rpf`; overwritten in the `levels.rpf` tiles |
 | pad | 0x06 | `u16` | 0 in `common.rpf`; text in the tiles |
-| flag word | 0x08 | `u32` | `0x1BBC8CED` in `common.rpf`; padding in the tiles |
+| word at the GTA V `compressed` offset | 0x08 | `u32` | `0x1BBC8CED` in `common.rpf`. Level tiles contain label bytes with bit 0 set. |
 | width, height | 0x0C | 2 x `u16` | 144, 164 in `common.rpf`; 64, 64 in every tile |
 | six bounds | 0x10 | 6 x `f32` | `(-13312, -9728, -302)` to `(5120, 11264, 404)` |
 | data size | 0x28 | `u32` | 48,544 in `common.rpf`; 8,704 in a tile |
@@ -167,13 +167,16 @@ same rules: a 44-byte header, 64 x 64 cells, 64 full-width row records with
 - Max values span 0..255 and min values 0..254. `min <= max` in all but 62
   cells, all in the tile at `(-5120, 2048)`, where the encoder wrote a min
   above its max.
-- Bytes 0x05..0x0B are leftover text, not a version minor and a flag. 0x04
-  stays 1, 0x05.. hold the tile name `n_m` (column + 1, row + 1), and the
-  remaining bytes keep the tail of the string `height`, right-aligned at 0x0B.
-  The 28 distinct 0x08..0x0B words are all text; none is zero and none changes
-  the arrays.
-- The census groups by grid size, not by the 0x04 version bytes, because
-  0x05 is the first digit of the name. Nothing depends on the 0x08 word.
+- Use the tile's minimum XY corner to recover its column and row. Subtract the
+  grid minimum and divide each axis by 512. The 1,476 distinct coordinate pairs
+  produce only 954 distinct seven-byte labels at 0x05..0x0B.
+- To reproduce the label, right-align `height` in those seven bytes, then write
+  the one-based `column_row` and its NUL at 0x05. This predicts 819 headers
+  exactly. Setting bit 0 at **0x08** in that prediction matches all seven bytes
+  on **1,476/1,476** tiles. In 81 tiles the bit occupies the expected NUL.
+  Every stored 0x08 word is odd. The bit's runtime meaning is unknown.
+- The census groups by grid size. Byte 0x04 stays 1, 0x05 holds the first
+  digit of the column, and the 0x08 word takes 28 distinct values.
 
 ```powershell
 python -I tools/gamedata_maps.py <work>\carve\levels --json levels.json
@@ -204,10 +207,9 @@ python -I tools/gamedata_maps.py <work>\carve\common --json maps.json
 
 ### Checksum and unknown fields
 
-- `PAMH` 0x08 is GTA V's `compressed` word only in the `common.rpf` payload,
-  where it holds `0x1BBC8CED`. In the 1,476 `levels.rpf` tiles bytes 0x04..0x0B
-  are leftover text (tile name plus `height`), so 0x08 is padding there. The
-  `0x1BBC8CED` value is not CRC32, Adler32, FNV-1a, joaat32 or a hashlib
+- The `common.rpf` `PAMH` payload holds `0x1BBC8CED` at GTA V's `compressed`
+  offset, 0x08. The level tiles overlap this word with the coordinate label
+  described above. The common value is not CRC32, Adler32, FNV-1a, joaat32 or a hashlib
   digest of the max/min arrays; it is reported as a flag word, not a proven
   checksum.
 - `MHIU` 0x28 is a `u8` default height, not a 32-bit word (ASSET-48). Its
@@ -223,6 +225,36 @@ python -I tools/gamedata_maps.py <work>\carve\common --json maps.json
   body or the payload with 0x28..0x2B zeroed. They do not equal any count or
   sum of the grid. They are most likely uninitialised struct padding after the
   `u8` and are reported as `pad_29`; with N = 2 this is a hypothesis.
+
+## `SPS1` shader-preset table
+
+The single `SPS1` payload in `common.rpf` (`0x650000`, `43,791` B inflated, 1 stream) is the material shader-preset
+lookup table (`tools/gamedata_sps1.py`), not an `"SPS1Z"` five-byte magic:
+
+| Offset | Type | Meaning | Measured in 1.0.2.1 `common.rpf` |
+|---|---|---|---|
+| `0x00` | `char[4]` | Magic | `"SPS1"` |
+| `0x04` | `u32` | `entry_count` | `858` (`0x0000035A`; its low byte `0x5A == 'Z'` caused the old `"SPS1Z"` reading) |
+| `0x08` | `entry[858]` | `{u8 preset_len, char preset[], u8 effect_len, char effect[], u8 render_bucket}` | `43,783` B consuming the entire payload to EOF (`0` extra bytes) |
+
+Measured over all **858** records and cross-checked against `shaders.rpf`'s two `SGD5` databases:
+
+- **Presets:** all `858` carry a unique case-insensitive `.sps` path (`8`..`51` bytes), split into `846` root
+  names and `12` one-folder paths with zero basename stem collisions.
+- **100% `SGD5` target resolution:** all **858 of 858** records (`539 of 539` distinct target effects, `4`..`47`
+  bytes) match an effect in `shaders.rpf` `SGD5` Database 0 (`0x10E39`, `910` effects; `0` in Database 1).
+- **Aliases:** `532` presets have `preset_stem == effect` and `326` alias a preset name onto a shared effect; only
+  `589` preset stems match an `SGD5` effect name directly (`269` preset stems are defined only in `SPS1`).
+- **Default render buckets (`0..7`):** `0` (`401`), `1` (`161`), `2` (`101`), `3` (`162`), `4` (`1`), `5` (`1`),
+  `6` (`30`), `7` (`1`). `63` target effects span multiple buckets across their presets (`58` in `{0, 3}`, `2` in
+  `{0, 1, 3}`, `1` in `{1, 3}`, `1` in `{0, 1, 2, 3, 6, 7}`, and `1` in `{4, 5}` — the single bucket-`4` and bucket-`5`
+  presets both point to effect hash `0xFC34F08B`, matching [`models.md`](models.md#shader-render-buckets)).
+
+```powershell
+python -I tools/gamedata_sps1.py <work>\carve\common --shaders shaders.rpf --json sps1.json
+```
+
+Only counts, bucket distributions and `--preset-hash` hashes are written; preset and effect names stay local.
 
 ## Grid atlases
 
@@ -251,11 +283,107 @@ corner, 1.0%; as the top-left corner with y growing downwards, 82.5%. The `level
 same picture: 99.83%, 1.0% and 83.0%. The centre
 reading also gives a minimum x of exactly -13,312, the `PAMH` heightmap's minimum x above.
 
-Tile names: none of the four `tileTextureNamePrefix` values starts an archive entry name or a texture-dictionary
-item name in the local catalog (118,925 named items, 119,090 item hashes). Neither the global nor the sector
-fallback names match an item name or its joaat hash, and ten `prefix + x + y + suffix` spellings over all
-2,112 tiles match nothing in three atlases and one hash in the fourth. The tile textures are therefore either
-outside the scanned archives or named another way; this is unresolved.
+Tile names: the tile textures do exist, but none is named after the tile. Every tile carries only the grid's
+`tileTextureNameSuffix` as its texture name, one tile per texture dictionary, and the dictionary names are not in
+the data. That is why `tileTextureNamePrefix` spellings and the fallback names matched no archive entry or item name
+in the earlier catalog search. `tools/world_grid_atlas.py` (below) finds them in the texture manifests of
+`make_game.py --stages assets`.
+
+### What the four grids hold
+
+All four are water data. Every count below is in the tool's printed summary or is the named `--json` field;
+`levels` and `textures` are `levels.rpf` and `textures.rpf`.
+
+| Grid (`clientSystemName`) | Tile texture | Tile dictionaries | Fallback (pixels per tile) | Placed |
+|---|---|---:|---|---:|
+| `WaterSystemHeightMap` | `watersystemheightmap`, 512 x 512 `R16_UNORM` | 738 in `levels` | 1024 x 2112 `R16_UNORM` (32) | 737 |
+| `shorelinegrid1` | `shore_wave_placement_set1`, 256 x 256 `B8G8R8A8_UNORM` | 268 in `levels` | 1024 x 2112 `BC7_UNORM` (32) | 262 |
+| `waterfogatlas` | `waterfog`, 128 x 128 `BC6H_UF16` | 1,313 in `textures` | 512 x 1056 `BC6H_UF16` (16) | 592 |
+| `waterfogatlas2` | `waterfog2`, 128 x 128 `BC6H_UF16` | the same 1,313 | 512 x 1056 `BC6H_UF16` (16) | 592 |
+
+- Each `globalFallbackTextureName` is a mosaic of the whole 32 x 66 grid. Fallback image row 0 is the grid's north
+  edge (largest y, see the fit below), and cell = row * 32 + column.
+- The two fog grids share their dictionaries: each of the 1,313 holds one `waterfog` and one `waterfog2`.
+- `shared_minigame000` holds the `mapswap_tblux` sector-override fallback of all four grids (`sector_fallbacks`)
+  and a few more tiles (`tiles_in_other_archives`: 10 water height, 2 shoreline, 1 fog pair). They are counted
+  and printed, not placed.
+- The water-height fallback has 1,134 constant cells of 2,112; its most common value, 20,480, covers 55.74% of the
+  pixels, and the values run from 20,470 to 49,247.
+
+### Placing the tiles
+
+A tile's cell is recovered by comparing it with its grid's fallback mosaic, then checked against archive order.
+
+- Water height and fog (`method: content`): each tile is point-sampled to the fallback's pixels per tile and
+  compared with every cell by mean absolute difference; the two fog textures of a dictionary are matched together.
+  An anchor is a tile with detail (standard deviation above 0.5) whose runner-up distance is at least twice the
+  best and 0.5 above it. 737 of 738 water-height tiles are anchors; the one flat tile stays unplaced. For fog,
+  617 dictionaries have detail in either texture and 561 are anchors.
+- Shoreline (`method: mask`): the fallback's most common colour, `(0, 128, 0, 128)`, is background. Tiles and cells
+  are compared by intersection over union of their feature masks (pixels more than 32 from the background), 264
+  fallback cells have features and 6 tiles have none. The tiles, in archive order, are aligned to cells in text
+  order (next point) by a dynamic programme that maximises the summed overlap. A tile is placed when it overlaps
+  the cell it is aligned to: 262 are (median overlap 0.83, `overlap_median`), and the 6 unplaced ones are the 6
+  without features. 208 tiles match one cell clearly without the order (best overlap more than 0.2 above the
+  runner-up); these are the shoreline anchors, and the alignment moves none of them
+  (`anchors_moved_by_alignment` 0).
+- **Archive order:** the tile dictionaries are stored in the order of their cells sorted as text of the decimal
+  cell index (`sorted(cells, key=str)`). Ascending steps of the anchors in archive order (`anchor_order`):
+
+| Order of the cells | Water height | Fog | Shoreline |
+|---|---:|---:|---:|
+| text of the cell index | 736 / 736 | 560 / 560 | 207 / 207 |
+| cell index as a number | 735 / 736 | 559 / 560 | 206 / 207 |
+| text of `row_column` | 709 / 736 | 540 / 560 | 189 / 207 |
+| text of `column_row` | 700 / 736 | 526 / 560 | 173 / 207 |
+
+Number order differs from text order only where the cell index changes its digit count. The one break of
+number order in each grid is there: in the `--json` placements the three-digit cells (from 912 in water height)
+are stored after the last four-digit cells, where text order puts them. The dictionary names most likely
+contain the decimal cell index; with one deciding step per grid this is a strong hint, not a read name.
+- Between two anchors, tiles are placed by archive order when their number equals the free cells between them
+  (`placed_by_order`): 31 fog tiles, none for water height. 721 fog dictionaries stay unplaced; 677 of them have
+  no detail in either texture (`unplaced_without_detail`), which content cannot place.
+- Cross-check (`in_water_height_cells`, `anchors_in_water_height_cells`, `placed_by_order_in_water_height_cells`):
+  all 262 placed shoreline tiles and all 561 fog anchors lie in a cell that also has a water-height tile; of the
+  31 fog tiles placed by order, 16 do.
+
+### Water-height values and `zInflation`
+
+The water-height values follow the ground. Over the fallback pixels above 36,000, a least-squares fit against the
+`MHIU` terrain heights (`water_fit`) gives:
+
+| `MHIU` payload | Units per metre | Value at 0 m | r (north up) | r (south up) |
+|---|---:|---:|---:|---:|
+| `0x144000` | 40.81 | 32,947 | 0.9457 | -0.2193 |
+| `0x16E000` | 40.97 | 32,815 | 0.9935 | -0.2187 |
+
+Reading row 0 as the south edge destroys the fit, which is why row 0 is north. Under the better fit, the
+fallback's 20,470 to 49,247 is -301.3 to 401.1 m (`water_metres`), close to the `PAMH` Z box of -302 to 404 m. The
+fit is consistent with a `R16_UNORM` value spread over -800 to 800 m (65,536 / 1,600 = 40.96 units per metre, 0 m
+at 32,768). Under that reading the dominant 20,480 is -300 m, at the floor of the `PAMH` Z box (-302 m) and below
+all ground in `MHIU` (-50 m), which would make it a "no water" value. Both readings are hypotheses: the scale comes from a fit, not from a field.
+
+`zInflation` was not observed at runtime. All four documents have origin z = 0 and `zInflation` 1,000, so if the
+runtime turns each 2D tile into a box from origin z - 1,000 to origin z + 1,000 for its stream test, that box
+covers every height the world data describes. The tool reports (`z_check`) that all 3 heightmap Z ranges in
+`common.rpf` (`PAMH` -302 to 404 m, both `MHIU` -50 to 500 m) lie inside -1,000 to 1,000, and the water heights
+above fall inside it as well. This is a consistency check of that reading, not a measurement of the runtime:
+nothing here shows whether the box is used for the stream test, the camera, or something else.
+
+```powershell
+python -I tools/rpf9_carve.py <game>\common.rpf <work>\carve\common
+python -I tools/world_grid_atlas.py <work> --carve <work>\carve\common --json <scratch>\grid_atlas.json
+python -I tests/test_world_grid_atlas.py
+```
+
+The tool imports numpy and Pillow (Pillow decodes `BC6H`); its placement, ordering and fitting logic is plain
+Python, and the tests of that part run on the standard library alone. The forward check in the tests builds four
+synthetic grids with tiles at known cells, stored in text order, and requires every tile with content to come back
+at its cell; stored in number order instead, the text-order check reports breaks. The `--json` file holds the cell
+of every placed tile, derived from your own copy of the game: keep it local.
+
+### `TextureGridInfo`
 
 In the 1.0.2.1 exports, one content change set lists four grid metadata registrations and three candidate
 archive paths as siblings. The list gives no per-grid archive assignment. The two fog grids share a tile
@@ -273,8 +401,9 @@ radius and the same 1,000 `zInflation`, around a different origin. Tested the sa
 placements fall inside with `origin` as the centre, 0.01% as the minimum corner and 11.8% as the top-left
 corner, so the centre convention holds for both document types.
 
-Not measured here (hypothesis): what the four grids hold (their names suggest per-tile map data for separate
-client systems), and how `zInflation` widens a tile's streaming box vertically.
+The tool looks up both fallback names of this document (`texture_grids`): `fallen_snow_cov_fallback_low` is in
+`textures.rpf` and `fallen_snow_cov_fallback_high` is in none of the exported manifests. The document has no tile
+name field, so the tool does not look for its tiles, and what this grid holds is not measured.
 
 ## XML documents
 
@@ -367,9 +496,77 @@ Two consequences for a loader. The stored matrices do not include `Scale`, so th
 built from `Position`, `Rotation` and `Scale` rather than read from `TransformMtx`. Profile indices are
 positions in `ProfileList`, so its order must be kept.
 
+**Package-wide census (ASSET-308, `tools/fog_volumes.py`).** Scanning all `0x7a` resources (assembled via
+`world_census.assemble`, up to 64 MiB and multi-stream, without a 256 KiB per-stream cutoff) in `packs.rpf`,
+`levels.rpf`, `data.rpf`, and `story000.rpf`, plus bounded zlib-stream scans across the remaining package
+archives (`common.rpf`, `anim.rpf`, `navmeshes.rpf`, `textures.rpf`, `script.rpf`, `story000_script.rpf`,
+`core_restofworld.rpf`, `core_restofworld001.rpf`, `story000_restofworld.rpf`, `shared_minigame000.rpf`,
+`core_bvh4.rpf`, `shared_minigame000_bvh4.rpf`, `appdata0.rpf`, `core_licenses_data.rpf`) for XML, RBF0, and
+`0x7a` schemas matching `CScatteringTransmittance__FogVolumeListData` (`0x03073767`) or
+`CScatteringTransmittance__FogVolume` (`0x81907918`) finds:
+
+- **`levels.rpf`** (`188,449` complete `0x7a`, `0` incomplete), **`data.rpf`** (`15,768` complete `0x7a`, `0`
+  incomplete — matching `docs/world.md` and `docs/page_directory.md` — plus `1,263` `RBF0`), **`story000.rpf`**
+  (`48,084` complete `0x7a`, `0` incomplete, plus `1` `RBF0`), and all other archives except `common.rpf` and
+  `packs.rpf`: **0** `FogVolumeListData` / `FogVolume` resources.
+- **`common.rpf`**: remains the only archive with the XML `FogVolumeProfileList` (`0x236000`, 43 profiles) and
+  world-coordinate `CScatteringTransmittance__FogVolumeListData` (`0x64c000`, 14 volumes).
+- **`packs.rpf`** (`4,678` complete `0x7a` resources assembled, `0` incomplete): **231 complete `0x7a`
+  resources** (`0x8ae9010..0xc120010`) containing **770 stored** `CScatteringTransmittance__FogVolume`
+  (`0x81907918`, 512 bytes, 45 members) records and **384 distinct serialized records**:
+  - **230 smaller resources** (`{1: 80, 2: 146, 3: 3, 4: 1}`, median `2`) carrying **385** stored records (`384`
+    distinct).
+  - **1 larger resource** carrying **385** stored records (`384` distinct) that match the 385 records from the 230
+    smaller resources byte-for-byte (including multiplicities).
+
+| Check (`packs.rpf` 0x7a, 770 stored / 384 distinct across 231 resources) | Result (stored occurrences) |
+|---|---|
+| `Position` | `(0, 0, 0)` in all 770 (local-space attachments) |
+| `PositionOffset` | non-zero in 766 of 770: X `-2.46..2.46`, Y `-9.20..20.62`, Z `-6.50..6.66` m |
+| `Scale` | X `0.43..6.00`, Y `0.13..28.00`, Z `0.13..2.63` m |
+| `Rotation` / `Shear` | non-zero in 82 / 388 of 770 |
+| `RotationMtx` and `TransformMtx` | identity in all 770 (even where `Rotation` or `Shear` is non-zero) |
+| `IsBox` (`+0x000`, `ty=0x01`) | `1` in 730, `0` in 40 |
+| `BlendMode` / `IntExtMode` | `1` in all 770 / `1` in 760, `0` in 10 |
+| `ProfileIndex` / `SecondaryProfileIndex` | `{0: 2, 10: 4, 12: 764}` (all in `0..42`) / `0` in all 770; `ProfileInterpolation` is 0 in all 770 |
+| `Type` / `SortKey` | `{0: 768, 2: 2}` / `{0: 768, 10: 2}` |
+
+This resolves the earlier hypothesis: across all 188,449 complete `0x7a` resources in `levels.rpf`, none carries
+`FogVolumeListData` or `FogVolume`. Instead, `packs.rpf` holds 231 resources totalling 770 stored local-space
+records (384 distinct serialized 512-byte records: 385 in 230 per-asset resources duplicated by 385 in one larger
+resource; `Position = 0`, non-zero `PositionOffset` and `Shear`, `IntExtMode = 1` in 760/770), and
+`RotationMtx`/`TransformMtx` stay identity there too — confirming a loader must compose the volume transform from
+`Position`, `PositionOffset`, `Rotation`, `Shear`, and `Scale`. Runtime placement identity, resource-relative
+reference targets, and what `IntExtMode` and `BlendMode` select at runtime remain untested.
 Not measured here (hypothesis): with half the volumes at the origin, two profiles in use and no interpolation,
 this list looks like a sample or default set; the placed fog of the map is probably elsewhere (map resources
-or another archive). What `IntExtMode` (interior/exterior) and `BlendMode` select is also untested.
+or another archive).
+
+**`IntExtMode` and `BlendMode` against placement and interiors (ASSET-312).** Measured on the same 14 volumes
+(`common.rpf`, `CScatteringTransmittance__FogVolumeListData` at `0x64c000`) and on the interior positions of
+`GameShape__Data__LocationNameLoopkup` (`InteriorNames`, 2,280 `Pos`; see [world.md](world.md)), both read with
+`tools/gamedata_reader.py <carve> --root <root> --out <dir>`. That document gives interior points, not bounds; no
+document in `common.rpf` stores interior extents (the `CMloArchetypeDef` bounds in `levels.rpf` are in interior
+space and need the placing instance). So containment cannot be tested: what is measured is only the distance
+from a volume centre (`Position` + `PositionOffset`) to the nearest interior point, and a point nearby would not
+show that a volume is inside an interior.
+
+| Field value | Volumes | `Position` | Nearest interior point | Within 100 m of one |
+|---|---|---|---|---|
+| `BlendMode` 0 | 7 | world coordinates, none at the origin | 117.48 to 230.16 m | 0 |
+| `BlendMode` 1 | 7 | exactly (0, 0, 0) in all 7, offset only | unknown (parent transform not known) | unknown |
+| `IntExtMode` 0 | 14 | both groups above | as above | 0 of the 7 world-placed |
+
+- `BlendMode` splits the list exactly by placement: 0 on the 7 world-placed volumes, 1 on the 7 at the origin.
+  The world position of those 7 is unknown: their offsets are local to a parent this document does not name.
+  #3873 reports `BlendMode` 1 on the 385 local-space records of `packs.rpf`; that counts record occurrences in
+  one representation of the pack block, so it agrees with the split without being independent placement
+  evidence. Hypothesis: 1 marks a volume attached to (and blended with) a parent transform; what it does in the
+  renderer is not measured.
+- `IntExtMode` cannot be correlated here: it is 0 in all 14, and none of the 7 world-placed centres is near an
+  interior point. The 2 volumes that use a profile with `IntExtMode` 1 (`ProfileIndex` 10) are origin volumes
+  with `IntExtMode` 0, so the volume field does not copy the profile's. Whether 1 means interior stays a
+  hypothesis; deciding it needs world-placed volumes with `IntExtMode` 1 and placed interior bounds.
 
 ## Schema style
 
@@ -434,8 +631,7 @@ Measured over the 630 clouds:
 - **`CoverageMinMax` is a distance range, not a fraction**: min <= max in all 630, values 0 to 30,000, medians 200
   (min) and 2,000 (max), so it reads as an inner/outer radius in world units.
 - `StrikeChance` and `BurstChance` are within 0..1 in all 630. `Rain` and `Fog` are within -1..1 (median 0),
-  `Density` within -100..100 (median 0.5) and `FogHeight` within -100..300: signed values, so these act as
-  offsets or overrides with a sign, not plain amounts.
+  `Density` within -100..100 (median 0.5) and `FogHeight` within -100..300.
 
 The cloud renderer's settings sit in one `STS_Config` document with 44 top-level sections: four cloud layers
 (`Nimbus`, `Cumulus`, `Stratus`, `Alto`) that share one set of 13 fields (noise weights and blends, erosion,
@@ -444,12 +640,33 @@ noise displacement); six media (`GlobalFog`, `LocalFog`, `Rain`, `Clouds`, `Clou
 share another set of 9; and 34 single-value or vector settings. Of the five cloud flags above, `Cumulus` and
 `Stratus` match a layer name, `Nimbus0`/`Nimbus1` would both fall on the one `Nimbus` layer, and
 `CirroStratus` has no layer of its own (`CloudsCirrus` is a medium, not a layer). The weather data's
-`CloudType` is fractional (14 distinct values from 0.01 to 0.67 over the 25 weathers), so it is a blend
-position rather than an index into these layers.
+`CloudType` has 14 distinct fractional values from 0.01 to 0.67 over the 25 weathers.
 
-Not measured here (hypothesis): how a cloud's radius range blends with the weather's `CloudType` and cloud maps,
-what a negative `Rain`/`Fog`/`Density` means (subtracting from the weather, or "unset"), and what the two
-`Nimbus` flags distinguish.
+### Custom-cloud map draw (ASSET-337)
+
+One atmospheric technique in the 1.0.2.1 shader dictionary lists a cloud-map compute pass, a custom-cloud
+vertex/pixel draw and a cloud-density compute pass in consecutive entries, in that order. The density
+program has two distinct resource rows whose compiled and authored name hashes match `CloudMapA` and
+`CloudMapB`. Across the resource and constant-buffer member rows of all 932 effects and 26,503 programs,
+neither hash column has an exact match for `Rain`, `Fog`, `Density`, `CoverageMinMax` or `CloudType`.
+
+The draw reads three consecutive words from a cloud record. They hold a half-precision coefficient and a
+16-bit selector, two half-precision radii, and a half-precision center pair. For distance `d` from that
+center in map coordinates and `outer > inner`, the pixel contribution before render-target blending is
+`coefficient * clamp((outer - d) / (outer - inner), 0, 1)`. Selectors 0 through 3 route it to R, G, B
+or A of the first target. Selector 4 writes it to both R and G of the second target.
+
+A Vulkan replay used the translated draw with synthetic records and blending disabled. Switching only the
+coefficient from +0.75 to -0.75 reversed all 1,804 nonzero pixels exactly. A coefficient of -1 also produced
+a negative contribution. Equal positive radii gave a hard edge at the sampled distances, all strictly inside
+or outside the radius. Across fifteen 64×64 readbacks, the largest absolute error against the expected
+pixel values was below 0.00048.
+
+The missing link is the producer that converts an XML cloud into these draw records. The world-to-map conversion
+for `CoverageMinMax`, the fields that supply the coefficient and selector (including the two `Nimbus` flags),
+and any handling of negative `Rain`, `Fog` or `Density` before the draw remain open. The replay also leaves
+the live target formats, overlap blending, and the relationship between the weather's `CloudType` and the
+two maps unmeasured.
 
 ## XML catalog
 
@@ -542,8 +759,8 @@ How the pieces link, checked by name (case-insensitive) over the archive:
   and 14 `To` values are weather type names, and 13 pairs have both.
 - The two `WeatherCycles` names occur in other `common.rpf` documents (2 and 1 documents), not as weather types.
 
-Not measured here (hypothesis): what the `Mod*` axes do at runtime (they read as weather-app forecast
-attributes), how `TimeMult` scales a cycle, and what the `Honor*` values gate.
+Measured further in [weather.md](weather.md): the `Mod*` axes against the numeric fields, the exact-case
+vocabulary mismatches, `TimeMult`, and the `Honor*` values.
 
 ## `OceanSimPresets`
 
@@ -554,20 +771,40 @@ Its element tree (counts per path; no values or names):
 |---|---:|---|
 | `Presets/Item` | 10 | one preset per sea region |
 | `Presets/Item/Name`, `Id` | 10 each | region label and id |
-| `Presets/Item/Location` | 10 | `x`, `y` attributes in world units: x -7,995 to 3,183, y -4,572 to 8,645 |
+| `Presets/Item/Location` | 10 | `x`, `y`, `z` attributes in world units. The 10 elevations are distinct. Horizontal extents are x -7,995 to 3,183 and y -4,572 to 8,645. |
 | `Presets/Item/Direction` | 10 | wave direction |
 | `Presets/Item/Octaves/Item` | 30 | exactly 3 per preset |
 | `Presets/Item/Octaves/Item/ControlPoints` | 30 | 4 `(x, y)` pairs each, both in 0..1 |
 | `WavefrontShapeA`, `B`, `G`, `R` `/Item/ControlPoints` | 1 each | one curve each |
 
-So the ocean is a small set of regional presets placed by world position, each with three wave octaves whose
-amplitude is a 4-point curve over a 0..1 input. The input is the sea state: the timecycle keyframe documents
-carry a `water_ocean_beaufort_scale` variable (26 documents, 676 values, 0 to 10), the Beaufort number per
-weather and time of day.
+The presets supply three octave curves per world position. A separate timecycle input,
+`water_ocean_beaufort_scale`, occurs 676 times across 26 keyframe documents and ranges from 0 to 10.
 
-Not measured here (hypothesis): which preset applies at a position (nearest `Location` is the obvious reading),
-how the Beaufort number maps onto the 0..1 curve input (Beaufort / 12 is one choice), and what the four
-`WavefrontShape` curves drive.
+The authored curves and locations provide two controls for a runtime capture.
+
+- Hold position fixed at an authored site and compare the octave amplitudes at Beaufort 10. All 30 curves
+  have strictly increasing x and endpoints at x = 0 and x = 1. Under piecewise-linear interpolation, 19
+  differ by more than 0.000001 between inputs 1 and 5/6, the predictions for division by 10 and by 12.
+  The other 11 are unsuitable as controls at that weather setting. The interpolation is an assumption of this test.
+- Hold the normalized input at 1. In the horizontal (XY) plane, 11 of the 45 pairs of sites have a midpoint
+  closer to the pair than to any third site. At 49% and 51% along each of those 11 segments, the nearest site switches. In every
+  case at least one octave's endpoint amplitudes differ by more than 0.000001 across the pair. A hard
+  nearest-site rule predicts a step there. Samples approaching the midpoint from both sides can distinguish
+  that prediction from a continuous blend.
+- To test whether elevation enters the selection, hold XY at one of those midpoints. Evaluate the 3D distance
+  first at one site's elevation and then at the other's. The unique nearest site switches for all 11 pairs.
+  A selector using only XY sees identical inputs for both measurements.
+
+The ocean simulation technique has six compute programs. Four declare the same nine constant-buffer members
+in the same order and at the same byte offsets. In all four, the pipeline reflection binds one constant buffer
+at `b5, space1`. The other two declare zero members and zero constant buffers. To reproduce the program
+selection, run `python -I tools/sgd5_effects.py <shaders.rpf> --effect OceanWaveSim --technique oceanWaveSim`.
+Compare the member keys and offsets in each program's counted trailer against the other passes, then check
+the constant-buffer register in its `PSV0` reflection.
+
+Which preset applies at a position, how Beaufort maps to the curve input, and what the four `WavefrontShape`
+curves drive remain open. The reflected member keys give a concrete target for tracing the writer or comparing
+dispatch inputs with position and weather varied independently.
 
 ## Timecycle documents
 
@@ -620,9 +857,84 @@ Modifiers come in two shapes:
 49 documents, so a submodifier is a by-name reference to another modifier, with its own blend attributes.
 The one unresolved item points outside this archive or at a document lost to the unread region.
 
+**Sample hours come from data.** One `time_data` document (root attributes `version` and `mode`) has exactly 13
+`sample` elements, each with `name`, `hour`, `uw_tc_mod` and `interpolation_type`, plus one `region`. The 13
+hours are integers from 0 to 22 in strictly increasing order, with gaps of 1 hour (7 times), 2 (twice), 3 (once)
+and 4 (twice); `interpolation_type` is `EASE_LINEAR_IN` on 9 samples and `EASE_QUARTIC_INOUT` on 4, and all 13
+`uw_tc_mod` values are the same name, which resolves to one of the 4,592 modifier names. The `region` name equals one of the two keyframe
+region names. So unlike GTA V, where the 13 sample times are compiled in, this build stores them in `time_data`;
+their count matches the 13 values of every keyframe variable. The `interpolation_type` labels are stored metadata:
+how the runtime selects the interval between two samples, and whether it applies the label, is not verified.
+
+The `hour` attributes of the 13 `sample` elements, in document order, are **0, 4, 5, 6, 7, 9, 12, 16, 18, 19, 20,
+21, 22**. They come from the one `time_data` payload of the `common.rpf` carve, at archive offset 1,773,568
+(`0x1b1000`): a single zlib stream, 268 B stored and 1,370 B inflated. The samples at hours 4, 20, 21 and 22
+carry the `EASE_QUARTIC_INOUT` label. That value *i* of a keyframe variable belongs to sample *i* is a
+hypothesis: it rests on the equal count and the document order, not on the executable. To export the sample
+records as JSON from a carve (the CLI prints summary counts; the JSON is game data and stays local):
+
+```
+python -I tools/gamedata_reader.py <work>/carve/common --root time_data --out <scratch>
+```
+
+Not measured here (hypothesis): how the two regions are chosen at runtime, what the two plain-modifier numbers
+are (GTA V reads them as a value pair blended by strength), and how `controlValue` maps onto game state.
+
+**The two plain-modifier numbers.** Measured over the 29,727 two-number variables of the plain modifiers
+(1,051 variable names, 3,257 modifiers with at least one such variable):
+
+- The second number is `0` in 26,186 pairs (88 %) and `1` in 3,104; only 437 take another value. In 2,300 of
+  the 3,257 modifiers it is `0` on every variable, in 21 it repeats the first number on every variable, and
+  936 mix. Per variable name, 624 names never have a non-zero second number (8,410 pairs), 83 always do
+  (1,289 pairs) and the other 344 vary from one modifier to the next.
+- The pair is not an ordered range: the first number is larger in 20,833 pairs, smaller in 4,604 and equal in
+  4,290.
+- Where the second number is non-zero (3,541 pairs) it does not follow the first: Pearson correlation 0.009,
+  and the first is `0` in 570 of them.
+- Against the keyframe documents (25,732 pairs with a second number of `0` whose name is also a keyframe
+  variable): `0` lies outside every value that variable takes in the 27 keyframe documents in 17,041 pairs,
+  but the first number is outside that range too in 15,183 of the same pairs. Plain-modifier values are not
+  bounded by the keyframe ranges, so this comparison does not tell what either number means.
+
+So `0` is the most frequent stored value of the second number. What it means, and how the runtime blends the
+two numbers by strength, is not settled by these counts.
+
 Not measured here (hypothesis): the hour of each of the 13 samples (GTA V's are fixed in code), how the two
-regions are chosen at runtime, what the two plain-modifier numbers are (GTA V reads them as a value pair
-blended by strength), and how `controlValue` maps onto game state.
+regions are chosen at runtime, what the two plain-modifier numbers mean and how the runtime blends them (see
+above), and how `controlValue` maps onto game state.
+**Plain-modifier number pairs `(a, b)`** (`tools/timecycle_pairs.py`, measured over all **29,727** two-number
+elements in the 4,291 plain modifiers across all 49 `timecycle_modifier_data` documents):
+
+| Measure | First number (`a`) | Second number (`b`) |
+|---|---:|---:|
+| Range (`min .. max`, median) | `-31,869.0 .. 400,000.0` (`0.789439`) | `-3.0 .. 5,000.0` (`0.0`) |
+| Distinct values (rounded to 6 dp) | 4,566 | 71 |
+| `< 0` | 2,972 (10.0%) | 7 (0.02%) |
+| `== 0` | 3,590 (12.1%) | 26,186 (88.1%) |
+| `(0, 1)` | 10,230 (34.4%) | 88 (0.30%) |
+| `== 1` | 6,973 (23.5%) | 3,104 (10.4%) |
+| `> 1` | 5,962 (20.1%) | 342 (1.15%) |
+
+Three patterns establish what the pair stores (matching RAGE's two-float `tcModData` slot):
+
+1. **`a` carries the variable's value; `b` is zero (`0.0`) on 88.1% of entries.** Across the 1,051 distinct plain
+   variables, 624 always have `b == 0.0`, 75 always have `b == 1.0`, and 343 appear with both `b == 0.0` and
+   `b == 1.0` (272 of them mixed within a single document, and 579 modifiers mix `0` and `1` across their own
+   variables) with the same physical range in `a`. A loader that applied `lerp(base, a, strength * b)` uniformly
+   would discard 88.1% of all modifier entries.
+2. **Fractional `b` in `(0, 1)` is a shared per-colour blend weight.** Only 18 variables ever take `b` outside
+   `{0, 1}`; 15 of them stay in `[0, 1]` (88 entries total). Across all **1,875 / 1,875** RGB triplets
+   (`*_r`/`*_g`/`*_b`) present in the same modifier, `b` is identical across all three channels (`1,554` with `0`,
+   `301` with `1`, `20` fractional — `0` mismatches).
+3. **Only three variables take `b` outside `[0, 1]` (349 entries, all keyframe variables), where `(a, b)` is a
+   same-unit value/range pair:** `far_clip` (`172/172` with `b > 1`, `a` in `0..5,000`, `b` in `40..5,000`,
+   `a == b` in 110, `a == 0` in 54, `0 < a < b` in 7, `a > b` in 1), `fog_start` (`161` with `b > 1`, `7` with
+   `b < 0`, `a` in `-1,000..5,000`, `b` in `-3..5,000`, `a == b` in 94, `a < b` in 89, `a > b` in 7), and
+   `fog_isotropic_phase` (`a == b` in all `10/10`, `1.0..6.0`).
+
+Not measured here (hypothesis): the hour of each of the 13 samples (GTA V's are fixed in code), how the two
+regions are chosen at runtime, the exact runtime rule distinguishing `b == 0` from `b == 1` on the 343 variables
+where both occur, and how `controlValue` maps onto game state.
 ## Vehicle and tyre XML documents
 
 Four roots account for 37 of the 45 documents (4,547,932 inflated bytes) in the vehicles/tyres category:
@@ -714,14 +1026,15 @@ and 4 (twice); `interpolation_type` is `EASE_LINEAR_IN` on 9 samples and `EASE_Q
 region names. So unlike GTA V, where the 13 sample times are compiled in, this build reads them (and the easing
 between them) from `time_data`; their count matches the 13 values of every keyframe variable.
 
-Not measured here (hypothesis): how the two regions are chosen at runtime, what the two plain-modifier numbers
-are (GTA V reads them as a value pair blended by strength), and how `controlValue` maps onto game state.
+Not measured here (hypothesis): how the two regions are chosen at runtime, the exact runtime rule distinguishing
+`b == 0` from `b == 1` on the 343 plain-modifier variables where both occur (see *Plain-modifier number pairs*
+above), and how `controlValue` maps onto game state.
 
 ## Relationship to `data.rpf` and `script.rpf`
 
 | Archive | Size | Streams | Inflated | Dominant payloads | XML | `RBF0` | `PSIN` |
 |---|---:|---:|---:|---|---:|---:|---:|
-| `common.rpf` | 6.6 MB | 954 | 50.2 MB | XML/config, text, `MHIU`, `PAMH`, `SPS1Z` | 844 streams | 0 | 0 |
+| `common.rpf` | 6.6 MB | 954 | 50.2 MB | XML/config, text, `MHIU`, `PAMH`, `SPS1` | 844 streams | 0 | 0 |
 | `data.rpf` | 481.5 MB | 28,509 | 1,403.3 MB | models/GPU pages, 1,263 `RBF0`, 2,281 `PSIN`, 3,132 resource pages | 0 | 1,263 | 2,281 |
 | `script.rpf` | 4.4 MB | 714 | 5.0 MB | 671 `PSIN` plus binary | 0 | 0 | 671 |
 
@@ -777,30 +1090,69 @@ Measured over the 434 patches and 7,839 points:
   `ShoreWaveMaxAmplitude` and `ShoreWaveWindScale` fields of the `CContentsOfWeatherXmlFile` weather data
   (its layout is documented in #1175).
 - **`maxDistance`** ranges 3.0 to 120.4 (median 74.9): how far the wave runs from the line.
-- **`lateralCoord`** is a float in -2.94..3.50 with 7,820 distinct values. It is not arc length and not monotonic
-  along 433 of the 434 patches, so it is not a running texture coordinate along the line.
+- **`lateralCoord`** is a float in -2.94..3.50 with 7,820 distinct values. It is a coordinate *along* the line,
+  not across it: within a patch it is linear in arc length (distance along the polyline from the first point),
+  `lateralCoord ≈ a + b × arc length`.
+  - The least-squares fit leaves a median largest residual of 0.012 per patch (90th percentile 0.059).
+  - The per-patch correlation with arc length has magnitude at least 0.994 on more than three quarters of the
+    patches.
+  - The rate is the same everywhere: |b| has a median of 0.00200 per world unit, so it changes by 1.0 every
+    500 world units (median 500.4; 10th to 90th percentile 473 to 544). The median rate per `waveType` is 0.00199
+    to 0.00202, so the wave type doesn't set it.
+  - It *decreases* along the point order: strictly on 416 of the 434 patches, and b < 0 on 426. Only 197 of the
+    7,405 point-to-point steps go against the patch's direction, by a median of 0.018. (It is monotonic, just not
+    increasing; an earlier count here only tested increasing.)
+  - On those 426 patches, `direction` points to the left of the polyline, so the coordinate runs the same way
+    relative to the waves everywhere.
+  - The offset a spreads over -2.0 to 3.4 (median 0.70), and a whole patch changes it by a median of -0.33. So
+    neighbouring patches can continue one another rather than each starting at 0 (10 start within 1e-4 of 0).
 
-Not measured here (hypothesis): what the five `waveType` values select, and what `lateralCoord` encodes (an
-offset across the line is one reading).
+  Hypothesis, from the shape rather than a consumer: a phase or texture coordinate along the coast that repeats
+  every 500 world units.
+- **`waveType`** doesn't change `amplitude` (1.0 at every point of every type) or the `lateralCoord` rate, and the
+  types overlap across the map. What differs:
+  - Type 3 (147 patches) has the shortest reach: its `maxDistance` median is 64.6, with the only values below
+    17 (down to 3.0). Types 0, 1 and 4 have medians of 72.4 to 78.1.
+  - The six type 2 patches lie in one area (patch centres x 358 to 1,560, y -1,685 to 6,041). The other types
+    span the whole coastline box.
+
+Not measured here: what the five `waveType` values select. Reach is the only measured difference besides type 2's
+location; a consumer of the field would settle it.
 
 ## Readable vs binary
 
 Readable: the 266 XML documents, 3 text/INI-like files, and the two `MHIU` 2048 x 2048
-heightmaps plus the `PAMH` max/min heightmap and the `SPS1Z` header. The XML is ordinary text
+heightmaps plus the `PAMH` max/min heightmap and the `SPS1` shader-preset table. The XML is ordinary text
 and can be consumed by any parser. `tools/gamedata_maps.py` decodes the `MHIU` row table and
-packed heights and the `PAMH` row table and max/min arrays. `SPS1Z` is a NUL-separated
-table of path/key strings with per-entry type/length markers; its structure is visible but its consumer is not
-implemented.
+packed heights and the `PAMH` row table and max/min arrays, and `tools/gamedata_sps1.py` decodes the
+`858`-entry `SPS1` preset table and joins it to `shaders.rpf`'s `SGD5` effect records.
 
 Not fully readable: the 8.6% unread span, the two opaque binary blobs, and the missing first blocks of the 9
 tail-only documents (their retained tails are readable but incomplete). The encrypted table of contents is
 outside this work by rule; names and exact file boundaries stay unknown until a documented table reader exists.
 
+## Text and binary tables (`tools/gamedata_blobs.py`)
+
+`tools/gamedata_blobs.py` decodes all five non-XML text and binary payloads in `common.rpf` (counts and structural
+bounds only; zero names or raw bytes):
+
+| Payload | Inflated B (streams) | Format & measured structure |
+|---|---:|---|
+| `0x64e000` (`.fx` preload list 0) | 24,285 (1) | `965` unique `<effect>.fx` lines (`0` comments, `0` folder separators): all **910 of 910** `shaders.rpf` `SGD5` Database 0 effect records appear in exact index order (`0..909`), plus `55` unshipped `.fx` names |
+| `0x64f1c0` (`.fx` preload list 1) | 575 (1) | `22` unique `<effect>.fx` lines (`0` comments): all **22 of 22** match `SGD5` Database 1 (`0x10289C81`) in exact index order (`0..21`) |
+| `0x640000` (`VFX_SETTINGS_FILE` `.dat`) | 117,176 (2) | `3,198` lines: `2,566` data lines (`2,537` `<dotted.key> <scalar>` pairs, `2` `key = value` lines, `27` multi-value rows of `5..24` tokens), `248` comments, `384` blanks (`13` of `122` distinct key prefixes, `381` data lines, match an `SGD5` Database 0 effect name) |
+| `0xad000` (fixed table) | 1,038,100 (16) | `u32 count = 801` followed by `801 x 1,296` B records to EOF (`4 + 801 x 1,296 = 1,038,100` B, `0` trailing bytes). Every record opens with `{u32 w0, u32 w1, u32 w2, u32 w3}` where `(w0, w1) == (w2, w3)` in **801 of 801** (`801` distinct pairs) before an undecoded `1,280`-byte record body (arithmetic permits `64 x 20` B; sub-record layout is not decoded by the tool) |
+| `0x23c000` (3-region spatial grid) | 3,274,036 (50) | **Region 1** (`0x000000..0x07FFFF`, `131,072` `u32` cells): `32` empty `0xC0000000` sentinels and `131,040` populated cells whose low 23 bits point (`131,040 / 131,040` aligned) into **Region 3** (`0x166934..0x31F533`, EOF `0x31F534`, `451,328` `u32` words partitioned by the `46,019` distinct cell offsets into spans of `1..24` words); located as the trailing run of 4-byte-aligned offsets matching `min(cell_offs)` (`0x166934`), with every word (`451,328 of 451,328`) falling in **Region 2** (`0x080000..0x166933`, `944,436` B partitioned with zero gaps into `21,662` records: `21,273` of `44` B, `313` of `24` B, `76` of `12` B) |
+
+```powershell
+python -I tools/gamedata_blobs.py <work>\carve\common --shaders shaders.rpf --json blobs.json
+```
+
 ## Dirt and canned colours (`CGraphicsDefinitionsData`)
 
 One `CGraphicsDefinitionsData` document holds the dirt/grime presets for peds, vehicles and props and the
-colour table they draw from. Seven sections, each a list of `Item key="..."` records (counts; no values or
-names):
+colour table they draw from. Seven sections, each a list of `Item key="..."` records (the table gives counts,
+no values or names):
 
 | Section | Items | Fields per item | `key` |
 |---|---:|---:|---|
@@ -809,7 +1161,7 @@ names):
 | `DirtDefinitions` | 24 | 25 (alpha curves and thresholds, vertex multipliers, normal/roughness/material contribution, spawn range, 6 `ClothHideDirtModifiers`) | equals `Name` in 22 of 24 |
 | `VehDirtDefinitions` | 1 | 12, including a `DirtTunings` block of tile, detail-map, mud and modulate start/end values | equals `Name` |
 | `VehDirtControls` | 5 | 13 | equals `Name` |
-| `VehSpawnIntensities` | 31 | 5 | equals `Name` |
+| `VehSpawnIntensities` | 31 | Name, `IntensitySets` (7 `Item`s of `DirtMin`/`DirtMax`/`MudMin`/`MudMax`), `DirtRainChance`, `DirtRainMin`, `DirtRainMax` | equals `Name` |
 | `PropDirtDefinitions` | 9 | 4 | equals `Name` |
 
 The keys are plain text, not joaat hashes, and a loader can index each section by `key`.
@@ -836,8 +1188,48 @@ with the `VehSpawnIntensities` keys, which is not evidence of a reference.
 `AlphaChannels` probabilities do not sum to 1 in any of the 7 entries, so they are not a probability
 distribution over the listed channels (independent chances or weights would fit). The `Channel` values are 0, 1 or 2.
 
-Not measured here (hypothesis): which texture channel numbering `Channel` uses, and how `VehSpawnIntensities`
-are chosen at spawn.
+**`Channel` numbers the mask texture's channels in component order: 0 = R, 1 = G, 2 = B** (ASSET-304). The
+dirt presets are ped presets, and `textures.rpf` holds one texture whose name marks it as the ped dirt masks
+(1024×1024 BC7, 11 mips, next to the ped dirt normal/roughness map). `tools/mask_channels.py` on its export:
+
+| Channel | Range | Mean | Cover ≥ 64 / 128 | Blobs ≥ 64 / 128 | Largest blob ≥ 64 |
+|---|---|---:|---:|---:|---:|
+| R | 0-255 | 124.1 | 66.5% / 49.3% | 4,612 / 9,167 | 92.0% |
+| G | 90-255 | 193.6 | 100% / 99.5% | 1 / 7 | 100% |
+| B | 0-255 | 88.4 | 50.7% / 34.9% | 35,175 / 49,374 | 21.0% |
+| A | 255 only | 255 | 100% | 1 | 100% |
+
+Alpha is constant, so the three `Channel` values can only be R, G and B; an order that counts alpha leaves one
+value on a channel with nothing in it. G is a soft layer that never drops below 90, and the two entries whose names
+describe a light dusty or urban grime use only `Channel` 1. R is a broad layer, one connected region at ≥ 64, and
+the snow entry uses only 0. B is the speckled one, with 7.6 times R's blobs at ≥ 64, and the entry named for spots
+uses only 2. The reversed order (0 = B) would put the spots on the broad layer and the snow on the speckled one.
+The three mixed entries combine 0 and 2. Each tie is a name read against measured texture content, so this is
+measured, not confirmed against the shader that samples the mask.
+
+Not measured here (hypothesis): how `VehSpawnIntensities` are chosen at spawn.
+**Spawn intensities are keyed by vehicle class.** Measured on 2026-11-23 from one retail Xbox Series
+1.0.2.1 install with `tools/veh_spawn_intensities.py` (numbers and ranges only; the tool never prints
+entry names). The 31 entries are 30 generic vehicle-class tokens plus one entry whose rain fields differ
+from every other chance-0.5 entry; each carries 7 intensity bands, so the section's own "5 fields" summary
+is top-level children only:
+
+| Measure | Value |
+|---|---|
+| `IntensitySets` bands per entry | 7 in all 31 |
+| distinct band signatures | 9, carrying 12, 8, 3, 2, 2, 1, 1, 1, 1 entries |
+| band 7 ranges over the signatures | `DirtMin` 0.353400..0.804305, `DirtMax` 0.450900..1.240000 |
+| mud (a `MudMin`/`MudMax` above zero) | in band 6 of 1 signature, band 7 of 6 signatures; everywhere it exists the range is 0.8..1.0 |
+| bands overlap | yes: each band is a draw range, not a partition (band 1's `DirtMax` exceeds band 2's `DirtMin` in the largest signature) |
+| `DirtRainChance` groups | 4: 0.5 in 24 entries (`DirtRainMin` 0.818644 except one at 0.7), 0.0 in 6, 0.3 in 1 |
+
+Band 1 to band 7 in the largest signature ladder through the same recurring endpoints
+(0.007828, 0.174168, 0.391389, 0.485323, 0.659491, 0.804305), so a run draws its dirt intensity from one
+of the seven ranges, and rain applies another random factor gated by `DirtRainChance`. Each entry has 7
+bands while `AlphaChannels` has 7 entries and `DirtDefinitions` references 5 of them; whether a spawn picks
+one band per `AlphaChannels` entry is open.
+
+Not measured here (hypothesis): whether a spawn selects one `IntensitySets` band per `AlphaChannels` entry.
 
 ## Entity component sets and component LOD
 
@@ -932,8 +1324,6 @@ Four representative roots in the world/navigation/map category (826,397 B across
   `o` in `Loopkup`.) Contains four keyed lookup tables (`key=`):
   - `LocationNames/Item` × 2,318 (`Name` on all 2,318; `TextureDictionary` and `Texture` on 46).
   - `InteriorNames/Item` × 1,358, holding `2,280` nested `<Item>` records with `{Name, Pos}`. Their 2,280 3D positions
-    span `x = -9,673.0..4,705.3`, `y = -7,308.0..8,589.9`, `z = -78.0..820.9` — 100% inside the world bounds of the
-    `PAMH` heightmap and `GridAtlasInfo` grids above.
     span `x = -9,673.0..4,705.3`, `y = -7,308.0..8,589.9`, `z = -78.0..820.9` — their 2D `x`/`y` coordinates fall 100%
     inside the `x`/`y` extent of the `PAMH` heightmap (`-13,312..5,120`, `-9,728..11,264`) and `GridAtlasInfo` grids
     above, while `z` reaches `820.9` (above the `PAMH` `404` m ceiling).
@@ -951,6 +1341,46 @@ Four representative roots in the world/navigation/map category (826,397 B across
   `RumbleCurveStart`) linked by `43` `Successes/Item` transitions (`type="CHazardTransition"`, gated by
   `CAIConditionGatorPit` [36], `CAIConditionAmbientEventDirection` [5], `CAIConditionOr` [1], `CAIConditionAnd` [1]).
   All **18 of 18** non-empty transition target `<Node>` references resolve to one of the 20 `CHazardNode` keys.
+
+## Door interaction, ped loadouts, climbing, lasso and AI rule schemas
+
+Fourteen previously undocumented well-formed `common.rpf` documents span **1,682,656 inflated bytes** across **32**
+streams. Counts, schemas, `type` classes and internal/cross-document key resolutions only; no entry names or values:
+
+### `CDoorInteractionDataList` (404,957 B, 7 streams, 5,831 elements)
+
+Fourteen top-level keyed sections (all 14 named across the reference paths and target sections below; `372` `key=` attributes, `979` `type=` attributes across `31` classes, `44` `content="matrix34"` transforms, `133` vectors, `791` `value=` scalars) form a self-contained internal lookup graph:
+
+| Section / reference path | Count | Resolves to / notes |
+|---|---:|---|
+| `DoorTypeToDataSetCollectionsMapping` / `List/Item` | 7 / 80 | `CDoorAssetList`; **80 of 80** resolve to `DataSetCollections` (`18` distinct) |
+| `DataSetCollections` / `List/Item` | 21 / 60 | `CDoorAssetList`; **60 of 60** resolve to `DoorInteractionDataSets` (`56` of `56` sets) |
+| `DoorInteractionDataSets` (`key=`, `type="CDoorInteractionDataSet"`) | 56 | `40` carry `parentPath`, all **40 of 40** resolving via `../Item[@key='...']` (`gamedata_graph.md`); `DoorType` (**20 of 20** → `DoorTypeToDataSetCollectionsMapping`), `OverlayDataSet` (**9 of 9** → `DoorInteractionAnimOverlayDataSets`), `PedHeadingData` (**11 of 11** non-empty → `DoorInteractionHeadingDatas`), `Interactions/Item` (**93 of 93** → `DoorInteractionDatas`), `PostAlignInteractions/Item` (**11 of 11** → `DoorInteractionPostAlignDatas`) |
+| `DoorInteractionDatas` (`91`) & `DoorInteractionPostAlignDatas` (`11`) | 102 | `DoorType` (**91 of 91** on interactions), `BreakoutData` (**91 of 91** + **11 of 11** → `DoorInteractionBreakoutDatas` [`6`]), `UpperbodyRequestData` (**91 of 91** + **11 of 11** → `DoorInteractionUpperbodyPoseDatas` [`8`]), `MTHWeightData` (**73 of 73** non-empty → `DoorInteractionMTHDatas` [`3`]), `InterruptToIdleBlendout` (**7 of 7** → `DoorInteractionBodyBlendOutDatas` [`1`]), `PedHeadingData` (**11 of 11** on interactions; **73 of 73** non-empty across all `.//PedHeadingData` → `DoorInteractionHeadingDatas` [`5`]), `AnimData/UpperbodyBodyBlendFilterTemplateOrSelector` (**4 of 4** → `HashSelectors` [`1`]) |
+| `DoorInteractionAnimOverlayDataSets` (`1`) & `DoorInteractionAnimOverlayDatas` (`8`) | 9 | `OverlayDatas/Item`: **8 of 8** resolve to `DoorInteractionAnimOverlayDatas` |
+| `DoorInteractionUpperbodyPoseDatas` (`8`) & `UpperbodyPoseRequiredBlackboardVariables` (`4`) | 12 | `WeaponData1H/DesiredPose` (**8 of 8**) and `WeaponData2H/DesiredPose` (**8 of 8**) resolve to `UpperbodyPoseRequiredBlackboardVariables` |
+
+### Ped loadouts, task tuning, headbob, speeds, motivation and motion prediction
+
+| Root | Inflated B (streams) | Measured schema and key resolution |
+|---|---:|---|
+| `CPedInventoryLoadOutManager` | 411,101 (7) | `8,103` elements, `5` `type` classes (`1,692` nested `Items/Item` across the document): `LoadOuts/Item` × `569` (`Name`, `Items`, holding `1,013` direct items: `601` `CLoadOutWeapon`, `302` `CLoadOutRef`, `110` `CLoadOutRandom`) and `NamedLoadoutItems/Item` × `191` (`key=`: `136` `CLoadOutRandom`, `45` `CLoadOutWeapon`, `10` `CLoadOutRef`). `DefaultLoadout` resolves **1 of 1** to `LoadOuts`, and **521 of 521** `CLoadOutRef/Name` elements (`184` distinct) resolve case-insensitively to `NamedLoadoutItems` (`518 of 521` / `185` distinct under exact case); `CLoadOutWeapon` carries `551` `WeaponRecipe` and `546` `WeaponPreset` (`231` distinct) fields |
+| `CTaskDataInfoManager` | 192,988 (3) | `3,532` elements (`2,990` `value=`): `aTaskData/Item` × `49` (`type="CTaskDataInfo"`, `27` distinct child fields) and `DefaultSet ref` (**1 of 1** → `aTaskData`). In `FleeStyleSets/{Base,InVehicle,OnMount}`, **47 of 49** entries each (`41` of `42` distinct) resolve case-insensitively to `aTaskData` (`16 of 49` / `13 of 42` under exact case) |
+| `STPedNavigationPredictiontPresetContainer` | 92,999 (2) | `1,648` elements (`1,597` `value=`; preserves `Predictiont` spelling): `mapPredictionPresets/Item` × `14` (`key=`), holding `21` `arPredictionSetConfigs/Item` blocks (`1..8` per preset, `71..75` fields each, `81` distinct field names across the 21 blocks covering collision, capsule, drops, step-ups, walls, cover shadows, corners, slope and climb flags) |
+| `STPedMotionPredictionSetContainer` | 50,327 (1) | `898` elements (`864` `value=`): `mapPredictionPresets/Item` × `10` (`key=`), holding `12` `arPredictionSets/Item` blocks (`1..3` per preset, `67` fields each from the same prediction-flag schema) |
+| `CPedHeadbobSettingsManager` → `CHeadbobConditionManager` | 88,190 (2) + 16,610 (1) | `CPedHeadbobSettingsManager` (`1,347` elements) defines `OnFootSettings` (`12` `IntensitySettingsMap/Item`, `6` `BodyBlendSettingsMap/Item`) and `InTransportSettings` (`12` and `0`) across `CPedHeadbobSettings` (`2`), `CPedHeadbobIntensitySettings` (`24`) and `CPedHeadbobBodyBlendSettings` (`6`). All **84 of 84** `pCondition ref` links (`15` distinct) resolve **across documents** to `CHeadbobConditionManager/Conditions/Item/@key` (`18` `CHeadbobCondition` entries built from `CAICondition*` condition trees) |
+| `CPedSpeedDataBlock` | 86,390 (2) | `2,248` elements (`1,455` `value=`, `0` `type=`): `Data/Item` × `16` (distinct `Name` entries, each with `WanderSpeeds`, `Default`, `Combat`, `Flee` over `{Walk,Jog,Run,Sprint}{Min,Max}` plus `QuadBike`, `EScooter`, `MobScooter`, `Caddy` × `16` and `Bike` × `15`, and `1` `ItemSpeeds/Item`) plus `DefaultItemSpeeds/Item` × `1` |
+| `CPedMotivationInfoManager` | 32,388 (1) | `872` elements (`499` `value=`): `EventMotivationImpactProfiles/Item` × `7` (`key=`, `35` `EventTypes/Item` across `5` keys, `51` `MotivationImpacts/Item` pairs `{Motivation, ImpactParams}`), `PedMotivationDefinitions/Item` × `14`, and `aFearResponseProfiles/Item` × `4`; `DefaultFearProfileName` resolves **1 of 1** to `aFearResponseProfiles` |
+
+### Lasso, climbing, animal attack behaviours, relationships and AI search POIs
+
+| Root | Inflated B (streams) | Measured schema and key resolution |
+|---|---:|---|
+| `CLassoDataManager` | 126,639 (2) | `2,718` elements across `11` top-level sections (`99` `key=`, `692` `value=`, `380` 3D vectors with `7` `w`): `LassoHogtieFlagSets/Item` (`8`, referenced **24 of 24** by `ModelToLassoHogtieFlagsKey` plus all **3** default flag fields), `EntityLassoAttachInfo/Item` (`18`, referenced **26 of 26** by `ModelNameToEntityLassoAttachInfo` plus `DefaultHumanEnityLassoAttachInfo` and `DefaultHorseEnityLassoAttachInfo` [`Enity` preserved in XML]), and `LassoAttachments/Item` (`23`, referenced **18 of 18** by `DefaultAttachment` and **20 of 20** by `Attachments/Item`), plus `LassoWeaponLoopBoneTags/Item` × `15` |
+| `CAnimalAttackBehaviours` | 55,388 (1) | `877` elements (`378` `type=`): `Behaviours/Item` × `6` (`type="CAnimalAttackBehaviour"`, `{Name, AnimalTuning, Task, Triggers}`) holding `64` `CAnimalAttackTrigger` entries, `58` gated by `CAICondition*` boolean trees (`308` nodes across `32` condition classes, led by `CAIConditionAnd` [`53`], `CAIConditionNot` [`31`], `CAIConditionDistanceBetweenEntities` [`21`]) |
+| `CClimbTuneMgr` | 54,137 (1) | `1,102` elements across `12` top-level sections (`TraversalData`, `LandData`, `PlayerClimbData` [20 scalars], `PlayerStepUpData` [15 scalars], `PlayerLedgeGrabData` [16 entries], `PlayerJumpData` [11 entries], `AnimalJumpData` [11 scalars], `InputControlData` [4 scalars], `aClimbParams/Item` × `2` [`CClimbParams`], `aDropdownDetectorParams/Item` × `2` [`CDropDownDetectorParams`, with `matOverride` `content="matrix34"`]); `DefaultClimbParams ref` and `DefaultDropDownParams ref` resolve **1 of 1** each |
+| `Relationships__GroupsData` | 35,555 (1) | `554` elements: `Groups/Item` × `64` (`key=`) containing `423` `Relationships/Item` entries across `4` relationship-level text values (`62` distinct targets); all **423 of 423** resolve internally to `Groups/Item/@key` |
+| `CSearchPointOfInterestRuleSet` | 34,987 (1) | `684` elements (`47` `CAICondition*` nodes across `14` classes): `PointOfInterestDefinitions/PointOfInterest` × `12` (`key=`) and `SearchSituations/Situation` × `13` (`key=`). All **112 of 112** `AllowedPointsOfInterest/Type/@key` (`12` of `12` POIs) resolve to `PointOfInterestDefinitions`, and all **7 of 7** non-empty `NextSituation` links (`6` distinct) resolve to `SearchSituations` |
 
 ## No-sharing rule
 

@@ -15,7 +15,8 @@
 //     first origin after ScheduleFrameEventX is the next vblank. The origin event of vblank n is signalled
 //     offset microseconds after it (ScheduleFrameEventX's offset).
 //   * A frame is "in flight" from PresentX until the vblank that shows it. Frames show one per vblank, in order.
-//     WaitFrameEventX does not return while `latency` frames are in flight.
+//     WaitFrameEventX does not return while `latency` frames are in flight. A frame presented while the origin event
+//     is not armed is not paced (PresentX does not hold it for a vblank): it shows at once and is never in flight.
 //   * A wait that comes late (after the next origin already passed) returns at once with the newest passed origin;
 //     the missed origins are skipped, not queued.
 //   * Tokens are 1, 2, 3, ... (0 is the null token), one per successful wait, never reused, across suspend/resume.
@@ -296,7 +297,7 @@ public:
         const std::uint64_t now = clock_.now_us();
         retire_locked(now);
         last_presented_ = std::max(last_presented_, token);
-        if (!interval_set_) {  // not paced: shows at once
+        if (!interval_set_ || !armed_) {  // not paced (PresentX holds no vblank until the event is armed): shows at once
             for (Record& r : records_)
                 if (r.token == token) { r.presented = r.displayed = true; r.present_us = r.display_us = now; }
             return;
@@ -320,10 +321,11 @@ public:
         retire_locked(now);
         cv_.notify_all();
     }
-    // A blank present (no planes) carries no token: it is only counted as a frame to show.
+    // A blank present (no planes) carries no token: it is only counted as a frame to show. With no interval set or
+    // the origin event not armed it is not paced: it shows at once and is not counted.
     void note_untokened_present() {
         std::lock_guard guard(mutex_);
-        if (!interval_set_) return;
+        if (!interval_set_ || !armed_) return;
         const std::uint64_t now = clock_.now_us();
         retire_locked(now);
         const std::uint64_t since = now > epoch_us_ ? now - epoch_us_ : 0;

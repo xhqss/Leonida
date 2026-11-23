@@ -10,37 +10,43 @@ Counts, target masks, numeric constants and format requirements only; no shader 
 ## 1. Corpus census of deferred pixel-shader output signatures (`OSG1` / `PSV0`)
 
 Every DXBC container in `shaders.rpf` carries an `OSG1` (and `PSV0`) output signature table with `{register,
-semantic_index, component_type, mask, min_precision}` per `SV_TargetN` output, and the unpacked FSSM header records the
-exported target count as `u32` at `+0x0FC`.
+semantic_index, component_type, mask, min_precision}` per declared output element. (The FSSM header dword at `+0x0FC`
+holds `5` and `6` on the two sampled `PS_DeferredTextured` blobs below, but holds `16` and `18` on two stock vehicle
+deferred passes, so target counts must be read from `OSG1` rather than FSSM `+0x0FC`.)
 
-Across the **2,989** pixel shaders with `Deferred` in their container name (including **807** `PS_DeferredTextured`
-variants: 380 five-target, 371 six-target and 56 three-target):
+Depending on whether container names are matched case-insensitively on raw RPF entry names (`2,989` pixel shaders) or
+case-sensitively on `Deferred` in the carved `.dxbc` file stems (`3,004` pixel shaders, including `807`
+`PS_DeferredTextured` variants: 380 five-target, 371 six-target and 56 three-target):
 
-| Targets declared (`+0x0FC` / `OSG1`) | `*Deferred*` PS count | `PS_DeferredTextured` count | Corpus-wide PS count | `OSG1` component type on all colour targets | Per-target `OSG1` write masks (`SV_Target0..N-1`) |
-|---:|---:|---:|---:|---|---|
-| 6 (`SV_Target0..5`) | 953 | 371 | 955 | `float32` (`ctype = 3`, `prec = 0`) | `0xF, 0xF, 0xF, 0xF, 0x3, 0xF` (`mrt4` is 2-component `RG`) |
-| 6 (`SV_Target0..5`) | 737 | 0 | 747 | `float32` (`ctype = 3`, `prec = 0`) | `0xF, 0xF, 0xF, 0xF, 0xF, 0xF` (all six `RGBA`) |
-| 5 (`SV_Target0..4`) | 1,160 | 380 | 1,168 | `float32` (`ctype = 3`, `prec = 0`) | `0xF, 0xF, 0xF, 0xF, 0x3` (`mrt4` is 2-component `RG`) |
-| 5 (`SV_Target0..4`) | 2 | 0 | 20 | `float32` (`ctype = 3`, `prec = 0`) | `0xF, 0xF, 0xF, 0xF, 0xF` |
-| 3 (`SV_Target0..2`) | 125 | 56 | 248 | `float32` (`ctype = 3`, `prec = 0`) | `0xF, 0xF, 0x3` (`mrt2` is 2-component `RG`) |
-| other (`0, 1, 2, 4` or `5 + SV_Depth`) | 12 | 0 | — | `float32` (3 single-target `uint32`) | depth-only, discard, or reduced passes |
+| `OSG1` outputs declared | `*Deferred*` PS (entry match / `.dxbc` stem match) | `PS_DeferredTextured` count | Corpus-wide PS (entry / `.dxbc` stem) | `OSG1` component type on all colour targets | Per-target `OSG1` write masks (`SV_Target0..N-1`) |
+|---|---:|---:|---:|---|---|
+| 6 colour (`SV_Target0..5`) | 953 / 949 | 371 | 955 / 955 | `float32` (`ctype = 3`, `prec = 0`) | `0xF, 0xF, 0xF, 0xF, 0x3, 0xF` (`SV_Target4` mask is 2-component `RG`) |
+| 6 colour (`SV_Target0..5`) | 737 / 735 | 0 | 747 / 747 | `float32` (`ctype = 3`, `prec = 0`) | `0xF, 0xF, 0xF, 0xF, 0xF, 0xF` (all six `RGBA`) |
+| 5 colour + `SV_Depth` | 0 / 0 | 0 | 1 / 0 | `float32` (`ctype = 3`, `prec = 0`) | `0xF, 0xF, 0xF, 0xF, 0x3` + `SV_Depth` (`0x1`) |
+| 5 colour (`SV_Target0..4`) | 1,160 / 1,160 | 380 | 1,168 / 1,166 | `float32` (`ctype = 3`, `prec = 0`) | `0xF, 0xF, 0xF, 0xF, 0x3` (`SV_Target4` mask is 2-component `RG`) |
+| 5 colour (`SV_Target0..4`) | 2 / 2 | 0 | 20 / 20 | `float32` (`ctype = 3`, `prec = 0`) | `0xF, 0xF, 0xF, 0xF, 0xF` |
+| 3 colour (`SV_Target0..2`) | 125 / 125 | 56 | 248 / 248 | `float32` (`ctype = 3`, `prec = 0`) | `0xF, 0xF, 0x3` (`SV_Target2` mask is 2-component `RG`) |
+| other (`0..4` outputs) | 12 / 33 | 0 | — | `float32` (3 single-target `uint32`) | depth-only, discard, or reduced passes |
 
-In the compiled RDNA2 code of every 5-target and 6-target `PS_DeferredTextured` variant, all exported targets
-(`mrt0..mrt4` or `mrt0..mrt5`) pack their outgoing register pairs with `v_cvt_pkrtz_f16_f32` and export them with
-`exp mrtN, ... compr` (`EXP_FORMAT_FP16_ABGR`).
+The two six-colour-target rows total **1,702** pixel shaders corpus-wide (`955 + 747`; plus 1 five-colour-target +
+`SV_Depth` shader with 6 `OSG1` rows = 1,703 six-row `OSG1` tables). In the compiled RDNA2 code across the `*Deferred*`
+pixel shaders, **16,306 of 16,306 (100%)** `exp mrtN` instructions use compressed half-float export (`compr`,
+`EXP_FORMAT_FP16_ABGR`), fed by `v_cvt_pkrtz_f16_f32`.
 
 ## 2. G-buffer target layout (`mrt0..mrt5`)
 
-Confirming #1891 against the 5-target (`mrt0..mrt4`) and 6-target (`mrt0..mrt5`) `PS_DeferredTextured` programs:
+Comparing #1891 against the 5-target (`mrt0..mrt4`) and 6-target (`mrt0..mrt5`) `PS_DeferredTextured` programs (note
+that the RTV format column below is **inferred from the shader-side encoding and #1891**, not declared by `OSG1` or a
+captured PSO):
 
-| Target | `OSG1` mask | Expected RTV format class | Channel layout and encoding in `PS_DeferredTextured` |
+| Target | `OSG1` mask | Inferred RTV format class (from shader encoding / #1891) | Channel layout and shader-side encoding in `PS_DeferredTextured` |
 |---|---|---|---|
-| `mrt0` (`SV_Target0`) | `0xF` (`RGBA`) | `R8G8B8A8_UNORM` | **Albedo + alpha/material byte:** `rgb` holds base colour/albedo; in 6-target variants `a` packs a byte extracted from an integer register and scaled by `1.0 / 255.0` (`0x3b808081`). |
+| `mrt0` (`SV_Target0`) | `0xF` (`RGBA`) | `R8G8B8A8_UNORM` | **Albedo + alpha/material byte:** `rgb` holds base colour/albedo; in the sampled 6-target variant `a` packs a byte extracted from an integer register (`ubyte0`) and scaled by `1.0 / 255.0` (`0x3b808081`). |
 | `mrt1` (`SV_Target1`) | `0xF` (`RGBA`) | `R8G8B8A8_UNORM` | **Scalar in `r` + 24-bit octahedral world normal split across `g`, `b`, `a`:** see section 3 below. |
-| `mrt2` (`SV_Target2`) | `0xF` (`RGBA`) | `R8G8B8A8_UNORM` | **Square-root encoded material/specular channels:** `rgb` values pass through hardware square root (`sqrt(x)`, or `sqrt(1.0 - sqrt(x))` on 6-target variants) before export so the deferred lighting pass squares them back; `a` holds an unencoded `[0, 1]` scalar (`0.5` or a conditional select). |
-| `mrt3` (`SV_Target3`) | `0xF` (`RGBA`) | `R8G8B8A8_UNORM` | **Flags + byte IDs:** `x` and `y` carry clamped `[0, 1]` material/shading flags biased by a dither term (`scale = 2.0 / 255.0` = `0x3c008081`, `offset = -1.0 / 255.0` = `0xbb808081`); `z` and `w` carry two 8-bit integer IDs extracted with byte-to-float conversion (`ubyte0`, `ubyte1`) and multiplied by `1.0 / 255.0` (`0x3b808081`). |
-| `mrt4` (`SV_Target4`) | `0x3` (`RG`, 2,113 deferred PS) or `0xF` (`RGBA`, 739 deferred PS) | Float format (e.g. `R16G16_FLOAT`) | **Motion vectors:** unscaled signed float screen-space motion offset (`xy`, with `zw` disabled as `off, off` on the 2,113 `mask = 0x3` variants). |
-| `mrt5` (`SV_Target5`) | `0xF` (`RGBA`, 1,690 deferred PS) | `R8G8B8A8_UNORM` | **Sixth deferred target** on the 6-target permutations (`rgb` material terms + clamped alpha). |
+| `mrt2` (`SV_Target2`) | `0xF` (`RGBA`) | `R8G8B8A8_UNORM` | **Square-root encoded channels:** producer applies hardware square root (`sqrt(x)` or `sqrt(1.0 - sqrt(x))`) before `v_cvt_pkrtz_f16_f32` export; #1891 notes that the lighting consumer squares `mrt2` back (tentatively specular / $F_0$ material terms, pending lighting-consumer verification). |
+| `mrt3` (`SV_Target3`) | `0xF` (`RGBA`) | `R8G8B8A8_UNORM` | **Flags + byte IDs:** `x` and `y` carry clamped `[0, 1]` values biased by a dither term (`scale = 2.0 / 255.0` = `0x3c008081`, `offset = -1.0 / 255.0` = `0xbb808081`); `z` and `w` carry two 8-bit integer IDs extracted with byte-to-float conversion (`ubyte0`, `ubyte1`) and multiplied by `1.0 / 255.0` (`0x3b808081`). |
+| `mrt4` (`SV_Target4`) | `0x3` (`RG`, 2,113 / 2,109 deferred PS) or `0xF` (`RGBA`, 739 / 737 deferred PS) | Float format (e.g. `R16G16_FLOAT`) | **Motion vectors:** unscaled signed float screen-space motion offset (`xy`; in the sampled 5- and 6-target `PS_DeferredTextured` disassembly with `mask = 0x3`, exported as `exp mrt4, vN, vN, off, off compr`). |
+| `mrt5` (`SV_Target5`) | `0xF` (`RGBA`, 1,690 / 1,684 deferred PS) | `R8G8B8A8_UNORM` | **Sixth deferred target** on the 6-target permutations (`rgb` material terms + clamped alpha). |
 
 ## 3. The 24-bit octahedral normal in `mrt1.gba` and why binding `f16` targets breaks lighting
 semantic_index, component_type, mask, min_precision}` per declared output element. (The FSSM header dword at `+0x0FC`
@@ -96,7 +102,7 @@ captured PSO):
    multiplied by `1.0 / 255.0` (`0x3b808081`), rounded toward zero to `f16` (`v_cvt_pkrtz_f16_f32`), and exported to
    `mrt1.g`, `mrt1.b`, and `mrt1.a`.
 
-### Consequence for the runtime and test harnesses
+### Arithmetic across all 256 byte values and consequence for the runtime
 
 - **Declared signatures do not separate `UNORM8` from `FLOAT16`:** because `OSG1` and `PSV0` declare `float32` on all
   six `SV_Target0..5` outputs and the RDNA2 code uses `exp mrtN ... compr` (`EXP_FORMAT_FP16_ABGR`) for all of them,

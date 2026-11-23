@@ -359,7 +359,7 @@ class ArchiveTests(unittest.TestCase):
             with open(path, "wb") as fh:
                 fh.write(b"RPF9" + struct.pack("<I", 16) + b"\0" * 8 + body + zlib.compress(b"\x63\x30\x00\x00" * 8))
             out_json = os.path.join(tmp, "out.json")
-            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out_json], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out_json], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 0, r.stderr)
             with open(out_json, encoding="utf-8") as fh:
                 out = json.load(fh)
@@ -373,7 +373,7 @@ class ArchiveTests(unittest.TestCase):
             with open(path, "wb") as fh:
                 fh.write(b"RPF9" + struct.pack("<I", 16) + b"\0" * 8 + zlib.compress(run))
             out_json = os.path.join(tmp, "out.json")
-            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out_json], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out_json], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 0, r.stderr)
             with open(out_json, encoding="utf-8") as fh:
                 out = json.load(fh)
@@ -381,7 +381,7 @@ class ArchiveTests(unittest.TestCase):
 
     def test_directory_scan_uses_stable_archive_order(self):
         with tempfile.TemporaryDirectory() as root:
-            def walk(path):
+            def walk(path, onerror=None):
                 directories = ["z", "a"]
                 yield path, directories, []
                 for directory in directories:
@@ -399,7 +399,7 @@ class ArchiveTests(unittest.TestCase):
             ])
 
     def test_negative_limit_is_an_error(self):
-        r = subprocess.run([sys.executable, "-I", TOOL, TOOL, "--limit", "-1"], capture_output=True, text=True)
+        r = subprocess.run([sys.executable, "-I", TOOL, TOOL, "--limit", "-1"], capture_output=True, text=True, errors="replace")
         self.assertEqual(r.returncode, 2)
 
     @staticmethod
@@ -413,7 +413,7 @@ class ArchiveTests(unittest.TestCase):
     def test_json_over_an_input_archive_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             path, data = self._archive(tmp)
-            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", path], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", path], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("would overwrite the input", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
@@ -426,7 +426,7 @@ class ArchiveTests(unittest.TestCase):
             sub = os.path.join(tmp, "pack")
             os.mkdir(sub)
             path, data = self._archive(sub)
-            r = subprocess.run([sys.executable, "-I", TOOL, tmp, "--json", path], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, tmp, "--json", path], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("would overwrite the input", r.stderr)
             with open(path, "rb") as fh:
@@ -435,7 +435,7 @@ class ArchiveTests(unittest.TestCase):
     def test_json_that_is_a_directory_is_refused_before_the_scan(self):
         with tempfile.TemporaryDirectory() as tmp:
             path, _ = self._archive(tmp)
-            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", tmp], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", tmp], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("is a directory", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
@@ -445,7 +445,7 @@ class ArchiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path, _ = self._archive(tmp)
             out = os.path.join(tmp, "reports", "vertex", "out.json")
-            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 0, r.stderr)
             with open(out, encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh)["blocks"], 1)
@@ -457,7 +457,7 @@ class ArchiveTests(unittest.TestCase):
             with open(blocker, "w", encoding="utf-8") as fh:
                 fh.write("a file, not a folder")
             out = os.path.join(blocker, "out.json")
-            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("cannot write", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
@@ -524,7 +524,7 @@ class Rpf9ValidationTests(unittest.TestCase):
 
     @staticmethod
     def _run(args):
-        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True, errors="replace")
 
     def test_invalid_headers_are_errors(self):
         cases = [
@@ -564,6 +564,54 @@ class Rpf9ValidationTests(unittest.TestCase):
                     r = self._run([str(path)])
                     self.assertEqual(r.returncode, 0, r.stderr)
                     self.assertEqual(json.loads(r.stdout)["streams"], streams)
+
+    def test_unlistable_subfolder_is_a_clean_error_not_a_silent_skip(self):
+        # os.walk skips a directory it cannot list unless onerror raises; the scan used to report an
+        # empty directory and exit 0, hiding the incomplete scan.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            sub = root / "sub"
+            sub.mkdir()
+            (sub / "x.rpf").write_bytes(b"RPF9" + struct.pack("<I", 8))
+            os.chmod(sub, 0o000)
+            try:
+                try:
+                    os.listdir(sub)
+                    self.skipTest("the sub-folder is still listable (running as root, or Windows)")
+                except OSError:
+                    pass
+                r = self._run([str(root)])
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("error:", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+            finally:
+                os.chmod(sub, 0o755)
+
+    def test_unlistable_subfolder_fails_when_chmod_is_not_enough(self):
+        # The test above self-skips on Windows and as root, and CI only runs this file on
+        # windows-latest, so the guard would go unexercised there. Forcing os.scandir to raise for
+        # one folder reproduces the same PermissionError os.walk hits for real, on every platform.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            sub = root / "sub"
+            sub.mkdir()
+            (sub / "x.rpf").write_bytes(b"RPF9" + struct.pack("<I", 8))
+            real_scandir = os.scandir
+            locked = os.path.normcase(os.path.abspath(str(sub)))
+
+            def scandir(path, *args, **kwargs):
+                if os.path.normcase(os.path.abspath(str(path))) == locked:
+                    raise PermissionError(13, "Access is denied", str(path))
+                return real_scandir(path, *args, **kwargs)
+
+            err = io.StringIO()
+            with mock.patch.object(vt.os, "scandir", scandir):
+                with contextlib.redirect_stderr(err):
+                    code = vt.main([str(root)])
+            self.assertEqual(code, 2, err.getvalue())
+            self.assertIn("error:", err.getvalue())
+            self.assertIn("sub", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
 
 
 if __name__ == "__main__":

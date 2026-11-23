@@ -386,6 +386,84 @@ int main() {
         check(!parse_rts0(v4.data(), v4.size()).ok, "RTS0 version 4 rejected");
     }
 
+    // pack_stage: the console layout (D3D-448).
+    {
+        check(stage_base(Stage::Compute) == 4 && stage_base(Stage::Mesh) == 16 && stage_base(Stage::Pixel) == 8 &&
+                  stage_base(Stage::Vertex) == 8 && stage_base(Stage::Geometry) == 8,
+              "pack_stage: stage bases cs s4, ms s16, vs/ps/gs s8");
+        check(stage_dwords(ParamType::Table, 0) == 1 && stage_dwords(ParamType::Descriptor, 0) == 2 &&
+                  stage_dwords(ParamType::Constants, 3) == 3,
+              "pack_stage: a table takes 1 dword, a root view 2, constants their count");
+
+        // The shape of the package's FidelityFX compute signatures: two tables, then four root CBVs. The console
+        // launched those programs with 14 user SGPRs and they read the tables at s4/s5 and the CBVs as s[6:7]..s[12:13].
+        RootSignature fsr;
+        fsr.params = {table(), table(), view(), view(), view(), view()};
+        const StagePackResult r = pack_stage(fsr, Stage::Compute);
+        check(r.ok && r.base == 4, "pack_stage: FidelityFX shape packs for compute");
+        check(r.first_sgpr == std::vector<uint32_t>({4, 5, 6, 8, 10, 12}),
+              "pack_stage: tables at s4, s5 and root CBVs at s6, s8, s10, s12");
+        check(r.end_sgpr == 14, "pack_stage: ends at s14, the programs' USER_SGPR count");
+        check(r.d3d12_cost == 10, "pack_stage: D3D12 cost 1 + 1 + 2 * 4");
+        const PackResult old = pack(fsr);
+        check(old.ok && old.dword_count == 12, "pack_stage: the s0 model spans 12 dwords for the same signature");
+
+        // Static samplers take no SGPRs; the same parameters land at the stage's own base.
+        RootSignature mixed;
+        mixed.params = {consts(3), table(), view()};
+        mixed.static_samplers.resize(2);
+        const StagePackResult ps = pack_stage(mixed, Stage::Pixel);
+        check(ps.ok && ps.first_sgpr == std::vector<uint32_t>({8, 11, 12}) && ps.end_sgpr == 14,
+              "pack_stage: pixel stage from s8, static samplers free");
+        const StagePackResult ms = pack_stage(mixed, Stage::Mesh);
+        check(ms.ok && ms.first_sgpr == std::vector<uint32_t>({16, 19, 20}) && ms.end_sgpr == 22,
+              "pack_stage: mesh stage from s16");
+
+        // An empty signature is valid and uses nothing.
+        const StagePackResult empty = pack_stage(RootSignature{}, Stage::Compute);
+        check(empty.ok && empty.first_sgpr.empty() && empty.end_sgpr == 4, "pack_stage: empty signature");
+    }
+
+    // pack_stage refuses a spill instead of truncating: compute has 28 SGPRs above s4, mesh 16 above s16.
+    {
+        RootSignature exact;
+        exact.params = {consts(28)};
+        check(pack_stage(exact, Stage::Compute).ok, "pack_stage: 28 constants fill compute exactly");
+        RootSignature over;
+        over.params = {consts(27), view()};  // the view would need s31..s32
+        const StagePackResult r = pack_stage(over, Stage::Compute);
+        check(!r.ok && r.first_sgpr.empty() && r.error.find("root parameter 1") != std::string::npos &&
+                  r.error.find("spill") != std::string::npos,
+              "pack_stage: a parameter that does not fit whole is refused and named");
+        RootSignature fits_old;
+        fits_old.params = {consts(30)};  // fits pack()'s 32 from s0, not 28 from s4
+        check(pack(fits_old).ok && !pack_stage(fits_old, Stage::Compute).ok,
+              "pack_stage: compute budget is 28, not 32");
+        RootSignature tables;
+        tables.params.assign(20, table());  // one dword each: compute s4..s23; pack() needs 40
+        check(pack_stage(tables, Stage::Compute).ok && !pack(tables).ok,
+              "pack_stage: 20 one-dword tables fit compute, which pack() refuses (40 dwords of tables)");
+        tables.params.assign(16, table());  // fills mesh s16..s31 exactly
+        check(pack_stage(tables, Stage::Mesh).ok, "pack_stage: 16 tables fill the mesh stage exactly");
+        tables.params.push_back(table());
+        check(!pack_stage(tables, Stage::Mesh).ok, "pack_stage: a 17th table spills on mesh");
+    }
+
+    // pack_stage keeps pack()'s validation.
+    {
+        RootSignature zero;
+        zero.params = {consts(0)};
+        check(!pack_stage(zero, Stage::Compute).ok, "pack_stage: zero-value constants rejected");
+        // Every parameter takes at least as many SGPRs as it costs, so the 32-SGPR budget refuses before the
+        // 64-dword cost limit can; an over-cost signature is refused all the same.
+        RootSignature costly;
+        costly.params = {consts(40), consts(30)};
+        check(!pack_stage(costly, Stage::Compute).ok, "pack_stage: over-cost signature refused");
+        RootSignature many;
+        many.params.assign(65, table());
+        check(!pack_stage(many, Stage::Compute).ok, "pack_stage: more than 64 parameters rejected");
+    }
+
     if (g_failures != 0) std::printf("%d FAILURES\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

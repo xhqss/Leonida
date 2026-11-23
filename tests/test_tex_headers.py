@@ -895,7 +895,7 @@ class CliInputTest(unittest.TestCase):
 
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", os.path.join(TOOLS_DIR, "tex_headers.py"), *args],
-                              capture_output=True, text=True, timeout=60)
+                              capture_output=True, text=True, errors="replace", timeout=60)
 
     def test_out_in_a_missing_folder_is_created(self):
         # Before: main() opened --out directly after the scan, so this ended in a FileNotFoundError traceback.

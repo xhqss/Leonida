@@ -8,10 +8,13 @@
 #include "../src/shader_library.h"
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
+#include <winver.h>
 #include <array>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <string>
+#include <vector>
 
 #ifndef LEONIDA_TEST_INDIRECT_COUNT_SPV
 #error "LEONIDA_TEST_INDIRECT_COUNT_SPV must name the synthetic GLSL compute module"
@@ -139,7 +142,9 @@ bool run(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, UINT count,
     return true;
 }
 
-std::array<UINT, 2> expected(UINT count, bool update) {
+// The second dispatch of a gpu_update run reads the count written by the copy before it (3).
+// With second_count == count instead, this is what a host that reuses the first count gives.
+std::array<UINT, 2> expected(UINT count, bool update, UINT second_count = 3) {
     auto result = std::array<UINT, 2>{};
     const auto accumulate = [&](UINT c) {
         for (UINT i = 0; i < std::min(c, kMaximum); ++i) {
@@ -148,8 +153,26 @@ std::array<UINT, 2> expected(UINT count, bool update) {
         }
     };
     accumulate(count);
-    if (update) accumulate(3);
+    if (update) accumulate(second_count);
     return result;
+}
+
+// Build and revision of a loaded system DLL ("22621.5415"; Windows shows it as 10.0.22621.5415), or "unknown".
+std::string module_version(const wchar_t* name) {
+    const HMODULE module = GetModuleHandleW(name);
+    wchar_t path[MAX_PATH]{};
+    if (!module || !GetModuleFileNameW(module, path, MAX_PATH)) return "unknown";
+    DWORD ignored = 0;
+    const DWORD size = GetFileVersionInfoSizeW(path, &ignored);
+    std::vector<std::uint8_t> data(size);
+    VS_FIXEDFILEINFO* info = nullptr;
+    UINT length = 0;
+    if (!size || !GetFileVersionInfoW(path, 0, size, data.data()) ||
+        !VerQueryValueW(data.data(), L"\\", reinterpret_cast<void**>(&info), &length) || !info)
+        return "unknown";
+    char text[64];
+    std::snprintf(text, sizeof text, "%u.%u", HIWORD(info->dwFileVersionLS), LOWORD(info->dwFileVersionLS));
+    return text;
 }
 }  // namespace
 
@@ -205,22 +228,36 @@ int main() {
     Ref<ID3D12Device> layer;
     if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&layer.p)))) return 1;
 
-    unsigned cases = 0;
+    // The layer is checked against expected(), the D3D12 rule that the count is read when the GPU executes the
+    // command. WARP must match it too, with one measured exception: in-box WARP 10.0.22621.5415 (Windows 11 23H2)
+    // reuses the first count for the second ExecuteIndirect after the GPU copy overwrites it (0 -> 3 gives 0/0,
+    // 1 -> 3 gives 2/2). That case is reported, not failed, when WARP gives exactly the stale-count result.
+    unsigned cases = 0, stale_host = 0;
     for (UINT count : {0u, 1u, 3u, 7u}) {
         for (bool update : {false, true}) {
             std::array<UINT, 2> native_result{}, layer_result{};
+            const auto want = expected(count, update);
             if (!run(host.p, native_code, count, update, native_result, false) ||
-                !run(layer.p, container, count, update, layer_result, true) ||
-                native_result != expected(count, update) || layer_result != native_result) {
+                !run(layer.p, container, count, update, layer_result, true) || layer_result != want ||
+                (native_result != want && !(update && native_result == expected(count, update, count)))) {
                 std::fprintf(stderr, "count %u update %d: host %u/%u, layer %u/%u, expected %u/%u\n",
                              count, int(update), native_result[0], native_result[1],
-                             layer_result[0], layer_result[1],
-                             expected(count, update)[0], expected(count, update)[1]);
+                             layer_result[0], layer_result[1], want[0], want[1]);
                 return 1;
+            }
+            if (native_result != want) {
+                std::printf("count %u update 1: host WARP build %s reused the first count (%u/%u, expected %u/%u); "
+                            "the layer matches the expected result\n",
+                            count, module_version(L"d3d10warp.dll").c_str(), native_result[0], native_result[1],
+                            want[0], want[1]);
+                ++stale_host;
             }
             ++cases;
         }
     }
+    if (stale_host)
+        std::printf("%u GPU-count-overwrite case(s) checked against the expected result only (stale WARP count)\n",
+                    stale_host);
     if (vk.validation_errors()) {
         std::fprintf(stderr, "validation errors: %u\n", vk.validation_errors());
         return 1;

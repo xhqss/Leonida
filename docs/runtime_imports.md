@@ -22,10 +22,13 @@ runtime\build\gta6rt.exe --dry-run "$game\XboxBvhBuilder.dll" --game-dir $game
 Each run prints one line per mapped module:
 
 ```
-XboxBvhBuilder.dll  base=0000000180000000 size=909312 entry=+0x227cc  shim=2 host=55 module=0 unimplemented=0
+XboxBvhBuilder.dll  base=0000000180000000 size=909312 entry=+0x227cc  shim=4 host=53 module=0 unimplemented=0
     shim          d3d12_xs.dll!D3D12SerializeVersionedRootSignature
     shim          xmem.dll!XMemVirtualQuery
+    shim          api-ms-win-crt-runtime-l1-1-0.dll!_configure_narrow_argv
+    shim          api-ms-win-core-libraryloader-l1-2-0.dll!DisableThreadLibraryCalls
 1 module(s) mapped, 0 unimplemented import(s)
+unimplemented by return policy: hresult=0 other=0
 ```
 
 `shim` counts imports served by the clean-room tables, `host` counts imports served by the desktop DLLs,
@@ -33,30 +36,32 @@ XboxBvhBuilder.dll  base=0000000180000000 size=909312 entry=+0x227cc  shim=2 hos
 
 ## Measured result
 
-All 16 DLLs in the package map at their preferred base `0x180000000` with no relocation, and every import binds:
+All 16 DLLs in the package map at their preferred base `0x180000000` with no relocation, and every import binds. `gta6rt --init` on each one also runs its TLS callbacks and `DllMain` and exits 0 (counts re-measured with `--dry-run` and `--init` on `main` `aa2988cc`, Windows 11):
 
-| Image | Size of image | Entry RVA | Shim | Host | Module | Unimplemented |
-|---|---:|---:|---:|---:|---:|---:|
-| `Bink2Scarlett.dll` | 278,528 | `0x2ac1c` | 3 | 57 | 0 | 0 |
-| `XboxBvhBuilder.dll` | 909,312 | `0x227cc` | 4 | 53 | 0 | 0 |
-| `amd_fidelityfx_upscaler_xbox.dll` | 802,816 | `0x26780` | 6 | 80 | 0 | 0 |
-| `amd_fidelityfx_loader_xbox.dll` | 32,768 | `0x18d0` | 5 | 17 | 0 | 0 |
-| `libHttpClient.GDK.dll` | 999,424 | `0x11f0` | 11 | 187 | 0 | 0 |
-| `XCurl.dll` | 188,416 | `0x17b0` | 9 | 131 | 0 | 0 |
-| `concrt140.dll` | 303,104 | `0x29160` | 2 | 101 | 0 | 0 |
-| `msvcp140.dll` | 577,536 | `0x525a0` | 9 | 178 | 0 | 0 |
-| `msvcp140_1.dll` | 36,864 | `0x15c0` | 2 | 31 | 0 | 0 |
-| `msvcp140_2.dll` | 192,512 | `0x1efa0` | 2 | 94 | 0 | 0 |
-| `msvcp140_atomic_wait.dll` | 81,920 | `0x3c80` | 4 | 60 | 0 | 0 |
-| `msvcp140_codecvt_ids.dll` | 28,672 | `0x1340` | 2 | 22 | 0 | 0 |
-| `vccorlib140.dll` | 344,064 | `0x27e50` | 7 | 107 | 0 | 0 |
-| `vcomp140.dll` | 86,016 | `0x6580` | 7 | 71 | 0 | 0 |
-| `vcruntime140.dll` | 110,592 | `0xf890` | 3 | 38 | 0 | 0 |
-| `vcruntime140_1.dll` | 49,152 | `0x3e90` | 1 | 33 | 0 | 0 |
+| Image | Size of image | Entry RVA | Shim | Host | Module | Unimplemented | `--init` |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `Bink2Scarlett.dll` | 278,528 | `0x2ac1c` | 4 | 56 | 0 | 0 | exit 0 |
+| `XboxBvhBuilder.dll` | 909,312 | `0x227cc` | 4 | 53 | 0 | 0 | exit 0 |
+| `amd_fidelityfx_upscaler_xbox.dll` | 802,816 | `0x26780` | 6 | 80 | 0 | 0 | exit 0 |
+| `amd_fidelityfx_loader_xbox.dll` | 32,768 | `0x18d0` | 5 | 17 | 0 | 0 | exit 0 |
+| `libHttpClient.GDK.dll` | 999,424 | `0x11f0` | 26 | 172 | 0 | 0 | exit 0 |
+| `XCurl.dll` | 188,416 | `0x17b0` | 24 | 116 | 0 | 0 | exit 0 |
+| `concrt140.dll` | 303,104 | `0x29160` | 2 | 101 | 0 | 0 | exit 0 |
+| `msvcp140.dll` | 577,536 | `0x525a0` | 13 | 174 | 0 | 0 | exit 0 |
+| `msvcp140_1.dll` | 36,864 | `0x15c0` | 2 | 31 | 0 | 0 | exit 0 |
+| `msvcp140_2.dll` | 192,512 | `0x1efa0` | 2 | 94 | 0 | 0 | exit 0 |
+| `msvcp140_atomic_wait.dll` | 81,920 | `0x3c80` | 4 | 60 | 0 | 0 | exit 0 |
+| `msvcp140_codecvt_ids.dll` | 28,672 | `0x1340` | 2 | 22 | 0 | 0 | exit 0 |
+| `vccorlib140.dll` | 344,064 | `0x27e50` | 7 | 107 | 0 | 0 | exit 0 |
+| `vcomp140.dll` | 86,016 | `0x6580` | 7 | 71 | 0 | 0 | exit 0 |
+| `vcruntime140.dll` | 110,592 | `0xf890` | 3 | 38 | 0 | 0 | exit 0 |
+| `vcruntime140_1.dll` | 49,152 | `0x3e90` | 1 | 33 | 0 | 0 | exit 0 |
 
 Since the library-loader shims (`runtime/shims/library_loader.cpp`), a module's `LoadLibrary*`, `GetModuleHandle*`, `GetProcAddress` and `FreeLibrary` imports count as shim, through `kernel32`, `kernelbase` or the `api-ms-win-core-libraryloader-*` set it names. That is why every image above has a few more shim and fewer host imports than before; the Xbox-specific imports below are unchanged. `DisableThreadLibraryCalls` is served the same way: a mapped module gets `TRUE` (the real function refuses a module the Windows loader did not map, which failed the `DllMain` of the four `msvcp140_*` satellite DLLs), and any other handle goes to the real function.
 
-The process shim (`runtime/shims/process.cpp`) serves `ExitProcess` and `GetCommandLineA/W` the same way: through `kernel32`, `kernelbase`, and `api-ms-win-core-processthreads-l1-1-0` and `api-ms-win-core-processenvironment-l1-1-0`, the sets the API-set umbrella libraries (`OneCore_apiset.lib`, `mincore.lib`) bind them to. `vcomp140.dll` imports `ExitProcess` from the first of these. The UCRT's `_get_narrow_winmain_command_line` and `_get_wide_winmain_command_line` are served too, so a `WinMain` executable gets the game's command line as `lpCmdLine`. The table above is `gta6rt --dry-run` on each DLL at the commit that added this paragraph.
+The process shim (`runtime/shims/process.cpp`) serves `ExitProcess` and `GetCommandLineA/W` the same way: through `kernel32`, `kernelbase`, and `api-ms-win-core-processthreads-l1-1-0` and `api-ms-win-core-processenvironment-l1-1-0`, the sets the API-set umbrella libraries (`OneCore_apiset.lib`, `mincore.lib`) bind them to. `vcomp140.dll` imports `ExitProcess` from the first of these. The UCRT's `_get_narrow_winmain_command_line` and `_get_wide_winmain_command_line` are served too, so a `WinMain` executable gets the game's command line as `lpCmdLine`. `abort()` raises `SIGABRT` when the guest installed a handler (the guest's `signal()` import binds to the host CRT, so its table is the one raised here); with the default or ignore disposition, or a handler that returns, the run still ends with code 3. `run_tiny_game_abort_exit_codes` compares that with a native run of the stand-in image. The table above is `gta6rt --dry-run` on each DLL at the commit that added this paragraph.
+
+The shims added since account for the rest of the difference from the first version of the table. The UCRT's `_configure_narrow_argv`, `_configure_wide_argv`, `__p___argc`, `__p___wargv` and `abort` are served by `runtime/shims/process.cpp`, which is why almost every DLL gained one or two. The file-system calls listed in *Console paths and the write overlay* below (`CreateFile2`, `CopyFile2`, `CreateDirectoryW`, `FindFirstFileExW`, `SetFileAttributesW` and the rest) account for `msvcp140.dll`, `vcomp140.dll`, `Bink2Scarlett.dll`'s `CreateFile2` and part of the two HTTP clients. `winhttp.dll` is a module the shims own (*WinHTTP offline* below), so every `WinHttp*` import binds to it: 15 in `libHttpClient.GDK.dll` (all 16 but `WinHttpCrackUrl`) and 15 in `XCurl.dll` (all but `WinHttpQueryOption`). That is why the two HTTP clients moved the most: 11 to 26 and 9 to 24 shim imports.
 
 The six unique Xbox-specific imports (eight consumer/import pairs) are exactly the set recorded in
 [`d3d12_vulkan.md` §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi):
@@ -92,6 +97,8 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   not see (RT-218; the other console layers map those two drives this way, and only the executable can say which
   spelling GTA VI uses). A path under `--game-dir` or the overlay is always a host path, so a package that sits on
   a host drive `G:` keeps working, and with no folders configured `G:` and `T:` stay host drives.
+  `T:\` is a drive root like `GAME:\`: its folder is made on the first `T:` call, so it is a folder before anything
+  is written there, and removing or moving it fails with `ERROR_ACCESS_DENIED`.
 - An open that can write, and `DeleteFile`, use the overlay: `--overlay DIR`, default `<game-dir>\overlay`. A
   write-open of a package file copies it into the overlay first, so `OPEN_EXISTING` keeps its bytes. The copy is
   written under `<overlay>\.gta6rt-copy` and renamed into place, one copy-up at a time, so a process killed mid-copy
@@ -114,12 +121,26 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   `ERROR_ACCESS_DENIED` (as deleting one does), a move between `GAME:` and a host path with `ERROR_NOT_SAME_DEVICE`, and
   `MOVEFILE_DELAY_UNTIL_REBOOT` with `ERROR_INVALID_PARAMETER`.
 - `CopyFile`, `CopyFileEx` and `CopyFile2` read the source the way a read does and write a `GAME:` destination in the
-  overlay; fail-if-exists counts a name only the package has. Either side can be a host path. Where the host has no
-  `CopyFile2` (Wine 9, whose loader binds the import to a stub that aborts the process), the shim copies with
-  `CopyFileExW` instead: the flags both calls define and the cancel flag are passed on, CopyFile2-only hints are
-  dropped, and a `COPYFILE2` progress routine is not called.
+  overlay; fail-if-exists counts a name only the package has. Either side can be a host path. `CopyFile2` checks its
+  parameter block before preparing the destination: one shorter than `COPYFILE2_EXTENDED_PARAMETERS` is
+  `E_INVALIDARG` and writes nothing, as Windows answers. Where the host has no `CopyFile2` (Wine 9, whose loader binds
+  the import to a stub that aborts the process), the shim copies with `CopyFileExW` instead: the flags both calls
+  define and the cancel flag are passed on (a flag already set cancels before anything is written), CopyFile2-only
+  requests that leave the contents as `CopyFileExW` writes them (no offload, compressed traffic, sparse copy, ...)
+  are dropped, and a `COPYFILE2` progress routine is not called. A call it can't run as asked (`SKIP_ALTERNATE_STREAMS`,
+  `DIRECTORY`, `OPEN_AND_COPY_REPARSE_POINT`, `IGNORE_SOURCE_ENCRYPTION`, an unknown flag, or a longer V2 block) is
+  `ERROR_NOT_SUPPORTED` and writes nothing. `rt::fs::force_copy_file2_fallback` makes the test take this path on
+  Windows too.
 - `SetFileAttributes*` sets the attributes on the overlay copy, copying a package file up (or mirroring a package
   folder) first, so the package keeps its own.
+- A folder has to exist in the title's view before it is used. An open that writes fails with `ERROR_PATH_NOT_FOUND`
+  when its folder is missing, was removed, or is a file, and creates nothing (`T:` is the exception: a create there
+  makes its parent folders); `FindFirstFile` fails the same way for a
+  listing inside such a folder (a pattern that matches nothing in a folder that exists is still
+  `ERROR_FILE_NOT_FOUND`, and a listing directly below a file is `ERROR_DIRECTORY`, as on the host).
+- `MoveFile*` onto the same name succeeds and changes nothing. A rename that changes only the case renames the overlay
+  entry; a package file gets an overlay copy under the new spelling, and a package folder is refused like any other
+  move of one.
 
 `runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
 
@@ -198,7 +219,7 @@ count and width, the function at that position of xgameruntime-docs' "Layout" li
 | `XErrorImpl` (`IXErrorImpl`, slots 3-5) | 3 (`XCurl.dll`) | slot 3, the docs' `_unknown_`, takes an HRESULT and a pointer: `XErrorReport(HRESULT, const char*)` |
 | `XNetworkingImpl` (`IXNetworkingImpl2`, slots 3-20) | 11-17 (`XCurl.dll`), 3-20 (`libHttpClient.GDK.dll`, each in its documented argument shape, e.g. 18-20 (enum, u64 pointer / u64 / pointer)) | the Utf16 `XNetworkingQuerySecurityInformationForUrl*` trio, `XNetworkingVerifyServerCertificate`, `XNetworkingGetConnectivityHint`, `XNetworkingRegister/UnregisterConnectivityHintChanged` (pointer, bool). Served offline, asked for with `IXNetworkingImpl2`'s id |
 | `XSystemImpl` (`IXSystemImpl5`, slots 3-8 known) | 3-8 (`libHttpClient.GDK.dll`) | 3-5 `XSystemGetConsoleId` / `GetXboxLiveSandboxId` / `GetAppSpecificDeviceId` (size, pointer, pointer each), 6 `XSystemHandleTrack` (two pointers, IXSystemImpl3), 7 `XSystemIsHandleValid` (pointer), 8 `XSystemAllowFullDownloadBandwidth` (bool, IXSystemImpl4); IXSystemImpl2 and 5 add no known method. Served offline |
-| `XPersistentLocalStorageImpl` (`IXPersistentLocalStorageImpl3`, slots 3-8) | none called (the table of ids only) | slots 3-7 are `XPersistentLocalStorageGetPathSize` / `GetPath` / `GetSpaceInfo` / `PromptUserForSpaceAsync` / `PromptUserForSpaceResult`, slot 8 `XPersistentLocalStorageMountForPackage` (IXPersistentLocalStorageImpl3). Slots from the public xgameruntime-docs and Wine IDL, not measured in a caller. Served offline: the folder is `<overlay>\persistent`, the quota is the 2048 MB of `MicrosoftGame.Config`, a prompt for space the quota holds succeeds, and `MountForPackage` is `E_NOTIMPL` |
+| `XPersistentLocalStorageImpl` (`IXPersistentLocalStorageImpl3`, slots 3-8) | none called (the table of ids only) | slots 3-7 are `XPersistentLocalStorageGetPathSize` / `GetPath` / `GetSpaceInfo` / `PromptUserForSpaceAsync` / `PromptUserForSpaceResult`, slot 8 `XPersistentLocalStorageMountForPackage` (IXPersistentLocalStorageImpl3). Slots from the public xgameruntime-docs and Wine IDL, not measured in a caller. Served offline: the folder is `<overlay>\.gta6rt-persistent`, which `GAME:` does not see, the quota is the 2048 MB of `MicrosoftGame.Config`, a prompt for space the quota holds succeeds, and `MountForPackage` is `E_NOTIMPL` |
 | `XPackageImpl` (`IXPackageImpl3`) | 3-19, 22, 24-27, 30, 32-34, 37-40 (`libHttpClient.GDK.dll`) | slots 3-34 are IXPackageImpl's 32 entries, 35-38 IXPackageImpl2's 4, 39-40 IXPackageImpl3's 2. Served offline: 3 identifier, 4 packaged process, 11 user locale, 24-26 mount path size / path / close; the rest log once and return `E_NOTIMPL` |
 | `XGameImpl` (`IXGameImpl3`, slots 3-5) | none in the package's DLLs (`libHttpClient.GDK.dll` holds its id only in the linked id table); the executable's requests are unmeasured | from the xgameruntime IDL: 3 `XGameGetXboxTitleId` (pointer), 4 `XLaunchNewGame` (two strings and a user handle, `void`), 5 `XLaunchRestartOnCrash` (string, u32). Served offline: the title id is `MicrosoftGame.Config`'s `<TitleId>` (`E_FAIL` without one), a new game launch is logged and ignored, a crash restart succeeds with nothing registered |
 
@@ -218,8 +239,9 @@ answer 0. `XErrorImpl` logs each report and hands it to the callback `XErrorSetC
 `XNetworkingImpl` answers as a console without a network would: the connectivity hint is initialized with no
 connectivity (level None), the port and URL security-information queries fail with
 `HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)` (the `*Async` ones complete with it through XAsync), the
-certificate check fails the same way, change registrations return tokens that never fire, and the three
-`IXNetworkingImpl2` additions are `E_NOTIMPL`.
+certificate check fails the same way, the two change registrations send the one initial notification Microsoft
+documents (on the queue's completion port, the process queue when none is given: the hint above, or port 0) and
+none after, and the three `IXNetworkingImpl2` additions are `E_NOTIMPL`.
 
 `XUserImpl` (`runtime/shims/xgameruntime_user.cpp`) is served from xgameruntime-docs' layout alone. No package DLL
 calls an `XUser*` slot (`libHttpClient.GDK.dll` only holds the GUID table), so its slots are **not measured** yet.
@@ -388,8 +410,9 @@ end to end with a synthetic bundled DLL importing `xmem.dll!XMemAlloc` and `XMem
 - Sessions, connections and requests are local handles: no name is resolved and no socket is opened.
 - `WinHttpSendRequest` fails with `ERROR_WINHTTP_CANNOT_CONNECT`. On a `WINHTTP_FLAG_ASYNC` session it returns `TRUE`
   and the failure arrives as WinHTTP delivers one: `WINHTTP_CALLBACK_STATUS_REQUEST_ERROR` with `{API_SEND_REQUEST,
-  ERROR_WINHTTP_CANNOT_CONNECT}`, on a thread-pool thread, with the request's context. A request closed first gets
-  no error callback.
+  ERROR_WINHTTP_CANNOT_CONNECT}`, on a thread-pool thread, with the request's context. A `dwContext` of 0 keeps the
+  context set with `WINHTTP_OPTION_CONTEXT_VALUE`, as the host's `winhttp.dll` does. A request closed first gets no
+  error callback.
 - Reading a response and `WinHttpWriteData` fail with `ERROR_WINHTTP_INCORRECT_HANDLE_STATE`. Options, timeouts and
   headers are accepted; `WINHTTP_OPTION_CONTEXT_VALUE` and `WINHTTP_OPTION_HANDLE_TYPE` can be queried.
 - A status callback is inherited by child handles, and so is the parent's `WINHTTP_OPTION_CONTEXT_VALUE` as it is

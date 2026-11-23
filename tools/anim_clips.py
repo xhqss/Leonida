@@ -171,9 +171,12 @@ def parameter_node(s, at, parameters):
     when +0x58 is 2, +0x120 points at a block whose +0x18 is the node. A node starts {u64 0, u32 type, u32 0}.
     Types 3, 4, 5, 6 and 8 have 1, 2, 3, 4 and 5 axes: +0x10 is an array of 8-byte {u32 name hash, u16, u16}.
     Type 3 is one sampled axis: then an array of (u32 sample index, f32 value) sorted by value, f32 min, f32 max.
-    Types 4, 5, 6 and 8 keep their sample count at NODE_SAMPLE_COUNT_AT; the rest of them is not decoded.
+    Types 4, 5, 6 and 8 keep their sample count at NODE_SAMPLE_COUNT_AT, and +0x20 is a {ptr, count} array of
+    16-byte items ("pairs": words 0 and 2; {u32, u32 0, u32, u32 0} on types 6 and 8, null on type 4, not decoded);
+    the rest of them is not decoded.
     Type 1 has no axes and its sample count (1) at +0x20.
-    -> (type, axis or None) or None; axis = {names, slots, sample_count, and for type 3 samples, min, max}"""
+    -> (type, axis or None) or None; axis = {names, slots, sample_count, and samples, min, max for type 3 or
+    pairs for types 4-8}"""
     if parameters == 1:
         node = s.ptr(at + 0x138)
     elif parameters == 2:
@@ -199,6 +202,9 @@ def parameter_node(s, at, parameters):
                             min=s.f32(node + 0x30), max=s.f32(node + 0x34), sample_count=ns)
             else:
                 axis["sample_count"] = s.u32(node + NODE_SAMPLE_COUNT_AT[kind])
+                pairs, npairs = s.array(node + 0x20)     # null on type 4 and most type 5
+                axis["pairs"] = None if pairs is None else [(s.u32(pairs + 16 * i), s.u32(pairs + 16 * i + 8))
+                                                            for i in range(npairs)]
     return kind, axis
 
 
@@ -744,6 +750,9 @@ def count_motion_blend(c, stats):
     count_motion_samples(c, kind, axis, stats)
     if kind != 3:
         stats[f"motion_node_axes:{kind}:{len(axis['names'])}"] += 1
+        if kind != 1:
+            pairs = axis["pairs"]
+            stats[f"motion_node_pairs:{kind}:" + ("null" if pairs is None else str(len(pairs)))] += 1
         for h in axis["names"]:
             stats[f"motion_node_axis_name:{kind}:" + AXIS_NAMES.get(h, "unresolved")] += 1
         return

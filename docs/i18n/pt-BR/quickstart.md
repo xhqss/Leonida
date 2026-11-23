@@ -3,7 +3,6 @@
 > [!NOTE]
 > A documentação em inglês ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) e
 > [`docs/README.md`](../../README.md)) é a **referência oficial**. Este guia reúne apenas instruções estáveis de
-> configuração e compilação (sincronizado com o commit `16282101`). Para o status diário do projeto, consulte o
 > configuração e compilação (sincronizado com o commit `f847748c`). Para o status diário do projeto, consulte o
 > [`README.md`](../../../README.md).
 
@@ -25,7 +24,7 @@ O projeto está em fase inicial: **o jogo ainda não dá boot**.
 ## Pré-requisitos
 
 - **Sua própria cópia** do pacote Xbox Series, versão `1.0.2.1` (pasta com `MicrosoftGame.Config` e os arquivos `.rpf` legíveis em disco).
-- **Windows 10/11 x64** com cerca de **30 GB livres** para preparar só o runtime ou **350 GB** para o build completo.
+- **Windows 10/11 x64** com cerca de **30 GB livres** para preparar só o runtime ou **400 GB** para o build completo.
 - [Python 3.12+](https://www.python.org/downloads/) (marque *"Add python.exe to PATH"*).
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [Vulkan SDK](https://vulkan.lunarg.com/) (`spirv-as`, `spirv-val` e `vulkaninfo`).
@@ -51,12 +50,9 @@ O projeto está em fase inicial: **o jogo ainda não dá boot**.
 - **Visual Studio 2022** com *Desenvolvimento para desktop com C++* e **Windows SDK `10.0.26100` ou mais recente** (necessário para o estágio `runtime`, que usa root signatures 1.2).
 - [ffmpeg](https://ffmpeg.org/download.html) no `PATH` *(opcional: decodifica streams XMA2 e é exigido ao usar `--wav`)*.
 
-**Pouco espaço em disco:** o valor de ~350 GB refere-se ao build completo. Para *executar* o port,
-`--stages check,shaders,runtime` precisa de cerca de **30 GB**; o estágio `assets` (~300 GB) serve apenas para as
+**Pouco espaço em disco:** o valor de ~400 GB refere-se ao build completo. Para *executar* o port,
+`--stages check,shaders,runtime` precisa de cerca de **30 GB**; o estágio `assets` (~370 GB) serve apenas para as
 ferramentas de extração de assets, e `--wav` adiciona várias vezes o tamanho dos arquivos Ogg Opus. `--work` e `--out`
-podem apontar para outro disco; se o pacote do jogo estiver em uma unidade somente leitura, use `--overlay` em um disco
-gravável. Mantenha os arquivos `.s` em `work/shaders/dxbc/disasm`: apagá-los mantendo a pasta faz o estágio parecer
-concluído com zero shaders, e um link simbólico em `disasm` é recusado.
 podem apontar para outro disco; se o pacote do jogo estiver em uma unidade somente leitura, use `--overlay` (no
 `gta6rt`) em um disco gravável. Mantenha os arquivos `.s` em `work/shaders/dxbc/disasm`: apagá-los mantendo a pasta faz
 o estágio parecer concluído com zero shaders, e um link simbólico em `disasm` é recusado.
@@ -92,16 +88,15 @@ python -I make_game.py --check --full-check            # também compara o SHA-2
 python -I make_game.py --game "D:\caminho\do\pacote" --out "D:\Games\Leonida" --work "E:\leonida-work"
 python -I make_game.py --stages shaders,assets         # roda apenas os estágios escolhidos
 python -I make_game.py --game "D:\caminho\do\pacote" --wav  # também decodifica Ogg Opus para PCM WAV (grande)
-python -I make_game.py --wave64-emulate auto           # auto (padrão), on ou off
+python -I make_game.py --wave64-emulate off            # auto (padrão), on ou off; veja abaixo
 ```
 
 Os estágios executam nesta ordem: `check` → `shaders` → `assets` → `runtime` → `pipelines`.
 
-- **`--wave64-emulate`**: emula shaders compute/mesh wave64 em GPUs com subgrupos de 32 lanes (NVIDIA e Intel). O padrão `auto` consulta `vulkaninfo` e ativa a emulação automaticamente quando necessário (exceto em GPUs AMD RDNA2 no driver Windows que executam wave64 nativamente, onde o compilador do driver falha em código LDS emulado, #857). O modo escolhido fica salvo junto aos shaders traduzidos.
+- **`--wave64-emulate`**: emula shaders compute/mesh wave64 em GPUs com subgrupos de 32 lanes (NVIDIA e Intel). O padrão `auto` consulta `vulkaninfo` e ativa a emulação se alguma GPU não tiver subgrupos de 64 lanes ou se o tamanho for desconhecido, verificando também se a GPU do runtime suporta compute e mesh em 64 lanes (com `--mesh-compute`, apenas o suporte em compute é necessário). No driver Windows da AMD, `auto` usa wave64 nativo em GPUs RDNA1 e RDNA2 quando a GPU do runtime suporta (para placas RDNA1 sem suporte a mesh shaders, a decisão usa o estágio compute), mesmo que outra GPU seja de 32 lanes ou que `vulkaninfo` não esteja disponível, pois o compilador desse driver pode falhar em código LDS emulado (#857). O modo escolhido fica salvo junto aos shaders traduzidos; use `--wave64-emulate on` para forçar a emulação ou `--wave64-emulate off` para forçar wave64 nativo.
 - **Flags de fallback do tradutor**: `--no-float-controls` (omite `SignedZeroInfNanPreserve`), `--bary-fallback` (lê baricêntricas de um input interpolado sem `VK_KHR_fragment_shader_barycentric`), `--texel-offset-fallback` (incorpora offsets `image_sample*_o` na coordenada sem `VK_KHR_maintenance8`) e `--mesh-compute` (traduz mesh shaders como compute sem `VK_EXT_mesh_shader`) são repassadas ao tradutor e salvas junto aos shaders; alterá-las retraduz os shaders (veja [`docs/design.md`](../../design.md)).
-- **`--work`**: recomenda-se apontar para um disco com pelo menos 350 GB livres para o build completo (ou ~30 GB com `--stages check,shaders,runtime`); o estágio `shaders` é o mais demorado e usa metade das threads da CPU por padrão (ajustável com `--jobs`).
+- **`--work`**: recomenda-se apontar para um disco com pelo menos 400 GB livres para o build completo (ou ~30 GB com `--stages check,shaders,runtime`); o estágio `shaders` é o mais demorado e usa metade das threads da CPU por padrão (ajustável com `--jobs`).
 - **`--wav`**: fica desativado por padrão porque WAV PCM de 16 bits é várias vezes maior que Ogg Opus; quando ativado, decodifica os streams Ogg Opus para `work\assets\audio\wav` e pula arquivos WAV já existentes ao retomar um build.
-- **`--work`**: escolhe onde ficam os arquivos intermediários. O estágio `shaders` usa metade das threads da CPU por padrão (ajustável com `--jobs`).
 
 ### Build com pouco espaço em disco
 
@@ -111,7 +106,7 @@ Para preparar o runtime e os shaders com cerca de **30 GB livres**, execute na r
 python -I make_game.py --stages check,shaders,runtime
 ```
 
-O estágio `assets` serve às ferramentas de extração e ocupa cerca de 300 GB. A opção `--wav` aumenta ainda mais
+O estágio `assets` serve às ferramentas de extração e ocupa cerca de 370 GB. A opção `--wav` aumenta ainda mais
 o espaço usado pelos áudios. Você pode apontar `--work` e `--out` para outro disco. Se o disco do pacote for
 somente leitura, passe `--overlay` ao iniciar o runtime e aponte para uma pasta em um disco gravável.
 - **`--wave64-emulate`**: emula shaders compute/mesh wave64 em GPUs com subgrupos de 32 lanes (NVIDIA e Intel). O padrão `auto` consulta `vulkaninfo` e ativa a emulação se alguma GPU não tiver subgrupos de 64 lanes ou se o tamanho for desconhecido, verificando também se a GPU do runtime suporta compute e mesh em 64 lanes (com `--mesh-compute`, apenas o suporte em compute é necessário). No driver Windows da AMD, `auto` usa wave64 nativo em GPUs RDNA1 e RDNA2 quando a GPU do runtime suporta (para placas RDNA1 sem suporte a mesh shaders, a decisão usa o estágio compute), mesmo que outra GPU seja de 32 lanes ou que `vulkaninfo` não esteja disponível, pois o compilador desse driver pode falhar em código LDS emulado (#857). O modo escolhido fica salvo junto aos shaders traduzidos; use `--wave64-emulate on` para forçar a emulação ou `--wave64-emulate off` para forçar wave64 nativo.

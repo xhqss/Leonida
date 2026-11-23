@@ -195,6 +195,7 @@ def run(spvasm):
         math.copysign(math.inf, math.copysign(1.0, a) * math.copysign(1.0, b)) if a and not math.isnan(a) else math.nan,
         "OpFOrdGreaterThan": lambda a, b: a > b, "OpFOrdLessThan": lambda a, b: a < b,
         "OpFOrdEqual": lambda a, b: a == b,
+        "OpFOrdLessThanEqual": lambda a, b: a <= b, "OpFOrdGreaterThanEqual": lambda a, b: a >= b,   # False on a NaN
         "OpLogicalOr": lambda a, b: a or b, "OpLogicalAnd": lambda a, b: a and b,
         "OpSLessThanEqual": lambda a, b: s32(a) <= s32(b), "OpSGreaterThanEqual": lambda a, b: s32(a) >= s32(b),
         "OpULessThan": lambda a, b: a < b, "OpUGreaterThan": lambda a, b: a > b,

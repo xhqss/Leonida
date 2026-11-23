@@ -20,10 +20,11 @@ sys.path.insert(0, str(TOOLS))
 import report_paths  # noqa: E402
 
 # Tools that use report_paths and must not define their own copy again.
-SHARED = ("awc_manifest", "gamedata_index", "gamedata_xml", "glb_inspect", "navmesh_index", "rpf_probe", "tile_probe", "world_names")
-# Tools that still carry their own copy (BUILD-589 follow-up: open pull requests edit them). Do not add to this list:
+SHARED = ("anim_index", "awc_manifest", "gamedata_index", "gamedata_xml", "glb_inspect", "navmesh_index",
+          "rpf_probe", "tile_probe", "world_lights_paths", "world_names")
+# The one tool that still carries its own copy (an open pull request edits its call site). Do not add to this list:
 # import report_paths instead.
-LEGACY_COPIES = {"anim_index", "navmesh_decode", "world_lights_paths"}
+LEGACY_COPIES = {"navmesh_decode"}
 
 
 def touch(path):
@@ -124,6 +125,56 @@ class MacVolumeTests(unittest.TestCase):
             self.assertTrue(report_paths.case_insensitive_volume("/definitely/not/there/at/all/x.json"))
             asked = report_paths.os.pathconf.call_args[0][0]
             self.assertTrue(os.path.exists(asked), asked)
+
+
+class FoldingVolumeTests(unittest.TestCase):
+    """A volume that ignores case without normcase or pathconf saying so is found with one scratch folder."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = os.path.realpath(self.tmp.name)
+
+    def p(self, *parts):
+        return os.path.join(self.dir, *parts)
+
+    def volume_folds_case(self):
+        touch(self.p("probe.tmp"))
+        return os.path.exists(self.p("PROBE.TMP"))
+
+    def test_case_only_difference_follows_the_volume(self):
+        os.makedirs(self.p("reports"))
+        self.assertEqual(report_paths.same_name_on_folding_volume(self.p("reports", "R.json"),
+                                                                 self.p("reports", "r.json")),
+                         self.volume_folds_case())
+
+    def test_other_spellings_of_one_folder_are_one_report(self):
+        os.makedirs(self.p("reports"))
+        self.assertTrue(report_paths.same_name_on_folding_volume(self.p("reports", "R.json"),
+                                                                 self.p("reports", ".", "R.json")))
+
+    def test_names_that_differ_by_more_than_case_never_ask_the_volume(self):
+        os.makedirs(self.p("reports"))
+        with mock.patch.object(report_paths.tempfile, "TemporaryDirectory",
+                               side_effect=AssertionError("asked the volume")):
+            self.assertFalse(report_paths.same_name_on_folding_volume(self.p("reports", "out.json"),
+                                                                     self.p("reports", "lights.json")))
+
+    def test_it_leaves_no_scratch_folder_behind(self):
+        os.makedirs(self.p("reports"))
+        report_paths.same_name_on_folding_volume(self.p("reports", "R.json"), self.p("reports", "r.json"))
+        self.assertEqual(sorted(os.listdir(self.p("reports"))), [])
+
+    def test_a_folder_that_does_not_exist_is_not_created(self):
+        self.assertFalse(report_paths.same_name_on_folding_volume(self.p("missing", "R.json"),
+                                                                  self.p("missing", "r.json")))
+        self.assertFalse(os.path.exists(self.p("missing")))
+
+    def test_same_report_path_asks_the_volume_when_the_name_rules_disagree(self):
+        # The name rules say "different"; the volume has the last word on a pair that differs only by case.
+        with mock.patch.object(report_paths, "path_key", side_effect=os.path.realpath),                 mock.patch.object(report_paths, "same_name_on_folding_volume", return_value=True) as probe:
+            self.assertTrue(report_paths.same_report_path(self.p("R.json"), self.p("r.json")))
+        probe.assert_called_once()
 
 
 class NoPrivateCopiesTests(unittest.TestCase):

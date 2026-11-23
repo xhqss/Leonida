@@ -45,6 +45,10 @@ frames. CTest runs `bink_play --headless --frames 30` as `bink_play_headless`, w
 headless in about 1 s (81-118 fps over runs) on a Ryzen 7 5700X (the decoder is CPU-only), so the 4K stinger plays in
 real time; the windowed run shows all 450 frames.
 
+An independent run on a second machine (Windows 11, Ryzen 7 7800X3D, own 1.0.2.1 package) plays a 1280x720 181-frame
+`KB2n` stream headless in 0.27 s (**672 fps**), consistent with the decoder being CPU-only and the 4K rate above
+being resolution-bound rather than machine-bound.
+
 ## Gaps
 
 No audio: the movie's Bink Audio tracks are not decoded and no sound system is opened (as in `bink_decode_test`).

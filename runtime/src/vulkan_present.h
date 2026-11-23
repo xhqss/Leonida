@@ -35,13 +35,18 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
 #include <map>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace leonida {
@@ -161,6 +166,7 @@ public:
     }
 
     ~VulkanPresenter() {
+        context_.holds().cancel_after(this);  // presents still queued behind held work are dropped
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
         {
@@ -186,7 +192,10 @@ public:
     VulkanPresenter& operator=(const VulkanPresenter&) = delete;
 
     bool ok() const { return ok_; }
-    VkExtent2D extent() const { return extent_; }
+    VkExtent2D extent() const {
+        const std::uint64_t packed = extent_packed_;
+        return {std::uint32_t(packed >> 32), std::uint32_t(packed)};
+    }
     VkFormat format() const { return format_; }
     std::uint64_t presented() const { return presented_; }
     // The present mode a tearing present uses (IMMEDIATE, else FIFO_RELAXED) while the current swapchain was created
@@ -194,6 +203,7 @@ public:
     VkPresentModeKHR tear_mode() const { return tear_mode_; }
     bool tear_supported() const { return tear_mode_ != VK_PRESENT_MODE_MAX_ENUM_KHR; }
     // Whether the last present was queued in the tearing mode, and how many were.
+    // A present queued behind held work (see submit()) is reported as not tearing.
     bool last_present_tore() const { return last_tore_; }
     std::uint64_t tear_presents() const { return tear_presents_; }
 
@@ -279,7 +289,10 @@ public:
 
     // Polled while a present waits for a swapchain image (every 50 ms): when it returns true the present gives up with
     // VK_NOT_READY, so a caller that is being suspended is never held by a window that stopped taking frames.
-    void set_abort(std::function<bool()> abort) { abort_ = std::move(abort); }
+    void set_abort(std::function<bool()> abort) {
+        std::lock_guard lock(abort_mutex_);
+        abort_ = std::move(abort);
+    }
 
     // Presents a black frame: the swapchain image cleared, nothing read. PresentX with no planes.
     VkResult present_blank(bool vsync, bool tear = false) {
@@ -290,6 +303,7 @@ public:
     // read_back(). False when the surface cannot do it or its format is not 8 bits per channel with 4 channels.
     // Call before the first present.
     bool enable_capture() {
+        std::lock_guard lock(present_mutex_);
         if (!ok_) return false;
         capture_ = true;
         stale_ = true;
@@ -305,6 +319,7 @@ public:
     // that was skipped because the window is minimised (it returned VK_SUCCESS but showed nothing), until the next
     // frame that is shown (the frame before it is not what the window was last asked to show), or when the wait fails.
     bool read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format) {
+        std::lock_guard lock(present_mutex_);
         if (!capture_ || !capture_ptr_ || !captured_) return false;
         const Frame& frame = frames_[(frame_index_ + frames_.size() - 1) % frames_.size()];
         if (vkWaitForFences_(context_.device(), 1, &frame.done, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
@@ -315,10 +330,95 @@ public:
         return true;
     }
 
-    // Shared by present(), present_blank() and present_planes(). `binding` null and `planes` null: clear instead of blit;
-    // `planes`: compose them (`binding`, `source`, `source_rect` unused).
+    // Shared by present(), present_blank() and present_planes().
+    //
+    // A Present is ordered behind the work the queues hold (a batch that waits for a Signal not yet submitted,
+    // queue_holds.h): it would otherwise blit whatever the source texture held before that batch ran. It is not
+    // blocked: it is queued, returns VK_SUCCESS as ExecuteCommandLists does for a held batch, and is submitted,
+    // in order with the presents before it, by the thread that releases the last operation held when it was called
+    // (its failure is printed there). Held work that is never released holds back the presents after it, as it
+    // holds back the queue's own work; with nothing held this is the plain path. A blank present reads nothing and
+    // is only ordered behind earlier presents. Waiting instead was rejected: the Signal that releases the work may
+    // be one the application's own thread makes after Present returns. Like a full frame-latency queue, a Present that
+    // finds max_deferred_presents queued ahead of it does wait, for held work to release (logged once; set_abort ends
+    // the wait), so the queue behind never-released work is bounded. A queued Present reports its tear as false
+    // (last_present_tore()): the frame pacer's default sync.
+    static constexpr std::size_t max_deferred_presents = 8;
+
     VkResult submit(const ResourceBinding* binding, ResourceId source, bool vsync, const PresentRect* source_rect,
                     bool srgb, bool tear = false, const PresentPlanes* planes = nullptr) {
+        wait_for_room();
+        std::lock_guard lock(present_mutex_);
+        // `binding` null and `planes` null: clear instead of blit; `planes`: compose them (`binding`, `source`,
+        // `source_rect` unused). Only a present that reads a texture waits for held work.
+        if (deferred_.empty() && !((binding || planes) && context_.holds().any_held()))
+            return submit_now(binding, source, vsync, source_rect, srgb, tear, planes);
+        PendingPresent pending{binding != nullptr, source, vsync, source_rect != nullptr, {}, srgb, tear,
+                               planes != nullptr, {}};
+        if (source_rect) pending.rect = *source_rect;
+        if (planes) pending.planes = *planes;
+        deferred_.push_back(pending);
+        last_tore_ = false;
+        context_.holds().after_held(this, [this] { run_deferred(); });
+        return VK_SUCCESS;
+    }
+
+private:
+    bool should_abort() {
+        std::function<bool()> abort;
+        {
+            std::lock_guard lock(abort_mutex_);
+            abort = abort_;
+        }
+        return abort && abort();
+    }
+
+    // Called without present_mutex_: the thread that releases the queued presents needs it.
+    void wait_for_room() {
+        bool logged = false;
+        for (;;) {
+            {
+                std::lock_guard lock(present_mutex_);
+                if (deferred_.size() < max_deferred_presents) return;
+            }
+            if (!logged) {
+                logged = true;
+                std::fprintf(stderr, "[rt] d3d12: %zu Presents are queued behind held work; this one waits for it\n",
+                             max_deferred_presents);
+            }
+            if (should_abort()) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    struct PendingPresent {
+        bool has_source;
+        ResourceId source;
+        bool vsync;
+        bool has_rect;
+        PresentRect rect;
+        bool srgb;
+        bool tear;
+        bool has_planes;
+        PresentPlanes planes;
+    };
+
+    void run_deferred() {
+        std::lock_guard lock(present_mutex_);
+        if (deferred_.empty()) return;
+        const PendingPresent p = deferred_.front();
+        deferred_.pop_front();
+        ResourceBinding binding{};
+        const VkResult result = submit_now(p.has_source ? &binding : nullptr, p.source, p.vsync,
+                                           p.has_rect ? &p.rect : nullptr, p.srgb, p.tear,
+                                           p.has_planes ? &p.planes : nullptr);
+        if (result != VK_SUCCESS)
+            std::fprintf(stderr, "[rt] d3d12: a Present held behind queued work failed when it was released (%d)\n",
+                         int(result));
+    }
+
+    VkResult submit_now(const ResourceBinding* binding, ResourceId source, bool vsync, const PresentRect* source_rect,
+                        bool srgb, bool tear = false, const PresentPlanes* planes = nullptr) {
         last_tore_ = false;
         if (!ok_) return VK_ERROR_INITIALIZATION_FAILED;
         // The swapchain's HDR10 format is only for composed planes that ask for it; a blit of an SDR source or a blank
@@ -741,7 +841,7 @@ private:
             const VkResult result = vkAcquireNextImageKHR_(context_.device(), swapchain_, 50'000'000, semaphore,
                                                            VK_NULL_HANDLE, image);
             if (result != VK_TIMEOUT && result != VK_NOT_READY) return result;
-            if (abort_ && abort_()) return VK_NOT_READY;
+            if (should_abort()) return VK_NOT_READY;
         }
     }
 
@@ -896,6 +996,13 @@ private:
         VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (capture_) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         if ((caps.supportedUsageFlags & usage) != usage) return false;
+        // Not used by the presenter itself (it blits or copies into the images), but overlays that hook the swapchain
+        // draw their own frame into its images through a framebuffer, which needs COLOR_ATTACHMENT: without it
+        // Bandicam's VK_LAYER_bandicam_helper builds framebuffers and image views on images that don't allow it
+        // (VUID-VkFramebufferCreateInfo-pAttachments-00877, VUID-VkImageViewCreateInfo-image-04441). The surface
+        // reports it for every swapchain (the spec requires it in supportedUsageFlags), and the DXGI swapchain
+        // (dxgi_swapchain.h) already asks for it.
+        if (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
         std::uint32_t count = 0;
         if (vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, nullptr) != VK_SUCCESS || !count)
@@ -1029,6 +1136,7 @@ private:
         ready_ = std::move(ready);
         format_ = chosen.format;
         extent_ = extent;
+        extent_packed_ = (std::uint64_t(extent.width) << 32) | extent.height;
         hdr_active_ = chose_hdr;
         if (capture_) {
             // A capture that cannot be made fails the recreation with the swapchain in place and stale_ still set.
@@ -1112,11 +1220,15 @@ private:
     VkInstance instance_;
     VkPhysicalDevice physical_;
     VkQueue queue_;
+    mutable std::recursive_mutex present_mutex_;  // all presenter state: submit(), a deferred present, the accessors
+    mutable std::mutex abort_mutex_;               // abort_ alone: set_abort() must work while a present waits
+    std::deque<PendingPresent> deferred_;  // presents queued behind held work, in call order
     VkSurfaceKHR surface_;
     bool maintenance1_ = false;  // VK_KHR/EXT_swapchain_maintenance1 (and the surface extension) are enabled
     VkPresentModeKHR tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;  // set with the swapchain, see tear_mode()
-    bool last_tore_ = false;
-    std::uint64_t tear_presents_ = 0;
+    std::atomic<bool> last_tore_{false};
+    std::atomic<std::uint64_t> extent_packed_{0};  // extent_ for readers that must not wait for a present
+    std::atomic<std::uint64_t> tear_presents_{0};
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     VkExtent2D extent_{};
@@ -1125,15 +1237,15 @@ private:
     std::array<Frame, 2> frames_{};
     VkCommandPool pool_ = VK_NULL_HANDLE;
     std::uint64_t frame_index_ = 0;
-    std::uint64_t presented_ = 0;
+    std::atomic<std::uint64_t> presented_{0};
     bool vsync_ = true;
     bool stale_ = false;
     bool ok_ = false;
     bool swapchain_srgb_ = false;  // the swapchain format follows the source being presented (set once it exists)
     bool swapchain_hdr_req_ = false;  // the swapchain was built for an HDR10 request (it has the format only if hdr_active_)
     bool hdr_active_ = false;
-    std::uint64_t composed_ = 0;
-    bool force_hdr_encoding_ = false;
+    std::atomic<std::uint64_t> composed_{0};
+    std::atomic<bool> force_hdr_encoding_{false};
     bool warned_hdr_ = false;
     std::unique_ptr<PresentComposer> composer_;
     std::function<bool()> abort_;

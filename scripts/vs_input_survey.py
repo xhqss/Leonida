@@ -114,6 +114,8 @@ def survey(dxbc_dir):
         index = json.load(f)
     if not isinstance(index, list) or not all(isinstance(e, dict) for e in index):
         raise ValueError("index.json is not a list of shader entries")
+    if not all(isinstance(e.get("file"), str) for e in index if e.get("stage") == "vs"):
+        raise ValueError("index.json has a vertex shader entry without a string file")
     names = [os.path.splitext(e["file"])[0] for e in index if e.get("stage") == "vs"]
     markers, vgprs, families = Counter(), Counter(), Counter()
     missing = 0

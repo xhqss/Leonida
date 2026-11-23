@@ -308,21 +308,24 @@ function draw(P) {
   P.canvas.width = W * dpr; P.canvas.height = H * dpr; P.canvas.style.height = H + "px";
   P.canvas.setAttribute("aria-label", `${P.p.title}: ${comps.length} units. Arrow keys move, Enter opens details.`);
   P.lay = layout(comps, W, H, P.p.weighted);
+  const themeStyle = getComputedStyle(document.documentElement);
+  const palette = Object.fromEntries([...STATUS, "panel2", "line", "ink2", "ink3", "accent"]
+    .map((name) => [name, themeStyle.getPropertyValue("--" + name).trim()]));
   const ctx = P.canvas.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H);
   const flat = P.lay.flatMap((g) => g.cells);
   for (const g of P.lay) {
-    ctx.fillStyle = css("panel2"); ctx.fillRect(g.x, g.y, g.w, g.h);
-    ctx.strokeStyle = css("line"); ctx.strokeRect(g.x + 0.5, g.y + 0.5, g.w - 1, g.h - 1);
+    ctx.fillStyle = palette.panel2; ctx.fillRect(g.x, g.y, g.w, g.h);
+    ctx.strokeStyle = palette.line; ctx.strokeRect(g.x + 0.5, g.y + 0.5, g.w - 1, g.h - 1);
     for (const cell of g.cells) {
       const gap = cell.w >= 4 ? 1 : 0;
-      ctx.fillStyle = css(cell.c.status); ctx.fillRect(cell.x + gap / 2, cell.y + gap / 2, cell.w - gap, cell.h - gap);
+      ctx.fillStyle = palette[cell.c.status]; ctx.fillRect(cell.x + gap / 2, cell.y + gap / 2, cell.w - gap, cell.h - gap);
       if (cell.w >= 9 && cell.h >= 9 && cell.c.status !== "verified" && cell.c.status !== "implemented") glyph(ctx, cell);
       if (cell.w >= 60 && cell.h >= 18) { ctx.fillStyle = "rgba(8,10,12,.85)"; ctx.font = "10.5px Consolas, monospace"; ctx.textBaseline = "top"; ctx.fillText(fit(ctx, cell.c.name, cell.w - 6), cell.x + 3, cell.y + 3); }
     }
-    if (g.w > 40) { ctx.fillStyle = css("ink2"); ctx.font = "10.5px Consolas, monospace"; ctx.textBaseline = "middle"; const n = String(g.cells.length); ctx.fillText(fit(ctx, g.name, g.w - 14 - ctx.measureText(n).width), g.x + 4, g.y + HEAD / 2); ctx.fillStyle = css("ink3"); ctx.fillText(n, g.x + g.w - 4 - ctx.measureText(n).width, g.y + HEAD / 2); }
+    if (g.w > 40) { ctx.fillStyle = palette.ink2; ctx.font = "10.5px Consolas, monospace"; ctx.textBaseline = "middle"; const n = String(g.cells.length); ctx.fillText(fit(ctx, g.name, g.w - 14 - ctx.measureText(n).width), g.x + 4, g.y + HEAD / 2); ctx.fillStyle = palette.ink3; ctx.fillText(n, g.x + g.w - 4 - ctx.measureText(n).width, g.y + HEAD / 2); }
   }
-  if (P.focus >= 0 && flat[P.focus]) { const f = flat[P.focus]; ctx.strokeStyle = css("accent"); ctx.lineWidth = 2; ctx.strokeRect(f.x - 1, f.y - 1, f.w + 2, f.h + 2); ctx.lineWidth = 1; }
+  if (P.focus >= 0 && flat[P.focus]) { const f = flat[P.focus]; ctx.strokeStyle = palette.accent; ctx.lineWidth = 2; ctx.strokeRect(f.x - 1, f.y - 1, f.w + 2, f.h + 2); ctx.lineWidth = 1; }
 }
 function glyph(ctx, cell) {   // texture so status never relies on colour alone
   const { x, y, w, h } = cell, p = Math.min(w, h) * 0.25, s = cell.c.status;

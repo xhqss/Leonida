@@ -19,9 +19,11 @@ import sys
 
 try:
     from tools import navmesh_decode as nd
+    from tools.report_paths import same_report_path
 except ImportError:  # pragma: no cover - direct script execution
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import navmesh_decode as nd
+    from report_paths import same_report_path
 
 
 CHECK_NAMES = (
@@ -49,9 +51,20 @@ def verify_tile(b, stats):
     pool = nd._u32(b, 0x90)
     a8, b0 = nd._u64(b, 0xA8), nd._u64(b, 0xB0)
 
-    # 1. 12-byte adjacent-polygon edges at +0x88 (count = pool = u32@0x90).
+    # Cross-check u32@0x90 (pool) against +0x80 (2-byte vertex indices), +0x88 (12-byte edges),
+    # and the sum of polygon vertex counts in +0x98 (44-byte polygons).
+    b80 = nd.split_array(b, 0x80, 2, pool)
     b88 = nd.split_array(b, 0x88, 12, pool)
-    edges_ok = b88 is not None
+    b98 = nd.split_array(b, 0x98, 44, c4)
+    poly_vert_sum = 0
+    if b98 is not None:
+        for po, pcnt in b98:
+            for pi in range(pcnt):
+                poly_vert_sum += struct.unpack_from("<I", b, po + 44 * pi + 4)[0] & 0xF
+    pool_confirmed = b80 is not None and b98 is not None and poly_vert_sum == pool
+
+    # 1. 12-byte adjacent-polygon edges at +0x88 (count = pool = u32@0x90).
+    edges_ok = b88 is not None and pool_confirmed
     same_tile = 0
     unlinked = 0
     edge_flags_lo = Counter()
@@ -139,7 +152,6 @@ def verify_tile(b, stats):
 
     # 3. 44-byte polygons at +0x98: u32@0x20 packs (flags_hi9 << 23) | (link_start << 6) | link_count,
     #    chaining across all c4 polygons to d8 and indexing +0xB0 -> +0xA8 endpoints touching that polygon.
-    b98 = nd.split_array(b, 0x98, 44, c4)
     chain_ok = b98 is not None and links_bounds_ok
     endpoints_ok = chain_ok and links_ok
     lidx = struct.unpack_from(f"<{d8}H", b, lb) if (links_bounds_ok and d8 > 0) else ()
@@ -147,6 +159,7 @@ def verify_tile(b, stats):
     gpi = 0
     max_poly_links = 0
     w20_hi9 = Counter()
+    by_li = {}
     if b98 is not None:
         for po, pcnt in b98:
             for pi in range(pcnt):
@@ -170,6 +183,7 @@ def verify_tile(b, stats):
                         if not ((p0 == gpi or p1 == gpi) and (s0 == c8 or s1 == c8)):
                             endpoints_ok = False
                             break
+                        by_li.setdefault(li, set()).add(gpi)
                 nxt += cnt
                 gpi += 1
             if not chain_ok:
@@ -177,6 +191,15 @@ def verify_tile(b, stats):
         if nxt != d8:
             chain_ok = False
             endpoints_ok = False
+
+    # Every link referenced in +0xB0 must be listed by all of its local-tile endpoints (p0 when s0 == c8,
+    # and p1 when s1 == c8).
+    if endpoints_ok and by_li:
+        for li, gpis in by_li.items():
+            p0, p1, s0, s1 = struct.unpack_from("<HHII", b, la + 32 * li + 12)
+            if (s0 == c8 and p0 not in gpis) or (s1 == c8 and p1 not in gpis):
+                endpoints_ok = False
+                break
 
     chk["poly_link_chain"] = chain_ok
     chk["link_indices_endpoints"] = endpoints_ok
@@ -333,11 +356,14 @@ def main(argv=None):
     if not os.path.exists(args.input):
         sys.stderr.write(f"error: input path not found: {args.input}\n")
         return 2
+    if os.path.isdir(args.input) and (args.start != 0 or args.limit is not None):
+        sys.stderr.write("error: --start and --limit only apply to RPF9 archive files\n")
+        return 2
     if args.out is not None:
         if os.path.isdir(args.out):
             sys.stderr.write(f"error: --out path is a directory: {args.out}\n")
             return 2
-        if os.path.abspath(args.out) == os.path.abspath(args.input):
+        if same_report_path(args.out, args.input):
             sys.stderr.write("error: --out must not overwrite the input path\n")
             return 2
 

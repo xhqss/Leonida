@@ -41,7 +41,10 @@ class Reference(unittest.TestCase):
         self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: 0xB3800000}), 0x3F7FFFFF)     # -2^-24 -> below 1.0
         self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: 0x80000000}), 0)              # -0 -> +0
         self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: 0x4B7FFFFF}), 0)              # an integer
-        self.assertTrue(d.is_nan(one("v_fract_f32_e32 v1, v2", v={2: d.NINF})))
+        self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: d.NINF}), 0xFFC00000)       # gfx1036: exactly this
+        self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: d.PINF}), 0xFFC00000)
+        self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: 0x7F800001}), 0x7F800001)     # a signalling NaN stays
+        self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: 0xFFC00123}), 0xFFC00123)     # a NaN comes back as is
         self.assertEqual(one("v_fract_f32_e64 v1, -v2 mul:2", v={2: 0x3F000000}), 0x3F800000)  # 0.5 * 2
 
     def test_frexp(self):
@@ -252,6 +255,18 @@ class Cli(unittest.TestCase):
             d.translated = real
         self.assertEqual(rc, 1)
         self.assertIn("MISMATCH", out)
+
+    def test_a_run_where_every_program_was_skipped_is_not_a_success(self):
+        def refuse(lines, *args):
+            raise d.Skip("unsupported form")
+        real = d.translated
+        try:
+            d.translated = refuse
+            rc, out = self.main("--programs", "3", "--seed", "1", "--ops", "v_cvt_u32_f32")
+        finally:
+            d.translated = real
+        self.assertEqual(rc, 2, out)
+        self.assertIn("no program ran: every one was skipped", out)
 
     def test_hardware_oracle_without_the_tools_exits_77(self):
         env = dict(os.environ, LEONIDA_AMD_CLANG=str(TOOL.parent / "no-such-clang.exe"))

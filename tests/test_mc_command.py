@@ -178,8 +178,8 @@ class MissingLlvmMcTest(unittest.TestCase):
         env = dict(os.environ, LLVM_MC=self.missing)
         for name, argv in tools.items():
             with self.subTest(tool=name):
-                p = subprocess.run([sys.executable, "-I", *argv], capture_output=True, text=True, env=env,
-                                   cwd=self.tmp.name, timeout=300)
+                p = subprocess.run([sys.executable, "-I", *argv], capture_output=True, text=True,
+                                   errors="replace", env=env, cwd=self.tmp.name, timeout=300)
                 self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
                 self.assertIn("could not be started", p.stderr)

@@ -106,12 +106,14 @@ int main() {
         EXPECT(device->CreatePipelineLibrary(nullptr, 0, __uuidof(ID3D12PipelineLibrary), nullptr) == S_FALSE);
         Ref<ID3D12PipelineLibrary> bad;
         EXPECT(device->CreatePipelineLibrary(nullptr, 16, IID_PPV_ARGS(&bad.p)) == E_INVALIDARG && !bad.p);
+        // A foreign or truncated blob is E_INVALIDARG, as on the host runtime (d3d12_pipeline_library_host_test);
+        // one of ours from another version is D3D12_ERROR_DRIVER_VERSION_MISMATCH ("LPL1", version 2).
         const std::uint32_t foreign[4] = {0xDEADBEEFu, 1u, 0u, 0u};
-        EXPECT(device->CreatePipelineLibrary(foreign, sizeof(foreign), IID_PPV_ARGS(&bad.p)) ==
-                   D3D12_ERROR_DRIVER_VERSION_MISMATCH &&
-               !bad.p);
+        EXPECT(device->CreatePipelineLibrary(foreign, sizeof(foreign), IID_PPV_ARGS(&bad.p)) == E_INVALIDARG && !bad.p);
         const std::uint8_t tiny[4] = {1, 2, 3, 4};
-        EXPECT(device->CreatePipelineLibrary(tiny, sizeof(tiny), IID_PPV_ARGS(&bad.p)) ==
+        EXPECT(device->CreatePipelineLibrary(tiny, sizeof(tiny), IID_PPV_ARGS(&bad.p)) == E_INVALIDARG && !bad.p);
+        const std::uint32_t other_version[4] = {0x314C504Cu, 2u, 0u, 0u};
+        EXPECT(device->CreatePipelineLibrary(other_version, sizeof(other_version), IID_PPV_ARGS(&bad.p)) ==
                    D3D12_ERROR_DRIVER_VERSION_MISMATCH &&
                !bad.p);
     }

@@ -195,7 +195,7 @@ class PatternsInImHex(unittest.TestCase):
         self.assertIsNotNone(got, log)
         self.assertEqual(got["header"]["magic"], "9FPR")
         self.assertEqual(got["header"]["data_offset"], 0x100)
-        self.assertEqual((got["header"]["u32_08"], got["header"]["u32_0c"]), (0x11, 0x22))
+        self.assertEqual((got["header"]["u32_08"], got["header"]["trailer_size"]), (0x11, 0x22))
         self.assertEqual(len(got["header_rest_and_toc"]), 0x100 - 0x10)
 
     def test_psin_matches_psin_index_and_psin_data(self):

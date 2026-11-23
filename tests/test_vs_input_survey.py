@@ -100,7 +100,9 @@ def test_vs_input_survey():
             check(r.returncode == 2 and "Traceback" not in r.stderr and len(r.stderr.strip().splitlines()) == 1,
                   f"{what}: one error line, exit 2")
         for what, body in (("junk bytes", b"\xff\xfe\x80"), ("empty file", b""), ("not a list", b'{"a": 1}'),
-                           ("a list of non-objects", b"[1, 2]")):
+                           ("a list of non-objects", b"[1, 2]"),
+                           ("a vs entry without file", b'[{"stage": "vs"}]'),
+                           ("a vs entry with a non-string file", b'[{"stage": "vs", "file": 5}]')):
             with open(idx, "wb") as f:
                 f.write(body)
             r = cli(d)

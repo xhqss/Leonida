@@ -55,7 +55,7 @@ MODES = {
 
 THREADS = 1024
 PER_THREAD = 8                       # inputs per thread, packed two to a dword
-PER_KERNEL = THREADS * PER_THREAD    # 8192 inputs, 4096 words: the launcher's limit
+PER_KERNEL = THREADS * PER_THREAD    # 8192 inputs, 4096 words per kernel: 8 kernels cover every input
 QNAN = 0x7E00
 TWO_PI_F32 = struct.unpack("<f", struct.pack("<f", 6.283185307179586))[0]
 

@@ -129,10 +129,13 @@ class PeImage:
     def directory(self, index: int) -> tuple[int, int]:
         return self.directories[index] if index < len(self.directories) else (0, 0)
 
-    def offset(self, rva: int, size: int = 1) -> int | None:
-        """File offset of an RVA span wholly backed by headers or one section."""
+    def _range(self, rva: int) -> tuple[int, int] | None:
+        """Contiguous file [start, end) backed by headers or the single section holding `rva`."""
+        if rva < 0:
+            return None
         if rva < self.size_of_headers:
-            return rva if 0 <= rva and rva + size <= min(self.size_of_headers, len(self.data)) else None
+            end = min(self.size_of_headers, len(self.data))
+            return (rva, end) if rva < end else None
         for s in self.sections:
             # A section is VirtualSize bytes in memory (SizeOfRawData when that is 0). File bytes past it are not
             # mapped, as in runtime/src/pe_loader.cpp: with SizeOfRawData larger than the span to the next
@@ -140,11 +143,23 @@ class PeImage:
             span = s["vsize"] or s["rawsize"]
             if s["rva"] <= rva < s["rva"] + span:
                 delta = rva - s["rva"]
-                if delta + size > min(s["rawsize"], span):
+                mapped = min(s["rawsize"], span)
+                if delta >= mapped:
                     return None
                 at = s["rawptr"] + delta
-                return at if at + size <= len(self.data) else None
+                end = min(s["rawptr"] + mapped, len(self.data))
+                return (at, end) if at < end else None
         return None
+
+    def offset(self, rva: int, size: int = 1) -> int | None:
+        """File offset of an RVA span wholly backed by headers or one section."""
+        if size <= 0:
+            return None
+        bounds = self._range(rva)
+        if bounds is None:
+            return None
+        start, end = bounds
+        return start if start + size <= end else None
 
     def section_data(self, section: dict) -> bytes:
         at = section["rawptr"]
@@ -153,8 +168,11 @@ class PeImage:
         return self.data[at:at + min(section["rawsize"], len(self.data) - at)]
 
     def string_at(self, rva: int) -> str | None:
-        at = self.offset(rva)
-        return None if at is None else _cstring(self.data, at)
+        bounds = self._range(rva)
+        if bounds is None:
+            return None
+        start, end = bounds
+        return _cstring(self.data, start, min(NAME_LIMIT, end - start))
 
     def word(self, at: int) -> int:
         return struct.unpack_from("<Q" if self.is64 else "<I", self.data, at)[0]
@@ -165,7 +183,7 @@ class PeImage:
         out = []
         width = 8 if self.is64 else 4
         for i in range(MAX_ENTRIES):
-            at = self.offset(lookup_rva + i * width)
+            at = self.offset(lookup_rva + i * width, width)
             if at is None:
                 break
             value = self.word(at)
@@ -174,7 +192,7 @@ class PeImage:
             if value & ordinal_flag:
                 out.append(f"#{value & 0xFFFF}")
                 continue
-            name = self.string_at((value & 0x7FFFFFFF) + 2)  # skip the 2-byte hint
+            name = self.string_at(value + 2)  # skip the 2-byte hint
             out.append(name if name is not None else "?")
         return out
 
@@ -220,8 +238,11 @@ def _exports(img: PeImage) -> list[str]:
     rva, size = img.directory(DIR_EXPORT)
     if not rva or size < 40:
         return []
-    at = img.offset(rva)
+    at = img.offset(rva, 40)
     if at is None:
+        start = img.offset(rva)
+        if start is not None and start + 40 > len(img.data):
+            raise PeFormatError("truncated export directory")
         return []
     (_chars, _stamp, _major, _minor, _name, base, functions, name_count, addr_functions,
      addr_names, addr_ordinals) = struct.unpack_from("<IIHHIIIIIII", img.data, at)
@@ -230,14 +251,13 @@ def _exports(img: PeImage) -> list[str]:
         if index >= functions:
             return False
         # A zero RVA marks an unused slot. An RVA inside the export directory is a valid forwarder.
-        slot = img.offset(addr_functions + index * 4)
-        return (slot is not None and slot + 4 <= len(img.data)
-                and struct.unpack_from("<I", img.data, slot)[0] != 0)
+        slot = img.offset(addr_functions + index * 4, 4)
+        return slot is not None and struct.unpack_from("<I", img.data, slot)[0] != 0
 
     named, names = set(), []
     for i in range(min(name_count, MAX_ENTRIES)):
-        name_at = img.offset(addr_names + i * 4)
-        ord_at = img.offset(addr_ordinals + i * 2)
+        name_at = img.offset(addr_names + i * 4, 4)
+        ord_at = img.offset(addr_ordinals + i * 2, 2)
         if name_at is None or ord_at is None:
             break
         index = struct.unpack_from("<H", img.data, ord_at)[0]
@@ -255,18 +275,23 @@ def _exports(img: PeImage) -> list[str]:
 def _export_module_name(img: PeImage) -> str:
     """The module name the export directory records (its Name field), or "" when there is none."""
     rva, size = img.directory(DIR_EXPORT)
-    at = img.offset(rva) if rva and size >= 40 else None
-    if at is None or at + 16 > len(img.data):
+    at = img.offset(rva, 40) if rva and size >= 40 else None
+    if at is None:
         return ""
     return img.string_at(struct.unpack_from("<I", img.data, at + 12)[0]) or ""
 
 
 def _tls_callbacks(img: PeImage) -> int:
     rva, size = img.directory(DIR_TLS)
-    if not rva or size < (40 if img.is64 else 24):
+    header_size = 40 if img.is64 else 24
+    callbacks_end = 32 if img.is64 else 16
+    if not rva or size < header_size:
         return 0
-    at = img.offset(rva)
+    at = img.offset(rva, header_size)
     if at is None:
+        start = img.offset(rva)
+        if start is not None and start + callbacks_end > len(img.data):
+            raise PeFormatError("truncated TLS directory")
         return 0
     callbacks_va = struct.unpack_from("<Q" if img.is64 else "<I", img.data, at + (24 if img.is64 else 12))[0]
     if not callbacks_va or callbacks_va < img.image_base:
@@ -275,7 +300,7 @@ def _tls_callbacks(img: PeImage) -> int:
     count = 0
     width = 8 if img.is64 else 4
     for i in range(MAX_ENTRIES):
-        entry = img.offset(callbacks + i * width)
+        entry = img.offset(callbacks + i * width, width)
         if entry is None or not img.word(entry):
             break
         count += 1

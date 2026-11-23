@@ -240,6 +240,22 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceFeatures2 enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &enable12};
     enable.features.shaderInt64 = VK_TRUE;
     enable.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+    const std::vector<std::uint32_t> shader_code[] = {read_spv(argv[1]), read_spv(argv[2])};
+    bool dynamic_storage = false;
+    for (int stage = 0; stage < 2; ++stage) {
+        const auto& code = shader_code[stage];
+        if (code.empty()) {
+            std::fprintf(stderr, "cannot read %s\n", argv[1 + stage]);
+            return 1;
+        }
+        dynamic_storage = dynamic_storage || leonida::vk_test::spirv_declares_capability(
+            code.data(), code.size() * sizeof(code[0]), leonida::vk_test::spv_storage_image_array_dynamic_indexing);
+    }
+    if (dynamic_storage && !have.features.shaderStorageImageArrayDynamicIndexing) {
+        std::printf("unsupported: shaderStorageImageArrayDynamicIndexing\n");
+        return unsupported;
+    }
+    enable.features.shaderStorageImageArrayDynamicIndexing = dynamic_storage;
     // ps_imgatomic: image atomics in a pixel shader need fragment stores and atomics.
     const bool atomic_mode = std::strstr(argv[2], "imgatomic") != nullptr;
     if (atomic_mode) {
@@ -264,6 +280,8 @@ int main(int argc, char** argv) {
     qci.pQueuePriorities = &priority;
     leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr), when the device has it
     fma.query(gipa, inst, pd);
+    // A device without VK_KHR_shader_fma cannot create a pipeline from a stage that uses OpFmaKHR: skip the pair.
+    if (!fma.accepts_file(argv[1]) || !fma.accepts_file(argv[2])) return 77;
     fma.link_after(&enable);
     const char* fma_extension = fma.extension();
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable};
@@ -435,11 +453,7 @@ int main(int argc, char** argv) {
     VkShaderModule vs, fs;
     bool tail_block = false;
     for (int stage = 0; stage < 2; ++stage) {
-        const auto code = read_spv(argv[1 + stage]);
-        if (code.empty()) {
-            std::fprintf(stderr, "cannot read %s\n", argv[1 + stage]);
-            return 1;
-        }
+        const auto& code = shader_code[stage];
         if (pc_tail && leonida::vk_test::spirv_declares_set(code.data(), code.size() * 4, leonida::vk_test::pc_tail_set))
             tail_block = true;
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -681,7 +695,9 @@ int main(int argc, char** argv) {
         const auto flush = [&]() {
             vkResetCommandBuffer(cmd, 0);
             if (const VkResult r = vkBeginCommandBuffer(cmd, &begin); r != VK_SUCCESS) return false;
-            const bool ok = set.flush(cmd);
+            // Ticket 1: what a flush that replaces the table stamps its retired generation with; release_retired(0)
+            // below must keep it, as the owner's completed ticket 0 means nothing has finished.
+            const bool ok = set.flush(cmd, 1);
             return submit() == VK_SUCCESS && ok;
         };
 
@@ -910,10 +926,10 @@ int main(int argc, char** argv) {
                 while ((hash_descriptor_key(key) & (slots - 1)) != target) ++key[7];
             }
             for (std::uint32_t i = 0; i < kDescriptorProbes; ++i) set.insert_key(keys[i], decoy_index);
-            EXPECT(!set.flush_needs_idle() && flush());
+            EXPECT(!set.flush_replaces_table() && flush());
             EXPECT(set.insert_key(keys.back(), gradient_index));
-            EXPECT(slot_count() == slots && set.flush_needs_idle());
-            EXPECT(flush() && !set.flush_needs_idle());
+            EXPECT(slot_count() == slots && set.flush_replaces_table());
+            EXPECT(flush() && !set.flush_replaces_table());
             for (const auto& key : keys) {
                 EXPECT(table.lookup(key) == (key == keys.back() ? gradient_index : decoy_index));
                 EXPECT(set.erase_key(key));
@@ -932,7 +948,7 @@ int main(int argc, char** argv) {
         set.insert_key(make_ssharp_key(ssharp.data()), sampler_index);
         for (std::uint32_t k = 100000; k < 100006; ++k) set.insert_key(numbered(k), decoy_index);
         const std::uint32_t depth = probe_depth(table.build_gpu_buffer(), tsharp);
-        EXPECT(slot_count() == slots && depth == 3 && !set.flush_needs_idle());
+        EXPECT(slot_count() == slots && depth == 3 && !set.flush_replaces_table());
         EXPECT(flush());
         CHECK(draw());
         compare("1 gradient", nullptr);
@@ -940,30 +956,38 @@ int main(int argc, char** argv) {
         // 2. Without its key the T# is a miss: index 0, the fallback image of zeros.
         const float zeros[4] = {0, 0, 0, 0};
         EXPECT(set.erase_key(tsharp) && !set.erase_key(tsharp));
-        EXPECT(!set.flush_needs_idle());  // erasing empties its slot only: the three keys ahead stay where they are
-        EXPECT(flush() && !set.flush_needs_idle());
+        EXPECT(!set.flush_replaces_table());  // erasing empties its slot only: the three keys ahead stay where they are
+        EXPECT(flush() && !set.flush_replaces_table());
         CHECK(draw());
         compare("2 miss", zeros);
 
         // 3. The table grows: a new, larger buffer behind binding 2.
         set.insert_key(tsharp, gradient_index);
-        EXPECT(!set.flush_needs_idle());  // one more entry, in place
+        EXPECT(!set.flush_replaces_table());  // one more entry, in place
         for (std::uint32_t k = 200000; k < 200200; ++k) set.insert_key(numbered(k), decoy_index);
-        EXPECT(slot_count() > slots && table.lookup(tsharp) == gradient_index && set.flush_needs_idle());
+        EXPECT(slot_count() > slots && table.lookup(tsharp) == gradient_index && set.flush_replaces_table());
+        const VkDescriptorSet before_growth = set.set();
+        const std::uint64_t made_before = set.generations_made();
         EXPECT(flush());
+        // A new generation: another descriptor set (every descriptor written so far copied into it) and table, the
+        // old one retired but intact until released (D3D-314).
+        EXPECT(set.set() != before_growth && set.generations_made() == made_before + 1 && set.retired_count() >= 1);
         CHECK(draw());
         compare("3 grown", nullptr);
+        set.release_retired(0);  // a ticket past what completed (nothing): keeps the generation
+        EXPECT(set.retired_count() >= 1);
         set.release_retired();
+        EXPECT(set.retired_count() == 0);
 
         const float orange_colour[4] = {1.0f, 128.0f / 255.0f, 0.0f, 1.0f};
-        // Rewriting the same mapping is a no-op. Changing it needs idle even with no table growth.
+        // Rewriting the same mapping is a no-op. Changing it makes a new generation even with no table growth.
         const std::uint32_t grown_slots = slot_count();
-        EXPECT(set.insert_key(tsharp, gradient_index) && !set.flush_needs_idle());
-        EXPECT(set.insert_key(tsharp, decoy_index) && slot_count() == grown_slots && set.flush_needs_idle());
-        EXPECT(flush() && !set.flush_needs_idle());
+        EXPECT(set.insert_key(tsharp, gradient_index) && !set.flush_replaces_table());
+        EXPECT(set.insert_key(tsharp, decoy_index) && slot_count() == grown_slots && set.flush_replaces_table());
+        EXPECT(flush() && !set.flush_replaces_table());
         CHECK(draw());
         compare("4 rebound", orange_colour);
-        EXPECT(set.insert_key(tsharp, gradient_index) && set.flush_needs_idle());
+        EXPECT(set.insert_key(tsharp, gradient_index) && set.flush_replaces_table());
         EXPECT(flush());
         CHECK(draw());
         compare("5 restored", nullptr);
@@ -971,17 +995,17 @@ int main(int argc, char** argv) {
         // A submit that never reached the queue must keep the table upload pending: the retry has to see the new
         // mapping instead of the fallback or the old index (a recovered submit failure, the case a device reports
         // through table_upload_result(false)).
-        EXPECT(set.insert_key(tsharp, decoy_index) && set.flush_needs_idle());
+        EXPECT(set.insert_key(tsharp, decoy_index) && set.flush_replaces_table());
         vkResetCommandBuffer(cmd, 0);
         CHECK(vkBeginCommandBuffer(cmd, &begin));
-        EXPECT(set.flush(cmd));  // recorded in a command buffer that is never submitted
+        EXPECT(set.flush(cmd, 1));  // recorded in a command buffer that is never submitted
         CHECK(vkEndCommandBuffer(cmd));
         set.table_upload_result(false);
-        EXPECT(set.flush_needs_idle());  // the retry rewrites the whole table: the device must idle first
+        EXPECT(set.flush_replaces_table());  // the retry rewrites the whole table, in a new generation
         EXPECT(flush());
         CHECK(draw());
         compare("6 rebound after a failed submit", orange_colour);
-        EXPECT(set.insert_key(tsharp, gradient_index) && set.flush_needs_idle());
+        EXPECT(set.insert_key(tsharp, gradient_index) && set.flush_replaces_table());
         EXPECT(flush());
 
         // Another view at the same index, then removal of the index.
@@ -1057,6 +1081,7 @@ int main(int argc, char** argv) {
     for (const auto image : {target, stored, decoy, gradient}) vkDestroyImage(dev, image, nullptr);
     for (const auto buffer : {readback, upload, heap}) vkDestroyBuffer(dev, buffer, nullptr);
     for (const auto memory : allocations) vkFreeMemory(dev, memory, nullptr);
+    tail.destroy(vkGetDeviceProcAddr, dev);  // the --pc-tail-ubo block, when the shaders use one
     vkDestroyDevice(dev, nullptr);
     if (messenger) {
         LI(vkDestroyDebugUtilsMessengerEXT);

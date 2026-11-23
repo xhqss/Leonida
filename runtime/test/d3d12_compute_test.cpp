@@ -310,7 +310,8 @@ int main() {
                                                            reinterpret_cast<void**>(&device.p))));
         rt::d3d12::set_device_outer(inner, device.p);
 
-        // Root signature: [0] two constants (s0, s1), [1] a root UAV (s2:s3), [2] a one-CBV table (s4:s5).
+        // Root signature: [0] two constants (s4, s5), [1] a root UAV (s6:s7), [2] a one-CBV table (s8, its 32-bit VA):
+        // the console compute layout (rt::rootsig::pack_stage, D3D-448).
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, 0};
         D3D12_ROOT_PARAMETER params[3] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -443,6 +444,44 @@ int main() {
             EXPECT(limited->CreateComputePipelineState(&limited_desc, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL && !refused.p);
         }
 
+        // The GPU address arena is no larger than the device's maxBufferSize and maxMemoryAllocationSize
+        // (src/arena_size.h), whatever LEONIDA_ARENA_MB asks for: with LEONIDA_ARENA_MB=3000 on a GPU that reports
+        // 2 GiB (RX 6800), a run under LEONIDA_VK_VALIDATION=1 has no vkAllocateMemory error. A device that reports
+        // a 32 MiB maxMemoryAllocationSize (simulated) gets at most 32 MiB from the default 256, and a buffer past
+        // that is refused.
+        {
+            VkPhysicalDeviceMaintenance4Properties m4{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES};
+            VkPhysicalDeviceMaintenance3Properties m3{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES, &m4};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &m3};
+            d.instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(d.physical, &properties);
+            const std::uint64_t arena = rt::d3d12::device_arena_size(device.p);
+            EXPECT(arena > 0 && arena <= m4.maxBufferSize && arena <= m3.maxMemoryAllocationSize);
+
+            constexpr std::uint64_t capped_limit = 32ull << 20;
+            rt::d3d12::VulkanDeviceInfo capped_info = info;
+            capped_info.max_memory_allocation_size = capped_limit;
+            Ref<ID3D12Device> capped;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(capped_info, IID_PPV_ARGS(&capped.p))));
+            const std::uint64_t capped_arena = rt::d3d12::device_arena_size(capped.p);
+            EXPECT(capped_arena > 0 && capped_arena <= capped_limit);
+            const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+            const auto fits = buffer_desc(1u << 20, D3D12_RESOURCE_FLAG_NONE);
+            const auto too_large = buffer_desc(capped_limit + (1u << 20), D3D12_RESOURCE_FLAG_NONE);
+            Ref<ID3D12Resource> inside, past;
+            EXPECT(SUCCEEDED(capped->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &fits,
+                                                            D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                            IID_PPV_ARGS(&inside.p))));
+            EXPECT(inside->GetGPUVirtualAddress() + (1u << 20) <= capped_arena);
+            EXPECT(capped->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &too_large, D3D12_RESOURCE_STATE_COMMON,
+                                                  nullptr, IID_PPV_ARGS(&past.p)) == E_OUTOFMEMORY && !past.p);
+            std::printf("arena: %llu MiB (device limits: maxBufferSize %llu MiB, maxMemoryAllocationSize %llu MiB); "
+                        "%llu MiB with a simulated 32 MiB maxMemoryAllocationSize\n",
+                        static_cast<unsigned long long>(arena >> 20),
+                        static_cast<unsigned long long>(m4.maxBufferSize >> 20),
+                        static_cast<unsigned long long>(m3.maxMemoryAllocationSize >> 20),
+                        static_cast<unsigned long long>(capped_arena >> 20));
+        }
+
         // Buffers in the arena, an upload buffer outside it, a readback buffer for the results.
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
@@ -506,7 +545,7 @@ int main() {
         list->SetComputeRootUnorderedAccessView(0, va_a);
         EXPECT(list->Close() == E_INVALIDARG);
 
-        // Two dispatches: the second changes s0 and the UAV; each must keep what it was recorded with.
+        // Two dispatches: the second changes s4 and the UAV; each must keep what it was recorded with.
         EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
         ID3D12DescriptorHeap* heaps[] = {heap.p};
         list->SetDescriptorHeaps(1, heaps);

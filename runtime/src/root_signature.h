@@ -117,6 +117,67 @@ constexpr uint32_t kMaxD3d12Cost = 64;
 // D3D12 cost limit, or holds more than 64 root parameters.
 [[nodiscard]] PackResult pack(const RootSignature& sig);
 
+// The console layout of root arguments in a stage's user SGPRs (docs/d3d12_vulkan.md section 3.5, D3D-448).
+//
+// Parameters go in root-signature order from the stage's first root-argument SGPR, each while it fits whole:
+// a 32-bit constant takes one SGPR per value, a root CBV/SRV/UAV two (its 64-bit VA), a descriptor table ONE
+// (the 32-bit VA of its first descriptor; the heaps live below 4 GiB). Static samplers take none.
+//
+// How each part is known:
+//   - compute, base s4: measured. The console compiler's output (section 7) and the package's FidelityFX DLL, whose
+//     29 compute containers carry their RTS0 next to the console-compiled program: base s4 plus the signature's span
+//     in this layout equals the program's RSRC2 USER_SGPR count in 29 of 29, and the programs read the tables and
+//     root CBVs at exactly these SGPRs (tools/rootsig_census.py --disasm). The game's compute census agrees (lowest
+//     pointer s4, one-dword tables).
+//   - vertex/pixel/geometry s8 and mesh s16: a hypothesis from the corpus census only (lowest pointer SGPR per stage);
+//     no signature confirms them, and visibility is not modelled (every parameter takes its place in every stage).
+// A parameter that does not fit goes to the console's spill array behind s[0:1] (compute, section 7) together with
+// every parameter after it; that array is not modelled, so such a signature is refused, never truncated.
+enum class Stage : uint32_t { Vertex = 0, Pixel = 1, Geometry = 2, Compute = 3, Mesh = 4 };
+
+[[nodiscard]] constexpr uint32_t stage_base(Stage stage) noexcept {
+    switch (stage) {
+        case Stage::Compute:
+            return 4;
+        case Stage::Mesh:
+            return 16;
+        case Stage::Vertex:
+        case Stage::Pixel:
+        case Stage::Geometry:
+            return 8;
+    }
+    return 8;
+}
+
+// User SGPRs one parameter takes in the console layout (see Stage).
+[[nodiscard]] constexpr uint32_t stage_dwords(ParamType type, uint32_t num_values) noexcept {
+    switch (type) {
+        case ParamType::Constants:
+            return num_values;
+        case ParamType::Descriptor:
+            return 2;
+        case ParamType::Table:
+            return 1;
+    }
+    return 0;
+}
+
+constexpr uint32_t kNoSgpr = 0xFFFFFFFFu;
+
+struct StagePackResult {
+    bool ok = false;
+    std::string error;            // set when !ok; names the refusing parameter
+    Stage stage = Stage::Compute;
+    uint32_t base = 0;            // stage_base(stage)
+    std::vector<uint32_t> first_sgpr;  // per parameter: its first user SGPR (kNoSgpr when the signature is refused)
+    uint32_t end_sgpr = 0;        // one past the last SGPR used: the RSRC2 USER_SGPR count the layout implies
+    uint32_t d3d12_cost = 0;      // cost against the 64-dword D3D12 limit
+};
+
+// Lays the parameters out for `stage` in the console layout. Fails like pack() on more than 64 parameters, a
+// constant parameter of 0 values or the 64-dword cost limit, and on any parameter that would spill.
+[[nodiscard]] StagePackResult pack_stage(const RootSignature& sig, Stage stage);
+
 // D3D12 cost of one parameter against the 64-dword limit.
 [[nodiscard]] constexpr uint32_t param_cost(ParamType type, uint32_t num_values) noexcept {
     switch (type) {

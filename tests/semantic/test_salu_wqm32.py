@@ -147,6 +147,31 @@ class DataPathWqm32Tests(unittest.TestCase):
                 )
                 self.assertEqual((words[0], words[1]), (exp_d, exp_scc))
 
+    def test_data_in_place_and_null_destination(self):
+        for x in (0x00000000, 0x00000020, 0x40080001):
+            want_d, want_scc = ref_wqm32(x)
+            with self.subTest(alias=hex(x)):
+                words, _ = run_ps("ps_wqm_alias", [
+                    f"s_mov_b32 s0, {x:#x}",
+                    "s_cmp_eq_u32 0, 1" if want_scc else "s_cmp_eq_u32 1, 1",
+                    "s_wqm_b32 s0, s0",
+                    "s_cselect_b32 s2, 1, 0",
+                    "v_mov_b32 v0, s0",
+                    "v_mov_b32 v1, s2",
+                ])
+                self.assertEqual((words[0], words[1]), (want_d, want_scc))
+        for x, want_scc in ((0x00000000, 0), (0x80000000, 1)):
+            with self.subTest(null=hex(x)):
+                words, _ = run_ps("ps_wqm_null", [
+                    f"s_mov_b32 s0, {x:#x}",
+                    "s_cmp_eq_u32 0, 1" if want_scc else "s_cmp_eq_u32 1, 1",
+                    "s_wqm_b32 null, s0",
+                    "s_cselect_b32 s2, 1, 0",
+                    "v_mov_b32 v0, s0",
+                    "v_mov_b32 v1, s2",
+                ])
+                self.assertEqual((words[0], words[1]), (x, want_scc))
+
 
 class LaneMaskWqm32Tests(unittest.TestCase):
     def test_lane_mask_wave32_quad_expansion_in_wave_interp(self):
@@ -186,6 +211,90 @@ class LaneMaskWqm32Tests(unittest.TestCase):
                         got_mask |= 1 << lane
                 self.assertEqual(got_mask, exp_mask)
 
+    def run_vs32(self, name, lines, wave=32):
+        """Run a vertex shader on one wave; return each lane's param0 words."""
+        spv = translate_lines(name, lines + [
+            "v_mov_b32_e32 v20, 0",
+            "exp pos0 v20, v20, v20, v20 done",
+            "exp param0 v0, v1, v2, v3",
+            "s_endpgm",
+        ])
+        outs = wi.run_wave(spv, wave=wave,
+                           builtins={"VertexIndex": lambda lane: lane, "InstanceIndex": lambda lane: 0})["outputs"]
+        return [next(v for k, v in o.items() if k.endswith("param0")) for o in outs]
+
+    def test_exec_lo_sgpr_and_null_destinations(self):
+        # v1 = 0x22 on the lanes the new EXEC keeps, v2 = D's bit for this lane; SCC is seeded to the other value.
+        masks = (0x00000000, 0x00000020, 0x80000000, 0x40080021, 0xFFFFFFFF)
+        forms = [
+            # (dst, src, EXEC set from the mask first)
+            ("exec_lo", "vcc_lo", False),
+            ("exec_lo", "exec_lo", True),
+            ("exec_lo", "literal", False),   # data, not a lane mask, written to EXEC
+            ("s4", "s2", False),             # lane mask in an SGPR
+            ("null", "vcc_lo", False),
+        ]
+        for dst, src, from_exec in forms:
+            for mask in masks:
+                want_d, want_scc = ref_wqm32(mask)
+                with self.subTest(dst=dst, src=src, mask=hex(mask)):
+                    lines = ["v_mbcnt_lo_u32_b32 v4, -1, 0", "v_lshlrev_b32_e32 v5, v4, 1",
+                             f"v_and_b32_e32 v6, {mask:#x}, v5", "v_mov_b32_e32 v1, 0x11"]
+                    if from_exec:
+                        lines.append("v_cmpx_ne_u32_e32 0, v6")
+                    elif src == "vcc_lo":
+                        lines.append("v_cmp_ne_u32_e32 vcc_lo, 0, v6")
+                    elif src == "s2":
+                        lines.append("v_cmp_ne_u32_e64 s2, 0, v6")
+                    operand = f"{mask:#x}" if src == "literal" else src
+                    lines += [
+                        "s_cmp_eq_u32 0, 1" if want_scc else "s_cmp_eq_u32 1, 1",
+                        f"s_wqm_b32 {dst}, {operand}",
+                        "s_cselect_b32 s10, 1, 0",
+                        "v_mov_b32_e32 v1, 0x22",
+                        "s_mov_b32 exec_lo, -1",
+                        "v_mov_b32_e32 v0, s10",
+                        f"v_cndmask_b32_e64 v2, 0, 1, {dst}" if dst == "s4" else "v_mov_b32_e32 v2, 0",
+                        "v_mov_b32_e32 v3, 0",
+                    ]
+                    outs = self.run_vs32("vs_wqm_dst", lines)
+                    new_exec = want_d if dst == "exec_lo" else MASK32
+                    for lane in range(32):
+                        want = (want_scc, 0x22 if new_exec >> lane & 1 else 0x11,
+                                want_d >> lane & 1 if dst == "s4" else 0, 0)
+                        self.assertEqual(outs[lane], want, f"lane {lane}")
+
+    def test_wave64_exec_half_changes_and_votes_only_its_half(self):
+        # In wave64, s_wqm_b32 exec_lo, exec_lo expands lanes 0..31 only and SCC votes over them (likewise exec_hi):
+        # the other half is kept, and an empty half gives SCC = 0 even when the other half has lanes on.
+        cases = [
+            # (half, exec_lo, exec_hi, new exec_lo, new exec_hi, SCC)
+            ("exec_lo", 0x00000020, 0x00000001, 0x000000F0, 0x00000001, 1),
+            ("exec_lo", 0x00000000, 0x00000001, 0x00000000, 0x00000001, 0),
+            ("exec_hi", 0x00000001, 0x00000020, 0x00000001, 0x000000F0, 1),
+            ("exec_hi", 0x00000001, 0x00000000, 0x00000001, 0x00000000, 0),
+        ]
+        for half, lo, hi, want_lo, want_hi, want_scc in cases:
+            want_exec = want_lo | want_hi << 32
+            with self.subTest(half=half, lo=hex(lo), hi=hex(hi)):
+                outs = self.run_vs32("vs_wqm_w64half", [
+                    "s_mov_b64 s[12:13], exec",
+                    "v_mov_b32_e32 v1, 0x11",
+                    f"s_mov_b32 exec_lo, {lo:#x}",
+                    f"s_mov_b32 exec_hi, {hi:#x}",
+                    "s_cmp_eq_u32 0, 1" if want_scc else "s_cmp_eq_u32 1, 1",
+                    f"s_wqm_b32 {half}, {half}",
+                    "s_cselect_b32 s10, 1, 0",
+                    "v_mov_b32_e32 v1, 0x22",
+                    "s_mov_b64 exec, -1",
+                    "v_mov_b32_e32 v0, s10",
+                    "v_mov_b32_e32 v2, 0",
+                    "v_mov_b32_e32 v3, 0",
+                ], wave=64)
+                for lane in range(64):
+                    self.assertEqual(outs[lane], (want_scc, 0x22 if want_exec >> lane & 1 else 0x11, 0, 0),
+                                     f"lane {lane}")
+
     def test_ps_lane_mask_emits_quad_swap_and_vote_any(self):
         spv = translate_lines(
             "ps_wqm_mask_struct",
@@ -201,7 +310,8 @@ class LaneMaskWqm32Tests(unittest.TestCase):
             ],
         )
         self.assertGreaterEqual(spv.count("OpGroupNonUniformQuadSwap %uint"), 2)
-        self.assertIn("OpGroupNonUniformAny %bool", spv)
+        self.assertIn("OpGroupNonUniformBallot %v4uint_bal", spv)
+        self.assertIn("%c20", spv)
 
 
 if __name__ == "__main__":

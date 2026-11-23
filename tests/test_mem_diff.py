@@ -49,6 +49,19 @@ class Harness(unittest.TestCase):
                 self.assertEqual(counts["pass"], 60)
 
 
+class EverythingSkipped(unittest.TestCase):
+    def test_a_run_where_every_program_was_skipped_is_not_a_success(self):
+        import contextlib
+        import io
+        from unittest import mock
+        out = io.StringIO()
+        with mock.patch.object(md, "run_one", lambda *args: ("skip", "unsupported form")), \
+                contextlib.redirect_stdout(out):
+            rc = md.main(["--programs", "2", "--seed", "1"])
+        self.assertEqual(rc, 2, out.getvalue())
+        self.assertIn("no program ran: every one was skipped", out.getvalue())
+
+
 class Reference(unittest.TestCase):
     """The reference model on hand-made cases (the expected words are worked out by hand)."""
 
@@ -81,6 +94,21 @@ class Reference(unittest.TestCase):
                  "v_mov_b32 v4, 9", "v_mov_b32 v5, 7", "buffer_atomic_cmpswap v[4:5], off, s[0:3], 0 glc"]
         ref = self.run_ref(lines, memory)
         self.assertEqual((ref.mem[0x6000], ref.v[4]), (9, 7))
+
+    def test_buffer_load_sbyte_lane_offset(self):
+        lines = ["s_mov_b32 s0, 0x7000", "s_mov_b32 s1, 0", "s_mov_b32 s2, 0x10", "s_mov_b32 s3, 0",
+                 "buffer_load_sbyte v4, off, s[0:3], 0 offset:2"]
+        ref = self.run_ref(lines, {0x7000: 0x0080_0000})
+        self.assertEqual(ref.v[4], 0xFFFFFF80)
+
+    def test_global_atomic_cmpswap_glc_and_no_glc(self):
+        lines = ["s_mov_b32 s4, 0x8000", "s_mov_b32 s5, 0", "v_mov_b32 v2, 0x14",
+                 "v_mov_b32 v4, 11", "v_mov_b32 v5, 5",
+                 "global_atomic_cmpswap v6, v2, v[4:5], s[4:5] offset:-4 glc",
+                 "v_mov_b32 v4, 22",
+                 "global_atomic_add v2, v4, s[4:5] offset:-4"]
+        ref = self.run_ref(lines, {0x8010: 5})
+        self.assertEqual((ref.v[6], ref.mem[0x8010]), (5, 33))
 
 
 class FormatDecode(unittest.TestCase):

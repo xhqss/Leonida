@@ -411,7 +411,7 @@ class ModuleStructureAndDecorationsTest(unittest.TestCase):
             ("OpTypeInt_short", spv.OP_TYPE_INT, (1, 32)),
             ("OpTypeInt_long", spv.OP_TYPE_INT, (1, 32, 0, 9)),
             ("OpTypeFloat_short", spv.OP_TYPE_FLOAT, (1,)),
-            ("OpTypeFloat_long", spv.OP_TYPE_FLOAT, (1, 32, 0)),
+            ("OpTypeFloat_long", spv.OP_TYPE_FLOAT, (1, 16, 0, 0)),
             ("OpTypeVector_short", spv.OP_TYPE_VECTOR, (1, 2)),
             ("OpTypeMatrix_long", spv.OP_TYPE_MATRIX, (1, 2, 3, 4)),
             ("OpTypeArray_short", spv.OP_TYPE_ARRAY, (1, 2)),
@@ -444,6 +444,24 @@ class ModuleStructureAndDecorationsTest(unittest.TestCase):
         self.assertEqual(len(iface.outputs), 1)
         self.assertEqual(iface.outputs[0].symbol, var)
         self.assertEqual(iface.outputs[0].varyings[0].address, spv.Address(3))
+
+    def test_accepts_encoded_float_outside_interface(self):
+        b = SpirvBuilder("vs")
+        bf16 = b.emit_type(spv.OP_TYPE_FLOAT, 16, 0)  # BFloat16KHR
+        b.constant(bf16, 0x3F00)
+        b.variable(spv.STORAGE_OUTPUT, b.numeric("f", 32, 4), location=3)
+        output, = b.reflect().outputs
+        self.assertEqual(
+            output.varyings,
+            (spv.Varying(spv.Address(3), spv.NumericType("f", 32, 4)),),
+        )
+
+    def test_rejects_encoded_float_varying(self):
+        b = SpirvBuilder("vs")
+        bf16 = b.emit_type(spv.OP_TYPE_FLOAT, 16, 0)  # BFloat16KHR
+        b.variable(spv.STORAGE_OUTPUT, bf16, location=3)
+        with self.assertRaisesRegex(spv.InterfaceError, "unsupported floating-point encoding"):
+            b.reflect()
 
     def test_ignores_non_interface_decorations_and_validates_known_ones(self):
         b = SpirvBuilder("ps")
@@ -567,6 +585,19 @@ class TypeAndConstantResolutionTest(unittest.TestCase):
                 v = b.reflect().outputs[0].varyings[0]
                 self.assertEqual(v.type, spv.AggregateType("array", (spv.NumericType("f", 32),), expected))
 
+    def test_array_length_accepts_int8_constants(self):
+        for opcode in (spv.OP_CONSTANT, spv.OP_SPEC_CONSTANT):
+            for signed, count in ((False, 0x82), (True, 5)):
+                with self.subTest(opcode=opcode, signed=signed):
+                    b = SpirvBuilder("vs")
+                    length_type = b.int_type(8, signed=signed)
+                    length_id = b.alloc()
+                    b.emit(opcode, length_type, length_id, count)
+                    arr_t = b.emit_type(spv.OP_TYPE_ARRAY, b.float_type(), length_id)
+                    b.variable(spv.STORAGE_OUTPUT, arr_t, location=0)
+                    varying = b.reflect().outputs[0].varyings[0]
+                    self.assertEqual(varying.type, spv.AggregateType("array", (spv.NumericType("f", 32),), count))
+
     def test_array_length_constant_errors(self):
         # Not an OpConstant (references an undefined ID).
         b = SpirvBuilder("vs")
@@ -583,10 +614,10 @@ class TypeAndConstantResolutionTest(unittest.TestCase):
         with self.assertRaisesRegex(spv.InterfaceError, "must be an integer"):
             b.reflect()
 
-        # Unsupported integer width (8-bit) for array length.
+        # Unsupported integer width for array length.
         b = SpirvBuilder("vs")
-        i8 = b.emit_type(spv.OP_TYPE_INT, 8, 0)
-        c = b.constant(i8, 3)
+        u24 = b.int_type(24)
+        c = b.constant(u24, 3)
         arr_t = b.emit_type(spv.OP_TYPE_ARRAY, b.numeric("f", 32), c)
         b.variable(spv.STORAGE_OUTPUT, arr_t, location=0)
         with self.assertRaisesRegex(spv.InterfaceError, "must be an integer"):
@@ -603,6 +634,8 @@ class TypeAndConstantResolutionTest(unittest.TestCase):
 
         # Zero and negative signed counts.
         bad_counts = [
+            ("zero_u8", 8, False, (0,)),
+            ("neg_i8", 8, True, (0xFFFFFF80,)),
             ("zero_u32", 32, False, (0,)),
             ("neg_i16", 16, True, (0x8000,)),
             ("neg_i32", 32, True, (0xFFFFFFFF,)),
@@ -820,19 +853,33 @@ class EntryPointSelectionTest(unittest.TestCase):
                 with self.assertRaisesRegex(spv.InterfaceError, f"is {model}, expected vs"):
                     b_unsup.reflect(stage="vs")
 
-        # Duplicate interface ID in OpEntryPoint.
-        b_dup_id = SpirvBuilder("vs")
-        v = b_dup_id.variable(spv.STORAGE_OUTPUT, b_dup_id.numeric("f", 32), location=0, add_to_interface=False)
-        b_dup_id.entry_point("main", [v, v])
-        with self.assertRaisesRegex(spv.InterfaceError, "duplicate entry-point interface ID"):
-            spv.Module(b_dup_id.build())
-
         # Entry point referencing a missing OpVariable.
         b_missing_var = SpirvBuilder("vs")
         ghost = b_missing_var.alloc()
         b_missing_var.entry_point("main", [ghost])
         with self.assertRaisesRegex(spv.InterfaceError, f"missing variable %{ghost}"):
             b_missing_var.reflect()
+
+    def test_accepts_repeated_interface_ids_before_spirv_1_4(self):
+        for version in (0x00010000, 0x00010300):
+            with self.subTest(version=hex(version)):
+                builder = SpirvBuilder("vs", version=version)
+                scalar = builder.numeric("f", 32)
+                first = builder.variable(spv.STORAGE_OUTPUT, scalar, location=0)
+                second = builder.variable(spv.STORAGE_OUTPUT, scalar, location=1)
+                builder.entry_point("main", [second, first, second, first])
+                module = spv.Module(builder.build())
+                self.assertEqual(module.entry_points[0].interface_ids, (second, first))
+                self.assertEqual([d.symbol for d in builder.reflect().outputs], [first, second])
+
+    def test_rejects_repeated_interface_ids_from_spirv_1_4(self):
+        for version in (0x00010400, 0x00010500):
+            with self.subTest(version=hex(version)):
+                builder = SpirvBuilder("vs", version=version)
+                output = builder.variable(spv.STORAGE_OUTPUT, builder.numeric("f", 32), location=0)
+                builder.entry_point("main", [output, output])
+                with self.assertRaisesRegex(spv.InterfaceError, "duplicate entry-point interface ID"):
+                    builder.reflect()
 
     def test_ignores_resource_storage_classes_with_descriptor_bindings(self):
         b = SpirvBuilder("ps")

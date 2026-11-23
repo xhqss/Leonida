@@ -233,6 +233,15 @@ class WholeWaveDump(unittest.TestCase):
         self.assertIs(ok, None)
         self.assertTrue(detail.startswith("SKIP"))
 
+    def test_a_77_with_an_unsupported_reason_keeps_that_reason(self):
+        """A 64-wide device, a module that needs OpFmaKHR the device lacks: the skip names OpFmaKHR, not the subgroup."""
+        msg = ("unsupported: cs_x.spv needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32) and the device lacks it; "
+               "translate with --fma glsl\n")
+        ok, detail = self.judge(77, DEVICE_64 + msg)
+        self.assertIs(ok, None)
+        self.assertTrue(detail.startswith("SKIP (cs_x.spv needs OpFmaKHR"), detail)
+        self.assertNotIn("64-wide", detail)
+
     def test_right_words_without_the_confirmation_fail(self):    # a vk_compute_test that ignores the flag
         ok, detail = self.judge(0, DEVICE_64 + dump(WANT))
         self.assertIs(ok, False)
@@ -261,6 +270,17 @@ class NotWholeWave(unittest.TestCase):
     def test_plain_dump_needs_no_confirmation_and_a_77_is_a_failure(self):
         self.assertEqual(judge(0, dump(WANT)), (True, "55 48"))
         self.assertIs(judge(77, "unavailable\n")[0], False)
+
+    def test_a_77_with_an_unsupported_reason_is_a_skip(self):
+        """A module that needs OpFmaKHR on a device without VK_KHR_shader_fma: vk_compute_test exits 77 with a reason."""
+        msg = ("unsupported: cs_x.spv needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32) and the device lacks it; "
+               "translate with --fma glsl\n")
+        for kw in ({}, {"emulated": True}, {"partial": True}):
+            with self.subTest(**kw):
+                ok, detail = judge(77, DEVICE_32 + msg, **kw)
+                self.assertIs(ok, None)
+                self.assertTrue(detail.startswith("SKIP (cs_x.spv needs OpFmaKHR"), detail)
+        self.assertIs(judge(77, DEVICE_32 + "no reason given\n")[0], False)       # a bare 77 stays a failure
 
     def test_hex_words(self):
         ok, detail = rgt.judge_cs_dump(0, dump([0x400080FF, 7]), [0x400080FF, 7], wave64=False, partial=False,
@@ -324,6 +344,35 @@ class UniformBranchCheck(unittest.TestCase):
 
 class Wave32LaneDumps(unittest.TestCase):
     """run_gpu_tests.py skips cs_wqm_w32 and cs_w32_lane_wrap below 32 lanes with check.py's rule."""
+    def test_process_exit_takes_precedence_in_both_runners(self):
+        import check
+        name = "cs_w32_lane_wrap"
+        narrow = "device: synthetic (subgroup 8..16)\n"
+        for code, msg, skipped in ((1, narrow, False), (0, narrow, True),
+                                   (77, "unsupported: device feature unavailable\n", True)):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as tmp:
+                with patch.object(check, "run", return_value=(code, msg)):
+                    verdict = check.compute_test(tmp, tmp, name, "1", "dump", needs_32_lanes=True)
+                with self.subTest(runner="check.py"):
+                    self.assertEqual(isinstance(verdict, check.Skip), skipped, verdict)
+                    if not skipped:
+                        self.assertIn("exit 1", verdict)
+
+                def launch(cmd, **kwargs):
+                    if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
+                        (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                        return 0, ""
+                    return code, msg
+
+                args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+                output = io.StringIO()
+                with (patch.object(rgt, "assemble_to_s", side_effect=lambda mc, src, dst, n: Path(dst).touch()),
+                      patch.object(rgt, "spirv_as"), patch.object(rgt, "run_cmd", side_effect=launch),
+                      contextlib.redirect_stdout(output)):
+                    status = rgt.run_suite(args, tmp)
+                self.assertEqual(status, 0 if skipped else 1, output.getvalue())
+                self.assertIn(f"{'SKIP' if skipped else 'FAIL'}  {name}", output.getvalue())
+
     def test_uses_check_py_rule(self):
         import check
         self.assertIs(rgt.narrow_subgroup_skip, check.narrow_subgroup_skip)
@@ -493,6 +542,61 @@ class F16InterpUnderBaryFallback(unittest.TestCase):
                     with self.subTest(bary=bary, f16=f16), \
                             patch.object(check, "BARY_FALLBACK", bary), patch.object(check, "F16_HALVES", f16):
                         self.assertEqual(check.pixel_test("unused", tmp, name), want)
+
+
+class TestProgramThatDiesBeforeItsVerdict(unittest.TestCase):
+    """The rows whose test program judges itself show its last output line. A program that died first (a driver
+    crash while it creates a pipeline: exit -11 on Linux, 0xC0000005 on Windows) has only printed its device or
+    extension line, or nothing, so the FAIL line must carry the exit status to say what happened."""
+    DIED = {   # one row each: what its program had printed when it died
+        "cs_lds": "device: X\n", "cs_exec64": "device: X\n", "cs_bvh": "device: X\n", "cs_wavemask": "device: X\n",
+        "cs_imgstore": "device: X\n", "cs_imgload": "device: X\n", "cs_sample_lz_int_d16": "device: X\n",
+        "ps_texture_sample": "device: X\nenabled VK_KHR_maintenance8\n",
+        "ps_texture_sample_d16": "device: X\nenabled VK_KHR_maintenance8\n",
+        "ps_cube_sample": "device: X\n", "ps_gather_wrap": "device: X\n",
+        "ps_tex": "", "ps_imgatomic": "",
+    }
+
+    def run_one(self, name, code, printed):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name + ".asm", build=tmp, llvm_mc="unused", require_pass=False)   # one row
+
+            def launch(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+                if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
+                    (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                return SimpleNamespace(returncode=code, stdout="", stderr=printed)
+
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt.subprocess, "run", side_effect=launch),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                rc = rgt.run_suite(args, tmp)
+        rows = [ln.split(None, 2) for ln in output.getvalue().splitlines() if ln.startswith("  FAIL")]
+        return rc, rows, output.getvalue()
+
+    def test_the_fail_line_says_the_program_died(self):
+        for code in (-11, 0xC0000005):
+            for name, printed in self.DIED.items():
+                with self.subTest(name=name, code=code):
+                    rc, rows, out = self.run_one(name, code, printed)
+                    self.assertEqual(rc, 1, out)
+                    self.assertEqual(len(rows), 1, out)
+                    last = printed.splitlines()[-1] if printed else "no test output"
+                    self.assertEqual(rows[0][1:], [name, f"exit {code}: {last}"], out)
+
+    def test_no_pixel_count_for_a_frame_that_was_never_read(self):
+        _rc, rows, out = self.run_one("ps_gather_wrap", -11, "device: X\n")
+        self.assertNotIn("pixels differ", rows[0][2], out)
+
+    def test_a_verdict_keeps_its_line(self):
+        self.assertEqual(rgt.verdict_line(0, "device: X\ncs_lds: 64 lanes mirrored"), "cs_lds: 64 lanes mirrored")
+        self.assertEqual(rgt.verdict_line(0, ""), "")
+        self.assertEqual(rgt.verdict_line(1, "device: X\ncs_lds: lane 3 differs"), "exit 1: cs_lds: lane 3 differs")
+        rc, rows, out = self.run_one("cs_imgstore", 0, "device: X\ncs_imgstore: 64 texels match\n")
+        self.assertEqual((rc, rows), (0, []), out)
+        self.assertIn("PASS  cs_imgstore           cs_imgstore: 64 texels match", out)
 
 
 class FmaFusedSuite(unittest.TestCase):

@@ -59,7 +59,7 @@ def load_stats(path):
     """Read counters keyed by (shader, stage) from vk_pipeline_check --stats."""
     out = defaultdict(dict)
     with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(f, strict=True)
         header = reader.fieldnames or []
         missing = [c for c in REQUIRED if c not in header]
         if missing:
@@ -69,6 +69,8 @@ def load_stats(path):
             raise ValueError(f"line 1: duplicated required header column(s): {', '.join(duplicates)}")
         for row in reader:
             line = reader.line_num
+            if None in row:
+                raise ValueError(f"line {line}: row has more fields than the header")
             absent = [c for c in REQUIRED if row[c] is None]
             if absent:
                 raise ValueError(f"line {line}: row missing required column(s): {', '.join(absent)}")

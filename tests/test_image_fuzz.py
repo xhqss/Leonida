@@ -30,6 +30,41 @@ def test_empty_format_selection_is_a_usage_error(tmp_path):
     assert not work.exists()
 
 
+def test_work_that_is_a_file_is_a_usage_error(tmp_path):
+    work = tmp_path / "work.txt"
+    work.write_text("keep me", encoding="utf-8")
+    result = subprocess.run([sys.executable, "-I", imf.__file__, "--formats", "R8G8B8A8_UNORM", "--programs", "1",
+                             "--work", str(work)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 2, result.stderr
+    assert "ERROR: --work is not a folder" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert work.read_text(encoding="utf-8") == "keep me"
+
+
+def test_work_under_a_file_is_a_usage_error(tmp_path):
+    blocker = tmp_path / "blocker.txt"
+    blocker.write_text("x", encoding="utf-8")
+    result = subprocess.run([sys.executable, "-I", imf.__file__, "--formats", "R8G8B8A8_UNORM", "--programs", "1",
+                             "--work", str(blocker / "work")], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 2, result.stderr
+    assert "ERROR: --work is not a folder" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert blocker.read_text(encoding="utf-8") == "x"
+
+
+def test_work_that_is_a_dangling_symlink_is_a_usage_error(tmp_path):
+    link = tmp_path / "link"
+    try:
+        os.symlink(tmp_path / "missing", link, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("cannot create a symlink here")
+    result = subprocess.run([sys.executable, "-I", imf.__file__, "--formats", "R8G8B8A8_UNORM", "--programs", "1",
+                             "--work", str(link)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 2, result.stderr
+    assert "ERROR: --work is not a folder" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
 def test_format_codes_match_the_translator_table():
     with open(os.path.join(imf.TOOLS, "gfx10_formats.json"), encoding="utf-8") as f:
         by_name = {name: int(code) for code, name in json.load(f).items()}

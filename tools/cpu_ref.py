@@ -814,6 +814,8 @@ def main(argv=None):
 
     inputs = {"lanes": args.lanes, "vcc": args.vcc}
     if args.lanes == 1:
+        if not 0 <= args.lane < 64:
+            ap.error("--lane must be in 0..63")
         inputs["lane"] = args.lane
     if args.exec is not None:
         inputs["exec"] = args.exec

@@ -16,7 +16,9 @@ a deterministic reference execution oracle. Standard library only; no GPU, no ga
 from __future__ import annotations
 
 import os
+import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -29,14 +31,21 @@ sys.path.insert(0, os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "to
 sys.path.insert(0, HERE)
 
 import rdna2spirv  # noqa: E402
+import spirv_asm  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
 
 M32 = 0xFFFFFFFF
 M64 = 0xFFFFFFFFFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
-FSSM = bytearray(0x148)
-struct.pack_into("<4I", FSSM, 0x138, 0x88, 32, 1, 1)
-FSSM = bytes(FSSM)
+
+
+def make_fssm(threads: int = 32) -> bytes:
+    fssm = bytearray(0x148)
+    struct.pack_into("<4I", fssm, 0x138, 0x88, threads, 1, 1)
+    return bytes(fssm)
+
+
+FSSM = make_fssm(32)
 
 BASE, OUT = 0x2000, 0x3000
 SEED = [0x44332211, 0x88776655, 0xCCBBAA99]
@@ -177,20 +186,25 @@ class GlobalSubDwordReferenceOracle:
             raise ValueError(f"Unsupported store op: {op}")
 
 
-def translate(body: list[str]) -> str:
+def translate(body: list[str], threads: int = 32, emulate: bool = False) -> str:
     with tempfile.TemporaryDirectory() as tmp:
         for d in ("disasm", "fssm"):
             os.mkdir(os.path.join(tmp, d))
         with open(os.path.join(tmp, "cs_gsub.dxbc"), "wb") as f:
             f.write(STUB_DXBC)
         with open(os.path.join(tmp, "fssm", "cs_gsub.fssm"), "wb") as f:
-            f.write(FSSM)
+            f.write(make_fssm(threads=threads))
         src = os.path.join(tmp, "disasm", "cs_gsub.s")
-        with open(src, "w", encoding="utf-8") as f:
+        with open(src, "w", encoding="utf-8", newline="\n") as f:
             f.write("; cs_gsub\n" + "".join(f"\t{ln}\n" for ln in body) + "\ts_endpgm\n")
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", ResourceWarning)
-            return rdna2spirv.translate(src)
+        prev = rdna2spirv.WAVE64_EMULATE
+        rdna2spirv.WAVE64_EMULATE = emulate
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                return rdna2spirv.translate(src)
+        finally:
+            rdna2spirv.WAVE64_EMULATE = prev
 
 
 def run(body: list[str], memory: dict[int, int] | None = None) -> dict[int, int]:
@@ -274,7 +288,7 @@ class TestGlobalSubDwordInterpreterExecution(unittest.TestCase):
     """End-to-end tests comparing SPIR-V execution with reference oracle predictions."""
 
     def test_basic_loads_against_oracle(self):
-        mem_init = {BASE: 0x89ABCDEF, BASE + 4: 0x01234567}
+        mem_init = {BASE: 0x89ABCDEF, BASE + 4: 0x01234567, BASE + 8: 0xEFCDAB80}
         bank = GlobalSubDwordMemoryBank(mem_init)
         oracle = GlobalSubDwordReferenceOracle(bank)
 
@@ -285,7 +299,7 @@ class TestGlobalSubDwordInterpreterExecution(unittest.TestCase):
             ("global_load_sshort", 2),
         ]
         for op, size in ops:
-            for offset in (0, 1):
+            for offset in range(8):
                 with self.subTest(op=op, offset=offset):
                     body = [
                         f"v_mov_b32_e32 v1, {BASE + offset:#x}",
@@ -408,6 +422,74 @@ class TestGlobalSubDwordInterpreterExecution(unittest.TestCase):
                          {1, 5})
         self.assertEqual(rdna2spirv.read_before_write_vgprs([parse_line("\tglobal_load_ushort v5, v1, s[0:1]")]),
                          {1})
+
+    def test_short_loads_crossing_dword_both_modes_and_inactive_lane(self):
+        mem_init = {BASE: 0x7FAABBCC, BASE + 4: 0x11223380}
+        for op, want in (("global_load_ushort", 0x807F), ("global_load_sshort", 0xFFFF807F)):
+            for addr_reg, off_mod in ((BASE + 3, ""), (BASE + 4, " offset:-1")):
+                with self.subTest(op=op, addr=hex(addr_reg), off_mod=off_mod):
+                    mem = run([
+                        f"v_mov_b32_e32 v1, {addr_reg:#x}",
+                        "v_mov_b32_e32 v2, 0",
+                        "v_mov_b32_e32 v5, 0xdeadbeef",
+                        f"{op} v5, v[1:2], off{off_mod}",
+                        "s_waitcnt vmcnt(0)",
+                        f"v_mov_b32_e32 v6, {OUT:#x}",
+                        "global_store_dword v6, v5, s[0:1]",
+                    ], memory=mem_init)
+                    self.assertEqual(mem[OUT], want)
+
+            with self.subTest(op=op, inactive=True):
+                mem = run([
+                    f"v_mov_b32_e32 v1, {BASE + 3:#x}",
+                    "v_mov_b32_e32 v5, 0xdeadbeef",
+                    "s_mov_b32 s4, exec_lo",
+                    "s_mov_b32 exec_lo, 0",
+                    f"{op} v5, v1, s[0:1]",
+                    "s_mov_b32 exec_lo, s4",
+                    "s_waitcnt vmcnt(0)",
+                    f"v_mov_b32_e32 v6, {OUT:#x}",
+                    "global_store_dword v6, v5, s[0:1]",
+                ], memory=mem_init)
+                self.assertEqual(mem[OUT], 0xDEADBEEF)
+
+    def _load_validation_modules(self):
+        return (
+            ("w32_ushort_saddr", translate([
+                f"v_mov_b32_e32 v1, {BASE + 3:#x}",
+                "global_load_ushort v5, v1, s[0:1]",
+            ])),
+            ("w32_sshort_voff", translate([
+                f"v_mov_b32_e32 v1, {BASE + 4:#x}",
+                "v_mov_b32_e32 v2, 0",
+                "global_load_sshort v5, v[1:2], off offset:-1",
+            ])),
+            ("w64_emulate_sshort", translate([
+                "s_mov_b64 exec, -1",
+                f"v_mov_b32_e32 v1, {BASE + 3:#x}",
+                "v_readfirstlane_b32 s16, v1",
+                "global_load_sshort v5, v1, s[0:1]",
+            ], threads=64, emulate=True)),
+        )
+
+    def test_sub_dword_loads_spirv_assembly(self):
+        for label, spv in self._load_validation_modules():
+            with self.subTest(case=label):
+                binary = spirv_asm.assemble(spv, target_env="vulkan1.2")
+                self.assertEqual(struct.unpack_from("<I", binary, 0)[0], 0x07230203)
+
+    @unittest.skipUnless(shutil.which("spirv-val"), "needs spirv-val")
+    def test_sub_dword_loads_spirv_val(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for label, spv in self._load_validation_modules():
+                with self.subTest(case=label):
+                    spv_path = os.path.join(tmp, f"{label}.spv")
+                    with open(spv_path, "wb") as f:
+                        f.write(spirv_asm.assemble(spv, target_env="vulkan1.2"))
+                    res = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", spv_path],
+                                         capture_output=True, text=True)
+                    if res.returncode != 0:
+                        self.fail(f"spirv-val failed for {label}: {res.stderr}")
 
 
 if __name__ == "__main__":

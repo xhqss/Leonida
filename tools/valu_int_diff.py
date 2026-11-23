@@ -212,7 +212,7 @@ def eval_ref_op(op, srcs, old_dst, clamp=False, op_sel=None, op_sel_hi=None):
         return (s + a[2]) & MASK32
 
     # 16-bit VOP3 ops with op_sel:[s0, s1, (s2,) dst]
-    if op in ("v_add_nc_u16", "v_sub_nc_u16", "v_subrev_u16", "v_add_nc_i16", "v_sub_nc_i16",
+    if op in ("v_add_nc_u16", "v_sub_nc_u16", "v_add_nc_i16", "v_sub_nc_i16",
               "v_mul_lo_u16", "v_min_u16", "v_max_u16", "v_min_i16", "v_max_i16"):
         h0 = _half(a[0], op_sel[0])
         h1 = _half(a[1], op_sel[1])
@@ -221,8 +221,6 @@ def eval_ref_op(op, srcs, old_dst, clamp=False, op_sel=None, op_sel_hi=None):
             r = _clamp_u16(h0 + h1) if clamp else ((h0 + h1) & MASK16)
         elif op == "v_sub_nc_u16":
             r = _clamp_u16(h0 - h1) if clamp else ((h0 - h1) & MASK16)
-        elif op == "v_subrev_u16":
-            r = _clamp_u16(h1 - h0) if clamp else ((h1 - h0) & MASK16)
         elif op == "v_add_nc_i16":
             v = _s16(h0) + _s16(h1)
             r = _clamp_i16(v) if clamp else (v & MASK16)
@@ -345,7 +343,6 @@ OPS = [
     ("v_msad_u8", 3, False, "plain"),
     ("v_add_nc_u16", 2, True, "op16_2"),
     ("v_sub_nc_u16", 2, True, "op16_2"),
-    ("v_subrev_u16", 2, True, "op16_2"),
     ("v_add_nc_i16", 2, True, "op16_2"),
     ("v_sub_nc_i16", 2, True, "op16_2"),
     ("v_mul_lo_u16", 2, False, "op16_2"),

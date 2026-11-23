@@ -5,9 +5,12 @@ check.py / run_gpu_tests.py stop with "missing vk_compute_test", and so do the f
 
     python -I tests/test_build_runtime_fallback.py
 """
+import os
 from pathlib import Path
 import re
+import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +70,83 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         self.assertIn("chcp 65001 >nul", text)
         self.assertLess(text.index("chcp 65001 >nul"), text.index('call `"$vcvars`"'))
 
+    @unittest.skipUnless(sys.platform == "win32", "requires Windows PowerShell")
+    def test_path_fallback_prefers_vs_and_skips_msys_cmake(self):
+        text = SCRIPT.read_text(encoding="utf-8")
+        # Extract the helper functions and the two Find-BuildTool assignments directly from scripts/build_runtime.ps1.
+        helpers_start = text.index("function Invoke-ToolProbe")
+        helpers_end = text.index("$root = Split-Path")
+        lookup_start = text.index("$cmakeDir = Join-Path")
+        lookup_end = text.index("$cfg = if")
+        snippet = text[helpers_start:helpers_end] + "\n" + text[lookup_start:lookup_end]
+
+        def run_probe(vs_dir: Path, path_dirs: list[Path]) -> tuple[str, str]:
+            ps = (
+                "$ErrorActionPreference = 'Stop'\n"
+                "$vs = $env:LEONIDA_VS_DIR\n"
+                + snippet
+                + "\nWrite-Output \"CMAKE=$cmake\"\nWrite-Output \"NINJA=$ninja\"\n"
+            )
+            env = dict(os.environ, PATH=";".join(str(p) for p in path_dirs), LEONIDA_VS_DIR=str(vs_dir))
+            res = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
+                env=env, capture_output=True, text=True, check=True, timeout=30,
+            )
+            found = {}
+            for line in res.stdout.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    found[k.strip()] = v.strip()
+            return found.get("CMAKE", ""), found.get("NINJA", "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vs_empty = root / "vs_empty"
+            msys_dir = root / "msys_bin"
+            native_cmake_dir = root / "native_cmake_bin"
+            native_ninja_dir = root / "native_ninja_bin"
+            for d in (vs_empty, msys_dir, native_cmake_dir, native_ninja_dir):
+                d.mkdir()
+
+            # MSYS/devkitPro-like cmake: lacks Visual Studio generators in --help.
+            msys_cmake = msys_dir / "cmake.cmd"
+            msys_cmake.write_text("@echo off\r\necho * Ninja\r\necho   Unix Makefiles\r\nexit /b 0\r\n", encoding="ascii")
+
+            # Native Windows cmake: lists both Visual Studio and Ninja generators.
+            native_cmake = native_cmake_dir / "cmake.cmd"
+            native_cmake.write_text(
+                "@echo off\r\necho   Visual Studio 18 2026\r\necho * Ninja\r\nexit /b 0\r\n",
+                encoding="ascii",
+            )
+            native_ninja = native_ninja_dir / "ninja.cmd"
+            native_ninja.write_text("@echo off\r\necho 1.12.1\r\nexit /b 0\r\n", encoding="ascii")
+
+            # 1) No VS CMake tools, MSYS cmake comes first on PATH -> must skip MSYS and pick native PATH cmake + ninja.
+            cmake, ninja = run_probe(vs_empty, [msys_dir, native_cmake_dir, native_ninja_dir])
+            self.assertEqual(Path(cmake).resolve(), native_cmake.resolve())
+            self.assertEqual(Path(ninja).resolve(), native_ninja.resolve())
+
+            # 2) Only MSYS cmake on PATH -> must reject it so build_runtime.ps1 falls back to cl.exe.
+            cmake, ninja = run_probe(vs_empty, [msys_dir])
+            self.assertEqual(cmake, "")
+            self.assertEqual(ninja, "")
+
+            # 3) Native cmake on PATH without ninja -> ninja stays empty so CMake branch does not run.
+            cmake, ninja = run_probe(vs_empty, [native_cmake_dir])
+            self.assertEqual(Path(cmake).resolve(), native_cmake.resolve())
+            self.assertEqual(ninja, "")
+
+            # 4) VS bundled CMake + Ninja present -> must prefer VS over PATH.
+            vs_full = root / "vs_full"
+            vs_cmake = vs_full / "Common7" / "IDE" / "CommonExtensions" / "Microsoft" / "CMake" / "CMake" / "bin" / "cmake.exe"
+            vs_ninja = vs_full / "Common7" / "IDE" / "CommonExtensions" / "Microsoft" / "CMake" / "Ninja" / "ninja.exe"
+            vs_cmake.parent.mkdir(parents=True)
+            vs_ninja.parent.mkdir(parents=True)
+            vs_cmake.write_bytes(b"")
+            vs_ninja.write_bytes(b"")
+            cmake, ninja = run_probe(vs_full, [native_cmake_dir, native_ninja_dir])
+            self.assertEqual(Path(cmake).resolve(), vs_cmake.resolve())
+            self.assertEqual(Path(ninja).resolve(), vs_ninja.resolve())
 
 if __name__ == "__main__":
     unittest.main()

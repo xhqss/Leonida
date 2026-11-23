@@ -172,7 +172,9 @@ def translated_words(tmp_path, name):
 
 
 def test_every_f16_shader_is_listed():
-    on_disk = sorted(f[:-4] for f in os.listdir(SHADER_DIR) if f.startswith("ps_f16_") and f.endswith(".asm"))
+    # ps_f16_fnan_* are the NaN-operand med3 shaders, with their own words and test (tests/semantic/test_float_nan_fract.py)
+    on_disk = sorted(f[:-4] for f in os.listdir(SHADER_DIR)
+                     if f.startswith("ps_f16_") and f.endswith(".asm") and not f.startswith("ps_f16_fnan_"))
     assert on_disk == NAMES == sorted(REFERENCE)
 
 

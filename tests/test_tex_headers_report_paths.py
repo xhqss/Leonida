@@ -74,7 +74,10 @@ class ReportPathTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             carve, cpu_path, _ = make_carve(td)
             alias = pathlib.Path(td) / "report.json"
-            os.link(cpu_path, alias)
+            try:
+                os.link(cpu_path, alias)
+            except (OSError, NotImplementedError) as e:
+                self.skipTest(f"hard links unavailable: {e}")
             before = cpu_path.read_bytes()
             self.assertTrue(os.path.samefile(cpu_path, alias))
             result = self.run_tool(carve, "--out", alias)

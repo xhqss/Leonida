@@ -2,6 +2,7 @@
 ; threads 0-2 export the vk_harness triangle and attr0, thread 0 exports prim (0,1,2). Needs a DXBC with PSV0
 ; (128 threads, 64/64 outputs, triangles). Run: VKH_MESH=1 vk_harness ms_tri.spv fs_passthru.spv out.raw ->
 ; every pixel = ((x+0.5)/64, (y+0.5)/64, 0.5, 1).
+; Both waves send the same allocation. Its counts must survive the barrier before the exports.
 v_mbcnt_lo_u32_b32 v0, -1, 0
 v_mbcnt_hi_u32_b32 v0, -1, v0
 s_bfe_u32 s4, s3, 0x40018
@@ -17,6 +18,7 @@ v_mov_b32_e32 v7, 1.0
 v_mov_b32_e32 v8, 0.5
 s_mov_b32 m0, 0x1003
 s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)
+s_barrier
 v_cmpx_gt_u32_e32 3, v0
 exp pos0 v1, v2, v6, v7 done
 exp param0 v3, v4, v8, v7

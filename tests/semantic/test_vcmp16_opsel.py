@@ -13,6 +13,7 @@ Run directly:
 import gc
 import math
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -456,6 +457,8 @@ class ConstantsAndLiteralsOpSelTests(unittest.TestCase):
         self.assertEqual(run_ps_bit(pack16(H_ONE, H_FOUR), 0, "v_cmp_eq_f16_e64 s4, v1, 0x40003C00 op_sel:[0,0]", mask="s4"), 1)
         self.assertEqual(run_ps_bit(pack16(H_FOUR, H_TWO), 0, "v_cmp_eq_f16_e64 s4, v1, 0x40003C00 op_sel:[1,1]", mask="s4"), 1)
 
+    @unittest.skipUnless(shutil.which("spirv-as") and shutil.which("spirv-val"),
+                         "needs spirv-as and spirv-val on PATH")
     def test_spirv_val_compliance(self):
         cases = [
             ("f16_opsel_const", ["v_cmp_eq_f16_e64 s4, v1, 1.0 op_sel:[0,1]", "v_cndmask_b32_e64 v0, 0, 1, s4", "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"]),

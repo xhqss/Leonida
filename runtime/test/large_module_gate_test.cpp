@@ -136,6 +136,15 @@ static int cgroup_limits_are_read_up_the_tree() {
     CHECK(leonida::cgroup_memory_room((root / "self").string(), (root / "cg").string()) == 2000);
     write_file(root / "cg/user.slice/app.scope/memory.current", "7000\n"); // over its limit: no room
     CHECK(leonida::cgroup_memory_room((root / "self").string(), (root / "cg").string()) == 0);
+    // A mount rooted at a constrained cgroup still exposes its budget at the mount root.
+    write_file(root / "cg/user.slice/app.scope/memory.max", "max\n");
+    write_file(root / "cg/memory.max", "5000\n");
+    write_file(root / "cg/memory.current", "3000\n");
+    CHECK(leonida::cgroup_memory_room((root / "self").string(), (root / "cg").string()) == 2000);
+    write_file(root / "self", "0::/\n");
+    CHECK(leonida::cgroup_memory_room((root / "self").string(), (root / "cg").string()) == 2000);
+    write_file(root / "cg/memory.max", "max\n");
+    CHECK(leonida::cgroup_memory_room((root / "self").string(), (root / "cg").string()) == UINT64_MAX);
     write_file(root / "self", "12:memory:/legacy\n");                      // cgroup v1 only: no limit read
     CHECK(leonida::cgroup_memory_room((root / "self").string(), (root / "cg").string()) == UINT64_MAX);
     CHECK(leonida::cgroup_memory_room((root / "missing").string(), (root / "cg").string()) == UINT64_MAX);

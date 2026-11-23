@@ -228,6 +228,9 @@ def _publish(dest, write, newline):
     except BaseException:
         if temp is not None:
             with suppress(OSError):
+                # The staging file may have inherited a read-only destination's mode; make it deletable
+                # first, or Windows strands it beside the report when the replace fails.
+                os.chmod(temp, 0o600)
                 os.unlink(temp)
         raise
 
@@ -270,11 +273,13 @@ def offset(text):
 
 
 def is_scanned_input(path, input_path, pattern):
-    """True when a report path is one of the files the scan reads: writing it would destroy the input."""
+    """True when a report path would replace the carve manifest or a scanned input."""
     if same_report_path(path, input_path):
         return True
     if not os.path.isdir(input_path) or not os.path.isfile(path):
         return False
+    if same_report_path(path, os.path.join(input_path, "index.json")):
+        return True
     pattern = pattern or "*.bin"
     # Walk up from the report path and compare each folder like same_report_path does (normcase, realpath,
     # samefile), so a spelling that differs only in case, or goes through a link, is still inside the input.

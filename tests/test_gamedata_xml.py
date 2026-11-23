@@ -5,16 +5,21 @@
 Fixtures are hand-written documents: nested elements, attributes, macro and platform references,
 an include-like manifest, a tail-only fragment and a malformed document. No game data is used.
 """
+import contextlib
 import csv
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "gamedata_xml.py")
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import gamedata_xml as g  # noqa: E402
 
 ALPHA = (
     b'\xef\xbb\xbf<?xml version="1.0" encoding="utf-8"?>\n'
@@ -231,11 +236,13 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertIn("not-a-charset", p.stdout)
 
     def test_comments_in_a_document_that_does_not_parse_are_counted(self):
-        # A truncated or tail-only document stops the parser at the error; its comments still count, and
-        # comment-like text in CDATA (closed or cut off) still doesn't.
+        # The fallback must respect the context of each delimiter after the parser stops.
         cases = {"open.xml": (b"<a><!--x--><!--y-->", 2),
                  "tail.xml": (b"</b><!--x--></a><!--y-->", 2),
-                 "cdata.xml": (b"<a><!--x--><![CDATA[<!--no-->]]><b><![CDATA[<!--cut", 1)}
+                 "cdata.xml": (b"<a><!--x--><![CDATA[<!--no-->]]><b><![CDATA[<!--cut", 1),
+                 "cdata-in-comment.xml": (b"<a></b><!--literal <![CDATA[--><!--later-->", 2),
+                 "comment-in-pi.xml": (b"<a></b><?step literal <!-- ?> <!--later-->", 1),
+                 "unfinished-comment.xml": (b"<a><!--unfinished <![CDATA[", 1)}
         for name, (body, want) in cases.items():
             with self.subTest(name=name):
                 doc = self.write(name, body)
@@ -332,6 +339,36 @@ class GamedataXmlTest(unittest.TestCase):
                 self.assertFalse(row["fragment"])
         self.assertEqual(report["summary"]["tail_only"], 0)
         self.assertEqual(report["summary"]["fragments"], 0)
+
+    def test_a_folder_that_cannot_be_listed_fails_the_scan(self):
+        def fake_walk(root, onerror=None):
+            self.assertIsNotNone(onerror, "os.walk needs onerror, or an unlistable folder is skipped")
+            onerror(PermissionError(13, "permission denied", os.path.join(root, "blocked")))
+            return iter(())
+
+        err = io.StringIO()
+        with mock.patch.object(g.os, "walk", side_effect=fake_walk), \
+                mock.patch.object(sys, "argv", ["gamedata_xml.py", self.root]), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc = g.main()
+        self.assertEqual(rc, 2)
+        self.assertIn("permission denied", err.getvalue())
+
+    @unittest.skipUnless(os.name == "posix" and getattr(os, "geteuid", lambda: 0)() != 0,
+                         "needs a POSIX filesystem and a non-root user to make a folder unlistable")
+    def test_a_real_unlistable_folder_fails_the_scan(self):
+        blocked = os.path.join(self.root, "blocked")
+        os.makedirs(blocked)
+        os.chmod(blocked, 0)
+        err = io.StringIO()
+        try:
+            with mock.patch.object(sys, "argv", ["gamedata_xml.py", self.root]), \
+                    contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = g.main()
+        finally:
+            os.chmod(blocked, 0o755)
+        self.assertEqual(rc, 2)
+        self.assertIn("blocked", err.getvalue())
 
     def test_unwritable_csv_or_json_is_one_error_line(self):
         doc = self.write("alpha.xml", ALPHA)

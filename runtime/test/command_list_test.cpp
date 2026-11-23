@@ -104,7 +104,8 @@ int main() {
     CHECK(std::get<BufferBarrier>(list.commands()[2]).resource == 7);
     CHECK(std::get<TextureBarrier>(list.commands()[3]).flags == texture_barrier_discard);
 
-    // Copies: D3D12's own call rules (aligned footprints, a non-empty box, distinct CopyResource operands).
+    // Copies: D3D12's own call rules (aligned footprints; degenerate boxes and DEFAULT-heap
+    // CopyResource self-copies are accepted as no-ops and must not record Vulkan commands).
     CHECK(list.reset());
     CHECK(list.copy_buffer({1, 0, 2, 16, 64}));
     CHECK(list.copy_buffer({1, 0, 2, 16, 0}));
@@ -116,13 +117,18 @@ int main() {
     CHECK(!list.copy_texture({placed, 0, 0, 0, placed, false, {}}));                 // footprint to footprint
     CHECK(!list.copy_texture({texture, 0, 0, 0, {4, true, 0, 100, 8, 8, 1, 256}, false, {}}));  // offset not 512
     CHECK(!list.copy_texture({texture, 0, 0, 0, {4, true, 0, 512, 8, 8, 1, 100}, false, {}}));  // pitch not 256
-    CHECK(!list.copy_texture({texture, 0, 0, 0, texture, true, {2, 2, 0, 2, 6, 1}}));          // empty box
+    CHECK(list.commands().size() == 3);
+    CHECK(list.copy_texture({texture, 0, 0, 0, texture, true, {2, 2, 0, 2, 6, 1}}));           // empty box, no-op
+    CHECK(list.commands().size() == 3);
     CHECK(list.copy_resource({5, 6}));
-    CHECK(!list.copy_resource({5, 5}));
+    CHECK(list.commands().size() == 4);
+    CHECK(list.copy_resource({5, 5}));  // DEFAULT-heap self-copy; COM layer rejects UPLOAD self-copies
+    CHECK(list.commands().size() == 4);
     // A volume's box has a z range, and its footprint a depth; a resolve needs two different resources.
     CHECK(list.copy_texture({texture, 0, 0, 2, {4, true, 0, 512, 4, 4, 4, 256}, true, {0, 0, 1, 4, 4, 3}}));
     CHECK(!list.copy_texture({texture, 0, 0, 0, {4, true, 0, 512, 4, 4, 0, 256}, false, {}}));  // no slices
-    CHECK(!list.copy_texture({texture, 0, 0, 0, texture, true, {0, 0, 2, 4, 4, 2}}));           // empty in z
+    CHECK(list.copy_texture({texture, 0, 0, 0, texture, true, {0, 0, 2, 4, 4, 2}}));            // empty in z, no-op
+    CHECK(list.commands().size() == 5);
     CHECK(list.resolve_subresource({7, 1, 8, 0}));
     CHECK(!list.resolve_subresource({7, 0, 7, 0}));
     CHECK(!list.resolve_subresource({0, 0, 8, 0}));

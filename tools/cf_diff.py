@@ -31,7 +31,8 @@ Usage:
     python -I tools/cf_diff.py --seed S --program K --show [--minimize]     # print (and shrink) one program
 
 Exit code 0 when every program matches, 1 on a mismatch (case, seed, lane, the expected and actual words and the
-listing; with --minimize also a reduced listing), 2 on harness errors. Skips are counted with reasons.
+listing; with --minimize also a reduced listing), 2 on harness errors or when every program was skipped (nothing was
+compared). Skips are counted with reasons.
 """
 import argparse
 import gc
@@ -633,10 +634,12 @@ def main(argv=None):
     structured = not a.dispatch_loop
     if a.program is not None:
         rc = 0
+        matched = 0
         for wave in waves:
             body = program_for(a.seed, a.program, wave, a.depth)
             status, detail = run_case(f"ps_cf_{a.program:04d}_w{wave}", body, wave, structured)
             print(f"program {a.program} wave{wave}: {status} {detail}")
+            matched += status == "match"
             if status == "mismatch":
                 rc = 1
                 if a.minimize:
@@ -644,6 +647,9 @@ def main(argv=None):
                     print("reduced:", run_case("ps_cf_min", body, wave, structured)[1])
             if a.show or a.minimize:
                 print(listing_text(build(body, wave), f"ps_cf_{a.program:04d}_w{wave}"))
+        if not rc and not matched:   # same order as the suite: a mismatch (1) outranks "nothing was compared" (2)
+            print("no program ran: every one was skipped")
+            return 2
         return rc
     counts, failures = run_suite(a.programs, a.seed, waves, structured, a.depth)
     skips = sum(counts["skip"].values())
@@ -659,7 +665,12 @@ def main(argv=None):
         print(f"  ... {len(failures) - 10} more")
     if counts["harness-error"]:
         return 2
-    return 1 if counts["mismatch"] else 0
+    if counts["mismatch"]:
+        return 1
+    if not counts["pass"]:
+        print("no program ran: every one was skipped")
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

@@ -420,11 +420,14 @@ and joins them with the `InteriorNames` section (full archive, `--jobs 15`, abou
 |---|---:|
 | `CMloArchetypeDef` definitions / distinct names | 1,706 / 1,706 |
 | `CMloInstanceDef` placements / distinct interiors placed | 2,590 / 1,704 |
+| placements of a name with no `CMloArchetypeDef` | 0 |
 | keys naming an interior (confirmed by the 64-bit key) | 1,357 (1,357) |
 | keys whose interior is placed | 1,356 |
 | ... with as many positions as placements | 1,268 |
 | ... with more positions than placements | 64 |
 | ... with fewer positions than placements | 24 |
+| ... whose placements have no `position` to measure from | 0 |
+| inner-item `Pos` values that are not three numbers (dropped) | 0 |
 
 So a key selects one interior archetype, and its inner items are, in most cases, one per placed copy of that
 interior: the `Name` of each item labels that copy.
@@ -440,8 +443,15 @@ positions to the nearest placed copy of its own interior's box (0 = inside):
 
 | Rotation | Inside | ≤ 1 m | ≤ 2 m | ≤ 5 m | ≤ 25 m | ≤ 100 m | Median | In a non-`limbo` room box |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| stored quaternion | 315 | 1,015 | 1,189 | 1,443 | 1,867 | 2,199 | 1.72 m | 213 |
-| conjugated | 571 | 950 | 1,121 | 1,416 | 1,863 | 2,199 | 2.10 m | 482 |
+| stored quaternion | 315 | 1,015 | 1,189 | 1,443 | 1,867 | 2,199 | 1.72 m | 215 |
+| conjugated | 571 | 950 | 1,121 | 1,416 | 1,863 | 2,199 | 2.10 m | 484 |
+
+The interior and room boxes are scaled by each placement's `scaleXY` and `scaleZ` before measuring. Only 6 of
+the 2,590 placements are scaled at all (`scaleZ` 0.998), so this changes two room hits per convention and none
+of the distances. A point within 1e-6 m of an interior or room face counts as inside it (`EPS`), since the
+inverse of a float32 rotation can leave a face point about 1e-17 m outside. Positions are float32 and resolve to
+about 1 mm near the map edge, so a tolerance this far below that decides as exact arithmetic would; on the full
+archive it changes no count above.
 
 The interior box's largest side has a median of 16.7 m. Most positions are therefore just outside or just inside
 the interior shell, which fits an entry or label point; that they are doors is a hypothesis (portals were not
@@ -452,8 +462,9 @@ compared). The conjugated rotation puts more positions inside rooms, consistent 
 Interior rooms (`CMloRoomDef` `0b1811f1`, 0x70 bytes: `name` +0x00, `bbMin` +0x10, `bbMax` +0x20) are reached
 through the interior's array members, which use the `InstanceList` reference of
 [Instanced props and grass](#instanced-props-and-grass) (1-based block index, offset from bit 20, u16 count). Room
-names are lower-cased joaat; in all 908 resources that hold one interior, its first room is `limbo`. A room's hash member `a261e0a9` (+0x34)
-holds the hash of 267 interior keys.
+names are lower-cased joaat; all 1,706 interiors have rooms, and in every one the first room is `limbo`
+(`interiors_first_room_limbo`). A room's hash member `a261e0a9` (+0x34) holds the joaat of 267 interior keys
+(`keys_in_a_room_key_member`).
 
 ```powershell
 python -I tools\gamedata_reader.py <work>\common --root GameShape__Data__LocationNameLoopkup --out <work>\gamedata
@@ -571,6 +582,11 @@ MINX,MINY,MAXX,MAXY` bounds the RAGE world X/Y. `world.json` then has `"layout":
 `stats.placements` block: `rows`, `malformed`, `other_lod_level`, `outside_region`, `selected`, `placed`,
 `placed_unverified` (no key in the row), `key_mismatch`, `unresolved_archetype` (no exported model has that name),
 `model_not_loadable`, `degenerate_scale`, `mirrored` and `distinct_models`.
+
+`--max-tex-size` limits the longest edge of embedded DDS previews to 512 pixels by default.
+When shrinking a DDS tagged sRGB, the converter averages RGB in linear light, weights each texel by its
+alpha, and encodes the result as sRGB again. An opaque black and white pair averages to 188 in sRGB
+and 128 in an untagged RGBA8 texture.
 
 ### Shared geometry (`--instancing`)
 
@@ -816,8 +832,10 @@ only; no names.
   67 to 254, not contiguous), and none of those 149 has a tag: they read as unused placeholder slots, which would
   keep the slot index (the value a material would store) stable. The other 106 names occur once each, and
   only one of them has neither tag.
-- `MaterialDataList`, which would carry each material's procedural tag, survives only from mid-document (see
-  the snow and mud section below); 1 of the 107 tag names occurs in its retained part.
+- Five retained fragments of `MaterialDataList` contain 399 complete material records with 1,433 nested tag
+  entries. One of the 107 procedural table names occurs as a substring in the retained text, but none matches
+  a field value in those records exactly. The fragments cover only part of the list (see the snow and mud
+  section below). A numeric value in the slot range (0–254) alone does not identify a slot reference.
 
 Not measured here (hypothesis): whether materials index this table by slot, as in GTA V, and where the
 object and plant definitions live.
@@ -851,9 +869,55 @@ Cross-checks:
   name and no texture-dictionary item name or its joaat hash in the local catalog (118,925 named items). The
   catalog is incomplete for names, so this does not show the textures are absent.
 
-Not measured here (hypothesis): which surfaces the 16 entries are (their names suggest snow, mud and sand
-variants), how `Type` selects a track type for peds, animals and vehicles, and the size of the deformation map
-(`DeformationWorldSpaceWidth` is the obvious input).
+### The 16 surface entries and the deformation map (ASSET-305)
+
+Measured on a 1.0.2.1 package (one `CSnowTrackData` document, one complete stream, found with
+`tools/gamedata_xml.py` on a `rpf9_carve.py` carve of `common.rpf`). Classes and counts only; the entry and
+material strings are not reproduced.
+
+- **11 surfaces are defined and 5 slots are empty.** Entries 0 to 10 each have a `Name`, a distinct opaque
+  `DebugColor` and their own parameter set (11 distinct parameter sets). Entries 11 to 15 have no `Name`
+  text, a `DebugColor` of `0x00000000`, no physics material, and one shared parameter set that equals none of
+  the 11 (their terrain render scales are 0). The array is 16 long whatever the content, which fits a
+  fixed-size table indexed by a 4-bit surface id; the index is not read in a shader here.
+- **The 11 surfaces, by class** (from the `Name` and the physics-material names of each entry):
+
+  | Entry | Class | Physics materials |
+  |---:|---|---:|
+  | 0 | snow | 1 |
+  | 1 | quicksand | 1 |
+  | 2 | mud (grass, wet, sticky, soft periphyton) | 4 |
+  | 3 | scree / gravel | 2 |
+  | 4 | sand and loose dirt | 4 |
+  | 5 | compact dirt, clay, dry mud | 3 |
+  | 6 | algae and soft debris (seaweed, rubbish, bagasse, tar pit) | 6 |
+  | 7 | plastic mulch | 1 |
+  | 8 | parallax-only (named after POM), no physics material | 0 |
+  | 9 | gravel trap | 1 |
+  | 10 | wet sand | 1 |
+
+  So the 24 physics materials go to 10 of the 11 surfaces; the 6 surfaces without a material are entry 8 and the
+  5 empty slots. `SupportPropFlatten` is set on the 2 sand entries (4 and 10).
+- **Cross-check with the material table.** The retained part of `MaterialDataList` is one stream without its
+  head, kept as five contiguous fragments (four 64 KiB blocks and a short tail, 403 `name` elements in all).
+  All 14 `isDeformableTerrain` items of the stream are in the first fragment, and all are `"true"`. 13 of them
+  belong to exactly the 13 of the 24 surface materials whose names occur in the stream (all 13 names are in the
+  first fragment); the 14th belongs to a record whose name is before the start of the stream. No other record
+  carries the flag, and no surface material lacks it. The other 11 surface materials do not occur in the
+  retained stream.
+- **Deformation map size.** `GlobalDeepSurfaceParams` gives `DeformationWorldSpaceWidth` = **96 m** and
+  `ParallaxWorldSpaceWidth` = **48 m**: one world-space width each. The document gives no second dimension, so a
+  square window is an assumption, not a reading. No field in the document gives a texel count, and no other carved XML in
+  `common.rpf` names `DeformationWorldSpaceWidth`; the map resolution is therefore not in the data files read
+  here (it would be in the executable or the render-target setup, neither of which is in the package), so the
+  size in texels, and where the renderer sets it, stay open.
+- **Track types.** The 9 `TrackTypeData` entries are 1 human, 6 animals and 2 vehicles (a car class and a
+  cycle). `Type` is `kSnowTracksBiped` on 5 (the human and 4 animals, including the horse),
+  `kSnowTracksQuadraped` on 2 animals and `kSnowTracksVehicle` on the 2 vehicles. Which entry a given ped model
+  uses is not in this document.
+
+Not measured here (hypothesis): the texel resolution and the second dimension of the deformation map, where it is centred (camera or
+player), and how an entry is chosen at run time (the material's flag, the surface index, or both).
 
 ## Map lights and the vehicle lane graph
 

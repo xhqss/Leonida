@@ -43,6 +43,14 @@ foreach ($archive in $archives) {
         if ($s.span -eq 0 -and ($s.compressed_bytes -ne 0 -or $s.unread_bytes -ne 0)) {
             throw 'A zero summary.span requires zero compressed and unread bytes.'
         }
+        # Stored streams and unread gaps occupy disjoint parts of the span. Subtract instead of
+        # adding the counters so a total just above Int64.MaxValue cannot lose precision.
+        if ($s.compressed_bytes -gt $s.span -or $s.unread_bytes -gt ($s.span - $s.compressed_bytes)) {
+            throw 'summary.compressed_bytes and summary.unread_bytes must fit within summary.span.'
+        }
+        if ($s.bink2_files -gt $s.files) {
+            throw 'summary.bink2_files must not exceed summary.files.'
+        }
     } catch {
         throw "Invalid carve index '$index': $($_.Exception.Message)"
     }

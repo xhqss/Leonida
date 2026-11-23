@@ -39,8 +39,10 @@ class CliErrorTest(unittest.TestCase):
 
     def run_tool(self, dis, asm, src=None):
         env = dict(os.environ, SPIRV_DIS=dis, SPIRV_AS=asm)
+        # The tool is a Python child: piped, it writes in the locale encoding (the ANSI code page on Windows), so read
+        # it back in that encoding. UTF-8 would turn a non-ASCII temp path into replacement characters.
         return subprocess.run([sys.executable, "-I", TOOL, src or self.src, self.out], env=env, capture_output=True,
-                              text=True, encoding="utf-8", errors="replace")
+                              text=True, errors="replace")
 
     def assert_failed(self, result):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)

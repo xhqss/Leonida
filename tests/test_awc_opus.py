@@ -353,6 +353,20 @@ class ExportBankTest(unittest.TestCase):
         self.assertIn("Permission denied", err.getvalue())
         export.assert_not_called()
 
+    def test_colliding_bank_output_directories_are_refused_before_export(self):
+        src = Path(self.tmp.name) / "banks"
+        src.mkdir()
+        listing = [(str(src), [], ["fixture.awc", "fixture.AWC"])]
+        with mock.patch.object(awc.os, "walk", return_value=listing), \
+                mock.patch.object(awc, "export_bank") as export, \
+                contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as exc:
+            awc.main([str(src), self.out, "--jobs", "1"])
+        self.assertEqual(exc.exception.code, 2)
+        self.assertIn("fixture.awc", err.getvalue())
+        self.assertIn("fixture.AWC", err.getvalue())
+        self.assertIn("would both export to", err.getvalue())
+        export.assert_not_called()
+
     def test_cli_bank_limits(self):
         src = Path(self.tmp.name) / "banks"
         src.mkdir()
@@ -445,6 +459,33 @@ class ExportBankTest(unittest.TestCase):
             self.assertEqual(last["granule"], 312 + 1920)      # pre-skip + declared real samples
             self.assertGreater(last["granule"], 0)
             self.assertEqual(last["serial"], 3)
+
+    def test_new_outputs_in_one_folder_probe_the_file_mode_once(self):
+        fmt = format_block(1, 48000, 0, 1)
+        path = os.path.join(self.tmp.name, "many.awc")
+        with open(path, "wb") as f:
+            f.write(build_bank([(sid, fmt, struct.pack("<h", sid)) for sid in range(1, 6)]))
+        real_open = os.open
+        probes = []
+
+        def counting_open(file, *args, **kwargs):
+            if str(file).endswith(".probe"):
+                probes.append(file)
+            return real_open(file, *args, **kwargs)
+        with mock.patch.object(os, "open", counting_open):
+            counts = awc.export_bank(path, self.out)
+        self.assertEqual(counts["pcm"], 5)
+        self.assertEqual(len(os.listdir(os.path.join(self.out, "many"))), 5)
+        self.assertEqual(len(probes), 1)
+
+    def test_pcm_data_size_must_match_the_declared_samples(self):
+        fmt = format_block(100, 22050, 0x00, 2)
+        path = os.path.join(self.tmp.name, "odd.awc")
+        with open(path, "wb") as f:
+            f.write(build_bank([(1, fmt, bytes(401)), (2, fmt, bytes(399)), (3, fmt, bytes(400))]))
+        counts = awc.export_bank(path, self.out)
+        self.assertEqual(counts, {"opus": 0, "pcm": 1, "other": 2, "music": 0})
+        self.assertEqual(os.listdir(os.path.join(self.out, "odd")), ["00000003.wav"])
 
     def test_stereo_plain_stream_length_is_per_channel(self):
         # A stereo format tag stores interleaved samples: 3840 counts = 1920 frames per channel.
@@ -928,6 +969,52 @@ class AwcIndexTableTest(unittest.TestCase):
         self.assertEqual([s["id"] for s in streams], [1, 2])
 
 
+class MusicChannelFormatTest(unittest.TestCase):
+    """AwcRecovery.cs:380 rejects music channels outside 1000..192000 Hz or not coded as Opus."""
+
+    RATE_AT = 56 + 22      # one-channel descriptor starts at 56; rate is at +22
+    CODEC_AT = 56 + 24
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.out = os.path.join(self.tmp.name, "out")
+
+    def bank(self, *, rate=None, codec=None):
+        d = bytearray(build_music_pcm_bank())
+        if rate is not None:
+            struct.pack_into("<H", d, self.RATE_AT, rate)
+        if codec is not None:
+            d[self.CODEC_AT] = codec
+        return bytes(d)
+
+    def channels(self, d):
+        _, music = awc.parse_awc(d)
+        return awc.music_channels(d, *music[0], collect_packets=False)
+
+    def test_zero_rate_is_rejected_and_sibling_pcm_is_kept(self):
+        d = self.bank(rate=0)
+        self.assertEqual(self.channels(d), [])
+        path = os.path.join(self.tmp.name, "streamed.awc")
+        with open(path, "wb") as f:
+            f.write(d)
+        counts = awc.export_bank(path, self.out)
+        self.assertEqual(counts, {"opus": 0, "pcm": 1, "other": 0, "music": 0})
+        self.assertTrue(os.path.isfile(os.path.join(self.out, "streamed", "00000021.wav")))
+
+    def test_rate_below_reference_bound_is_rejected(self):
+        self.assertEqual(self.channels(self.bank(rate=999)), [])
+
+    def test_reference_rate_bounds_are_accepted(self):
+        # The field is u16, so 65535 is the highest rate a bank can actually declare.
+        for rate in (1000, 65535):
+            with self.subTest(rate=rate):
+                self.assertEqual(len(self.channels(self.bank(rate=rate))), 1)
+
+    def test_non_opus_codec_is_rejected(self):
+        self.assertEqual(self.channels(self.bank(codec=0)), [])
+
+
 class MalformedBankTest(unittest.TestCase):
     def test_truncated_pcm_bank_creates_no_outputs(self):
         pcm = b"\x01\x00" * 4
@@ -961,6 +1048,32 @@ class MalformedBankTest(unittest.TestCase):
             with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out):
                 self.assertEqual(awc.main(), 0)
             self.assertIn("skip bad.awc", out.getvalue())
+
+
+class WriteFileReadOnlyTest(unittest.TestCase):
+    def test_failed_replace_over_a_read_only_file_leaves_no_staging_file(self):
+        real_remove = os.remove
+
+        def windows_remove(p):
+            if not os.access(p, os.W_OK):
+                raise PermissionError(13, "read-only file", p)
+            real_remove(p)
+
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "a.ogg")
+            with open(dest, "wb") as f:
+                f.write(b"old")
+            os.chmod(dest, 0o444)
+            try:
+                with mock.patch.object(awc.os, "replace", side_effect=OSError("replace failed")), \
+                        mock.patch.object(awc.os, "remove", side_effect=windows_remove):
+                    with self.assertRaises(OSError):
+                        awc.write_file(dest, b"new")
+                self.assertEqual(sorted(os.listdir(d)), ["a.ogg"])
+                with open(dest, "rb") as f:
+                    self.assertEqual(f.read(), b"old")
+            finally:
+                os.chmod(dest, 0o644)
 
 
 if __name__ == "__main__":

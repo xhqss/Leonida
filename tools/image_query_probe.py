@@ -26,7 +26,8 @@ Usage:
     python -I tools/image_query_probe.py --self-test        # the rules against values measured on gfx1036, no GPU
 
 Exit 0 when every word matches the rules, 1 on a mismatch (a finding: the rules above are wrong on this GPU), 2 on a
-harness error, 77 when the hardware oracle is unavailable or the GPU is not GFX10 (the T# layout is GFX10's).
+harness error or a --json report that cannot be written (the summary line still gives the result), 77 when the
+hardware oracle is unavailable or the GPU is not GFX10 (the T# layout is GFX10's).
 Nothing here reads game files.
 """
 import argparse
@@ -301,6 +302,8 @@ def main(argv=None):
             return 2
     finally:
         oracle.close()
+    total = len(report["resinfo"]) + len(report["lod"])
+    print(f"{total - bad} of {total} results follow the rules, {bad} do not")
     if a.json:
         try:
             os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
@@ -308,9 +311,7 @@ def main(argv=None):
                 json.dump(report, f, indent=1)
         except OSError as exc:
             print(f"cannot write {a.json}: {exc.strerror or exc}", file=sys.stderr)
-            return 1
-    total = len(report["resinfo"]) + len(report["lod"])
-    print(f"{total - bad} of {total} results follow the rules, {bad} do not")
+            return 2  # not 1: that would read as a result off the rules; the summary above has the result
     return 1 if bad else 0
 
 

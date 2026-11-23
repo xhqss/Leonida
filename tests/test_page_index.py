@@ -62,7 +62,7 @@ class PageIndexTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as source:
             for extension, writer in (("json", "write_json"), ("csv", "write_csv")):
                 with self.subTest(extension=extension):
-                    out = os.path.join(source, f"index.{extension}")
+                    out = os.path.join(source, f"pages.{extension}")
                     stderr = io.StringIO()
                     with (mock.patch.object(sys, "argv", [TOOL, source, out, "--quiet"]),
                           mock.patch.object(page_index, writer, side_effect=OSError("disk full")),
@@ -412,6 +412,15 @@ class PageIndexTest(unittest.TestCase):
                     self.assertIn("output must not overwrite the source", proc2.stderr)
                     with open(arc, "rb") as f:
                         self.assertEqual(f.read(), original)
+
+    def test_output_cannot_create_a_report_in_place_of_the_carve_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = os.path.join(tmp, "index.json")
+            proc = subprocess.run([sys.executable, "-I", TOOL, tmp, manifest, "--quiet"],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("output would overwrite the carve manifest", proc.stderr)
+            self.assertFalse(os.path.exists(manifest))
 
     def test_output_cannot_overwrite_carve_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:

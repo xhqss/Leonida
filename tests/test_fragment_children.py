@@ -115,6 +115,13 @@ class TestFragmentChildren(unittest.TestCase):
         self.assertEqual(stats["stray_drawables"], 1)
         self.assertEqual(stats["fragments_with_stray"], 1)
 
+    def test_stray_at_the_last_aligned_offset_is_found(self):
+        # 0x1f50 + 176 == 0x2000: the body ends exactly at the end of the page, with or without trailing padding
+        for padding in (0, 16):
+            with self.subTest(padding=padding):
+                stats = self.scan(archive(fragment(strays=(0x1f50,)) + bytes(padding)))
+                self.assertEqual(stats["stray_drawables"], 1)
+
     def test_null_shader_group_is_still_a_body(self):
         b = bytearray(fragment(drawables=2))
         struct.pack_into("<Q", b, MAIN + RECORD + 16, 0)

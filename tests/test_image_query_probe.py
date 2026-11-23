@@ -148,15 +148,20 @@ class Comparison(unittest.TestCase):
                 self.assertEqual(pr.main(["--waves", "32", "--json", str(report)]), 0)
             self.assertTrue(report.is_file())
 
-        with tempfile.TemporaryDirectory() as tmp, \
-                mock.patch.object(runner, "open_oracle", return_value=FakeOracle()):
-            report = Path(tmp) / "directory"
-            report.mkdir()
-            error = io.StringIO()
-            with redirect_stdout(io.StringIO()), redirect_stderr(error):
-                self.assertEqual(pr.main(["--waves", "32", "--json", str(report)]), 1)
-            self.assertIn(str(report), error.getvalue())
-            self.assertIn("cannot write", error.getvalue())
+    def test_a_report_that_cannot_be_written_still_shows_the_result_and_exits_2(self):
+        # Exit 1 means a result off the rules; an unwritable --json must not look like one, nor hide the summary.
+        for oracle, summary in ((FakeOracle(), r"follow the rules, 0 do not"),
+                                (FakeOracle(depth_2d=1), r"follow the rules, [1-9]\d* do not")):
+            with self.subTest(summary=summary), tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.object(runner, "open_oracle", return_value=oracle):
+                report = Path(tmp) / "directory"
+                report.mkdir()
+                out, error = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(error):
+                    self.assertEqual(pr.main(["--waves", "32", "--json", str(report)]), 2)
+                self.assertRegex(out.getvalue(), summary)
+                self.assertIn(str(report), error.getvalue())
+                self.assertIn("cannot write", error.getvalue())
 
 
 class Hardware(unittest.TestCase):

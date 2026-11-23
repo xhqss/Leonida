@@ -20,7 +20,8 @@ what format, and the export format of mrt0 (32_ABGR for the harness' RGBA32F tar
 template's own ISA and that part of its metadata, so the code under test can follow the same conventions.
 Templates: `const` (no inputs), `interp2` (two smooth vec4 varyings: location 0 = (u, v, 0, 1) and location 1 =
 (u, v, 0, 0) with u, v = 0..2 across the screen, as scripts/run_gpu_tests.py's vs_tri), or --vs/--ps files
-(.spv, or .spvasm assembled with spirv-as).
+(.spv, or .spvasm assembled with spirv-as). --format picks another color target (the driver then picks the export
+format for it, as for a game pipeline); the readback is that target's texels as stored.
 
 Checked on an AMD Radeon iGPU (gfx1036, Windows driver 26.10.1): the driver accepts a patched binary and the patched
 code runs as the pixel shader (no checksum over the code). The pixel stage there is compiled as wave64.
@@ -542,6 +543,28 @@ TEMPLATES = {
 }
 
 
+TEMPLATE_CONST_INT = """\
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %out
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %out Location 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+        %int = OpTypeInt 32 %int_kind
+         %v4 = OpTypeVector %int 4
+      %p_out = OpTypePointer Output %v4
+        %out = OpVariable %p_out Output
+         %i1 = OpConstant %int 1
+          %c = OpConstantComposite %v4 %i1 %i1 %i1 %i1
+       %main = OpFunction %void None %fn
+          %e = OpLabel
+               OpStore %out %c
+               OpReturn
+               OpFunctionEnd
+"""
+
+
 def spirv(path_or_text, out, work):
     """A .spv as is; SPIR-V assembly (a .spvasm path or template text) through spirv-as."""
     if not path_or_text.lstrip().startswith("Op") and path_or_text.endswith(".spv"):
@@ -573,8 +596,23 @@ def harness(build):
     raise Unavailable(f"no vk_harness in {build}")
 
 
-def run_harness(exe, vs, ps, out_raw, size, env_extra):
+# --format: the color target (VkFormat number, bytes per texel, component kind). The driver picks the export format
+# (spi_shader_col_format) for it, as for a game pipeline with that render target.
+FORMATS = {
+    "rgba32f": (109, 16, "float"), "rgba32u": (107, 16, "uint"), "rgba32i": (108, 16, "sint"),
+    "rg32f": (103, 8, "float"), "r32f": (100, 4, "float"), "r32u": (98, 4, "uint"),
+    "rgba16f": (97, 8, "float"), "rgba16unorm": (91, 8, "float"), "rgba16snorm": (92, 8, "float"),
+    "rgba16u": (95, 8, "uint"), "rgba16i": (96, 8, "sint"), "rg16f": (83, 4, "float"), "rg16unorm": (77, 4, "float"),
+    "rgba8unorm": (37, 4, "float"), "rgba8snorm": (38, 4, "float"), "rgba8u": (41, 4, "uint"),
+    "rgb10a2unorm": (64, 4, "float"),
+}
+
+
+def run_harness(exe, vs, ps, out_raw, size, env_extra, fmt="rgba32f"):
     env = dict(os.environ, **env_extra)
+    if fmt != "rgba32f":
+        number, nbytes, _ = FORMATS[fmt]
+        env["VKH_COLOR_FORMAT"] = f"{number}:{nbytes}"
     r = subprocess.run([exe, vs, ps, out_raw, str(size[0]), str(size[1])], capture_output=True, text=True, env=env)
     if r.returncode == 77:
         raise Unavailable(r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "vk_harness: unsupported")
@@ -614,19 +652,25 @@ def read_lines(path):
     return lines
 
 
-def pixels(raw_path, size):
+def pixels(raw_path, size, texel_bytes=16):
+    """Each texel of the readback as its little-endian dwords (one dword for a 4-byte format)."""
     with open(raw_path, "rb") as f:
         d = f.read()
     n = size[0] * size[1]
-    if len(d) != 16 * n:
-        raise RuntimeError(f"readback is {len(d)} bytes, expected {16 * n}")
-    return [list(struct.unpack_from("<4I", d, 16 * i)) for i in range(n)]
+    if len(d) != texel_bytes * n:
+        raise RuntimeError(f"readback is {len(d)} bytes, expected {texel_bytes * n}")
+    w = texel_bytes // 4
+    return [list(struct.unpack_from(f"<{w}I", d, texel_bytes * i)) for i in range(n)]
 
 
 class Oracle:
     """One template pipeline, built once; run() patches its pixel shader and draws."""
 
-    def __init__(self, build, vs=None, ps=None, template="interp2", size=(8, 8), mcpu="gfx1036", work=None):
+    def __init__(self, build, vs=None, ps=None, template="interp2", size=(8, 8), mcpu="gfx1036", work=None,
+                 fmt="rgba32f"):
+        if fmt not in FORMATS:
+            raise ValueError(f"unknown format {fmt!r} (known: {', '.join(FORMATS)})")
+        self.fmt, self.texel_bytes = fmt, FORMATS[fmt][1]
         self.exe = harness(build)
         self.size = tuple(size)
         self.mcpu = mcpu
@@ -636,10 +680,16 @@ class Oracle:
         self.vs = spirv(vs or VS_TRI, os.path.join(self.work, "vs.spv"), self.work)
         if ps is None and template not in TEMPLATES:
             raise ValueError(f"unknown template {template!r} (known: {', '.join(TEMPLATES)})")
-        self.ps = spirv(ps or TEMPLATES[template], os.path.join(self.work, "ps.spv"), self.work)
+        text = TEMPLATES[template] if ps is None else ps
+        if ps is None and FORMATS[fmt][2] != "float":
+            # an integer target takes an integer output (the template's float result, bitcast)
+            if template != "const":
+                raise ValueError(f"--format {fmt}: only the const template has an integer output")
+            text = TEMPLATE_CONST_INT.replace("%int_kind", "1" if FORMATS[fmt][2] == "sint" else "0")
+        self.ps = spirv(text, os.path.join(self.work, "ps.spv"), self.work)
         out_bin = os.path.join(self.work, "template.bin")
         r = run_harness(self.exe, self.vs, self.ps, os.path.join(self.work, "template.raw"), self.size,
-                        {"VKH_BINARY_OUT": out_bin})
+                        {"VKH_BINARY_OUT": out_bin}, fmt)
         if r.returncode or not os.path.exists(out_bin):
             raise RuntimeError("vk_harness could not build the template:\n" + r.stderr.strip()[-800:])
         self.device = next((m.group(1) for m in re.finditer(r"device[:=]\s*(.+)", r.stderr)), "")
@@ -653,7 +703,7 @@ class Oracle:
             self.arch = radv_arch(self.device)
             self.backend, self.ps_index = "radv", radv_ps_index(self.bins)
             self.wave64 = radv_layout(self.bins[self.ps_index][2]).wave == 64
-        self.template_pixels = pixels(os.path.join(self.work, "template.raw"), self.size)
+        self.template_pixels = pixels(os.path.join(self.work, "template.raw"), self.size, self.texel_bytes)
 
     def show(self):
         """The template's pixel-shader ISA (llvm-objdump) and the SPI part of its metadata."""
@@ -714,10 +764,10 @@ class Oracle:
         raw = os.path.join(self.work, "patched.raw")
         if os.path.exists(raw):
             os.remove(raw)
-        r = run_harness(self.exe, self.vs, self.ps, raw, self.size, {"VKH_BINARY_IN": path})
+        r = run_harness(self.exe, self.vs, self.ps, raw, self.size, {"VKH_BINARY_IN": path}, self.fmt)
         if r.returncode or not os.path.exists(raw):
             raise RuntimeError(f"vk_harness exited {r.returncode} with the patched binary:\n" + r.stderr.strip()[-800:])
-        return pixels(raw, self.size)
+        return pixels(raw, self.size, self.texel_bytes)
 
     def close(self):
         if self._tmp:
@@ -743,6 +793,8 @@ def main(argv=None):
     ap.add_argument("--ps", help="template pixel shader (.spv or SPIR-V assembly) instead of --template")
     ap.add_argument("--asm", help="the pixel-shader ISA to run (one instruction per line, ; comments)")
     ap.add_argument("--size", nargs=2, type=int, default=(8, 8), metavar=("W", "H"))
+    ap.add_argument("--format", default="rgba32f", choices=sorted(FORMATS),
+                    help="the color target (default rgba32f); the driver picks the export format for it")
     ap.add_argument("--mcpu", default="gfx1036")
     ap.add_argument("--show-template", action="store_true", help="print the template's ISA and SPI setup")
     ap.add_argument("--set", action="append", default=[], metavar="PATH=JSON",
@@ -761,7 +813,7 @@ def main(argv=None):
             if not eq:
                 raise ValueError(f"--set {item!r}: expected PATH=JSON")
             sets.append((path, json.loads(val)))
-        o = Oracle(a.build, a.vs, a.ps, a.template, a.size, a.mcpu)
+        o = Oracle(a.build, a.vs, a.ps, a.template, a.size, a.mcpu, fmt=a.format)
     except Unavailable as e:
         print(f"ps_oracle unavailable: {e}", file=sys.stderr)
         return 77

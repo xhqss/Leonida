@@ -5,8 +5,10 @@
 // XdxrLayout gives the byte layout of a structure from its element count alone: the same numbers answer
 // GetRaytracingAccelerationStructurePrebuildInfo and place the records when the build is recorded. The region
 // order (header, parent table, elements, nodes) is the one tools/xdxr_bvh.py writes (an ASSUMPTION there: a shader
-// reaches each region through the header). Nodes are BOX32, grouped four consecutive children at a time in Morton
-// order, level by level from the elements up; the root is the last node.
+// reaches each region through the header). Nodes are BOX32 (128 bytes, float boxes) or, when the layout asks for
+// them, BOX16 (64 bytes, half boxes rounded outward): a binary radix tree over the elements' Morton keys, collapsed
+// to four children per node by keeping every other level; the root is node 0. Their count depends on the keys, so
+// the layout has room for the most there can be and the header counts the ones a build wrote.
 //
 // XdxrBuilder records the dispatches into a command buffer. Every address is a buffer device address; `bias` is
 // added to the BLAS addresses read from instance descs (the distance between the application's GPU virtual
@@ -28,14 +30,13 @@ namespace leonida {
 
 struct XdxrLayout {
     static constexpr std::uint32_t header_size = 64;
-    static constexpr std::uint32_t node_size = 128;  // BOX32
 
     bool tlas = false;
+    bool box16 = false;                // inner nodes are BOX16
+    std::uint32_t node_size = 128;     // BOX32 128 bytes, BOX16 64
     std::uint32_t elements = 0;        // triangles (BLAS) or instances (TLAS)
     std::uint32_t element_size = 64;   // a leaf, or a 128-byte instance record
-    std::vector<std::uint32_t> level_counts;  // nodes per level, from the one above the elements to the root (1)
-    std::vector<std::uint32_t> level_first;   // index of each level's first node
-    std::uint32_t nodes = 0;
+    std::uint32_t nodes = 0;           // the most BOX32 nodes a build can write
     std::uint32_t parents_off = header_size;
     std::uint32_t elements_off = 0;
     std::uint32_t nodes_off = 0;
@@ -48,25 +49,30 @@ struct XdxrLayout {
     static constexpr std::uint32_t small_sort_max = 1024;  // xdxr_build.comp SMALL_SORT_MAX: one-workgroup sort
     std::uint64_t scratch = 0;         // scratch bytes
 
-    // False when the count would overflow the 32-bit offsets of the format.
-    bool compute(std::uint32_t count, bool top_level) {
+    // False when the count would overflow the 32-bit offsets of the format. `half_boxes`: BOX16 inner nodes.
+    bool compute(std::uint32_t count, bool top_level, bool half_boxes = false) {
         *this = XdxrLayout{};
         tlas = top_level;
+        box16 = half_boxes;
+        node_size = box16 ? 64u : 128u;
         elements = count;
         element_size = tlas ? 128u : 64u;
-        std::uint64_t below = count;
-        do {
-            const std::uint64_t here = below ? (below + 3) / 4 : 1;   // an empty structure keeps one empty root
-            level_first.push_back(nodes);
-            level_counts.push_back(std::uint32_t(here));
-            nodes += std::uint32_t(here);
-            below = here;
-        } while (below > 1);
-        const std::uint64_t body_units = (std::uint64_t(count) * element_size + std::uint64_t(nodes) * node_size) / 64;
+        // A kept inner node has two children when both of its binary children are elements, which takes two
+        // elements of its own, and three or four otherwise. With K nodes and a of the first kind, the child slots
+        // count K - 1 + N >= 2a + 3(K - a), and a <= N / 2, so K <= (3N - 2) / 4. An empty structure or a single
+        // element keeps one root.
+        nodes = count <= 1 ? 1u : std::uint32_t((3ull * count - 2) / 4);
+        // BOX16: one spare 64-byte unit after the last node a build writes (xdxr_build.comp MODE_HEADER zeroes it
+        // and the header's size counts it). The translator's image_bvh_intersect_ray loads a box node's 112 bytes of
+        // BOX32 bounds before it knows the type, so without it the last BOX16 node (64 bytes) would be read 48 bytes
+        // past the structure, a compacted one too.
+        const std::uint64_t pad = box16 ? 64u : 0u;
+        const std::uint64_t body_units =
+            (std::uint64_t(count) * element_size + std::uint64_t(nodes) * node_size + pad) / 64;
         const std::uint64_t parent_bytes = (4 * body_units + 63) / 64 * 64;
         const std::uint64_t e_off = header_size + parent_bytes;
         const std::uint64_t n_off = e_off + std::uint64_t(count) * element_size;
-        const std::uint64_t end = n_off + std::uint64_t(nodes) * node_size;
+        const std::uint64_t end = n_off + std::uint64_t(nodes) * node_size + pad;
         // node pointers hold the 64-byte unit index in 29 bits
         if (end > (std::uint64_t(1) << 32) - 64 || (end >> 6) >= (std::uint64_t(1) << 29)) return false;
         elements_off = std::uint32_t(e_off);
@@ -74,13 +80,17 @@ struct XdxrLayout {
         size = std::uint32_t(end);
         parent_entries = std::uint32_t(body_units);
         sort_size = count;
-        // centroid bounds, keys and element indices twice, digit counts per tile and their prefix sums, a box per
-        // element and per node
-        scratch = 64 + 16ull * sort_size + 8ull * radix_bins * tiles() + 24ull * (std::uint64_t(count) + nodes);
+        // centroid bounds and the node count, keys and element indices twice, digit counts per tile and their prefix
+        // sums, a box per element, a box accumulator per node, then per inner node of the binary tree its two
+        // children, its parent, its kept flag and its node index, a kept count per tile with its prefix sum, and
+        // each element's pointer in the tree
+        scratch = 64 + 16ull * sort_size + 8ull * radix_bins * tiles() + 24ull * count + 32ull * nodes +
+                  20ull * inner() + 8ull * kept_tiles() + 4ull * count;
         return true;
     }
-    std::uint32_t root() const { return nodes - 1; }
     std::uint32_t tiles() const { return (sort_size + radix_tile - 1) / radix_tile; }
+    std::uint32_t inner() const { return elements > 1 ? elements - 1 : 0; }   // binary tree inner nodes
+    std::uint32_t kept_tiles() const { return (inner() + radix_tile - 1) / radix_tile; }
 };
 
 // One geometry of a bottom-level build, as D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC gives it.
@@ -116,10 +126,16 @@ public:
     // destination itself, or another one, which is copied first) was built from the same topology, and is refitted
     // to the new positions. Its tree is kept and only its boxes change, which is valid for any motion and costs no
     // sort, though a refitted tree traverses more slowly as the geometry moves away from where it was built.
+    //
+    // `pair`: sibling triangles that share an edge go into one leaf as TRI0 and TRI1 (xdxr_build.comp MODE_NODES).
+    // The layout and the tree are the same either way. A refit rewrites every leaf as one triangle, so a structure
+    // that will be updated must be built without pairing (the layer pairs only builds without ALLOW_UPDATE), and an
+    // update ignores `pair`.
     bool record_blas(VkCommandBuffer cb, const XdxrLayout& layout, const std::vector<XdxrTriangles>& geometries,
-                     std::uint64_t dst, std::uint64_t scratch, std::uint64_t update_from = 0) {
+                     std::uint64_t dst, std::uint64_t scratch, std::uint64_t update_from = 0, bool pair = false) {
         if (!loaded_ || layout.tlas) return false;
         Push p = base(layout, dst, scratch);
+        if (pair && !update_from) p.flags |= flag_pair;
         if (update_from) refit_begin(cb, layout, p, update_from); else begin(cb, layout, p);
         std::uint32_t first = 0;
         for (std::size_t g = 0; g < geometries.size(); ++g) {
@@ -198,16 +214,18 @@ public:
 
 private:
     enum : std::uint32_t {
-        mode_init = 0, mode_triangles = 1, mode_instances = 2, mode_morton = 3, mode_level = 5, mode_header = 6,
-        mode_radix_count = 7, mode_radix_scan = 8, mode_radix_scatter = 9, mode_small_sort = 10, mode_copy = 11,
-        mode_copy_as = 12, mode_postbuild = 13
+        mode_init = 0, mode_triangles = 1, mode_instances = 2, mode_morton = 3, mode_karras = 4, mode_nodes = 5,
+        mode_header = 6, mode_radix_count = 7, mode_radix_scan = 8, mode_radix_scatter = 9, mode_small_sort = 10,
+        mode_copy_as = 12, mode_postbuild = 13, mode_kept = 14, mode_kept_scan = 15,
+        mode_kept_index = 16, mode_propagate = 17, mode_clear = 18
     };
     struct Addr { std::uint32_t lo = 0, hi = 0; };
     struct Push {  // xdxr_build.comp `Push`, std430 push-constant layout
         Addr dst, scratch, src0, src1, src2, bias;
         std::uint32_t mode = 0, count = 0, first = 0, arg0 = 0, arg1 = 0, arg2 = 0, geometry = 0, elements = 0,
-                      sort_size = 0, elements_off = 0, nodes_off = 0, parents_off = 0, total_size = 0, tlas = 0;
+                      sort_size = 0, elements_off = 0, nodes_off = 0, parents_off = 0, total_size = 0, flags = 0;
     };
+    enum : std::uint32_t { flag_tlas = 1, flag_box16 = 2, flag_pair = 4 };  // xdxr_build.comp FLAG_*
     static_assert(sizeof(Push) == 104, "push constants must match xdxr_build.comp");
 
     static Addr split(std::uint64_t a) { return {std::uint32_t(a), std::uint32_t(a >> 32)}; }
@@ -222,7 +240,8 @@ private:
         p.nodes_off = l.nodes_off;
         p.parents_off = l.parents_off;
         p.total_size = l.size;
-        p.tlas = l.tlas ? 1u : 0u;
+        p.flags = (l.tlas ? flag_tlas : 0u) | (l.box16 ? flag_box16 : 0u);
+        p.arg0 = l.nodes;                               // where the scratch arrays after the accumulators start
         return p;
     }
 
@@ -230,18 +249,18 @@ private:
         vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         Push init = p;
         init.mode = mode_init;
-        init.count = l.parent_entries > 3 ? l.parent_entries : 3;
+        init.count = l.parent_entries > 16 ? l.parent_entries : 16;   // the parent table has at least 16 entries
         dispatch(cb, init, init.count);
     }
 
-    // An update: the source's tree is copied unless it is the destination. Its parent table stays as it is, so there
-    // is no MODE_INIT.
+    // An update: the source's tree is copied unless it is the destination, as many bytes as its header says (a
+    // compacted source is shorter than the layout). Its parent table stays as it is, so there is no MODE_INIT.
     void refit_begin(VkCommandBuffer cb, const XdxrLayout& l, const Push& p, std::uint64_t source) {
         vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         const std::uint64_t dst = std::uint64_t(p.dst.hi) << 32 | p.dst.lo;
         if (source == dst) return;
         Push c = p;
-        c.mode = mode_copy;
+        c.mode = mode_copy_as;
         c.count = l.size / 4;
         c.src0 = split(source);
         dispatch(cb, c, c.count);
@@ -249,19 +268,26 @@ private:
 
     // Boxes bottom-up through the existing nodes, then the header (its bounds change; nothing else does).
     void refit_finish(VkCommandBuffer cb, const XdxrLayout& l, const Push& p) {
-        for (std::size_t level = 0; level < l.level_counts.size(); ++level) {
-            Push n = p;
-            n.mode = mode_level;
-            n.count = l.level_counts[level];
-            n.first = l.level_first[level];
-            n.arg2 = 1;                                 // refit: read each node's children from the node
-            dispatch(cb, n, n.count);
-        }
+        Push c = p;
+        c.mode = mode_clear;
+        c.count = l.nodes;
+        dispatch(cb, c, c.count);
+        propagate(cb, l, p, true);
         Push h = p;
         h.mode = mode_header;
         h.count = 1;
-        h.first = l.root();
+        h.arg2 = 1;                                     // an update: the bounds only
         dispatch(cb, h, 1, false);
+    }
+
+    // `update`: the elements' pointers are their own (an update never pairs), not the ones MODE_NODES recorded.
+    void propagate(VkCommandBuffer cb, const XdxrLayout& l, const Push& p, bool update = false) {
+        if (!l.elements) return;
+        Push b = p;
+        b.mode = mode_propagate;
+        b.count = l.elements;
+        b.arg2 = update ? 1u : 0u;
+        dispatch(cb, b, b.count);
     }
 
     void finish(VkCommandBuffer cb, const XdxrLayout& l, const Push& p) {
@@ -287,19 +313,27 @@ private:
                 dispatch(cb, s, 64 * l.tiles());
             }
         }
-        for (std::size_t level = 0; level < l.level_counts.size(); ++level) {
-            Push n = p;
-            n.mode = mode_level;
-            n.count = l.level_counts[level];
-            n.first = l.level_first[level];
-            n.arg0 = level ? l.level_counts[level - 1] : l.elements;
-            n.arg1 = level ? l.level_first[level - 1] : 0xffffffffu;
-            dispatch(cb, n, n.count);
+        // the binary radix tree, which of its inner nodes become BOX32 nodes, and their indices
+        if (l.inner()) {
+            Push t = p;
+            t.mode = mode_karras;
+            t.count = l.inner();
+            dispatch(cb, t, t.count);
+            t.mode = mode_kept;
+            dispatch(cb, t, 64 * l.kept_tiles());      // one workgroup of 64 per tile
+            t.mode = mode_kept_scan;
+            dispatch(cb, t, 64);                       // one workgroup
+            t.mode = mode_kept_index;
+            dispatch(cb, t, 64 * l.kept_tiles());
         }
+        Push n = p;
+        n.mode = mode_nodes;
+        n.count = l.inner() ? l.inner() : 1;          // one root of its own for zero or one element
+        dispatch(cb, n, n.count);
+        propagate(cb, l, p);
         Push h = p;
         h.mode = mode_header;
         h.count = 1;
-        h.first = l.root();
         dispatch(cb, h, 1, false);
     }
 

@@ -117,6 +117,16 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
 
 
+class CliTests(unittest.TestCase):
+    TOOL = os.path.join(ROOT, "tools", "f32_fuzz.py")
+
+    def test_no_arguments_prints_usage(self):
+        r = subprocess.run([sys.executable, "-I", self.TOOL], capture_output=True, text=True, timeout=5)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("usage:", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+
 class HardwareOracle(unittest.TestCase):
     """--oracle hw: kernel text, verdicts, GFX11 skips and the exit-77 contract (no GPU needed), plus a run on the
     GPU when the oracle tools are present."""
@@ -228,6 +238,11 @@ class HardwareOracle(unittest.TestCase):
             oracle = runner.open_oracle()
         except runner.Unavailable as e:
             self.skipTest(f"hardware oracle unavailable: {e}")
+        from hw_oracle import asm
+        why = asm.rdna23_skip_reason(oracle.arch)
+        if why:
+            oracle.close()
+            self.skipTest(why)
         try:
             ff.hw_probe_modes(oracle)
             cases = ff.gen_cases(300, 21, tuple(ff.ALL_OPS)) + ff.gen_probes(2, 21, tuple(ff.ALL_OPS))

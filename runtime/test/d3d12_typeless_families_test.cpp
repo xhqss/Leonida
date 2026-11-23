@@ -6,7 +6,8 @@
 // typed RTV of a typeless texture, whose PSO names the typed format, compared with the same pass on the host (HLSL
 // compiled by d3dcompiler_47). The layer's shaders are GLSL stand-ins for translated ones (test/glsl/vs_fullscreen.vert,
 // ps_typeless_float.frag, ps_typeless_uint.frag), found by the FSSM hash of their containers in a translator-style
-// index; without glslangValidator at build time only the clears run.
+// index; without glslangValidator at build time only the clears run. The draws run twice: into a 4x4 2D texture and
+// into a 4-texel 1D one through a TEXTURE1D RTV (a 1D attachment view).
 // A view format the layer does not map yet (its CheckFeatureSupport gives no RENDER_TARGET) is reported and skipped,
 // so the R8 family and the 16-bit integer and normalized formats are covered as soon as their mapping lands.
 // Synthetic data only. LEONIDA_VK_VALIDATION=1 runs it under VK_LAYER_KHRONOS_validation.
@@ -57,14 +58,15 @@ struct Pass {
     const std::vector<std::uint8_t>* ps;
 };
 
-// Renders into a 4x4 TYPELESS texture through an RTV in `view` and reads it back: a clear to `value`, or (`pass`
-// given) a full-screen draw whose PSO names `view`. False when a step failed.
+// Renders into a 4x4 TYPELESS texture (`line`: a 4-texel 1D one) through an RTV in `view` and reads it back: a clear
+// to `value`, or (`pass` given) a full-screen draw whose PSO names `view`. False when a step failed.
 bool render_and_read(ID3D12Device* device, DXGI_FORMAT typeless, DXGI_FORMAT view, const float* value,
-                     const Pass* pass, std::vector<unsigned char>& bytes) {
+                     const Pass* pass, std::vector<unsigned char>& bytes, bool line = false) {
+    const UINT height = line ? 1 : 4;
     D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Dimension = line ? D3D12_RESOURCE_DIMENSION_TEXTURE1D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = 4;
-    desc.Height = 4;
+    desc.Height = height;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
     desc.Format = typeless;
@@ -95,7 +97,7 @@ bool render_and_read(ID3D12Device* device, DXGI_FORMAT typeless, DXGI_FORMAT vie
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap.p)))) return false;
     D3D12_RENDER_TARGET_VIEW_DESC rtv{};
     rtv.Format = view;
-    rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    rtv.ViewDimension = line ? D3D12_RTV_DIMENSION_TEXTURE1D : D3D12_RTV_DIMENSION_TEXTURE2D;
     const auto handle = heap->GetCPUDescriptorHandleForHeapStart();
     device->CreateRenderTargetView(texture.p, &rtv, handle);
     Ref<ID3D12RootSignature> root;
@@ -129,8 +131,8 @@ bool render_and_read(ID3D12Device* device, DXGI_FORMAT typeless, DXGI_FORMAT vie
         FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))))
         return false;
     if (pass) {
-        const D3D12_VIEWPORT viewport{0, 0, 4, 4, 0, 1};
-        const D3D12_RECT scissor{0, 0, 4, 4};
+        const D3D12_VIEWPORT viewport{0, 0, 4, FLOAT(height), 0, 1};
+        const D3D12_RECT scissor{0, 0, 4, LONG(height)};
         list->SetGraphicsRootSignature(root.p);
         list->SetPipelineState(pso.p);
         list->OMSetRenderTargets(1, &handle, FALSE, nullptr);
@@ -334,11 +336,13 @@ int main() {
                 }
                 const std::size_t texel = reference.size() / 16;
                 ++compared;
-                const bool same = mine == reference;
-                failed += !same;
                 if (warp.p && render_and_read(warp.p, family.typeless, view, value, nullptr, software) &&
                     software != reference)
                     ++warp_differs;
+                // The layer rounds a normalised clear value to nearest even, as D3D does (#521): at a tie (0.5 on 8
+                // bits) NVIDIA's D3D12 driver writes one code lower than WARP and AMD, so WARP's bytes also count.
+                const bool same = mine == reference || (!software.empty() && mine == software);
+                failed += !same;
                 std::printf("typeless %d view %d clear (%g, %g, %g, %g): host %s, layer %s%s%s\n", int(family.typeless),
                             int(view), value[0], value[1], value[2], value[3], hex(reference, texel).c_str(),
                             hex(mine, texel).c_str(), same ? "" : "  MISMATCH",
@@ -384,28 +388,36 @@ int main() {
         {DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UNORM, false},
         {DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UINT, true},
     };
-    for (const auto& c : draws) {
-        if (!renders(ours.p, c.typeless, c.view)) {
-            std::printf("typeless %d view %d draw: SKIP, the layer has no render target in this format yet\n",
-                        int(c.typeless), int(c.view));
-            ++skipped;
-            continue;
+    for (const bool line : {false, true}) {
+        for (const auto& c : draws) {
+            if (!renders(ours.p, c.typeless, c.view)) {
+                std::printf("typeless %d view %d draw: SKIP, the layer has no render target in this format yet\n",
+                            int(c.typeless), int(c.view));
+                ++skipped;
+                continue;
+            }
+            const char* shape = line ? "1D " : "";
+            std::vector<unsigned char> mine, reference;
+            if (!render_and_read(host.p, c.typeless, c.view, nullptr, c.uint ? &host_uint : &host_float, reference,
+                                 line)) {
+                std::fprintf(stderr, "typeless %d view %d %sdraw: the host refused\n", int(c.typeless), int(c.view),
+                             shape);
+                return 1;
+            }
+            if (!render_and_read(ours.p, c.typeless, c.view, nullptr, c.uint ? &ours_uint : &ours_float, mine,
+                                 line)) {
+                std::fprintf(stderr, "typeless %d view %d %sdraw: the layer failed\n", int(c.typeless), int(c.view),
+                             shape);
+                return 1;
+            }
+            ++drawn;
+            const bool same = mine == reference;
+            draws_failed += !same;
+            const std::size_t texel = reference.size() / (line ? 4 : 16);
+            std::printf("typeless %d view %d %sdraw (%s): host %s, layer %s%s\n", int(c.typeless), int(c.view), shape,
+                        c.uint ? "7, 300, 1000, 3" : "0.5, -2, 1.5, 0.25", hex(reference, texel).c_str(),
+                        hex(mine, texel).c_str(), same ? "" : "  MISMATCH");
         }
-        std::vector<unsigned char> mine, reference;
-        if (!render_and_read(host.p, c.typeless, c.view, nullptr, c.uint ? &host_uint : &host_float, reference)) {
-            std::fprintf(stderr, "typeless %d view %d draw: the host refused\n", int(c.typeless), int(c.view));
-            return 1;
-        }
-        if (!render_and_read(ours.p, c.typeless, c.view, nullptr, c.uint ? &ours_uint : &ours_float, mine)) {
-            std::fprintf(stderr, "typeless %d view %d draw: the layer failed\n", int(c.typeless), int(c.view));
-            return 1;
-        }
-        ++drawn;
-        const bool same = mine == reference;
-        draws_failed += !same;
-        std::printf("typeless %d view %d draw (%s): host %s, layer %s%s\n", int(c.typeless), int(c.view),
-                    c.uint ? "7, 300, 1000, 3" : "0.5, -2, 1.5, 0.25", hex(reference, reference.size() / 16).c_str(),
-                    hex(mine, reference.size() / 16).c_str(), same ? "" : "  MISMATCH");
     }
     std::printf("%u draws compared with %s, %u differ\n", drawn, adapter.c_str(), draws_failed);
 #endif

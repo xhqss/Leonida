@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <vector>
 
 namespace leonida::vk_test {
@@ -20,6 +22,9 @@ inline constexpr bool shader_fma_in_headers = true;
 #else
 inline constexpr bool shader_fma_in_headers = false;
 #endif
+
+inline constexpr std::uint32_t spv_sampled_image_array_dynamic_indexing = 29;
+inline constexpr std::uint32_t spv_storage_image_array_dynamic_indexing = 31;
 
 // Find OpCapability (17) in a binary module.
 inline bool spirv_declares_capability(const void* data, std::size_t bytes, std::uint32_t capability) {
@@ -97,6 +102,17 @@ struct ShaderFma {
         std::fprintf(stderr, "unsupported: %s needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32) and the device "
                              "lacks it; translate with --fma glsl\n", name);
         return false;
+    }
+
+    // accepts() for every stage of a pipeline: a test that draws a translated pixel shader with a translated vertex
+    // shader must refuse the pair when EITHER stage needs FMAKHR, because the device then fails pipeline creation
+    // instead of skipping. A file that cannot be read is accepted here; the caller's own module loading reports it.
+    bool accepts_file(const char* path) const {
+        if (float32 || !path || !*path) return true;
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return true;
+        const std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        return accepts(bytes.data(), bytes.size(), path);
     }
 };
 
