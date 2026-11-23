@@ -99,6 +99,24 @@ std::vector<uint8_t> pattern(size_t n, uint32_t seed) {
     return v;
 }
 
+// A zlib stream (RFC 1950) over `plain`, built here rather than compressed: the two-byte header, one stored deflate
+// block (RFC 1951, BTYPE 00) and the big-endian Adler-32. A stored block is the plain bytes behind a few-byte
+// framing, so the test says whether the shim inflates the request or merely moves the file's bytes.
+std::vector<uint8_t> zlib_stored(const std::vector<uint8_t>& plain) {
+    const size_t n = plain.size();
+    std::vector<uint8_t> stream{0x78, 0x9c, 0x01, static_cast<uint8_t>(n), static_cast<uint8_t>(n >> 8),
+                                static_cast<uint8_t>(~n), static_cast<uint8_t>(~n >> 8)};
+    stream.insert(stream.end(), plain.begin(), plain.end());
+    uint32_t a = 1, b = 0;
+    for (const uint8_t x : plain) {
+        a = (a + x) % 65521;
+        b = (b + a) % 65521;
+    }
+    const uint32_t adler = (b << 16) | a;
+    for (int shift = 24; shift >= 0; shift -= 8) stream.push_back(static_cast<uint8_t>(adler >> shift));
+    return stream;
+}
+
 void write_file(const fs::path& p, const std::vector<uint8_t>& bytes) {
     fs::create_directories(p.parent_path());
     FILE* f = nullptr;
@@ -398,9 +416,6 @@ void test_reads_and_errors(Env& env) {
         DSTORAGE_REQUEST r = file_request(b, 0, few.data(), 8);
         r.DestinationSize = 16;
         cases.push_back({r, E_DSTORAGE_INVALID_DESTINATION_SIZE, "DestinationSize differs from SourceSize"});
-        r = file_request(b, 0, few.data(), 8);
-        r.Options.ZlibDecompress = 1;
-        cases.push_back({r, E_NOTIMPL, "zlib is not implemented yet"});
         r = file_request(b, 0, few.data(), 8);
         r.Options.BcpackMode = DSTORAGE_BCPACK_MODE_BC1;
         cases.push_back({r, E_NOTIMPL, "BCPack is not implemented yet"});
@@ -903,6 +918,53 @@ LONG CALLBACK hold_on_guard(EXCEPTION_POINTERS* x) {
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
+// A zlib request is inflated, not copied: the stream is compressed, DestinationSize is the plain size, and a stream
+// that does not inflate to it fails with the destination untouched (src/zlib_inflate.h).
+void test_zlib(Env& env) {
+    const std::vector<uint8_t> plain = pattern(1024, 9);
+    const std::vector<uint8_t> stream = zlib_stored(plain);
+    write_file(env.game / L"data" / L"z.bin", stream);
+    IDStorageFileX* z = open(env, L"GAME:\\data\\z.bin");
+    IDStorageQueueX2* q = make_queue(env, 0x80, false);
+    IDStorageStatusArrayX* s = make_status(env, 8);
+
+    std::vector<uint8_t> inflated(plain.size(), 0xEE);
+    DSTORAGE_REQUEST good = file_request(z, 0, inflated.data(), static_cast<uint32_t>(stream.size()));
+    good.DestinationSize = static_cast<uint32_t>(plain.size());
+    good.Options.ZlibDecompress = 1;
+    q->EnqueueRequest(&good);
+    q->EnqueueStatus(s, 0);
+
+    // Bytes 2 onward are not a zlib header (the stored block's LEN), so the stream is malformed from the start.
+    std::vector<uint8_t> untouched(64, 0x5A);
+    DSTORAGE_REQUEST broken = file_request(z, 2, untouched.data(), 64);
+    broken.DestinationSize = 64;
+    broken.Options.ZlibDecompress = 1;
+    q->EnqueueRequest(&broken);
+    q->EnqueueStatus(s, 1);
+
+    // The stream inflates to 1024 bytes; the request asks for 1040.
+    std::vector<uint8_t> mismatch(plain.size() + 16, 0x5A);
+    DSTORAGE_REQUEST wrong = file_request(z, 0, mismatch.data(), static_cast<uint32_t>(stream.size()));
+    wrong.DestinationSize = static_cast<uint32_t>(mismatch.size());
+    wrong.Options.ZlibDecompress = 1;
+    q->EnqueueRequest(&wrong);
+    q->EnqueueStatus(s, 2);
+
+    q->Submit();
+    check(wait_complete(s, 2), "every zlib request completes");
+    check_hr(s->GetHResult(0), S_OK, "a zlib request inflates");
+    check(inflated == plain, "the inflated bytes are the stream's plain bytes");
+    check_hr(s->GetHResult(1), E_DSTORAGE_INVALID_DESTINATION_SIZE, "a malformed stream is refused");
+    check(untouched == std::vector<uint8_t>(64, 0x5A), "a refused stream leaves its destination alone");
+    check_hr(s->GetHResult(2), E_DSTORAGE_INVALID_DESTINATION_SIZE, "an inflated size that differs is refused");
+    check(mismatch == std::vector<uint8_t>(plain.size() + 16, 0x5A), "and its destination is untouched too");
+
+    z->Release();
+    s->Release();
+    q->Release();
+}
+
 // DSTORAGE_PRIORITY_STATS: TotalRequestCount and the byte totals count submitted requests; PendingRequestCount counts
 // requests whose processing has started and not completed. A memory queue (realtime, the only priority it may have):
 // the counts are compared with the ones before.
@@ -1004,6 +1066,7 @@ int main() {
     test_factory_checks(env);
     test_open_paths(env);
     test_reads_and_errors(env);
+    test_zlib(env);
     test_fence_order_and_events(env);
     test_cancel(env);
     test_auto_submit_and_full_queue(env);

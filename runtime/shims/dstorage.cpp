@@ -32,6 +32,8 @@
 #include "dstorage_xs_abi.h"
 #include "shims.h"
 
+#include "../src/zlib_inflate.h"  // leonida::zlib_inflate, for a request with the zlib option
+
 using namespace dsx;
 
 namespace {
@@ -770,21 +772,26 @@ private:
         if (options::source_type(o) != desc_.SourceType) return E_DSTORAGE_INVALID_SOURCE_TYPE;
         if (options::bcpack(o) > DSTORAGE_BCPACK_MODE_BC7) return E_DSTORAGE_INVALID_BCPACK_MODE;
         if (options::swizzle(o) > DSTORAGE_SWIZZLE_MODE_4K_12K_4K_12K) return E_DSTORAGE_INVALID_SWIZZLE_MODE;
-        if (options::zlib(o) || options::bcpack(o) != 0 || options::swizzle(o) != 0) {
-            log_once("decompress", "zlib, BCPack and swizzle requests are not implemented yet (E_NOTIMPL)");
+        // BCPack and swizzle stay unimplemented: both are GPU-side transforms with a layout this layer does not have
+        // yet. zlib is not: the runtime carries its own inflate (src/zlib_inflate.h), so a zlib request is served here.
+        if (options::bcpack(o) != 0 || options::swizzle(o) != 0) {
+            log_once("decompress", "BCPack and swizzle requests are not implemented yet (E_NOTIMPL)");
             return E_NOTIMPL;
         }
         if (o & (options::kDestinationPages | options::kSourcePages)) {
             log_once("pages", "physical-page requests are not implemented yet (E_NOTIMPL)");
             return E_NOTIMPL;
         }
-        if (r.IntermediateSize != 0) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;  // only zlib + BCPack use it
-        if (r.DestinationSize != r.SourceSize) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+        if (r.IntermediateSize != 0) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;  // only BCPack takes one
+        const bool zlib = options::zlib(o) != 0;
         const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
-        const uint64_t total = static_cast<uint64_t>(r.DestinationSize) + (memory ? r.SourceSize : 0u);
+        if (!zlib && r.DestinationSize != r.SourceSize) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+        // DSTORAGE_MAX_REQUEST_SIZE is source + destination. A compressed source is often larger than its output, so it
+        // counts for a file source too, not only for a memory one (the size is what the scratch buffer will cost).
+        const uint64_t total = static_cast<uint64_t>(r.DestinationSize) + r.SourceSize;
         if (total > kMaxRequestBytes) return E_DSTORAGE_REQUEST_TOO_LARGE;
         // DSTORAGE_REQUEST: a destination over 32 MiB is allowed only with 64 KiB or 2 MiB pages, which are not
-        // implemented yet (refused above). The source equals the destination here, so this covers both buffers.
+        // implemented yet (refused above). Without compression the source equals the destination.
         if (r.DestinationSize > kMax4kPageDestinationSize) return E_DSTORAGE_REQUEST_TOO_LARGE;
         if (!r.Destination) return E_INVALIDARG;
         if (memory) {
@@ -794,8 +801,31 @@ private:
             if (!e.file_counted) return E_DSTORAGE_FILE_NOT_OPEN;
         }
         if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
+        if (zlib) return execute_zlib_request(e, memory);
         if (memory) return guarded_move(r.Destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
         return read_file_range(e.file->handle(), r.FileOffset, r.Destination, r.SourceSize);
+    }
+
+    // A zlib request: SourceSize compressed bytes from the file or from memory, inflating to exactly DestinationSize
+    // (the DirectStorage contract; IntermediateSize is 0 for zlib). The stream is inflated into a scratch vector and
+    // then moved into the destination, so a malformed stream leaves the destination untouched. A stream that does not
+    // inflate to DestinationSize is reported as E_DSTORAGE_INVALID_DESTINATION_SIZE: the API has no code of its own for
+    // a bad stream, and the size the caller asked for is what it can act on.
+    HRESULT execute_zlib_request(const Entry& e, bool memory) {
+        const DSTORAGE_REQUEST& r = e.request;
+        std::vector<uint8_t> compressed(r.SourceSize);
+        if (memory) {
+            if (!guarded_move(compressed.data(), r.Source, r.SourceSize)) return E_DSTORAGE_ACCESS_VIOLATION;
+        } else {
+            const HRESULT hr = read_file_range(e.file->handle(), r.FileOffset, compressed.data(), r.SourceSize);
+            if (FAILED(hr)) return hr;
+        }
+        std::vector<uint8_t> plain;
+        if (!leonida::zlib_inflate(compressed, plain, r.DestinationSize) || plain.size() != r.DestinationSize) {
+            log_once("zlib-bad", "a zlib request did not inflate to its DestinationSize (E_INVALIDARG)");
+            return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+        }
+        return guarded_move(r.Destination, plain.data(), plain.size()) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
     }
 
     void set_pending(int delta) {
