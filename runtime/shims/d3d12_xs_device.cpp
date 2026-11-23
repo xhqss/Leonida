@@ -1146,6 +1146,30 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
     return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out);
 }
 
+// Xbox device slot 48 (public HLE): CreateCommandQueueX(desc, riid, out). `desc` starts with a PC
+// D3D12_COMMAND_QUEUE_DESC and continues with Xbox words, and the PC prefix carries console values the host runtime
+// refuses: measured on 1.0.2.1 the first call is a compute queue whose Flags/NodeMask words are not PC values
+// (docs/retail_boot_chain.md §3.2). The flags are limited to D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT and the node
+// mask to 0 before the PC device sees them; the discarded words are logged once so a trace can show them.
+HRESULT proxy_create_command_queue_x(DeviceProxy* self, std::uint64_t desc_word, const IID* riid, void** out) {
+    note_slot(48);
+    if (!desc_word) return E_INVALIDARG;
+    D3D12_COMMAND_QUEUE_DESC desc{};
+    std::memcpy(&desc, reinterpret_cast<const void*>(desc_word), sizeof(desc));
+    const auto flags = static_cast<std::uint32_t>(desc.Flags) & D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
+    static std::atomic<bool> logged{false};
+    if (first_call(logged))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 48 queue desc type=%u priority=%d flags=0x%x node mask=0x%x -> PC flags 0x%x, "
+                     "node mask 0\n",
+                     static_cast<unsigned>(desc.Type), static_cast<int>(desc.Priority),
+                     static_cast<unsigned>(desc.Flags), desc.NodeMask, flags);
+    desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(flags);
+    desc.NodeMask = 0;
+    // The PC slot-8 body wraps the created queue in the queue proxy, which is what the Xbox ABI expects back.
+    return proxy_create_command_queue(self, &desc, riid, out);
+}
+
 // Xbox device slot 78 (public HLE): SetFrameIntervalX(output, interval_us, latency, flags). The output and flags are
 // not used before a presenter exists. The period is a vblank period in microseconds in the public samples (16667 for
 // 60 Hz), and latency is the allowed frames in flight. S_OK even for 0: a boot must not abort here, and nothing paces.
@@ -1212,7 +1236,27 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     auto* allocator = allocator_proxy_real_allocator(reinterpret_cast<void*>(allocator_word));
     if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
     auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
-    return self->real->CreateCommandList(0, type, allocator, initial_state, *riid, out);
+    // The console IID the title asks for is not in the PC SDK (#3520) and the host backend answers E_NOINTERFACE for it,
+    // so the PC ID3D12GraphicsCommandList is created and handed out as it is. docs/retail_boot_chain.md §3.3 records the
+    // fuller stand-in (#2490's console list proxy, which also translates the console slot numbers); until that exists
+    // this gets the lists created and closed, and a console slot the title calls on the PC list shows up as the first
+    // misrouted call rather than as a create failure.
+    static std::atomic<bool> iid_logged{false};
+    if (first_call(iid_logged)) {
+        const auto* words_iid = reinterpret_cast<const std::uint32_t*>(riid);
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 73 asks for IID {%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x} -> the PC "
+                     "ID3D12GraphicsCommandList\n",
+                     words_iid[0], words_iid[1] >> 16, words_iid[1] & 0xffff, words_iid[2] >> 24,
+                     (words_iid[2] >> 16) & 0xff, (words_iid[2] >> 8) & 0xff, words_iid[2] & 0xff, words_iid[3] >> 24,
+                     (words_iid[3] >> 16) & 0xff, (words_iid[3] >> 8) & 0xff, words_iid[3] & 0xff);
+    }
+    void* created = nullptr;
+    const HRESULT created_hr = self->real->CreateCommandList(
+        0, type, allocator, initial_state, __uuidof(ID3D12GraphicsCommandList), &created);
+    if (FAILED(created_hr)) return created_hr;
+    *out = created;
+    return S_OK;
 }
 
 // Device slot 75: ID3D12Device9::CreateCommandQueue1(desc, creator_id, riid, out), called by slot index.
@@ -1480,6 +1524,33 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                                                *riid, out);
 }
 
+// Xbox device slot 26: GetCustomHeapProperties. MSVC's x64 ABI returns D3D12_HEAP_PROPERTIES by value, so the first
+// register holds the caller's buffer and the second the device: the console call `(output, device, node mask, heap
+// type)` is that same ABI, not the swapped order docs/retail_boot_chain.md §3.1 assumed, and the generic forward below
+// reads the device's `real` pointer out of the title's buffer and faults (measured on 1.0.2.1). This thunk therefore
+// takes the first word as the output and the second as the proxy, and recognises the other order as well: the second
+// word is only a proxy pointer when the caller did not use the hidden-return form.
+std::uint64_t proxy_get_custom_heap_properties(void* first, std::uint64_t second, std::uint64_t third,
+                                              std::uint64_t fourth) {
+    const bool hidden_return = !is_device_proxy(first) && is_device_proxy(reinterpret_cast<void*>(second));
+    auto* proxy = static_cast<DeviceProxy*>(hidden_return ? reinterpret_cast<void*>(second) : first);
+    auto* out = static_cast<D3D12_HEAP_PROPERTIES*>(hidden_return ? first : reinterpret_cast<void*>(second));
+
+    static std::atomic<bool> logged{false};
+    if (first_call(logged))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 26 GetCustomHeapProperties%s: out %p node mask 0x%llx heap type %llu\n",
+                     hidden_return ? " (hidden return buffer)" : "", static_cast<void*>(out),
+                     static_cast<unsigned long long>(third), static_cast<unsigned long long>(fourth));
+    if (proxy && out) {
+        const D3D12_HEAP_PROPERTIES properties =
+            proxy->real->GetCustomHeapProperties(static_cast<UINT>(third), static_cast<D3D12_HEAP_TYPE>(fourth));
+        *out = properties;
+    }
+    // The console shape returns the buffer it was handed; the PC method leaves nothing in RAX for the caller to read.
+    return reinterpret_cast<std::uint64_t>(out);
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1492,6 +1563,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return proxy_add_ref(self);
     } else if constexpr (Slot == 2) {
         return proxy_release(self);
+    } else if constexpr (Slot == 26) {
+        return proxy_get_custom_heap_properties(self, a1, a2, a3);
     } else if constexpr (Slot == 8) {
         return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
                                                     reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
@@ -1549,9 +1622,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         }
         if (Slot == routes.queue_x) {
             log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
-                                                        reinterpret_cast<const IID*>(a2),
-                                                        reinterpret_cast<void**>(a3)));
+            return hr_to_u64(proxy_create_command_queue_x(self, a1, reinterpret_cast<const IID*>(a2),
+                                                          reinterpret_cast<void**>(a3)));
         }
         if (Slot == routes.list_x) {
             log_xbox_route_once(Slot, "CreateCommandListX", a1, a2, a3, a4, a5);
@@ -1704,8 +1776,8 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 }
 
 bool device_slot_overridden(unsigned slot) {
-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
-        slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
+    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 26 || slot == 31 || slot == 32 || slot == 34 ||
+        slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
         slot == 75 || slot == 76)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
