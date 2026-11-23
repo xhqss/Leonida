@@ -486,7 +486,12 @@ $env:LEONIDA_SKIP_ASSERTS='1'
 
 ## 14. 仓库状态
 
-- 分支 `main`，**105 个提交领先 `origin/main`**（含本文档这一笔），0 落后，工作树干净（只剩未跟踪的 `.idea/`、`tmp/`）。
-- 最新两个提交：`13d2785b0`（本文档）、`d435276bb`（拓扑 19 + 本次加的四组诊断）。
+- 分支 `main`，**领先 `origin/main` 91 个提交**（`origin/main` = `dfe4e4ad3`），0 落后，工作树干净
+  （只剩未跟踪的 `.idea/`、`tmp/`）。注意：`origin/main` 在 02:5x 被**本会话之外的进程** fast-forward 过
+  （reflog 里是 `fetch origin --recurse-submodules=no --progress --prune`，不是本会话发的），上游已到
+  `dfe4e4ad3`（`d3d12: guard null pInputElementDescs and validate graphics/compute PSO descriptors (#6689)`）；
+  按用户要求**没有合并**。
+- 本晚四个提交：`13d2785b0`（本记录）、`d435276bb`（拓扑 19 + 四组诊断）、`946ef794c`（slot 81 参数 +
+  `LEONIDA_COMMIT_ON_FAULT`）、`ed61a963b`（本记录的 9.2b 更新）。
 - **从未推送**，也不打算推送（用户明确：不做 PR，改为同步上游）。
 - 本文档与那一笔代码提交分开：改文档时只提交这一个文件。
