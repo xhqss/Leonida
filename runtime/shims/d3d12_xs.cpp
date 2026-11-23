@@ -241,11 +241,6 @@ static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);
 static_assert(std::is_same_v<decltype(&create_root_signature_deserializer), DeserializerFn>);
 static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacySerializeFn>);
 
-// Measured call (RT-5, 1.0.2.1): the title calls it once at startup with one pointer to a zeroed 32-byte block whose
-// dword at +4 it sets (a count), and only checks the result for failure. The PC/Vulkan side owns virtual memory,
-// so the policy is accepted and ignored.
-HRESULT WINAPI configure_virtual_memory(void* /*desc*/) { return S_OK; }
-
 }  // namespace
 
 SHIM_TABLE(d3d12_xs,
