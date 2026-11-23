@@ -2750,6 +2750,34 @@ void proxy_create_sampler_x(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, s
     self->real->CreateSampler(desc, handle);
 }
 
+// LEONIDA_DUMP_SHADERS=<dir>: a slot-67 payload the device has no translation for, written as the FSPX file
+// tools/fspx_unpack.py reads (a bare payload: the header, the four directory entries and their bytes), named
+// cs-<sha256 of the kind-6 program, first 16 hex digits>.fspx so it sits beside the device's own cs-<...>.fssm dump.
+// The whole payload matters here and only the device dump's program does not: the translator takes the thread-group
+// size, COMPUTE_PGM_RSRC2 and the wave size from kind 0 (docs/fspx.md, "Kind 0: dispatch state"), and a bare kind-6
+// program has none of them.
+void dump_untranslated_fspx(const std::vector<std::uint8_t>& payload) {
+    if (payload.empty()) return;
+    char dir[1024] = {};
+    size_t length = 0;
+    if (getenv_s(&length, dir, sizeof dir, "LEONIDA_DUMP_SHADERS") != 0 || length <= 1) return;
+    // The key is the kind-6 program, the same one the device hashes: the payload's own entry for it.
+    const leonida::FspxParts parts = leonida::fspx_parts(payload);
+    if (parts.code.empty()) return;
+    CreateDirectoryA(dir, nullptr);
+    const std::string base =
+        std::string(dir) + "\\cs-" + leonida::sha256_hex(parts.code).substr(0, 16) + ".fspx";
+    std::ofstream out(base, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+    out.close();
+    if (!out) {
+        std::fprintf(stderr, "[rt] d3d12_xs: could not write %s\n", base.c_str());
+        return;
+    }
+    std::fprintf(stderr, "[rt] d3d12_xs: wrote the untranslated FSPX payload to %s (%zu B)\n", base.c_str(),
+                 payload.size());
+}
+
 // The Xbox slot 67 creates a compute pipeline from native GPU code: (desc, riid, out), named
 // DeserializeComputePipelineStateX in amd_fidelityfx_upscaler_xbox.dll's messages (call at RVA 0x56d9). The desc
 // passes the root signature at +0x00, followed by pointer/size pairs for the shader's FSPX entries (docs/fspx.md):
@@ -2820,7 +2848,7 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
     static std::atomic<std::uint64_t> calls{0};
     const std::uint64_t call = calls.fetch_add(1, std::memory_order_relaxed) + 1;
     const HRESULT hr = self->real->CreateComputePipelineState(&pc_desc, *riid, out);
-    if (FAILED(hr))
+    if (FAILED(hr)) {
         std::fprintf(stderr,
                      "[rt] d3d12_xs: slot 67 call %llu failed with 0x%08lx (kind 0 %llu B, kind 1 %llu B, kind 6 %llu B, "
                      "kind 7 %llu B)\n",
@@ -2829,6 +2857,8 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
                      static_cast<unsigned long long>(xbox_desc->kind1_size),
                      static_cast<unsigned long long>(xbox_desc->kind6_size),
                      static_cast<unsigned long long>(xbox_desc->kind7_size));
+        dump_untranslated_fspx(payload);
+    }
     return hr;
 }
 
