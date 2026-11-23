@@ -161,6 +161,9 @@ int main(int argc, char** argv) {
     check(rt::d3d12_xs::device_slot_overridden(14), "device slot 14 is the descriptor-heap override");
     check(rt::d3d12_xs::device_slot_overridden(62), "device slot 62 is the compute-PSO override");
     check(rt::d3d12_xs::device_slot_overridden(76), "device slot 76 is the resource override");
+    check(rt::d3d12_xs::device_slot_overridden(86), "device slot 86 is the CreatePipelineState override");
+    check(rt::d3d12_xs::device_slot_overridden(101), "device slot 101 is the CreateStateObject override");
+    check(rt::d3d12_xs::device_slot_overridden(108), "device slot 108 is the GetResourceAllocationInfo2 override");
     check(rt::d3d12_xs::device_slot_overridden(67),
           "device slot 67 is the DeserializeComputePipelineStateX override (console native-code compute pipeline, not PC CreateProtectedResourceSession1)");
 
@@ -501,6 +504,101 @@ int main(int argc, char** argv) {
         check(SUCCEEDED(hr) && pso67 != nullptr, "slot 67 creates a compute PSO via CreateComputePipelineState");
         check(rt::d3d12_xs::device_slot_hits(67) == 1, "slot 67 hit counter is 1");
         check(rt::d3d12_xs::device_slot_first_call_seen(67), "slot 67 first-call flag is set");
+
+        // Slot 86: CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**), forwarded to PC
+        // ID3D12Device2::CreatePipelineState (PC slot 47).
+        if (slots > 47) {
+            struct alignas(void*) ComputeStream {
+                alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE root_type =
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
+                ID3D12RootSignature* root_sig = nullptr;
+                alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE cs_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS;
+                D3D12_SHADER_BYTECODE cs{};
+            } stream;
+            stream.root_sig = root_signature.Get();
+            stream.cs.pShaderBytecode = bytecode->GetBufferPointer();
+            stream.cs.BytecodeLength = bytecode->GetBufferSize();
+            D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(stream), &stream};
+            using XboxCreatePipelineStateFn =
+                HRESULT(WINAPI*)(void*, const D3D12_PIPELINE_STATE_STREAM_DESC*, const IID*, void**);
+            auto create_stream_pso = reinterpret_cast<XboxCreatePipelineStateFn>(proxy_vtbl[86]);
+            ComPtr<ID3D12PipelineState> pso86;
+            hr = create_stream_pso(device.Get(), &stream_desc, &iid_pso,
+                                   reinterpret_cast<void**>(pso86.GetAddressOf()));
+            check(SUCCEEDED(hr) && pso86 != nullptr,
+                  "slot 86 creates a PSO via PC ID3D12Device2::CreatePipelineState (slot 47)");
+            check(rt::d3d12_xs::device_slot_hits(86) == 1, "slot 86 hit counter is 1");
+            check(rt::d3d12_xs::device_slot_first_call_seen(86), "slot 86 first-call flag is set");
+        }
+    }
+
+    // Slot 101: CreateStateObject(const D3D12_STATE_OBJECT_DESC*, REFIID, void**), forwarded to PC
+    // ID3D12Device5::CreateStateObject (PC slot 62).
+    if (slots > 62) {
+        using XboxCreateStateObjectFn = HRESULT(WINAPI*)(void*, const D3D12_STATE_OBJECT_DESC*, const IID*, void**);
+        auto create_state_object = reinterpret_cast<XboxCreateStateObjectFn>(proxy_vtbl[101]);
+        D3D12_STATE_OBJECT_DESC empty_so{};
+        empty_so.Type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
+        void* so_out = reinterpret_cast<void*>(0x1111);
+        hr = create_state_object(device.Get(), &empty_so, nullptr, &so_out);
+        check(hr == E_POINTER && so_out == nullptr, "slot 101 nulls its output for a null IID");
+        check(rt::d3d12_xs::device_slot_hits(101) == 1, "slot 101 hit counter is 1");
+    }
+
+    // Slot 108: GetResourceAllocationInfo2(ret, this, visible_mask, count, descs, info1) with C-ABI struct return,
+    // 56-byte D3D12_RESOURCE_DESC entries, and Xbox layout/flag words, compared against direct PC
+    // ID3D12Device8::GetResourceAllocationInfo2 (PC slot 68).
+    if (slots > 68) {
+        ComPtr<ID3D12Device8> real_device8;
+        if (real && SUCCEEDED(real->QueryInterface(IID_PPV_ARGS(real_device8.GetAddressOf()))) && real_device8) {
+            D3D12_RESOURCE_DESC xbox_descs[2]{};
+            xbox_descs[0].Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            xbox_descs[0].Width = 64;
+            xbox_descs[0].Height = 64;
+            xbox_descs[0].DepthOrArraySize = 1;
+            xbox_descs[0].MipLevels = 1;
+            xbox_descs[0].Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            xbox_descs[0].SampleDesc.Count = 1;
+            xbox_descs[0].Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+            xbox_descs[0].Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | 0x300000u);
+            xbox_descs[1].Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            xbox_descs[1].Width = 4096;
+            xbox_descs[1].Height = 1;
+            xbox_descs[1].DepthOrArraySize = 1;
+            xbox_descs[1].MipLevels = 1;
+            xbox_descs[1].SampleDesc.Count = 1;
+            xbox_descs[1].Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+            xbox_descs[1].Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x200000u);
+
+            D3D12_RESOURCE_DESC1 pc_descs[2]{};
+            std::memcpy(&pc_descs[0], &xbox_descs[0], sizeof(D3D12_RESOURCE_DESC));
+            pc_descs[0].SamplerFeedbackMipRegion = {};
+            pc_descs[0].Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            pc_descs[0].Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            std::memcpy(&pc_descs[1], &xbox_descs[1], sizeof(D3D12_RESOURCE_DESC));
+            pc_descs[1].SamplerFeedbackMipRegion = {};
+            pc_descs[1].Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            pc_descs[1].Flags = D3D12_RESOURCE_FLAG_NONE;
+
+            D3D12_RESOURCE_ALLOCATION_INFO1 pc_info1[2]{};
+            const D3D12_RESOURCE_ALLOCATION_INFO pc_info =
+                real_device8->GetResourceAllocationInfo2(1, 2, pc_descs, pc_info1);
+
+            using XboxGetAllocInfo2CAbiFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(
+                D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT, const D3D12_RESOURCE_DESC*,
+                D3D12_RESOURCE_ALLOCATION_INFO1*);
+            auto get_alloc_info2 = reinterpret_cast<XboxGetAllocInfo2CAbiFn>(proxy_vtbl[108]);
+            D3D12_RESOURCE_ALLOCATION_INFO xbox_info{};
+            D3D12_RESOURCE_ALLOCATION_INFO1 xbox_info1[2]{};
+            D3D12_RESOURCE_ALLOCATION_INFO* ret_ptr =
+                get_alloc_info2(&xbox_info, device.Get(), 1, 2, xbox_descs, xbox_info1);
+            check(ret_ptr == &xbox_info && xbox_info.SizeInBytes == pc_info.SizeInBytes &&
+                      xbox_info.Alignment == pc_info.Alignment && xbox_info1[0].SizeInBytes == pc_info1[0].SizeInBytes &&
+                      xbox_info1[1].SizeInBytes == pc_info1[1].SizeInBytes,
+                  "slot 108 C-ABI GetResourceAllocationInfo2 with 56-byte Xbox descs matches PC Device8");
+            check(rt::d3d12_xs::device_slot_hits(108) == 1, "slot 108 hit counter is 1");
+        }
     }
 
     // _COM_Outptr_ (d3d12.h): a failed create leaves NULL in the output. WARP accepts invalid heap descriptions,

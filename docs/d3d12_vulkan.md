@@ -90,7 +90,13 @@ enough for the bundled middleware's `d3d12_xs` calls, not for the game. The laye
   desktop order, but also an extra texture-creation method at slot 76, a `CreateComputePipelineState` call at
   slot 62 where the PC interface it forwarded to presents `CreateStateObject` (different arity), and descriptor-heap
   start handles returned in RAX at heap slots 9/10. Implement the public chain plus those measured overrides
-  explicitly; do not assume every slot. Device 11 adds `CreateSampler2`; command list 8 adds
+  explicitly; do not assume every slot. On the retail executable's higher device slots (`runtime/shims/d3d12_xs_device.cpp`),
+  slot 86 routes `CreatePipelineState(desc, riid, out)` to PC slot 47 (`ID3D12Device2::CreatePipelineState`),
+  slot 101 routes `CreateStateObject(desc, riid, out)` to PC slot 62 (`ID3D12Device5::CreateStateObject`), and
+  slot 108 routes `GetResourceAllocationInfo2` (accepting the console C-ABI struct return with the return buffer in
+  `RCX` and the device in `RDX`, expanding 56-byte `D3D12_RESOURCE_DESC` entries to `D3D12_RESOURCE_DESC1` and
+  normalizing Xbox layout words and flag bits on the copy) to PC
+  slot 68 (`ID3D12Device8::GetResourceAllocationInfo2`). Device 11 adds `CreateSampler2`; command list 8 adds
   `OMSetFrontAndBackStencilRef` (public SDK).
 - **Unknown IIDs and slots.** `QueryInterface` must log the IID and return `E_NOINTERFACE` if it is not in the
   public chain. If the game then fails, the IID and the call site identify the Xbox-specific interface to reverse.
