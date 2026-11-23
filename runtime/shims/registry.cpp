@@ -80,7 +80,10 @@ std::vector<Lookup> g_lookups;
 //  xaudio2_9.dll             XAudio2Create: HRESULT (learn.microsoft.com/windows/win32/api/xaudio2/
 //  xaudio2_9redist.dll       nf-xaudio2-xaudio2create). xaudio2_9.dll is the console name (docs/d3d12_vulkan.md §7).
 //  dstorage.dll              DStorageGetFactory: HRESULT (learn.microsoft.com/windows/win32/api/dstorage/
-//  dstorage_xs.dll           nf-dstorage-dstoragegetfactory). dstorage_xs.dll is the console name.
+//  dstorage_xs.dll           nf-dstorage-dstoragegetfactory, and the GDK's gaming/gdk/docs/reference/system/dstorage/
+//  xcrdapi.dll               functions/dstoragegetfactory). dstorage_xs.dll is the console name; xcrdapi.dll is a
+//                            console module the title may import it from (docs/directstorage.md). dstorage.cpp serves
+//                            it; the class is kept for a build without that shim.
 const char* const kNotHResult[] = {
     "XAsyncCancel", "XAsyncComplete",
     "XTaskQueueCloseHandle", "XTaskQueueDispatch", "XTaskQueueGetCurrentProcessTaskQueue",
@@ -111,7 +114,7 @@ ReturnClass classify(const std::string& dll, const std::string& name) {
         if (name == "XAudio2Create") return ReturnClass::HResult;
     } else if (dll == "gameinput.dll") {
         if (name == "GameInputCreate") return ReturnClass::HResult;
-    } else if (dll == "dstorage.dll" || dll == "dstorage_xs.dll") {
+    } else if (dll == "dstorage.dll" || dll == "dstorage_xs.dll" || dll == "xcrdapi.dll") {
         if (name == "DStorageGetFactory") return ReturnClass::HResult;
     } else if (dll == "xgameruntime.dll") {
         if (name == "XGameRuntimeInitialize" || name == "XGameEventWrite") return ReturnClass::HResult;

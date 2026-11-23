@@ -231,6 +231,8 @@ void test_classification() {
     check(cls("gameinput.dll", "GameInputCreate") == ReturnClass::HResult, "GameInputCreate is hresult");
     check(cls("dstorage_xs.dll", "DStorageGetFactory") == ReturnClass::HResult,
           "the console dstorage name is hresult");
+    check(cls("xcrdapi.dll", "DStorageGetFactory") == ReturnClass::HResult, "xcrdapi's DStorageGetFactory is hresult");
+    check(cls("xcrdapi.dll", "XCrdLeonidaPolicyProbe") == ReturnClass::Other, "other xcrdapi imports are other");
     check(cls("xg_xs.dll", "XGCreateTexture2DComputer") == ReturnClass::Other, "unmeasured xg_xs import is other");
     check(cls("acphal.dll", "AcpHalCreate") == ReturnClass::Other, "unmeasured acphal import is other");
     check(cls("xgameruntime.dll", "XGameRuntimeInitialize") == ReturnClass::HResult, "XGameRuntimeInitialize");

@@ -121,7 +121,12 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xgameruntime_offline.cpp
     shims/library_loader.cpp
     shims/process.cpp
+    shims/dstorage.cpp
   )
+  # dstorage.cpp's guarded_move turns an access violation in a title's buffer into E_DSTORAGE_ACCESS_VIOLATION with
+  # __try. MSVC always catches it; clang-cl only with asynchronous exceptions (as for tiny_dll below). A source file
+  # property, so gta6rt and dstorage_test both get it. (From PR #4348, applied locally.)
+  set_source_files_properties(shims/dstorage.cpp PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang>:/EHa>")
   add_dependencies(gta6rt gta6rt_tls_host)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
@@ -249,6 +254,20 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(int3_skip_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(int3_skip_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(int3_skip_test PRIVATE /OPT:NOREF)
+
+  # Xbox DirectStorage (DStorageGetFactory under dstorage_xs.dll, xcrdapi.dll and dstorage.dll) over synthetic files:
+  # GAME: paths through the file shims, queues, status arrays, fences and errors. No GPU, no game data. (From PR #4348,
+  # applied locally.)
+  add_executable(dstorage_test
+    test/dstorage_test.cpp
+    shims/dstorage.cpp
+    shims/file_system.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(dstorage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(dstorage_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(dstorage_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(dstorage_test PRIVATE /OPT:NOREF)
 
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
   add_executable(winhttp_offline_test
@@ -1013,6 +1032,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
+  endif()
+  if(WIN32 AND TARGET dstorage_test)
+    add_test(NAME dstorage COMMAND dstorage_test)
   endif()
   if(WIN32 AND TARGET api_ref_state_test)
     add_test(NAME api_ref_state COMMAND api_ref_state_test)
