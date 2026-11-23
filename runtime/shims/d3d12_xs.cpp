@@ -141,11 +141,24 @@ HRESULT WINAPI configure_virtual_memory(void* first, const void* second, const v
     return rt::d3d12_trace::result("D3D12ConfigureVirtualMemoryX", S_OK);
 }
 
+// PR #7021: the title installs __XMemAllocationHooks__ in its memory manager, and a console descriptor heap lives in
+// the memory those hooks hand out, so the heap proxy allocates through them when they are present.
+void* xmem_descriptor_heap_alloc(std::size_t byte_size, std::uint64_t attributes) {
+    const rt::shims::XMemAllocationHooks* hooks = rt::shims::xmem_allocation_hooks();
+    return (hooks && hooks->alloc) ? hooks->alloc(byte_size, attributes) : nullptr;
+}
+
+void xmem_descriptor_heap_free(void* ptr, std::uint64_t attributes) {
+    const rt::shims::XMemAllocationHooks* hooks = rt::shims::xmem_allocation_hooks();
+    if (hooks && hooks->free) hooks->free(ptr, attributes);
+}
+
 // Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 24-word block that is only
 // logged and not used to create the device. The struct's total size is unknown, so the log reads 24 x 32-bit words
 // (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead, so 12_0 is used as the
 // least restrictive floor; higher feature levels are still exposed by the created device.
 HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, const IID* riid, void** out) {
+    rt::d3d12_xs::set_default_descriptor_heap_allocator(&xmem_descriptor_heap_alloc, &xmem_descriptor_heap_free);
     constexpr auto method = "D3D12XboxCreateDevice";
     using rt::d3d12_trace::result;
     if (!out) return result(method, E_POINTER);

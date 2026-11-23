@@ -1084,6 +1084,7 @@ Loader::~Loader() {
             entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
         }
     }
+    shims::remove_xmem_allocation_hooks(this);
     shims::remove_bundled_loader(this);
     shims::remove_module_lookup(this);
     for (auto* m : order_) {
@@ -1490,6 +1491,12 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
     // installed here, before bind_imports can return control to the caller and before any image code can run.
     initialize_tls(*m);
     parse_exports(*m);
+    if (auto it = m->exports.find("__XMemAllocationHooks__"); it != m->exports.end()) {
+        const auto offset = static_cast<uint64_t>(static_cast<uint8_t*>(it->second) - m->base);
+        if (offset <= m->size && m->size - offset >= sizeof(shims::XMemAllocationHooks)) {
+            shims::add_xmem_allocation_hooks(this, static_cast<const shims::XMemAllocationHooks*>(it->second));
+        }
+    }
     return *m;
 }
 

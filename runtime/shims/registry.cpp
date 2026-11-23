@@ -385,6 +385,11 @@ struct BundledLoaderEntry {
     const BundledModuleOps* ops;
 };
 
+struct XMemHooksEntry {
+    const void* owner;
+    const XMemAllocationHooks* hooks;
+};
+
 // Immortal: late mapped-DLL detach or atexit handlers may call GetProcAddress/FreeLibrary during process teardown.
 std::mutex& bundled_loader_mutex() {
     static auto* m = new std::mutex;
@@ -393,6 +398,16 @@ std::mutex& bundled_loader_mutex() {
 
 std::vector<BundledLoaderEntry>& bundled_loaders() {
     static auto* v = new std::vector<BundledLoaderEntry>;
+    return *v;
+}
+
+std::mutex& xmem_hooks_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
+std::vector<XMemHooksEntry>& xmem_hooks_entries() {
+    static auto* v = new std::vector<XMemHooksEntry>;
     return *v;
 }
 
@@ -476,6 +491,30 @@ bool owns_bundled_module_handle(void* module) {
     for (const auto& entry : snapshot_bundled_loaders())
         if (entry.ops->owns_handle(entry.ctx, module)) return true;
     return false;
+}
+
+void add_xmem_allocation_hooks(const void* owner, const XMemAllocationHooks* hooks) {
+    if (!owner || !hooks) return;
+    std::lock_guard lock(xmem_hooks_mutex());
+    xmem_hooks_entries().push_back({owner, hooks});
+}
+
+void remove_xmem_allocation_hooks(const void* owner) {
+    std::lock_guard lock(xmem_hooks_mutex());
+    auto& list = xmem_hooks_entries();
+    for (auto it = list.begin(); it != list.end();) {
+        if (it->owner == owner) {
+            it = list.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+const XMemAllocationHooks* xmem_allocation_hooks() {
+    std::lock_guard lock(xmem_hooks_mutex());
+    const auto& list = xmem_hooks_entries();
+    return list.empty() ? nullptr : list.back().hooks;
 }
 
 Table::Table(const Entry* entries, size_t count) {
