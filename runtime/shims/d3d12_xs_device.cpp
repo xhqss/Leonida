@@ -24,6 +24,7 @@
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
+#include "shims.h"  // rt::shims::mapped_image_base, for the heap slot 9 diagnostic
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -110,6 +111,11 @@ struct HeapProxy {
     DeviceProxy* device;    // keeps the Xbox-ABI device alive; GetDevice returns it
     void** real_vtable;
     std::atomic<unsigned long> refs;
+    // The CPU handle bases, once GetCPUDescriptorHandleForHeapStart has been called: `pc_cpu_base` is what the host
+    // runtime reports for this heap, `console_cpu_base` the address the title expects (its own descriptor memory). The
+    // two differ, so the descriptor-creating device slots translate between them.
+    std::uint64_t pc_cpu_base = 0;
+    std::uint64_t console_cpu_base = 0;
 };
 
 std::atomic<std::uint64_t> g_hits[kMaxSlots];
@@ -555,6 +561,8 @@ HRESULT heap_get_device(HeapProxy* self, const IID* riid, void** out) {
 // The PC methods write through the hidden return pointer (RDX) on the measured runtime; the Xbox ABI wants the
 // 8-byte value in RAX. Call with both conventions and keep whichever produced a value, so a runtime that really
 // returns in RAX also works. The extra register is harmless when the callee ignores it.
+D3D12_GPU_DESCRIPTOR_HANDLE heap_get_gpu_handle(HeapProxy* self);  // logged by heap_get_cpu_handle
+
 D3D12_CPU_DESCRIPTOR_HANDLE heap_get_cpu_handle(HeapProxy* self) {
     note_heap_slot(9);
     constexpr SIZE_T kUnset = ~static_cast<SIZE_T>(0);
@@ -563,7 +571,20 @@ D3D12_CPU_DESCRIPTOR_HANDLE heap_get_cpu_handle(HeapProxy* self) {
     using Fn = D3D12_CPU_DESCRIPTOR_HANDLE(WINAPI*)(ID3D12DescriptorHeap*, D3D12_CPU_DESCRIPTOR_HANDLE*);
     const D3D12_CPU_DESCRIPTOR_HANDLE returned =
         reinterpret_cast<Fn>(self->real_vtable[9])(self->real, &handle);
-    return handle.ptr != kUnset ? handle : returned;
+    const D3D12_CPU_DESCRIPTOR_HANDLE result = handle.ptr != kUnset ? handle : returned;
+    // What the PC runtime hands back is the only value the shim can return; the console ABI's handle is the title's own
+    // descriptor memory, so logging both this and the GPU handle is what tells the two apart (stop 13 in
+    // docs/retail_boot_chain.md).
+    static std::atomic<bool> logged{false};
+    if (first_call(logged)) {
+        const D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_get_gpu_handle(self);
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: heap slot 9 CPU handle 0x%llx (hidden-return 0x%llx, RAX 0x%llx), GPU handle "
+                     "0x%llx\n",
+                     static_cast<unsigned long long>(result.ptr), static_cast<unsigned long long>(handle.ptr),
+                     static_cast<unsigned long long>(returned.ptr), static_cast<unsigned long long>(gpu.ptr));
+    }
+    return result;
 }
 
 D3D12_GPU_DESCRIPTOR_HANDLE heap_get_gpu_handle(HeapProxy* self) {
@@ -593,7 +614,29 @@ std::uint64_t WINAPI heap_slot(HeapProxy* self, std::uint64_t a1, std::uint64_t 
         return hr_to_u64(heap_get_device(self, reinterpret_cast<const IID*>(a1),
                                          reinterpret_cast<void**>(a2)));
     } else if constexpr (Slot == 9) {
-        return static_cast<std::uint64_t>(heap_get_cpu_handle(self).ptr);
+        const D3D12_CPU_DESCRIPTOR_HANDLE handle = heap_get_cpu_handle(self);
+        self->pc_cpu_base = handle.ptr;
+        // A console descriptor heap lives in the title's own memory, so the CPU handle is an address the title chose and
+        // compares against: measured on 1.0.2.1, `cmp rbx, rax / je / int3` right after this call, with rbx holding the
+        // value of the global below. This shim reads that value and returns it, keeping the host runtime's own base for
+        // the descriptor-creating slots to translate between. A zero or implausible value keeps the host base, so a
+        // title that does not compare gets the real one.
+        constexpr std::uint64_t kExpectedBaseRva = 0x75df188;
+        std::uint64_t expected = 0;
+        uint64_t guest_base = 0;
+        if (rt::shims::mapped_image_base(reinterpret_cast<std::uint64_t>(_ReturnAddress()), guest_base))
+            expected = *reinterpret_cast<const std::uint64_t*>(guest_base + kExpectedBaseRva);
+        const bool usable = expected >= 0x10000 && (expected & 7) == 0;
+        static std::atomic<bool> logged{false};
+        if (first_call(logged)) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: heap slot 9: host base 0x%llx, the title's expected base 0x%llx -> %s\n",
+                         static_cast<unsigned long long>(handle.ptr), static_cast<unsigned long long>(expected),
+                         usable ? "returning the title's own address" : "returning the host address");
+        }
+        if (!usable) return static_cast<std::uint64_t>(handle.ptr);
+        self->console_cpu_base = expected;
+        return expected;
     } else if constexpr (Slot == 10) {
         return static_cast<std::uint64_t>(heap_get_gpu_handle(self).ptr);
     } else {
@@ -1861,14 +1904,16 @@ std::uint64_t forward_device(DeviceProxy* self, std::uint64_t a1, std::uint64_t 
 }
 
 // A device slot past the PC device's vtable (the real device predates the interface): E_NOTIMPL, logged once per
-// slot. The generic thunk and the slots the proxy handles itself (31/34/35/45/46/50, 75) log the same line.
-HRESULT refuse_beyond_device(unsigned slot, unsigned slot_count) {
+// slot. The generic thunk and the slots the proxy handles itself (31/34/35/45/46/50, 75) log the same line; `caller` is
+// the title's return address, so the site that needs the method is named rather than guessed.
+HRESULT refuse_beyond_device(unsigned slot, unsigned slot_count, void* caller = nullptr) {
     bool expected = false;
     if (slot < kMaxSlots && g_beyond_warned[slot].compare_exchange_strong(expected, true, std::memory_order_relaxed))
         std::fprintf(stderr,
-                     "[rt] d3d12_xs: device slot %u (%s) is beyond the PC device vtable (%u slots); returning "
-                     "E_NOTIMPL\n",
-                     slot, slot_name(slot), slot_count);
+                     "[rt] d3d12_xs: device slot %u (%s) is beyond the PC device vtable (%u slots), called from %s; "
+                     "returning E_NOTIMPL\n",
+                     slot, slot_name(slot), slot_count,
+                     rt::shims::module_offset(reinterpret_cast<std::uint64_t>(caller)).c_str());
     return E_NOTIMPL;
 }
 
@@ -1899,25 +1944,31 @@ HRESULT proxy_create_command_queue_x(DeviceProxy* self, std::uint64_t desc_word,
     if (!desc_word) return E_INVALIDARG;
     D3D12_COMMAND_QUEUE_DESC desc{};
     std::memcpy(&desc, reinterpret_cast<const void*>(desc_word), sizeof(desc));
-    const auto flags = static_cast<std::uint32_t>(desc.Flags) & D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
-    static std::atomic<bool> logged{false};
-    if (first_call(logged))
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: slot 48 queue desc type=%u priority=%d flags=0x%x node mask=0x%x -> PC flags 0x%x, "
-                     "node mask 0\n",
-                     static_cast<unsigned>(desc.Type), static_cast<int>(desc.Priority),
-                     static_cast<unsigned>(desc.Flags), desc.NodeMask, flags);
-    desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(flags);
     const auto original_flags = static_cast<std::uint32_t>(desc.Flags);
     const auto original_node = desc.NodeMask;
-    desc.NodeMask = 0;
+    const auto pc_flags = original_flags & static_cast<std::uint32_t>(D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT);
     // A description that already carries PC values reaches the PC path as the caller's own pointer: the sanitising copy
     // exists only for the console words, and a mock in xs_proxy_mock_test checks the pointer it handed in.
-    if (flags == original_flags && original_node == 0)
-        return proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(desc_word), riid,
-                                          out);
-    // The PC slot-8 body wraps the created queue in the queue proxy, which is what the Xbox ABI expects back.
-    return proxy_create_command_queue(self, &desc, riid, out);
+    const bool passthrough = pc_flags == original_flags && original_node == 0;
+    desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(pc_flags);
+    desc.NodeMask = 0;
+
+    const HRESULT hr =
+        passthrough ? proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(desc_word),
+                                                 riid, out)
+                    : proxy_create_command_queue(self, &desc, riid, out);
+    // Every call, the first eight: a refusal here shows up as a failed HRESULT in the title's own check, two frames
+    // later, with nothing in the log to say which description caused it.
+    static std::atomic<unsigned> calls{0};
+    const unsigned n = calls.fetch_add(1, std::memory_order_relaxed);
+    if (n < 8)
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 48 call %u: type=%u priority=%d flags=0x%x node mask=0x%x -> PC flags 0x%x, "
+                     "node mask 0, %s hr=0x%08x\n",
+                     n, static_cast<unsigned>(desc.Type), static_cast<int>(desc.Priority), original_flags,
+                     original_node, pc_flags, passthrough ? "caller pointer" : "sanitised copy",
+                     static_cast<unsigned>(hr));
+    return hr;
 }
 
 // Xbox device slot 78 (public HLE): SetFrameIntervalX(output, interval_us, latency, flags). The output and flags are
@@ -2120,6 +2171,17 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     note_slot(14);
     if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure, as the PC device does
     if (!riid) return E_POINTER;
+    // Measured (docs/retail_boot_chain.md, stop 13): the title compares the CPU handle the heap hands back with a value
+    // it already holds, so both the description it creates the heap from and the handles the heap reports are logged.
+    static std::atomic<bool> desc_logged{false};
+    if (desc && first_call(desc_logged)) {
+        const auto* words = reinterpret_cast<const std::uint32_t*>(desc);
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 14 heap desc: type %u descriptors %u flags 0x%x node mask 0x%x (raw %08x %08x "
+                     "%08x %08x)\n",
+                     static_cast<unsigned>(desc->Type), desc->NumDescriptors, static_cast<unsigned>(desc->Flags),
+                     desc->NodeMask, words[0], words[1], words[2], words[3]);
+    }
     // No output: a capability check, answered by the device (S_FALSE, as on the PC).
     if (!out) return self->real->CreateDescriptorHeap(desc, *riid, nullptr);
 
@@ -2309,6 +2371,28 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
                                                clear_value, __uuidof(ID3D12Resource), out);
 }
 
+// Xbox device slot 25: GetResourceAllocationInfo. Same hidden-return convention as slot 26 (MSVC returns the
+// D3D12_RESOURCE_ALLOCATION_INFO by value), so the first word is the caller's buffer and the second the device; the
+// generic forward would read the device's vtable out of that buffer.
+std::uint64_t proxy_get_resource_allocation_info(void* first, std::uint64_t second, std::uint64_t third,
+                                                 std::uint64_t fourth, std::uint64_t fifth) {
+    const bool hidden_return = !is_device_proxy(first) && is_device_proxy(reinterpret_cast<void*>(second));
+    auto* proxy = static_cast<DeviceProxy*>(hidden_return ? reinterpret_cast<void*>(second) : first);
+    auto* out = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(
+        hidden_return ? first : reinterpret_cast<void*>(second));
+    static std::atomic<bool> logged{false};
+    if (first_call(logged))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 25 GetResourceAllocationInfo%s: out %p visible mask 0x%llx descriptions %llu\n",
+                     hidden_return ? " (hidden return buffer)" : "", static_cast<void*>(out),
+                     static_cast<unsigned long long>(third), static_cast<unsigned long long>(fourth));
+    if (proxy && out) {
+        *out = proxy->real->GetResourceAllocationInfo(static_cast<UINT>(third), static_cast<UINT>(fourth),
+                                                      reinterpret_cast<const D3D12_RESOURCE_DESC*>(fifth));
+    }
+    return reinterpret_cast<std::uint64_t>(out);
+}
+
 // Xbox device slot 26: GetCustomHeapProperties. MSVC's x64 ABI returns D3D12_HEAP_PROPERTIES by value, so the first
 // register holds the caller's buffer and the second the device: the console call `(output, device, node mask, heap
 // type)` is that same ABI, not the swapped order docs/retail_boot_chain.md §3.1 assumed, and the generic forward below
@@ -2348,6 +2432,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return proxy_add_ref(self);
     } else if constexpr (Slot == 2) {
         return proxy_release(self);
+    } else if constexpr (Slot == 25) {
+        return proxy_get_resource_allocation_info(self, a1, a2, a3, a4);
     } else if constexpr (Slot == 26) {
         return proxy_get_custom_heap_properties(self, a1, a2, a3);
     } else if constexpr (Slot == 8) {
@@ -2395,6 +2481,41 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             self, a1, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2), a3,
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a4), reinterpret_cast<const IID*>(a5),
             reinterpret_cast<void**>(a6)));
+    } else if constexpr (Slot == 70) {
+        // A console slot that the PC vtable answers with CreatePlacedResource1, which wrote through a stack word the
+        // caller never set. The guest reaches it from a three-argument helper that then flushes one descriptor increment
+        // at the third argument, so it writes one descriptor; what it writes has to come from the description, logged
+        // here until the shape is known.
+        static std::atomic<unsigned> calls{0};
+        const unsigned n = calls.fetch_add(1, std::memory_order_relaxed);
+        if (n < 4) {
+            const auto* words = reinterpret_cast<const std::uint32_t*>(a1);
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 70 call %u: a1=%p a2=0x%llx a3=0x%llx words %08x %08x %08x %08x %08x "
+                         "%08x\n",
+                         n, reinterpret_cast<const void*>(a1), static_cast<unsigned long long>(a2),
+                         static_cast<unsigned long long>(a3), words[0], words[1], words[2], words[3], words[4],
+                         words[5]);
+        }
+        return hr_to_u64(S_OK);
+    } else if constexpr (Slot == 127) {
+        // A console slot the PC vtable does not have. The title reaches it from the memory-setup path that also calls
+        // XMemVirtualAlloc, with a description pointer in the first word, 8 in the second, an output in the third and
+        // more words on the stack; the shape is logged until it is known.
+        static std::atomic<unsigned> calls{0};
+        const unsigned n = calls.fetch_add(1, std::memory_order_relaxed);
+        if (n < 4) {
+            const auto* words = reinterpret_cast<const std::uint32_t*>(a1);
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 127 call %u: a1=%p a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx a6=0x%llx "
+                         "a7=0x%llx a8=0x%llx words %08x %08x %08x %08x %08x\n",
+                         n, reinterpret_cast<const void*>(a1), static_cast<unsigned long long>(a2),
+                         static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
+                         static_cast<unsigned long long>(a5), static_cast<unsigned long long>(a6),
+                         static_cast<unsigned long long>(a7), static_cast<unsigned long long>(a8), words[0], words[1],
+                         words[2], words[3], words[4]);
+        }
+        return hr_to_u64(E_NOTIMPL);
     } else {
         note_slot(Slot);
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
@@ -2423,7 +2544,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             return hr_to_u64(proxy_create_command_list_x(self, a1, a2, a3, reinterpret_cast<const IID*>(a4),
                                                          reinterpret_cast<void**>(a5)));
         }
-        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
+        if (Slot >= self->slot_count)
+            return hr_to_u64(refuse_beyond_device(Slot, self->slot_count, _ReturnAddress()));
 
         // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
         // struct-return pointer and any stack arguments keep their positions; XMM registers are untouched.

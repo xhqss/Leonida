@@ -5386,7 +5386,14 @@ public:
              desc->Priority != D3D12_COMMAND_QUEUE_PRIORITY_HIGH &&
              desc->Priority != D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) ||
             (desc->Flags & ~D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT) || desc->NodeMask > 1) {
-            log_once("CreateCommandQueue refused (type, priority, flags or node mask), type", desc->Type);
+            // The four words, not just the type: a caller that passes a console description needs all of them named.
+            static std::atomic<bool> refused_logged{false};
+            if (!refused_logged.exchange(true, std::memory_order_relaxed)) {
+                std::fprintf(stderr,
+                             "[rt] d3d12: CreateCommandQueue refused: type %u priority %d flags 0x%x node mask 0x%x\n",
+                             static_cast<unsigned>(desc->Type), static_cast<int>(desc->Priority),
+                             static_cast<unsigned>(desc->Flags), desc->NodeMask);
+            }
             return d3d12_trace::result(method, E_INVALIDARG);
         }
         // Global realtime priority needs SeIncreaseBasePriorityPrivilege enabled in the effective token, as on the
