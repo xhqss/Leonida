@@ -103,6 +103,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
 
   add_executable(gta6rt
     src/main.cpp
+    src/guest_asserts.cpp
     src/pe_loader.cpp
     # The executable's own static TLS reserve: with LEONIDA_GUEST_TLS_SLOT0=1 the loader gives index 0 to the mapped
     # image and keeps the executable's TLS at a helper's index, and this reserve keeps those blocks large enough for
@@ -880,6 +881,21 @@ if(BUILD_TESTING)
     target_link_options(startup_trace_test PRIVATE /OPT:NOREF)
     add_dependencies(startup_trace_test gta6rt_tls_host)
     add_test(NAME startup_trace COMMAND startup_trace_test)
+
+    # LEONIDA_SKIP_ASSERTS=N (src/guest_asserts.h): the decision function on synthetic inputs, and a real
+    # __debugbreak round trip on VirtualAlloc'd executable memory (guest code: outside every module).
+    add_executable(guest_asserts_test
+      test/guest_asserts_test.cpp
+      src/guest_asserts.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+    )
+    target_include_directories(guest_asserts_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(guest_asserts_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(guest_asserts_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_options(guest_asserts_test PRIVATE /OPT:NOREF)
+    add_dependencies(guest_asserts_test gta6rt_tls_host)
+    add_test(NAME guest_asserts COMMAND guest_asserts_test)
   endif()
 
   if(TARGET device_proxy_test)

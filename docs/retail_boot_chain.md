@@ -37,6 +37,11 @@ Without a debugger, the unhandled `int3` of a fatal assert ends the process with
 `C0000005` during teardown, not `80000003`. An exit code of `C0000374` from `--run` can be such an assert, not a
 heap bug.
 
+Hypothesis: a console devkit continues past a failed assert, and some of the title's asserts are tuning checks, not
+faults. `LEONIDA_SKIP_ASSERTS=N` (off by default; [runtime/README.md](../runtime/README.md)) steps `gta6rt` over the
+first N guest `int3` asserts, logging each, so a run can get past such a stop and show what comes next. A debugging
+aid for the title's own asserts; it does not touch any protection or anti-debug check.
+
 ## 2. Physical pages (`xmem.dll`)
 
 The shapes, from the call sites and the checks that follow them:

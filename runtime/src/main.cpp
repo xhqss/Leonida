@@ -29,6 +29,7 @@
 
 #include "base_reservation.h"
 #include "code_hooks.h"
+#include "guest_asserts.h"
 #include "mods.h"
 #include "pe_loader.h"
 #include "../shims/d3d12_trace.h"
@@ -147,6 +148,11 @@ int wmain(int argc, wchar_t** argv) {
                                    "this executable (docs/modding.md)\n", leonida::mods::active().size());
     }
     rt::d3d12_trace::set_enabled(trace_d3d12);
+    {
+        char skip_asserts[16] = {};
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_SKIP_ASSERTS", skip_asserts, sizeof skip_asserts);
+        rt::guest_asserts::install(n > 0 && n < sizeof skip_asserts ? rt::guest_asserts::parse_count(skip_asserts) : 0);
+    }
     if (int trace_error = 0; !trace_file.empty() && !rt::startup_trace::open(trace_file.c_str(), &trace_error)) {
         std::fprintf(stderr, trace_error == EEXIST ? "error: the trace file already exists; --trace only creates a new file\n"
                                                    : "error: cannot create the trace file\n");
