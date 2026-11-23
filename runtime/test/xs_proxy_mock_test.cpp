@@ -894,8 +894,10 @@ int check_xbox_slots() {
     pc_arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
     const D3D12_COMMAND_SIGNATURE_DESC pc_sig{12, 1, &pc_arg, 0};
     EXPECT(hr_of(raw(device, 41, word(&pc_sig), 0, word(&sig_iid), word(&sig))) == S_OK);
-    EXPECT(mock->calls[41] == 2 && mock->args[41][0] == word(&pc_sig));
-    EXPECT(mock->array[41][1] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH);
+    // A mesh dispatch carries D3D12_DISPATCH_ARGUMENTS like the console's type 105, and the backend models neither,
+    // so it is created as a compute dispatch in a copy too.
+    EXPECT(mock->calls[41] == 2 && mock->args[41][0] != word(&pc_sig));
+    EXPECT(mock->array[41][1] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH);
 
     EXPECT(xs::device_slot_overridden(41) && xs::device_slot_overridden(48) && xs::device_slot_overridden(73) &&
            xs::device_slot_overridden(78) && xs::device_slot_overridden(79) && xs::device_slot_overridden(80));
