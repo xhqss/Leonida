@@ -863,3 +863,24 @@ $env:PATH="E:\VulkanSDK\1.4.363.1\Bin;$env:PATH"
 判断标准：`grep -c 'no translated compute' tmp\run-next.log` 与 `tmp\dump-next\*.fspx` 的数量。
 现在这两者**几乎相等**（每一条失败都被 dump 了），说明瓶颈已经不在收集，而在翻译器；
 下一步是补 `tools/rdna2spirv.py` 的那几类拒绝（§9.6 的表），每补一类就重跑第 2、3 步。
+
+### 15.1 复现单条翻译失败（手上有三个现成的样本）
+
+```powershell
+$env:PATH="E:\VulkanSDK\1.4.363.1\Bin;$env:PATH"
+# 报 "s_flbit_i32_b64 of a lane mask"（§9.6 里最小的一类，适合先动手）
+& .\.venv\Scripts\python.exe -I tools\rdna2spirv.py `
+    tmp\fspx-batch4\disasm\cs-012cc73ded72e206.s --out tmp\one-out
+# 报 "fall-through into undecodable words"（最大的一类，100/315）
+& .\.venv\Scripts\python.exe -I tools\rdna2spirv.py `
+    tmp\fspx-batch4\disasm\cs-05512e37b979e246.s --out tmp\one-out
+```
+
+这两条命令各自只需要 1–3 秒，所以改一版翻译器、验一条样本、再整批重跑（第 2 步）是很快的循环。
+`tmp/fspx-batch4/` 里还有 315 个这样的样本，`.code`（kind 6 原文）、`.state`（kind 0）、`.json`（解码后的
+dispatch state）都在，`disasm/*.s` 是反汇编结果。
+
+**别再走的一条路**：我用"把 .s 里出现的 mnemonic 和 `rdna2spirv.py` 的字符串做差集"来猜缺哪条指令，
+结论是错的——翻译器对 `_e32/_e64/_sdwa/_dpp` 后缀、以及 `_saveexec_b32/b64` 之类是按 `endswith` 家族匹配的，
+字符串表里查不到不代表没实现。要判覆盖率得用 `tools/isa_coverage.py`，但它要 AMD 的
+`amdgpu_isa_rdna2.xml`（未随仓库提供，见 `docs/isa_coverage.md` 的下载行）。
