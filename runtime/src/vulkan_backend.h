@@ -1455,7 +1455,12 @@ public:
         if (is_device_lost()) return 0;
         return retire_tickets_.completed([this](VkSemaphore semaphore, std::uint64_t value) {
             std::uint64_t done = 0;
-            return vk.vkGetSemaphoreCounterValue(device_, semaphore, &done) == VK_SUCCESS && done >= value;
+            const VkResult result = vk.vkGetSemaphoreCounterValue(device_, semaphore, &done);
+            // For an ExecuteCommandLists whose queues have nothing else outstanding this is the first Vulkan call,
+            // so a lost device is often discovered here. Reporting it (a transient failure stays transient) is what
+            // stops the queue from acquiring and submitting command buffers on a removed device (vk_queue_query_sync).
+            if (result == VK_ERROR_DEVICE_LOST) mark_device_lost();
+            return result == VK_SUCCESS && done >= value;
         });
     }
 

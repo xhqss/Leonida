@@ -125,7 +125,10 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # GTA6RT_HOST_BASE keeps the loader's own image off the default x64 EXE base (0x140000000), where a mapped EXE
   # without relocations wants to go. Windows moves the EXE with ASLR anyway; Wine loads it at its preferred base.
   set(GTA6RT_HOST_BASE /BASE:0x10000000000)
-  target_link_options(gta6rt PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
+  # The driver compiles the game's shaders on this process's stack. The largest translated module in the corpus
+  # (+spec_CS_RaytracingResolve_ae7b7f3c_Wrapped, a 4+ MiB ray-tracing resolve compute shader) overflows MSVC's
+  # default 1 MiB reserve in the AMD compiler (0xC00000FD, measured on the RX 7800 XT); 32 MiB compiles it.
+  target_link_options(gta6rt PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE} /STACK:33554432)
   target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_xs_rootsig gta6rt_xtaskqueue psapi)
 
   # Root-signature forwarding test: needs a real PC d3d12.lib to serialize the synthetic descriptors.
@@ -1122,6 +1125,11 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(${tool} PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     if(WIN32)
       target_compile_definitions(${tool} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    if(MSVC)
+      # These tools create pipelines for corpus modules on worker threads (PE stack reserve, as gta6rt above): the
+      # biggest ones overflow the 1 MiB default inside the driver's compiler.
+      target_link_options(${tool} PRIVATE /STACK:33554432)
     endif()
   endforeach()
   if(MSVC)
