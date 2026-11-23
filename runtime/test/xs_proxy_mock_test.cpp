@@ -1296,7 +1296,7 @@ int check_tail(bool want_guarded) {
     // refusing: frame pacing flows through them. Nothing is forwarded — the real queue never sees them.
     for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot)
         EXPECT(hr_of(raw(queue, slot)) == S_OK && queue_mock->calls[slot] == 0);
-    for (unsigned slot = 12; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
+    // Fence slot 12 is served with the address of the fence's completed value (PR #7290); the rest of the tail\n    // is refused.\n    EXPECT(hr_of(raw(fence, 12)) != E_NOTIMPL);\n    for (unsigned slot = 13; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
     EXPECT(xs::queue_table_overruns() == 0 && xs::fence_table_overruns() == 0);
     EXPECT(release(queue) == 0 && release(fence) == 0 && release(device) == 0 && mock->refs == 0);
     return 0;
@@ -1363,7 +1363,8 @@ int check_descriptor_heap_hooks() {
 
     raw(device, 17, 0x11, kCustomBase + off3);                                          // CreateConstantBufferView
     EXPECT(real->args[17][1] == kMockHeapCpuStart + off3);
-    raw(device, 18, 0x22, 0x33, kCustomBase + off3);                                    // CreateShaderResourceView
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};  // the mock copies it during the call, so it must be real
+    raw(device, 18, 0x22, word(&srv_desc), kCustomBase + off3);                         // CreateShaderResourceView
     EXPECT(real->args[18][2] == kMockHeapCpuStart + off3);
     raw(device, 19, 0x22, 0x33, 0x44, kCustomBase + off7);                              // CreateUnorderedAccessView
     EXPECT(real->args[19][3] == kMockHeapCpuStart + off7);

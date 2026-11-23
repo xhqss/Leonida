@@ -412,7 +412,13 @@ int check_slots(const Backend& b) {
         before = qhits(30);
         EXPECT(as_hr(call_slot(queue.p, 30)) != E_NOTIMPL);
         EXPECT(qhits(30) == before + 1 && xs::queue_slot_first_call_seen(30));
+        // Fence slot 12 is served: it returns the address of the fence's completed value, which a wait keeps
+        // current (PR #7290). Every other slot past the chain is refused.
+        before = fhits(12);
+        EXPECT(as_hr(call_slot(fence.p, 12)) != E_NOTIMPL);
+        EXPECT(fhits(12) == before + 1 && xs::fence_slot_first_call_seen(12));
         for (unsigned slot = fence_slots; slot < xs::fence_proxy_table_size(); ++slot) {
+            if (slot == 12) continue;
             before = fhits(slot);
             EXPECT(as_hr(call_slot(fence.p, slot)) == E_NOTIMPL);
             EXPECT(fhits(slot) == before + 1 && xs::fence_slot_first_call_seen(slot));

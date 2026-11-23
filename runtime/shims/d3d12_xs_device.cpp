@@ -2154,7 +2154,7 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
 // (docs/retail_boot_chain.md §3.2). The flags are limited to D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT and the node
 // mask to 0 before the PC device sees them; the discarded words are logged once so a trace can show them.
 HRESULT proxy_create_command_queue_x(DeviceProxy* self, std::uint64_t desc_word, const IID* riid, void** out) {
-    note_slot(48);
+    // The generic thunk counts slot 48 before it routes here, so this helper does not count it again.
     if (!desc_word) return E_INVALIDARG;
     D3D12_COMMAND_QUEUE_DESC desc{};
     std::memcpy(&desc, reinterpret_cast<const void*>(desc_word), sizeof(desc));
@@ -3012,6 +3012,7 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
 // word is only a proxy pointer when the caller did not use the hidden-return form.
 std::uint64_t proxy_get_custom_heap_properties(void* first, std::uint64_t second, std::uint64_t third,
                                               std::uint64_t fourth) {
+    note_slot(26);
     const bool hidden_return = !is_device_proxy(first) && is_device_proxy(reinterpret_cast<void*>(second));
     auto* proxy = static_cast<DeviceProxy*>(hidden_return ? reinterpret_cast<void*>(second) : first);
     auto* out = static_cast<D3D12_HEAP_PROPERTIES*>(hidden_return ? first : reinterpret_cast<void*>(second));
