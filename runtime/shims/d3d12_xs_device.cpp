@@ -3034,10 +3034,52 @@ std::uint64_t proxy_get_custom_heap_properties(void* first, std::uint64_t second
 
 // The Xbox routes at their configured indices. Returns false when `slot` is none of them. Slot 70 asks too, because an
 // override that moves a route onto 70 must win over the built-in 70 handler.
+// Device slot 81 (measured on the retail title; docs/2026-11-24_overnight_bringup.md §9.2b): the title's resource
+// finalizer calls it as (a ring-buffer token, flags 0x11100, &count, out[]) with *count = 6 on entry, then reads
+// out[i] + 0 as a page size (0x10000 or 0x1000), out[i] + 8 as a flag byte and out[i] + 0x18 as a handle, stepping by
+// the 0x38 bytes of D3D12_RESOURCE_DESC. A non-zero count sends it on to write page-table entries. The ABI table lists
+// 78..81 as frame pacing, GetFrameStatisticsX last, which does not match this shape at all, so the slot's meaning is
+// open; what it answers is what decides. LEONIDA_SLOT81 picks the answer while that is being measured:
+//
+//   unset (or anything else)  refuse as before: E_NOTIMPL
+//   zero                      S_OK with no pages to report, which keeps the caller's page-table walk out of the boot
+//   page64                    S_OK with one 64 KiB page and a null handle
+std::uint64_t proxy_slot_81(std::uint64_t flags, std::uint64_t count_word, std::uint64_t out_word) {
+    static const std::string answer = [] {
+        char value[32] = {};
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_SLOT81", value, sizeof value);
+        return n ? std::string(value, n) : std::string();
+    }();
+    if (answer != "zero" && answer != "page64") return hr_to_u64(E_NOTIMPL);
+    auto* const count = reinterpret_cast<std::uint32_t*>(count_word);
+    if (!count) return hr_to_u64(E_POINTER);
+    const std::uint32_t offered = *count;
+    if (answer == "zero") {
+        *count = 0;
+    } else {
+        auto* const out = reinterpret_cast<std::uint8_t*>(out_word);
+        if (!out || !offered) {
+            *count = 0;
+        } else {
+            std::memset(out, 0, 0x38);
+            *reinterpret_cast<std::uint32_t*>(out) = 0x10000;  // the console's 64 KiB graphics page
+            *count = 1;
+        }
+    }
+    static std::atomic<bool> logged{false};
+    if (first_call(logged))
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 81 answered \"%s\" (flags 0x%llx, offered %u -> %u)\n",
+                     answer.c_str(), static_cast<unsigned long long>(flags), offered, *count);
+    return hr_to_u64(S_OK);
+}
+
 bool route_xbox_device_slot(DeviceProxy* self, unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                             std::uint64_t a4, std::uint64_t a5, std::uint64_t& result) {
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
-    if (slot == routes.frame_interval) {
+    if (slot == 81) {
+        log_xbox_route_once(slot, "console page-size query", a1, a2, a3, a4, a5);
+        result = proxy_slot_81(a2, a3, a4);
+    } else if (slot == routes.frame_interval) {
         log_xbox_route_once(slot, "SetFrameIntervalX", a1, a2, a3, a4, a5);
         result = hr_to_u64(proxy_set_frame_interval_x(self, a1, a2, a3, a4));
     } else if (slot == routes.schedule_event) {
@@ -3696,7 +3738,7 @@ bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 14 || (slot >= 17 && slot <= 24) ||
         slot == 25 || slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 || slot == 36 ||
         slot == 41 || slot == 45 || slot == 46 || slot == 50 || slot == 56 || slot == 61 || slot == 62 ||
-        slot == 67 || slot == 70 || slot == 74 || slot == 75 || slot == 76 || slot == 86 || slot == 101 ||
+        slot == 67 || slot == 70 || slot == 74 || slot == 75 || slot == 76 || slot == 81 || slot == 86 || slot == 101 ||
         slot == 108 || slot == 133 || slot == kCreateCommittedResource3X)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
