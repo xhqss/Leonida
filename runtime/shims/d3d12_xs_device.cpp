@@ -3125,6 +3125,54 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                         std::fprintf(stderr, "\n");
                     }
                 }
+                // LEONIDA_LOG_VSHARP: find where a GFX10 V# really starts. A console descriptor slot is 32 bytes and a
+                // title computes the table VA from the heap start, so the first V# need not be at the address as passed.
+                // Slides a 16-byte decode over [-0x40, +0x100) and scores the fields; prints the plausible windows only.
+                if (std::getenv("LEONIDA_LOG_VSHARP")) {
+                    static std::atomic<int> logged{0};
+                    const int nth = logged.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (nth <= 12) {
+                        constexpr std::uint64_t kBack = 0x40, kSpan = 0x40 + 0x100;
+                        std::uint8_t raw[kSpan] = {};
+                        leonida::copy_committed(raw, table_va >= kBack ? table_va - kBack : table_va, kSpan);
+                        std::fprintf(stderr, "[rt] vsharp table %d: type %d index %llu at 0x%llx\n", nth,
+                                     int(self->type), static_cast<unsigned long long>(a1),
+                                     static_cast<unsigned long long>(table_va));
+                        for (std::uint64_t rel = 0; rel + 16 <= kSpan; rel += 4) {
+                            const auto* w = reinterpret_cast<const std::uint32_t*>(raw + rel);
+                            const std::uint64_t base =
+                                (std::uint64_t(w[1] & 0xffff) << 32) | (w[0] & 0xfffffffcull);
+                            const unsigned stride = (w[1] >> 16) & 0x3fff;
+                            const std::uint64_t num = w[2];
+                            const unsigned sel0 = w[3] & 7, sel1 = (w[3] >> 3) & 7;
+                            const unsigned sel2 = (w[3] >> 6) & 7, sel3 = (w[3] >> 9) & 7;
+                            const unsigned format = (w[3] >> 12) & 0x7f;  // a V#'s FORMAT is 7 bits, [18:12]
+                            const unsigned oob = (w[3] >> 28) & 3;
+                            const unsigned type = (w[3] >> 30) & 3;
+                            const std::uint64_t bytes = stride ? num * stride : num;
+                            const bool fits = base && base < leonida::arena_host_size && bytes &&
+                                              bytes <= leonida::arena_host_size - base;
+                            int score = 0;
+                            if (type == 0) ++score;
+                            if (sel0 <= 5 && sel1 <= 5 && sel2 <= 5 && sel3 <= 5) ++score;
+                            if (format >= 1 && format <= 127) ++score;
+                            if (base && base < leonida::arena_host_size) ++score;
+                            if (fits) ++score;
+                            if (stride == 0 || stride <= 256) ++score;
+                            if (score >= 4) {
+                                const long long offset =
+                                    static_cast<long long>(rel) - static_cast<long long>(kBack);
+                                std::fprintf(stderr,
+                                             "[rt]   offset %+lld: %08x %08x %08x %08x base 0x%llx stride %u num "
+                                             "%llu fmt %u oob %u sel %u%u%u%u score %d\n",
+                                             offset, w[0], w[1], w[2], w[3],
+                                             static_cast<unsigned long long>(base), stride,
+                                             static_cast<unsigned long long>(num), format, oob, sel0, sel1, sel2,
+                                             sel3, score);
+                            }
+                        }
+                    }
+                }
                 // LEONIDA_LOG_TABLE: every 16-byte window of the table decoded as the translated shader decodes it --
                 // a GFX10 V#, `base = (word1 & 0xffff) << 32 | (word0 & ~3)`, `stride = word1[29:16]`,
                 // `num_records = word2` -- and flagged when `heap_base + base` leaves the GPU address arena, which is
