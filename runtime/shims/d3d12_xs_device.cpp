@@ -1976,7 +1976,11 @@ void sanitize_descriptor_table(std::uint8_t* table, std::uint64_t bytes) {
         const std::uint64_t base = (std::uint64_t(words[1] & 0xffff) << 32) | (words[0] & 0xfffffffcull);
         const unsigned stride = (words[1] >> 16) & 0x3fff;
         const std::uint64_t records = stride ? std::uint64_t(words[2]) * stride : words[2];
-        if (base >= arena || records > arena - base) {
+        // Only the base has to be an address: a title's V# can carry a record count that says nothing about the end
+        // of the buffer (a raw buffer's count is a byte size, a structured one a record count), and the shader's own
+        // bounds check is what stops a load. LEONIDA_XS_TABLE_STRICT also rejects an extent outside the arena.
+        const bool strict = std::getenv("LEONIDA_XS_TABLE_STRICT") != nullptr;
+        if (base >= arena || (strict && records > arena - base)) {
             // LEONIDA_LOG_SANITIZE: which entries the title wrote that cannot name a buffer in the arena. A table whose
             // entries are all zeroed here is not in the format the shader's 16-byte V# load expects.
             if (std::getenv("LEONIDA_LOG_SANITIZE")) {
@@ -1994,6 +1998,7 @@ void sanitize_descriptor_table(std::uint8_t* table, std::uint64_t bytes) {
         }
     }
 }
+
 
 // Title memory used as GPU memory. A root descriptor or a vertex or index view can name an address of the title's own
 // allocator, which no resource covers: title memory is host memory here, so the shader cannot read it as a device
@@ -2083,6 +2088,77 @@ std::uint64_t guest_translate(DeviceProxy* device, std::uint64_t va, std::uint64
     leonida::copy_committed(entry->mapped + offset, va, std::min(bytes, room));
     if (sanitize) sanitize_descriptor_table(entry->mapped + offset, std::min(bytes, room));
     return entry->gpu + offset;
+}
+
+// The window copy's bytes for `va`, once guest_translate has made the window, or null.
+std::uint8_t* guest_window_bytes(DeviceProxy* device, std::uint64_t va, std::uint64_t bytes) {
+    GuestWindows* windows = guest_windows(device);
+    if (!windows) return nullptr;
+    const std::uint64_t start = va & ~(kGuestWindow - 1);
+    std::lock_guard lock(windows->lock);
+    for (GuestWindow& window : windows->windows)
+        if (window.start == start) {
+            const std::uint64_t offset = va - start;
+            if (offset + bytes > window.len) return nullptr;
+            return window.mapped + offset;
+        }
+    return nullptr;
+}
+
+// The shader adds heap_base to every address a descriptor names. A console title names its own memory, whose console VA
+// is a host address here, so a V# base that is title memory has to become the device address of the window holding a
+// copy of those bytes (guest_translate). Bases that are already console VAs into the arena stay; a base that is
+// neither is zeroed. `va`'s window must exist (guest_translate ran for it) and `bytes` bytes of the table fit in it.
+void rewrite_table_descriptors(DeviceProxy* device, std::uint64_t va, std::uint8_t* window, std::uint64_t bytes) {
+    const std::uint64_t arena = leonida::arena_host_size;
+    std::vector<std::uint32_t> table(static_cast<std::size_t>(bytes / 4), 0);
+    leonida::copy_committed(reinterpret_cast<std::uint8_t*>(table.data()), va, bytes);
+    for (std::uint64_t at = 0; at + 16 <= bytes; at += 16) {
+        std::uint32_t* words = table.data() + at / 4;
+        const unsigned type = (words[3] >> 28) & 0xf;
+        std::uint64_t address = type >= 8 ? (((std::uint64_t(words[1] & 0xff) << 32) | words[0]) << 8)
+                                          : ((std::uint64_t(words[1] & 0xffff) << 32) | (words[0] & 0xfffffffcull));
+        if (!address) continue;
+        const std::uint64_t source = address;
+        // A title VA is a host address here, so title memory at that number wins over the "inside the arena" reading:
+        // a console VA that merely lies in the arena's range has no data behind it, while the title's memory does.
+        if (leonida::is_committed(reinterpret_cast<const void*>(address))) {
+            const std::uint64_t window_va = guest_translate(device, address, 4096);
+            if (window_va) {
+                address = window_va;
+            } else if (address >= arena) {
+                std::memset(words, 0, 16);
+                std::memcpy(window + at, words, 16);
+                continue;
+            }
+        } else if (address >= arena) {
+            const std::uint64_t window_va =
+                leonida::is_committed(reinterpret_cast<const void*>(address)) ? guest_translate(device, address, 64) : 0;
+            if (!window_va) {
+                std::memset(words, 0, 16);
+                std::memcpy(window + at, words, 16);
+                continue;
+            }
+            address = window_va;
+        }
+        if (type >= 8) {
+            words[0] = std::uint32_t(address >> 8);
+            words[1] = (words[1] & ~0xffu) | std::uint32_t((address >> 40) & 0xff);
+        } else {
+            words[0] = std::uint32_t(address & 0xfffffffcull) | (words[0] & 3u);
+            words[1] = (words[1] & 0xffff0000u) | std::uint32_t((address >> 32) & 0xffff);
+        }
+        std::memcpy(window + at, words, type >= 8 ? 32 : 16);
+        // LEONIDA_LOG_TABLE: what the rewrite made of the first records, and the first bytes of the data they name.
+        if (std::getenv("LEONIDA_LOG_TABLE") && at <= 32) {
+            std::uint32_t sample[4] = {};
+            leonida::copy_committed(reinterpret_cast<std::uint8_t*>(sample), source, 16);
+            std::fprintf(stderr,
+                         "[rt] rewrite +0x%llx: %08x %08x %08x %08x from 0x%llx; data %08x %08x %08x %08x\n",
+                         static_cast<unsigned long long>(at), words[0], words[1], words[2], words[3],
+                         static_cast<unsigned long long>(source), sample[0], sample[1], sample[2], sample[3]);
+        }
+    }
 }
 
 // The device address a shader must read for the title address `va`: the upload arena's, the title-memory window's, or
@@ -2969,11 +3045,21 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                     is_backing ? in_layer.ptr - reinterpret_cast<SIZE_T>(leonida::arena_host_base) : a2;
                 if (std::getenv("LEONIDA_XS_HEAP_VA")) a2 = heap_va;
                 else if (a2 == heap_va) {
-                    // LEONIDA_XS_TABLE_FIX: copy the title's table into a window the GPU can read and zero the
-                    // descriptors whose address cannot be one (sanitize_descriptor_table), so the shader reads the
-                    // title's own V#s without a device fault from a truncated 48-bit base.
+                    // LEONIDA_XS_TABLE_FIX: give the shader a window copy of the title's table, with each descriptor's
+                    // address rewritten to the window (or arena VA) the shader's heap_base + address must reach, and
+                    // zero the ones that name nothing (sanitize_descriptor_table). Without the rewrite the title's
+                    // base is a host address and heap_base + it reads unrelated arena bytes (2026-11-24: the black
+                    // composite frame).
                     if (std::getenv("LEONIDA_XS_TABLE_FIX")) {
                         const std::uint64_t translated = guest_translate(self->device, a2, 64 << 10, true);
+                        // LEONIDA_XS_TABLE_REWRITE: additionally turn each descriptor's address into the window that
+                        // holds those bytes. Off by default: the entries a title writes are not gfx10 V#s (the dword
+                        // after the address repeats the address, so a rewritten record count sends the shader on an
+                        // enormous loop and the GPU hangs).
+                        if (translated && std::getenv("LEONIDA_XS_TABLE_REWRITE")) {
+                            if (std::uint8_t* window = guest_window_bytes(self->device, a2, 64 << 10))
+                                rewrite_table_descriptors(self->device, a2, window, 64 << 10);
+                        }
                         if (translated) a2 = translated;
                     } else if (std::getenv("LEONIDA_XS_TABLE_VA")) {
                         a2 = shader_address(self->device, a2, 64 << 10);
@@ -3068,6 +3154,21 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                          static_cast<unsigned long long>(records),
                                          static_cast<unsigned long long>(base + records),
                                          outside ? " OUTSIDE THE ARENA" : "");
+                        }
+                        // What the shader reads at those bases: it adds heap_base to the V# base, so the bytes below are
+                        // the arena's. Vertex data looks like floats; a descriptor table looks like descriptors.
+                        if (leonida::arena_host_base) {
+                            for (unsigned i = 0; i < 3; ++i) {
+                                const std::uint32_t* r = bytes + i * 4;
+                                const std::uint64_t base =
+                                    (std::uint64_t(r[1] & 0xffff) << 32) | (r[0] & 0xfffffffcull);
+                                if (base + 16 > leonida::arena_host_size) continue;
+                                const auto* data =
+                                    reinterpret_cast<const std::uint32_t*>(leonida::arena_host_base + base);
+                                std::fprintf(stderr, "[rt]   base 0x%llx data: %08x %08x %08x %08x\n",
+                                             static_cast<unsigned long long>(base), data[0], data[1], data[2],
+                                             data[3]);
+                            }
                         }
                     }
                 }
