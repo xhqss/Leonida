@@ -337,7 +337,9 @@ void sync_descriptor_back(D3D12_CPU_DESCRIPTOR_HANDLE title_side, D3D12_CPU_DESC
 void sanitize_table_window(std::uint8_t* window, std::uint64_t bytes, std::uint64_t table_va) {
     const std::uint64_t arena = leonida::arena_host_size;
     int zeroed = 0;
-    for (std::uint64_t at = 0; at + 16 <= bytes; at += 16) {
+    // One console CBV/SRV/UAV slot is 32 bytes: a T# fills all eight dwords, a V# the first four. Stepping 16 bytes
+    // would read a T#'s second half as a V# and zeroing it would destroy the descriptor's hash key.
+    for (std::uint64_t at = 0; at + 32 <= bytes; at += 32) {
         auto* words = reinterpret_cast<std::uint32_t*>(window + at);
         if ((words[3] >> 28) & 0xf) continue;  // a T# (or something that is not a plain V#)
         const std::uint64_t base = (static_cast<std::uint64_t>(words[1] & 0xffff) << 32) | (words[0] & 0xfffffffcull);
@@ -352,6 +354,75 @@ void sanitize_table_window(std::uint8_t* window, std::uint64_t bytes, std::uint6
     if (zeroed > 8)
         std::fprintf(stderr, "[rt] table sanitize: 0x%llx %d V# entries zeroed in all\n",
                      static_cast<unsigned long long>(table_va), zeroed);
+}
+
+// LEONIDA_XS_TABLE_SCRATCH: a fixed, mapped scratch buffer for bound descriptor tables.
+//
+// A table VA is not a stable address: the title cycles through a ring of table pages, so translating each new VA into
+// its own 4 MiB window costs a window creation (and fills the arena) every frame. Instead, one mapped upload buffer is
+// made once; a bind copies the table's bytes into the next 64 KiB slot and hands the shader that slot's console VA
+// (the layer reports GPU virtual addresses as arena offsets, so the shader's heap_base + slot lands in the buffer).
+struct TableScratch {
+    std::mutex lock;
+    ID3D12Resource* resource = nullptr;
+    std::uint8_t* cpu = nullptr;
+    std::uint64_t gpu = 0;
+    std::size_t size = 0;
+    std::size_t used = 0;
+};
+
+TableScratch& table_scratch() {
+    static auto* scratch = new TableScratch;
+    return *scratch;
+}
+
+constexpr std::size_t kTableScratchSlot = 64 << 10;
+constexpr std::size_t kTableScratchSlots = 128;
+
+std::uint64_t table_scratch_copy(DeviceProxy* device, std::uint64_t table_va, const char* what) {
+    if (!device || !table_va || !leonida::is_committed(reinterpret_cast<const void*>(table_va))) return 0;
+    TableScratch& scratch = table_scratch();
+    std::lock_guard<std::mutex> lock(scratch.lock);
+    if (!scratch.cpu) {
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = kTableScratchSlot * kTableScratchSlots;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource* resource = nullptr;
+        void* cpu = nullptr;
+        if (FAILED(device->real->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                         __uuidof(ID3D12Resource),
+                                                         reinterpret_cast<void**>(&resource))) ||
+            !resource || FAILED(resource->Map(0, nullptr, &cpu)) || !cpu || !resource->GetGPUVirtualAddress()) {
+            if (resource) resource->Release();
+            return 0;
+        }
+        scratch.resource = resource;
+        scratch.cpu = static_cast<std::uint8_t*>(cpu);
+        scratch.gpu = resource->GetGPUVirtualAddress();
+        scratch.size = kTableScratchSlot * kTableScratchSlots;
+        std::fprintf(stderr, "[rt] table scratch: 0x%llx bytes at console VA 0x%llx\n",
+                     static_cast<unsigned long long>(scratch.size),
+                     static_cast<unsigned long long>(scratch.gpu));
+    }
+    const std::size_t slot = scratch.used % kTableScratchSlots;
+    ++scratch.used;
+    std::uint8_t* dest = scratch.cpu + slot * kTableScratchSlot;
+    leonida::copy_committed(dest, table_va, kTableScratchSlot);
+    if (std::getenv("LEONIDA_XS_TABLE_SANITIZE")) sanitize_table_window(dest, kTableScratchSlot, table_va);
+    static std::atomic<int> shown{0};
+    if (shown.fetch_add(1, std::memory_order_relaxed) < 8)
+        std::fprintf(stderr, "[rt] table scratch %s: 0x%llx -> slot %zu at 0x%llx\n", what,
+                     static_cast<unsigned long long>(table_va), slot,
+                     static_cast<unsigned long long>(scratch.gpu + slot * kTableScratchSlot));
+    return scratch.gpu + slot * kTableScratchSlot;
 }
 
 std::atomic<std::uint64_t> g_hits[kMaxSlots];std::atomic<bool> g_first[kMaxSlots];
@@ -3304,7 +3375,10 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 // d3d12_command_objects.md: console 35 -> PC 31). A compute shader reads its descriptors the same way,
                 // so the table needs the same translation; untranslated it reads arena bytes at the raw VA and can
                 // interpret them as a V# whose base is anything, which loses the device.
-                if (std::getenv("LEONIDA_XS_TABLE_VA")) {
+                if (std::getenv("LEONIDA_XS_TABLE_SCRATCH")) {
+                    const std::uint64_t scratch = table_scratch_copy(self->device, a2, "compute");
+                    if (scratch) a2 = scratch;
+                } else if (std::getenv("LEONIDA_XS_TABLE_VA")) {
                     constexpr std::uint64_t kTableBytes = 64 << 10;
                     const std::uint64_t translated = shader_address(self->device, a2, kTableBytes);
                     if (translated) {
@@ -3347,12 +3421,15 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                     }
                 } else if (std::getenv("LEONIDA_XS_HEAP_VA")) a2 = heap_va;
                 else if (a2 == heap_va) {
-                    // LEONIDA_XS_TABLE_FIX: give the shader a window copy of the title's table, with each descriptor's
-                    // address rewritten to the window (or arena VA) the shader's heap_base + address must reach, and
-                    // zero the ones that name nothing (sanitize_descriptor_table). Without the rewrite the title's
-                    // base is a host address and heap_base + it reads unrelated arena bytes (2026-11-24: the black
-                    // composite frame).
-                    if (std::getenv("LEONIDA_XS_TABLE_FIX")) {
+                    // LEONIDA_XS_TABLE_SCRATCH: copy the table into the fixed mapped scratch buffer and hand the shader
+                    // that slot; one 64 KiB copy per bind instead of a new 4 MiB window per table VA.
+                    if (std::getenv("LEONIDA_XS_TABLE_SCRATCH")) {
+                        const std::uint64_t scratch = table_scratch_copy(self->device, table_va, "graphics");
+                        if (scratch) a2 = scratch;
+                    } else if (std::getenv("LEONIDA_XS_TABLE_FIX")) {
+                        // LEONIDA_XS_TABLE_FIX: give the shader a window copy of the title's table, with each
+                        // descriptor's address rewritten to the window (or arena VA) the shader's heap_base + address
+                        // must reach, and zero the ones that name nothing (sanitize_descriptor_table).
                         const std::uint64_t translated = guest_translate(self->device, a2, 64 << 10, true);
                         // LEONIDA_XS_TABLE_REWRITE: additionally turn each descriptor's address into the window that
                         // holds those bytes. Off by default: the entries a title writes are not gfx10 V#s (the dword

@@ -787,6 +787,27 @@ heap"。本项目的实现里，层把描述符写进 **arena**（翻译后的 h
 这样每帧只有一次 64 KiB memcpy、零窗口创建，帧率不再被拖垮；对 compute 表（slot 35）同样适用。
 之后再回到"画面是否有内容"和"哈希键是否匹配"。
 
+## 5. 第十三轮（01:25）实现与结果
+
+`LEONIDA_XS_TABLE_SCRATCH=1`：绑定表时把标题的表字节拷进一个**固定的 8 MiB mapped UPLOAD buffer**
+（128 槽 × 64 KiB，启动时创建一次，console VA 0x30bc0000 起），a2 直接给槽地址。实测：
+
+- scratch 生效（`table scratch graphics: 0xb94ef00 -> slot 0 at 0x30bc0000`），**不再每帧建窗口**；
+- 但每 30 s 仍然只有 1 帧，并且**残留一个固定 fault** `console VA 0xd1e7dc27000`；
+- 按 32 字节槽（T# = 8 dword、V# = 前 4 dword）重新扫 sanitize 后，每张表仍有 **1000–1550 个槽**
+  被判定为"base 超出 arena 的 V#"，约占 2048 槽的 75%。说明**表内容大部分不是 gfx10 V#**，
+  或者我们扫的这张表并不是着色器真正读的那张。
+
+## 6. 当前状态与下一步
+
+- 已确认：slot 35（compute 表）必须翻译；表是标题内存、可拷；`DESC_SYNC` 能让标题侧看到层写的描述符。
+- 仍卡：① 残留 fault `0xd1e7dc27000`（不经过 `shader_address`，`LOG_BADVA` 抓不到，来源仍是 root
+  descriptor/VBV/层内部三者之一）；② 表内容与 gfx10 布局对不上的比例太高。
+- 下一步建议：给**所有**交给层、最终会进着色器的地址（root descriptor 们、VBV/IBV、SO、ExecuteIndirect
+  参数）在出口统一加一个"≥ arena 就打印"的检查（不只是 `shader_address`），先定位 0xd1e7dc27000；
+  同时用 `LEONIDA_LOG_TABLE`/`table3` 对同一张表在**绑定前后**各 dump 一次，确认标题确实把 `DESC_SYNC`
+  写回的字节拷进了表（若没拷，说明标题是从别处复制的，那 32 字节槽的解释还要再改）。
+
 
 
 
