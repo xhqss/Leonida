@@ -819,18 +819,19 @@ slot-133 池里 **drawable 的头**（`0x8e3` = 位置从 +16 起、28 字节一
 
 1. **回答"为什么只有 4 个全屏 blit"** —— 这是现在唯一真问题。已知线索：
    - 整轮只创建 **63 个描述符**（真实一帧要几千个）；
-   - 每帧 4 个 3-vertex 全屏 blit，表和 V# 全零 ⇒ 画的是**空**；
+   - 每帧 4 个 3-vertex 全屏 blit；串通 14.9 的链路后，表里只有 1 个 V#、**没有采样的 T#**
+     ⇒ 画的是**空**，而且这是标题的本意（黑屏，不是我们画错）；
    - `DeserializeComputePipelineStateX`（slot 67）**每轮都失败** `0x80070057`，
      缺 `FSPX kind-6 / kind-0` 的 compute 程序（§13.5）；
    - 12.3 核 CPU、GPU 3D 引擎 8%、12 个 amdvlk 线程自旋 ⇒ 标题在**等/重试**，不是在建场景。
    ⇒ 先修 slot 67 的语料缺口（用 `LEONIDA_DUMP_SHADERS` 把那批程序导出来，再
    `tools/rdna2spirv.py` 补翻译）。victory-gta6 修了 **730 个**这类程序，说明这是成片的。
-2. **把 11 个 CPU-only 堆的记录写进标题内存**（five-star-recomp 模型的第 1、3 条）：
-   现在 `XS_TITLE_HANDLES` 是"所有堆都写标题内存"，应该收敛成"CPU-only 堆写标题内存、
-   CPU handle 仍返回标题的地址"，这样标题 memcpy 的源就是它自己内存里那份，
-   它拷进 per-draw 表的记录才会带上层的编码。
-3. **bind 时按"至少 16 条"镜像，而不是按根签名 range**（五个库共同的坑）。
-4. 描述符链路本身**暂时冻结**：除非 1 有进展（标题真的开始建场景），否则再动它没有意义。
+2. ~~**把 11 个 CPU-only 堆的记录写进标题内存**（five-star-recomp 模型的第 1、3 条）~~ ——
+   **14.9 已经做掉了**（`XS_DESC_SYNC_CPU`），实测有效。该项剩余的部分：现在只有 32 次 sync
+   被调用（每轮 32 个视图），说明标题确实只建了这么少的视图，不是我们的路径漏了。
+3. **bind 时按"至少 16 条"镜像，而不是按根签名 range**（五个库共同的坑）：`mirror_table` 现在
+   固定 64 KiB，已经覆盖；如要更严格，可改成取根签名 range 的上界。
+4. 描述符链路本身**暂时冻结**：14.9 已经证明它通，剩下的瓶颈不在这一层。
 
 ### 14.7 关于"D3D12 退路"的评估（用户提出的备选）
 
@@ -854,5 +855,35 @@ slot-133 池里 **drawable 的头**（`0x8e3` = 位置从 +16 起、28 字节一
 
 - `table4` 普查修正：读 `arena_host_base + a2`（原来错读 `table_va` 当 host 地址），
   并新增"标题自己那份"的独立普查 + `arena_host_base/size` 打印。
-- 无新增开关；所有行为变化只在 `LEONIDA_LOG_TABLE4` 打开时可见。
+- `mirror_table` 修正：源地址原来是 `table_va` 当 host 地址（错），现在走
+  `title_address_of()` 把 arena 偏移换成标题自己的 console 地址再拷。
+- **V#/T# 判别式修正**（这是一个贯穿全层的隐性 bug）：原来用
+  `(dword3 >> 28) & 0xf != 0` 判 T#，但 gfx10 **V#** 的 dword 3 是
+  `format | OOB_SELECT(28-29) | ADD_TID_ENABLE(30)`，`OOB_SELECT = 3` 的 V# 顶 nibble
+  就是 3 ⇒ **每个这种 V# 都被当成 T#**。标题的 composite 表里 V# 全是 `0x30014fac`，
+  正好中招。T# 的 type 只有 **8..15** 合法，判别式改成 `>= 8`。
+  （普查、`sanitize_table_window` 等处都用这个判别式，所以"0 个 T#"的历史读数也不可信。）
+- 新增开关：`LEONIDA_XS_DESC_SYNC_CPU`、`LEONIDA_XS_MIRROR_VBASE`；无默认行为变化。
+
+### 14.9 本轮最后跑通的链路（**描述符管线第一次真正接通**）
+
+三级开关串起来，每一步都有实测证据：
+
+| 步骤 | 开关 | 实测证据 |
+| --- | --- | --- |
+| ① 层把描述符字节写进**标题自己的内存**（只对 **CPU-only 堆**，不动 shader-visible 堆） | `XS_DESC_SYNC_CPU=1` | `[rt] desc sync 1 V#: e0c2ff20 0000004d 00000060 30014fac base 0x4de0c2ff20 committed 1` —— 标题的 per-draw 表里出现了**层的编码**（此前只有 0） |
+| ② 标题的表按**正确源地址**镜像进 arena | `XS_GPU_HANDLE=1` + `XS_TABLE_MIRROR=1` | `[rt] table mirror graphics: title 0x4de0c2ef00 -> arena 0xb94ef00 (65536 bytes)`；arena 普查从 **2048/2048 全零**变成真实条目 |
+| ③ 表里 V# 的 console 地址换成 arena 偏移 | `XS_MIRROR_VBASE=1` | `[rt] table mirror: +0x0 V# base 0x4de0c2ff20 -> arena 0xb94ff20`；arena 槽 0 读作 `0b94ff20 00000000 00000060 30014fac` |
+
+**结果**：`60 s → 2220 presents`（37 Hz）、**0 assert、0 device fault**、6720 次 V# 改写。
+只开 ②（不开 ③）时**只有 1 个 present** 就停 —— 因为 V# base 还是 64 位标题地址，
+着色器的 `heap_base + base` 直接飞出去。③ 是让整条链路活下来的关键。
+
+**但窗口仍然是纯黑**（`mcp__windows__Screenshot` 抓 `Americas` 窗口确认）。
+原因现在很明确、也很干净：那张表里 **2048 个槽只有 1 个 V#（顶点/常量）和 0 个被采样的 T#**，
+标题**根本没打算采样任何东西**；整轮 63 个 `Create*View` 也说明它没有资源可画。
+⇒ **黑屏是"标题还没画东西"，不是"我们画错了"。** 描述符链路到这里可以算**通了**，
+剩下的不是描述符问题。
+
+**默认配置无回归**：30 s → 2760 presents、0 assert、0 fault（基线 2880–3180）。
 

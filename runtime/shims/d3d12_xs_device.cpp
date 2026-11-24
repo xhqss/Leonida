@@ -335,8 +335,27 @@ void log_descriptor_handle(const DeviceProxy* device, const char* what, SIZE_T h
 // the descriptor into the arena (the translated handle) while the title's memory at the handle it passed still holds
 // whatever was there, so a title-side copy carries garbage into the table the shader later loads. Copying the bytes
 // back makes both views of the slot agree.
+// Whether a descriptor heap is CPU-only (no D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE). five-star-recomp's model
+// (docs/d3d12x-shim.md, "Heaps") is the reason this matters: its title creates eleven CPU-only view heaps of 3,128
+// descriptors and copies their 32-byte records into its per-draw tables itself, so a record's bytes in *title memory*
+// are what a shader eventually reads. This title creates the same eleven heaps (heap 6..16, 0x18700 bytes each). A
+// shader-visible heap is different: the shader reads it through the arena, so copying the layer's bytes back into the
+// title's copy of it would not reach the shader anyway, and the render targets and clears a title handles by CPU
+// handle would start naming a copy the layer never wrote.
+bool heap_is_cpu_only(const HeapProxy* heap) {
+    if (!heap || !heap->real) return false;
+    const D3D12_DESCRIPTOR_HEAP_DESC desc = heap->real->GetDesc();
+    return (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) == 0;
+}
+
 void sync_descriptor_back(D3D12_CPU_DESCRIPTOR_HANDLE title_side, D3D12_CPU_DESCRIPTOR_HANDLE real) {
-    if (!std::getenv("LEONIDA_XS_DESC_SYNC")) return;
+    // LEONIDA_XS_DESC_SYNC: every heap. LEONIDA_XS_DESC_SYNC_CPU: only a CPU-only heap, which is what
+    // five-star-recomp's model needs and what a shader-visible heap must not get (see heap_is_cpu_only).
+    if (!std::getenv("LEONIDA_XS_DESC_SYNC")) {
+        if (!std::getenv("LEONIDA_XS_DESC_SYNC_CPU")) return;
+        DescriptorRange range{};
+        if (!find_descriptor_range(nullptr, title_side.ptr, &range) || !heap_is_cpu_only(range.heap)) return;
+    }
     if (!title_side.ptr || !real.ptr || title_side.ptr == real.ptr) return;
     constexpr std::size_t kSlotBytes = 32;  // one console CBV/SRV/UAV slot: a T#, or a V# padded to eight dwords
     std::memcpy(reinterpret_cast<void*>(title_side.ptr), reinterpret_cast<const void*>(real.ptr), kSlotBytes);
@@ -410,18 +429,99 @@ bool mirror_title_bytes(std::uint64_t va, std::uint64_t bytes) {
     return true;
 }
 
+// The title's own console address of a descriptor heap's arena offset: the range with a backing_start is the heap's
+// GPU-handle range, so the title-side address of `offset` is backing_start + (offset - that range's console start).
+// 0 when no such range exists (LEONIDA_XS_GPU_HANDLE registers them).
+SIZE_T title_address_of(std::uint64_t offset) {
+    std::lock_guard guard(descriptor_range_mutex());
+    for (const auto& range : descriptor_ranges()) {
+        if (range.backing_start && offset >= range.custom_start && offset < range.custom_end)
+            return range.backing_start + (offset - range.custom_start);
+    }
+    return 0;
+}
+
+// Copies [source, source + bytes) into the arena at `dest_offset`. The table a shader reads is title memory at the
+// title's own console address, while the shader reaches the arena at `heap_base + table_va`; the two are different
+// numbers, so the copy needs both. Until 2026-11-25 this copied from the *arena offset* as if it were a host
+// address, i.e. from an unrelated region, which is why LEONIDA_XS_TABLE_MIRROR "mirrored" a range table.
+bool mirror_title_bytes_at(SIZE_T source, std::uint64_t dest_offset, std::uint64_t bytes) {
+    if (!source || !leonida::arena_host_base || !leonida::arena_host_size) return false;
+    if (dest_offset >= leonida::arena_host_size) return false;
+    if (!leonida::is_committed(reinterpret_cast<const void*>(source))) return false;
+    const std::uint64_t n = std::min(bytes, leonida::arena_host_size - dest_offset);
+    if (!n) return false;
+    leonida::copy_committed(leonida::arena_host_base + dest_offset, source, n);
+    return true;
+}
+
+// The arena offset of the layer's copy of a console address that lies in a registered heap's title range: the inverse
+// of title_address_of. A V# in a table a title built itself names a buffer at such an address -- measured: the composite
+// draw's V#s hold 0x4de0c2ff20 / 0x4de22adc40, i.e. slots of the 1,245,184-descriptor heap, whose arena equivalents are
+// 0x161ff20 / 0x1e1dc40 and therefore reachable by the shader's heap_base + base. False when the address is not in one.
+bool arena_offset_of_title_address(std::uint64_t address, std::uint64_t* out) {
+    std::lock_guard guard(descriptor_range_mutex());
+    for (const auto& range : descriptor_ranges()) {
+        if (!range.backing_start) continue;
+        const std::uint64_t bytes = range.custom_end - range.custom_start;
+        if (address < range.backing_start || address - range.backing_start >= bytes) continue;
+        *out = range.custom_start + (address - range.backing_start);
+        return true;
+    }
+    return false;
+}
+
+// Rewrites the base of every buffer V# in a table the shader is about to read from a console address in title memory to
+// the arena offset of the layer's copy of the same bytes, so heap_base + base lands on them. A T# is left alone: its
+// base is a hash key, never an address. Returns how many were rewritten.
+int rewrite_table_volume_bases(std::uint64_t table_offset, std::uint64_t bytes) {
+    if (!leonida::arena_host_base || table_offset + bytes > leonida::arena_host_size) return 0;
+    auto* words = reinterpret_cast<std::uint32_t*>(leonida::arena_host_base + table_offset);
+    int rewritten = 0;
+    for (std::uint64_t at = 0; at + 32 <= bytes; at += 32) {
+        std::uint32_t* w = words + at / 4;
+        // A gfx10 T# carries its image type in dword 3 bits 28-31 and only values 8..15 are types (1D, 2D, 3D, cube
+        // and their array forms). A V# has OOB_SELECT in bits 28-29 and ADD_TID_ENABLE in bit 30, so a plain
+        // "non-zero top nibble means T#" test classifies every V# whose OOB_SELECT is 3 as a T# -- measured on this
+        // title's composite table, whose V#s all carry format 0x30014fac. Only >= 8 is a T#.
+        if (((w[3] >> 28) & 0xf) >= 8) continue;  // a T#
+        const std::uint64_t base = (std::uint64_t(w[1] & 0xffff) << 32) | (w[0] & 0xfffffffcull);
+        if (!base || (base >> 32) == 0) continue;  // empty, or already a 32-bit arena offset
+        std::uint64_t mapped = 0;
+        if (!arena_offset_of_title_address(base, &mapped) || mapped >= leonida::arena_host_size) continue;
+        w[0] = static_cast<std::uint32_t>(mapped) | (w[0] & 0x3u);
+        w[1] = (w[1] & 0xffff0000u) | static_cast<std::uint32_t>(mapped >> 32);
+        ++rewritten;
+        if (rewritten <= 8)
+            std::fprintf(stderr, "[rt] table mirror: +0x%llx V# base 0x%llx -> arena 0x%llx\n",
+                         static_cast<unsigned long long>(at), static_cast<unsigned long long>(base),
+                         static_cast<unsigned long long>(mapped));
+    }
+    return rewritten;
+}
+
 // The VA a shader must be handed for the root table `table_va`: the VA itself once its bytes (and, with
 // LEONIDA_XS_MIRROR_BASES, the bytes behind its V#s) are in the arena, 0 when the table could not be mirrored.
 std::uint64_t mirror_table(DeviceProxy* device, std::uint64_t table_va, const char* what) {
     if (!device) return 0;
     const std::uint64_t bytes =
         std::min<std::uint64_t>(kMirrorTableBytes, leonida::arena_host_size - std::min(table_va, leonida::arena_host_size));
-    if (!bytes || !mirror_title_bytes(table_va, bytes)) return 0;
+    // The title's copy of this heap slot when the heap's GPU-handle range is registered, otherwise the table VA
+    // itself (a table VA that really is a console address in title memory).
+    const SIZE_T source = title_address_of(table_va);
+    const bool copied = source ? mirror_title_bytes_at(source, table_va, bytes)
+                               : mirror_title_bytes(table_va, bytes);
+    if (!bytes || !copied) return 0;
     static std::atomic<int> logged{0};
     const int nth = logged.fetch_add(1, std::memory_order_relaxed) + 1;
     if (nth <= 8)
-        std::fprintf(stderr, "[rt] table mirror %s: 0x%llx (%llu bytes) into the arena at the same offset\n", what,
+        std::fprintf(stderr,
+                     "[rt] table mirror %s: title 0x%llx -> arena 0x%llx (%llu bytes)\n", what,
+                     static_cast<unsigned long long>(source ? source : table_va),
                      static_cast<unsigned long long>(table_va), static_cast<unsigned long long>(bytes));
+    // LEONIDA_XS_MIRROR_VBASE: a table the title built itself names its buffers by console addresses in its own
+    // descriptor heap; rewrite those V# bases to the arena offsets of the layer's copies before the shader reads it.
+    if (std::getenv("LEONIDA_XS_MIRROR_VBASE")) rewrite_table_volume_bases(table_va, bytes);
     if (!std::getenv("LEONIDA_XS_MIRROR_BASES")) return table_va;
     // The descriptors are a 32-byte grid and a V# is worth mirroring only when its base is title memory the shader
     // would read: one V# can be the position matrix (64 bytes), another a vertex buffer. Each base takes a page.
@@ -3880,7 +3980,7 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                     ++pairs;
                                     continue;
                                 }
-                                if ((w[3] >> 28) & 0xf) {
+                                if (((w[3] >> 28) & 0xf) >= 8) {
                                     ++tsharps;
                                     if (tsharps <= 6) {
                                         const std::uint64_t addr =
