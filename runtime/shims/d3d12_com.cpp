@@ -16,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <set>
@@ -445,6 +446,17 @@ public:
             if (handle) render_targets_[i] = *reinterpret_cast<const leonida::TargetView*>(handle);
         }
         depth_ = depth && depth->ptr ? *reinterpret_cast<const leonida::TargetView*>(depth->ptr) : leonida::TargetView{};
+        // LEONIDA_LOG_RT_BIND=1: the resource ids the first lists render into, to compare with the textures a present
+        // names (a frame of all zeros is either drawn elsewhere or not drawn at all).
+        if (std::getenv("LEONIDA_LOG_RT_BIND")) {
+            static int logged = 0;
+            if (logged++ < 60) {
+                std::fprintf(stderr, "[rt] rtv bind: count %u", count);
+                for (UINT i = 0; i < count; ++i)
+                    std::fprintf(stderr, " id %llu", static_cast<unsigned long long>(render_targets_[i].resource));
+                std::fprintf(stderr, "\n");
+            }
+        }
     }
 
     void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT factor[4]) override {
