@@ -2120,6 +2120,14 @@ void rewrite_table_descriptors(DeviceProxy* device, std::uint64_t va, std::uint8
                                           : ((std::uint64_t(words[1] & 0xffff) << 32) | (words[0] & 0xfffffffcull));
         if (!address) continue;
         const std::uint64_t source = address;
+        // LEONIDA_XS_TABLE_INDIRECT: the entry can name a per-resource structure whose first qword is the data rather
+        // than the data itself (title memory at such a base held {ptr, 0, ptr, 0} pairs). Follow one pointer first.
+        if (type < 8 && std::getenv("LEONIDA_XS_TABLE_INDIRECT") &&
+            leonida::is_committed(reinterpret_cast<const void*>(address))) {
+            std::uint64_t inner = 0;
+            leonida::copy_committed(reinterpret_cast<std::uint8_t*>(&inner), address, sizeof(inner));
+            if (inner) address = inner;
+        }
         // A title VA is a host address here, so title memory at that number wins over the "inside the arena" reading:
         // a console VA that merely lies in the arena's range has no data behind it, while the title's memory does.
         if (leonida::is_committed(reinterpret_cast<const void*>(address))) {
@@ -2147,6 +2155,14 @@ void rewrite_table_descriptors(DeviceProxy* device, std::uint64_t va, std::uint8
         } else {
             words[0] = std::uint32_t(address & 0xfffffffcull) | (words[0] & 3u);
             words[1] = (words[1] & 0xffff0000u) | std::uint32_t((address >> 32) & 0xffff);
+            // A title's table is not a gfx10 V# (the dword a shader reads as NUM_RECORDS repeats the address), so the
+            // count a shader would loop over is meaningless. Clamp it to what the window copy actually holds, which
+            // keeps a rewritten table usable instead of sending the shader on an enormous loop (a GPU hang).
+            const unsigned stride = (words[1] >> 16) & 0x3fff;
+            const std::uint64_t records = words[2];
+            const std::uint64_t limit = 4096;
+            words[2] = std::uint32_t(stride ? std::min<std::uint64_t>(records, limit / stride)
+                                            : std::min<std::uint64_t>(records, limit));
         }
         std::memcpy(window + at, words, type >= 8 ? 32 : 16);
         // LEONIDA_LOG_TABLE: what the rewrite made of the first records, and the first bytes of the data they name.
