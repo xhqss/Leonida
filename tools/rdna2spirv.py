@@ -7670,8 +7670,10 @@ class Gen:
             # s_lshl_b64); a lane-mask source stays Unsupported (#210).
             x = a[1]
             if self.holds_lane_mask(x):
-                raise Unsupported(op + " of a lane mask")
-            if x["k"] == "sgpr" and x.get("n") == 2:
+                # The mask's bits are the value: s_flbit_i32_b64 of a wave mask asks where the highest set lane is,
+                # which reading the register as this lane's 0 / ~0 would answer per lane instead.
+                lo, hi = self.wave_mask(x)
+            elif x["k"] == "sgpr" and x.get("n") == 2:
                 lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
             elif x["k"] == "imm":
                 v = x["v"] & 0xFFFFFFFFFFFFFFFF
@@ -16471,8 +16473,17 @@ def check_printed_encodings(path, info):
     holds that range, is checked: a hand-written listing, run_gpu_tests.py's "code 0x0..0x0 (synthetic)" and a
     test's header-only blob are not the bytes the text came from."""
     with open(path, encoding="utf-8", errors="replace") as f:
-        m = HDR.match(f.readline())
+        first = f.readline()
+    m = HDR.match(first)
     if not m or int(m.group(3), 16) <= int(m.group(2), 16):
+        return
+    # A listing that declares undecodable words has a hole in its pc stream: the skipped words are not instructions,
+    # so an instruction's pc no longer names the same offset in the blob and this check compares against the wrong
+    # bytes (measured: v_nop_e64 at 0x8 of a listing with "1 invalid words" reads the blob 4 bytes late). The check
+    # exists for a clean listing whose disassembler dropped a field, which is what llvm-mc did; the in-house decoder
+    # writes the holes itself, so a listing with them is skipped here instead of refused later.
+    invalid = re.search(r"(\d+) invalid words", first)
+    if invalid and int(invalid.group(1)) > 0:
         return
     fssm, code, _ = native_paths(path, info["name"])
     if not (os.path.isfile(fssm) or os.path.isfile(code)):
