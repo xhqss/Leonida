@@ -2191,6 +2191,53 @@ void rewrite_table_descriptors(DeviceProxy* device, std::uint64_t va, std::uint8
     }
 }
 
+// LEONIDA_XS_TABLE_VBASE: make the V#s a title wrote into a table readable by the shader.
+//
+// The table a title hands `SetGraphicsRootDescriptorTable` here is title memory at a numeric host address (va), and
+// the shader reads it as heap_base + va. The entries are the title's own descriptors: the composite VS reads a
+// 16-byte gfx10 V# at table+0x00 (the 4x4 position matrix) and another at table+0x40 (the vertex buffer), and their
+// bases are 48-bit console VAs (0x84400000002, 0x80800000004, ...) -- title memory at that numeric address, which no
+// device address can name. So for each descriptor slot (32-byte grid, first 16 bytes) whose base is committed title
+// memory, replace the base with the device address of the 4 MiB window guest_translate copies those bytes into; the
+// shader's heap_base + base then reads the title's real matrix instead of zeros. A base that is neither title memory
+// nor inside the arena names nothing, so zero the entry (a zero bounds check turns the load into 0) rather than let
+// the shader add heap_base to an address outside every mapping and lose the device.
+// The window count is capped: each base makes a 4 MiB window, and a title with a ring of tables would otherwise
+// allocate a window per frame.
+void rewrite_vsharp_bases(DeviceProxy* device, std::uint64_t va, std::uint8_t* window, std::uint64_t bytes) {
+    constexpr int kWindowCap = 64;
+    static std::atomic<int> window_count{0};
+    const std::uint64_t arena = leonida::arena_host_size;
+    std::vector<std::uint32_t> table(static_cast<std::size_t>(bytes / 4), 0);
+    leonida::copy_committed(reinterpret_cast<std::uint8_t*>(table.data()), va, bytes);
+    const auto log_first = [&](std::uint64_t at, std::uint64_t base, std::uint64_t to, bool zeroed) {
+        static std::atomic<int> shown{0};
+        if (shown.fetch_add(1, std::memory_order_relaxed) < 12)
+            std::fprintf(stderr, "[rt] vbase +0x%llx: base 0x%llx -> %s0x%llx committed %d\n",
+                         static_cast<unsigned long long>(at), static_cast<unsigned long long>(base),
+                         zeroed ? "zero " : "", static_cast<unsigned long long>(to),
+                         leonida::is_committed(reinterpret_cast<const void*>(base)) ? 1 : 0);
+    };
+    for (std::uint64_t at = 0; at + 16 <= bytes; at += 32) {
+        std::uint32_t* words = table.data() + at / 4;
+        const std::uint64_t base = (std::uint64_t(words[1] & 0xffff) << 32) | (words[0] & 0xfffffffcull);
+        if (!base) continue;
+        if (leonida::is_committed(reinterpret_cast<const void*>(base))) {
+            if (window_count.load(std::memory_order_relaxed) >= kWindowCap) continue;
+            const std::uint64_t window_va = guest_translate(device, base, 4096);
+            if (!window_va) continue;
+            if (window_va != base) window_count.fetch_add(1, std::memory_order_relaxed);
+            words[0] = std::uint32_t(window_va & 0xfffffffcull) | (words[0] & 3u);
+            words[1] = (words[1] & 0xffff0000u) | std::uint32_t((window_va >> 32) & 0xffff);
+            log_first(at, base, window_va, false);
+        } else if (base >= arena) {
+            std::memset(words, 0, 16);
+            log_first(at, base, 0, true);
+        }
+    }
+    std::memcpy(window, table.data(), bytes);
+}
+
 // The device address a shader must read for the title address `va`: the upload arena's, the title-memory window's, or
 // the address itself when it already is one.
 std::uint64_t shader_address(DeviceProxy* device, std::uint64_t va, std::uint64_t bytes) {
@@ -3073,7 +3120,16 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                             leonida::arena_host_size;
                 const std::uint64_t heap_va =
                     is_backing ? in_layer.ptr - reinterpret_cast<SIZE_T>(leonida::arena_host_base) : a2;
-                if (std::getenv("LEONIDA_XS_HEAP_VA")) a2 = heap_va;
+                if (std::getenv("LEONIDA_XS_TABLE_VBASE")) {
+                    // The title's own table, copied into a window and with its V# bases turned into the device
+                    // addresses of windows over the title memory they name (see rewrite_vsharp_bases).
+                    const std::uint64_t translated = guest_translate(self->device, a2, 64 << 10, false);
+                    if (translated) {
+                        if (std::uint8_t* window = guest_window_bytes(self->device, a2, 64 << 10))
+                            rewrite_vsharp_bases(self->device, a2, window, 64 << 10);
+                        a2 = translated;
+                    }
+                } else if (std::getenv("LEONIDA_XS_HEAP_VA")) a2 = heap_va;
                 else if (a2 == heap_va) {
                     // LEONIDA_XS_TABLE_FIX: give the shader a window copy of the title's table, with each descriptor's
                     // address rewritten to the window (or arena VA) the shader's heap_base + address must reach, and
@@ -3093,6 +3149,104 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                         if (translated) a2 = translated;
                     } else if (std::getenv("LEONIDA_XS_TABLE_VA")) {
                         a2 = shader_address(self->device, a2, 64 << 10);
+                    }
+                }
+                // LEONIDA_LOG_TABLE3: three-way dump of the memory a shader reads a table from. The composite VS
+                // reads a 16-byte gfx10 V# at table+0x00 and another at table+0x40 (its SPIR-V forms the address
+                // as heap_base + table_va and does s_load_dwordx4 at those offsets), so the question the protocol
+                // reaches is: which of the views holds a V#? The arena at the VA the shader adds (what heap_base +
+                // va reaches), the title's own pages at the same numeric VA, or the heap backing the range maps.
+                // - a2 is what the shim hands the layer (optionally translated by XS_TABLE_FIX / XS_HEAP_VA);
+                // - the range, when there is one, says where the layer writes the descriptors of that heap.
+                if (std::getenv("LEONIDA_LOG_TABLE3")) {
+                    static std::mutex t3_lock;
+                    static std::uint64_t t3_seen[16];
+                    static int t3_used = 0;
+                    bool fresh = false;
+                    {
+                        std::lock_guard guard(t3_lock);
+                        bool known = false;
+                        for (int i = 0; i < t3_used; ++i)
+                            if (t3_seen[i] == table_va) {
+                                known = true;
+                                break;
+                            }
+                        if (!known && t3_used < 16) {
+                            t3_seen[t3_used++] = table_va;
+                            fresh = true;
+                        }
+                    }
+                    if (fresh) {
+                        static std::atomic<int> t3_nth{0};
+                        const int nth = t3_nth.fetch_add(1, std::memory_order_relaxed) + 1;
+                        DescriptorRange range{};
+                        const bool in_range = find_descriptor_range(self->device, SIZE_T(table_va), &range);
+                        std::fprintf(stderr,
+                                     "[rt] table3 %d: index %llu va 0x%llx handed 0x%llx in_layer 0x%llx backing %d"
+                                     "; range %d custom 0x%llx real 0x%llx backing 0x%llx gpu %d\n",
+                                     nth, static_cast<unsigned long long>(a1),
+                                     static_cast<unsigned long long>(table_va),
+                                     static_cast<unsigned long long>(a2),
+                                     static_cast<unsigned long long>(in_layer.ptr), is_backing ? 1 : 0,
+                                     in_range ? 1 : 0, static_cast<unsigned long long>(range.custom_start),
+                                     static_cast<unsigned long long>(range.real_start),
+                                     static_cast<unsigned long long>(range.backing_start), range.gpu ? 1 : 0);
+                        const auto hex20 = [&](const char* tag, const std::uint8_t* base, std::uint64_t offset) {
+                            if (!base) return;
+                            std::fprintf(stderr, "[rt] table3 %d %s:", nth, tag);
+                            for (int i = 0; i < 20; ++i) {
+                                std::uint32_t word = 0;
+                                std::memcpy(&word, base + offset + 4 * i, sizeof(word));
+                                std::fprintf(stderr, " %08x%s", word, i == 3 || i == 15 ? "|" : "");
+                            }
+                            std::fprintf(stderr, "\n");
+                        };
+                        // What the shader reaches: heap_base + handed VA, in the arena's host mapping.
+                        if (leonida::arena_host_base && a2 < leonida::arena_host_size)
+                            hex20("arena", leonida::arena_host_base, a2);
+                        // The title's own pages at the same numeric address.
+                        if (leonida::is_committed(reinterpret_cast<const void*>(table_va))) {
+                            std::uint8_t words[80] = {};
+                            leonida::copy_committed(words, table_va, sizeof(words));
+                            hex20("title", words, 0);
+                        }
+                        // Where the layer writes the descriptors of the heap that contains this VA.
+                        if (in_range && leonida::arena_host_base && range.real_start >=
+                                                                         reinterpret_cast<SIZE_T>(leonida::arena_host_base)) {
+                            const std::uint64_t off = range.real_start -
+                                                      reinterpret_cast<SIZE_T>(leonida::arena_host_base) +
+                                                      (table_va - range.custom_start);
+                            if (off < leonida::arena_host_size) hex20("range-arena", leonida::arena_host_base, off);
+                        }
+                        if (in_range && range.backing_start) {
+                            std::uint8_t words[80] = {};
+                            const std::uint64_t off = range.backing_start + (table_va - range.custom_start);
+                            leonida::copy_committed(words, off, sizeof(words));
+                            hex20("range-title", words, 0);
+                        }
+                        // Decode the descriptors of the first tables as gfx10 V#s (the layout the composite VS uses,
+                        // see rewrite_vsharp_bases): slot k sits at 32*k and its first 16 bytes are the descriptor the
+                        // shader loads. "committed" says whether the base is title host memory, which is what
+                        // guest_translate can copy into a window; "head" is the first 16 bytes there, so a 4x4
+                        // position matrix (3f800000 and friends) can be recognised directly.
+                        if (nth <= 4) {
+                            std::uint32_t t[64] = {};
+                            leonida::copy_committed(reinterpret_cast<std::uint8_t*>(t), table_va, sizeof(t));
+                            for (int slot = 0; slot < 8; ++slot) {
+                                const std::uint32_t* w = t + slot * 8;
+                                const std::uint64_t base =
+                                    (std::uint64_t(w[1] & 0xffff) << 32) | (w[0] & 0xfffffffcull);
+                                const unsigned stride = (w[1] >> 16) & 0x3fff;
+                                const bool committed = leonida::is_committed(reinterpret_cast<const void*>(base));
+                                std::uint32_t head[4] = {};
+                                if (committed) leonida::copy_committed(reinterpret_cast<std::uint8_t*>(head), base, 16);
+                                std::fprintf(stderr,
+                                             "[rt] table3 %d slot %d: w3 %08x base 0x%llx stride %u records %u "
+                                             "committed %d head %08x %08x %08x %08x\n",
+                                             nth, slot, w[3], static_cast<unsigned long long>(base), stride, w[2],
+                                             committed ? 1 : 0, head[0], head[1], head[2], head[3]);
+                            }
+                        }
                     }
                 }
                 if (std::getenv("LEONIDA_LOG_ROOT")) {

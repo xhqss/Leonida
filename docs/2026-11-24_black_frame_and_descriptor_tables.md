@@ -526,6 +526,109 @@ table 1 (0xb94ef00):  +0: 42 0 0c0001 0d | +20: 42 0 0c0001 07 | +40: 42 0 0c000
 本机没有 capstone，但可以用 `dumpbin /DISASM`（MSVC 自带）或按 RVA 用项目 `tmp/dis.py` 的 PE 解析 + 
 手写几条指令解码先定位函数。拿到写表代码后，把这段结论写回本节。
 
+---
+
+# 追加：第八轮（2026-11-25 00:05）—— 静态读语料：合成 VS 要的就是标准 gfx10 V#，位置是表 +0x00 / +0x40
+
+写监视之前，先把"着色器到底想要什么"从语料里**静态**读出来 —— 语料目录里就有 `.spvasm`
+（`spirv-dis` 输出），不用跑游戏。`(sga_dr_vs_pos_color_tex_c32788bc_Wrapped.spvasm` 的关键路径：
+
+1. 表地址 = `heap_base + ((s9<<32) | (s8 & 0xfffffffc))`（第 425–434 行）。s8 是 user SGPR 基址，
+   s9 是 `s_load` 的 64 位地址高半，**必须为 0**，否则地址直接飞出 arena。
+2. 在表 **+0x00** 读 4 dword → s4..s7；在表 **+0x40** 读 4 dword → s0..s3（第 438–468 行）。
+   即合成 VS 的表布局 = `+0x00` 一个描述符、`+0x40` 一个描述符，和"32 字节槽"一致（槽 0、槽 2）。
+   **之前的 `LEONIDA_LOG_VSHARP` 在任意 16 字节窗口上打分，是因为不知道这两个固定偏移；
+   现在知道只有这两个位置有意义。**
+3. s4..s7 按 **gfx10 V#** 解：`base = (s5 & 0xffff)<<32 | (s4 & ~3)`，`stride = s5[29:16]`，
+   `num_records = s6`，随后从 `base + 0x00/0x10/0x20/0x30` 读 4 个 4-dword 行组成矩阵，每一步都按
+   `num_records*stride`（stride=0 时用 num_records）做边界检查（第 473–531 行）。
+4. s0..s3 同样按 gfx10 V# 解，再 `+0x160` 读顶点（第 669–720 行）。
+
+**结论：格式不再是未知数。** 着色器消费的就是标准 gfx10 16 字节 V#，字段解释与
+`docs/d3d12_vulkan.md` §3.3 完全一致。于是第七轮"表里的 A/B 解不出 V#"说明了另一件事：
+**在那个 VA 上读到的内存并不是着色器要读的那 16 字节** —— 层写描述符的位置 ≠ 表 VA 指向的位置，
+或者两处 VA 只是数值相同的巧合（第一轮"arena 同偏移全零、标题同 VA 有数据"正好对上这个解释）。
+
+## 1. 下一步（从"猜格式"改成"对地址"）
+
+三路对照 dump（一次 40 秒运行）：对 slot 36 收到的合成表 VA，同时打印
+
+- (a) arena 在该偏移的 0x80 字节（着色器实际会读到的）；
+- (b) 标题内存同 VA 的 0x80 字节（`copy_committed` 读到的）；
+- (c) 该 VA 落在哪个 `DescriptorRange`（CPU/GPU/backing 三个起点），以及层为这张表写过的 T#/V# 字节。
+
+判据：若 (c) 的 backing 与 (a) 不一致 → 写侧/读侧地址模型不一致（架构问题，见本文 §9 第 3 条）；
+若 (a) 本该是 V# 却是 0 → `Create*View`/`CopyDescriptors` 根本没写到这张表。
+
+## 2. 写监视降级为备选
+
+只有当三路对照仍然解释不了时，才上 `PAGE_GUARD` + VEH（成本高：要抓 RIP、还要反汇编）。
+
+---
+
+# 追加：第九轮（2026-11-25 00:10–00:20）—— 地址对上了：GPU handle = arena 偏移，但着色器读的那份是 0
+
+## 1. 新探针 `LEONIDA_LOG_TABLE3`（三路对照）
+
+slot 36 对每个（去重后的）表 VA 打四份 80 字节：
+
+- `arena`：`heap_base + va` 在 arena 宿主映射里读到的（**着色器实际读的**）；
+- `title`：宿主地址同数值的字节（`copy_committed`）；
+- `range-arena` / `range-title`：该 VA 命中 `DescriptorRange` 时，层的 real（arena 内）和标题 backing 上的同一偏移。
+
+另有 `slot k` 行：按 32 字节槽解第 k 槽前 16 字节成 gfx10 V#（base/stride/records/w3），并打印 base 是否
+committed、以及 base 处的头 4 个 dword。
+
+复现：
+
+```powershell
+powershell -File tmp\run-probe.ps1 -Tag heapva -Seconds 25 `
+  -Set 'XS_GPU_HANDLE=1,XS_HEAP_VA=1,LOG_TABLE3=1,DEVICE_FAULT=1,CAPTURE=...\tmp\vbcap2,CAPTURE_LIMIT=3'
+```
+
+## 2. 关键发现
+
+1. **不开 `XS_GPU_HANDLE` 时，表 VA 不在任何 `DescriptorRange`（`range 0`）**。此时 `copy_committed` 在
+   `0xb94ef00` 读到的东西（第七轮的 `{2,0x844,0xbc6,0x210440}`、`{0x42,0,0xc0001,0xd}`）**是碰巧被提交的
+   无关宿主内存**（第 2 节坑 #2 那个 `is_committed` 陷阱），不是标题写的描述符。**前几轮对这堆字节做的
+   格式推断全部作废**，包括"槽=32 字节 {A,B}"、"A/B 都不是 V#"。
+2. 开 `XS_GPU_HANDLE=1,XS_HEAP_VA=1` 后地址模型确定下来：
+
+   ```
+   table3 1: index 0 va 0xb94ef00 handed 0xb94ef00 in_layer 0x4ddba3ef00 backing 1;
+             range 1 custom 0xae10000 real 0x4ddaf00000 backing 0x4de00f0000 gpu 1
+   ```
+
+   即 **GPU handle 空间 = arena 偏移**（custom 0xae10000 是 heap 的 GPU handle 起点，real 是 arena 里的宿主
+   地址，backing 是标题自己的 XMem 映射）。`in_layer = real + (va - custom)` 与
+   `0x4ddaf00000 + (0xb94ef00-0xae10000) = 0x4ddba3ef00` 完全一致 → **地址对得上了**。
+3. 但同一偏移上：
+
+   - `range-arena`（着色器会读的 arena 副本）：**全 0**；
+   - `range-title`（标题 backing）：有数据，形如 `{ptr, 0, ptr, 0}` 的 16 字节对（`ptr` = 0x8ed1e20、
+     0xc227210 这类），偶尔夹 `bf800000 3f800000`（-1.0f / 1.0f）。
+
+   而 `LEONIDA_LOG_DESC_WRITE`（另一次 20 s 跑）显示层的 T# 写入都 **in arena 1**，目标在
+   `0x4DDAF00260` 这种偏移（arena 偏移 ≈ 0xAE00xxx）。
+
+## 3. 结论：heap 身份错位
+
+层把描述符写进了 heap X（arena 偏移 0xAE00xxx），标题的 `SetGraphicsRootDescriptorTable` 却指到 heap Y
+（注册范围从 0xAE10000 起）——两个 heap 的 GPU handle 区不重合，于是着色器在 `heap_base + table_va` 读到
+**全 0**，解出 V#=0（base/stride/records 全 0，边界检查通过但读出 0），矩阵 = 0，位置全退化，一个像素都不写。
+这与第一轮"arena 同偏移全零"、第三轮"洋红 PS 也不出像素"完全一致。
+
+## 4. 下一轮（具体）
+
+1. 给每个 descriptor heap 打唯一 id，记录 `(CPU start, GPU start, 范围)`：`CreateDescriptorHeap` 时打印一次；
+   `Create*View` 时打印 heap id + slot 序号；slot 36 时打印 table VA 落在哪个 heap id。
+   对不上就是错位点（最可能是 `GetGPUDescriptorHandleForHeapStart` 的偏移算法或 heap 复用了同一个 handle 区）。
+2. 修好后 `range-arena` 应该是标题 backing 里那份数据的副本（或直接就是同一块内存）；再看着色器读到的 V#
+   能不能解出一个能读的 base（此时 base 应在 arena 内）。
+3. 已弃用：`LEONIDA_XS_TABLE_VBASE`（把 V# base 当标题宿主地址去窗口化）。24 s 跑实测 device lost：
+   `fault 0x302e40000 / heap_base 0x202e40000` = `heap_base + 0x100000000`，证明那些 48 位 base 不是标题
+   宿主地址。开关保留，默认关。
+
 
 
 
