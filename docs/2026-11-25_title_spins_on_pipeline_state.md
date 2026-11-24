@@ -475,3 +475,138 @@ BL-4 的实现方案是"census the descriptor words the title writes（统计多
 既无法被这些数据证实也无法被否证——要先解决"描述符到底在哪"（§8.5 的两个分支）。
 把这条写进文档，是为了让下一个接手的人不要再去重做这个 census。
 
+---
+
+## 10. 这一轮踩到的坑（本轮新增，按代价排序）
+
+1. **`Select-String ... | Select-Object -Last N` 会把关键行截掉，然后骗你得出"问题解决了"。**
+   本轮我就因此错误地宣布"断言消失了"：断言发生在 swapchain 创建**之前**，而我只看了日志最后 6 行。
+   正确做法：先按模式**计数**（`(Select-String -Pattern 'assert skipped' | Measure-Object).Count`），
+   再看上下文。任何"某个症状不见了"的结论都必须用计数、并用足够长的运行时间（断言在 ~第 13 秒才出现）。
+2. **`git reset --hard` 是本轮唯一一次动破坏性 git 命令**（为了清掉自己那次失败 cherry-pick 的
+   冲突标记，HEAD 是刚提交的自己）。以后要么别用 `-n` cherry-pick，要么先用 `git stash`。
+   注意 `git cherry-pick --abort` 对 `-n` 的 cherry-pick **无效**（会说 "no cherry-pick in progress"），
+   而 `git checkout -- <file>` 对 unmerged 路径也会拒绝，只剩 reset 一条路。
+3. **`ctest -j8` 不能和游戏运行同时跑**：本轮同时跑时多出 `d3d12_texture_tiles` 和
+   `d3d12_bindless_churn_validated` 两个假失败，单独重跑都通过。跑 ctest 前先 `Stop-Process gta6rt`，
+   并且不要并发跑探针。
+4. **本会话的 Python 子进程不能写文件**（沙箱只给它读）：`tmp/exe_bytes.py` 落盘会
+   `PermissionError`。所以工具改成**打印**（`tmp/hexdump_rva.py`）。PowerShell 子进程可以写。
+5. **不要用 PowerShell 的 `Set-Content` 改项目文件**（本轮违例一次：`d3d12_xs_device.cpp`）。
+   之后核对过：`git diff --stat` 只有预期行数、无 BOM、全 LF，未造成损坏；但以后一律用内置 edit 工具。
+6. **`upload_translate` 只覆盖 upload chunk**。slot 70 那些地址是标题 XMem 堆里的地址，
+   所以"加一句 upload_translate 就好了"不成立（本轮实测：翻译前后地址一模一样）。
+7. **`guest_translate` 的 4 MiB 窗口不回收**：标题地址每帧前进一个窗口 ⇒ 约 800 MB/s 内存增长、
+   帧率减半。任何"按地址建窗口"的方案都必须先做有界池（本轮 §8.3 的 1 MiB 槽位池就是答案）。
+8. **`Select-String -Context` 的输出顺序会混**（`table3` 那种多条探针交叉打印时），
+   对同一个 VA 的多份 dump 要按行号排序后再对照。
+9. **断言探针要打 `rsi/rdi/rbp`**，不能只打 `rcx..r9`：这个标题的断言参数在 `rsi` 指向的记录里，
+   前四个参数寄存器全是无关值（本轮补上之后才看清 `cmp dword [rsi+4], 0` 在读什么）。
+10. **`LEONIDA_ARENA_MB` 的上限是 2048 MiB**（设备同时受 `maxBufferSize` 与
+    `maxMemoryAllocationSize` 限制），不是文档里说的 4095；`4095` 会被静默裁到 2048。
+
+---
+
+## 11. 继续工作的入口（下一轮直接从这里开始）
+
+本轮把 §9.5 的断言追到了**下一层**，这是目前最具体的一条线：
+
+`0x1403440d0..0x1403441a0` 反汇编显示这段代码在做：
+
+```
+140344100  f6 47 30 03              test byte [rdi+0x30], 3          ; rdi = 一个 D3D12_RESOURCE_DESC*
+14034410c  49 81 fc 07 00 08 00     cmp  r12, 0x80007
+140344115  b8 00 10 00 00           mov  eax, 0x1000
+14034412a  48 89 47 08              mov  [rdi+8], rax                ; desc->Alignment = 4096
+14034413f  ff 90 c8 00 00 00        call qword [rax+0xc8]            ; 全局设备对象 vtable 的 slot 25
+140344145  c5 f8 11 06              vmovups [rsi], xmm0              ; 把 16 字节返回值拷到 rsi
+14034414e  48 81 7e 08 00 10 00 00  cmp  qword [rsi+8], 0x1000
+140344190  83 7e 04 00              cmp  dword [rsi+4], 0
+140344196  cc                       int3
+```
+
+- `0xc8/8 = 25` ⇒ 这就是**设备 slot 25 = `GetResourceAllocationInfo`**，和断言前那行
+  `slot 25: render targets sized as console tiles, 393216 B for 262144 B` 对得上。
+- 断言时 `rsi` 的 16 字节是 `ffffffff ffffffff | 00010000 00000000`，也就是
+  **`SizeInBytes = UINT64_MAX`**（层里 `apply_console_placement` 把 `UINT64_MAX` 当作
+  "PC 设备拒绝了这条 desc"的哨兵，直接 return）。
+- ⇒ **真正的问题很可能是：某一次 `GetResourceAllocationInfo` 返回了 `UINT64_MAX`（无效），
+  标题拿到它之后断言。** 不是描述符、不是 null view。
+
+下一轮第一件事（10 分钟）：
+
+1. 在 `proxy_get_resource_allocation_info` 里把**每一条返回 `UINT64_MAX` 的调用**连 desc
+   （Dimension/Width/Height/DepthOrArraySize/MipLevels/Format/SampleDesc/Layout/Flags/Alignment）
+   一起打印出来（前 8 条 + 每 500 条），确认是哪条 desc 被 PC 设备拒绝；
+2. 再对被拒的那条 desc 逐字段和 `d3d12.h` 的合法性要求对照（Alignment 只有
+   0 / 4 / 64K 三个合法值，而标题这里写的是 **4096** ⇒ 很可能就是 `Alignment = 4096` 导致
+   PC 设备返回 `UINT64_MAX`；见 `alignment 4096` 这一项，它既不是 0 也不是 4 或 65536）。
+3. 如果确认是 Alignment=4096：把 desc 的 Alignment 按 D3D12 规则归一化后再问 PC 设备
+   （或自己按 console 的 placement 规则算），让标题拿到合法结果。
+
+---
+
+## 12. 第三轮：那个断言是**真修掉了**（不是跳过）
+
+### 12.1 定位过程（15 分钟，按 §11 的入口走的）
+
+新开关 `LEONIDA_LOG_ALLOC_REFUSED=1`：每次 `GetResourceAllocationInfo`（设备 slot 25）
+返回 `UINT64_MAX` 就打一条，带 desc 的全部字段。第一次运行就抓到**唯一**一条：
+
+```
+[rt] d3d12_xs: slot 25 refused a description (#1, mask 0x1, 1 of them):
+[rt] d3d12_xs:   [0] dimension 3 alignment 0x0 width 2560 height 1440 depth 1 mips 1 format 19
+                     samples 1/0 layout 0 flags 0x6
+```
+
+（`dimension 3` = TEXTURE2D，`format 19` = `DXGI_FORMAT_R32G8X24_TYPELESS`，
+`flags 0x6` = `ALLOW_DEPTH_STENCIL | ALLOW_UNORDERED_ACCESS`。）
+
+然后同一条 desc 逐字段做**对照重试**（同一个探针里，每次去掉一个候选字段）：
+
+```
+as sent                          -> size 0xffffffffffffffff alignment 0x10000   ← 被拒
+without ALLOW_UNORDERED_ACCESS   -> size 0x1330000        alignment 0x10000   ← 通过
+without ALLOW_DEPTH_STENCIL      -> size 0xffffffffffffffff alignment 0x10000   ← 仍被拒
+without either flag              -> size 0x12c0000        alignment 0x10000
+as D32_FLOAT                     -> size 0xf00000         alignment 0x10000
+```
+
+⇒ **唯一原因是"深度格式上带 `ALLOW_UNORDERED_ACCESS`"**。PC 的 D3D12 不给任何深度格式 UAV 支持，
+所以这条组合非法；console 允许，所以我们之前是"把非法描述交给宿主、拿到 `UINT64_MAX`、
+标题拿去建资源、断言"。
+
+而断言现场 `rsi` 的 16 字节正是 `{SizeInBytes = 0xffffffffffffffff, Alignment = 0x10000}`
+—— 与 `as sent` 那一行的返回值一字不差。**§9.5 的"未知记录"到此闭环。**
+
+### 12.2 修法
+
+`runtime/shims/d3d12_xs_desc_clean.h` 新增：
+
+- `is_depth_format(DXGI_FORMAT)`：9 个深度/模板格式（含对应的 TYPELESS）；
+- `drop_depth_uav_flag(Desc&)`：格式是深度且带 `ALLOW_UNORDERED_ACCESS` 时丢掉该位；
+- `pc_resource_desc()` 里调用它（覆盖 console→PC 的转换）。
+
+并在三条会把 desc 交给 PC 设备的路径上统一应用：slot 25（`GetResourceAllocationInfo`，
+含 PC-ABI 分支）、slot 108（`GetResourceAllocationInfo2`）、slot 127（
+`CreateCommittedResource3X`）。理由：这是**宿主的规则**，不是某个 ABI 的规则。
+
+### 12.3 验证
+
+| 检查 | 修前 | 修后 |
+| --- | --- | --- |
+| `LEONIDA_LOG_ALLOC_REFUSED` 抓到的被拒 desc | 1 条（每次运行） | **0 条** |
+| guest 断言 `game_scarlett_master.exe+0x344196` | 每次运行 1 次 | **0 次**（40 s 与 180 s 都没有） |
+| **`LEONIDA_SKIP_ASSERTS=0`（不跳过断言）** | 13 秒后进程退出 | **跑满 120 s：22,980 presents、0 fault、0 断言** |
+| 默认跑法 | 2880 presents / 30 s，0 fault | 3780 presents / 40 s（≈95/s），0 fault |
+
+⇒ **标题不再需要 `LEONIDA_SKIP_ASSERTS`**。这一点很重要：那个开关会**静默吃掉**所有 guest 断言，
+它之前一直掩盖着这个 bug。建议以后的回归基线都跑 `LEONIDA_SKIP_ASSERTS=0`，让断言露出来。
+
+### 12.4 但画面还是黑的（诚实结论）
+
+修完之后：描述符总数**仍是 63**（最大槽号 103）、每帧仍是 4 个 3 顶点 blit、
+表槽仍是 368,373 + 4096·frame 且从未被写、抓帧 `min=0 max=0`。
+也就是说：**这个断言只是"宿主给的分配信息非法"这条独立 bug，不是"没有场景渲染"的原因。**
+§8.5 / §11 描述的"描述符表到底在哪"仍然是黑屏的主线。
+

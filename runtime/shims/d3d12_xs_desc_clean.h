@@ -23,6 +23,39 @@ constexpr std::uint32_t kPcResourceFlagsMask =
 
 constexpr auto kXboxTiledResourceLayout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
 
+// Formats the PC runtime stores as depth/stencil. It gives none of them a UAV, so ALLOW_UNORDERED_ACCESS on such a
+// description is invalid there: measured on 1.0.2.1, a 2560x1440 R32G8X24_TYPELESS description with
+// ALLOW_DEPTH_STENCIL | ALLOW_UNORDERED_ACCESS makes GetResourceAllocationInfo answer UINT64_MAX, and the same
+// description without the UAV bit is accepted (0x1330000 bytes). The title then asserts on the UINT64_MAX right after
+// the call (its check at game_scarlett_master.exe+0x344196), so the bit has to go.
+constexpr bool is_depth_format(DXGI_FORMAT format) noexcept {
+    switch (format) {
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        case DXGI_FORMAT_R16_TYPELESS:
+        case DXGI_FORMAT_D16_UNORM:
+        case DXGI_FORMAT_D32_FLOAT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Drops ALLOW_UNORDERED_ACCESS from a description whose format is depth/stencil, the one combination the console
+// allows and the PC runtime refuses. Returns whether it dropped the bit. Works on D3D12_RESOURCE_DESC and
+// D3D12_RESOURCE_DESC1 alike.
+template <class Desc>
+inline bool drop_depth_uav_flag(Desc& pc) noexcept {
+    const auto flags = static_cast<std::uint32_t>(pc.Flags);
+    if ((flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0 || !is_depth_format(pc.Format)) return false;
+    pc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(flags & ~std::uint32_t{D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS});
+    return true;
+}
+
 // Strip Xbox-only flags and translate the Xbox tiled layout. Preserve all other layouts so the host can validate them.
 inline D3D12_RESOURCE_DESC pc_resource_desc(const D3D12_RESOURCE_DESC& xbox) {
     D3D12_RESOURCE_DESC pc = xbox;
@@ -31,6 +64,7 @@ inline D3D12_RESOURCE_DESC pc_resource_desc(const D3D12_RESOURCE_DESC& xbox) {
                                                                    : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     }
     pc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<std::uint32_t>(xbox.Flags) & kPcResourceFlagsMask);
+    drop_depth_uav_flag(pc);
     return pc;
 }
 

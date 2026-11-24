@@ -5465,6 +5465,9 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlagsMask);
+    // The console lets a depth resource carry the UAV flag; the PC runtime has no UAV for a depth format and refuses
+    // the description, so the bit goes before creation (measured: the same description is accepted without it).
+    rt::d3d12_xs::drop_depth_uav_flag(pc_desc);
 
     static std::atomic<bool> logged{false};
     if (first_call(logged))
@@ -5591,6 +5594,7 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
             }
             constexpr std::uint32_t kPcResourceFlagsMask = 0x1FFu;
             d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<std::uint32_t>(d.Flags) & kPcResourceFlagsMask);
+            rt::d3d12_xs::drop_depth_uav_flag(d);
             cleaned[i] = d;
         }
         descs_to_pass = cleaned.data();
@@ -5842,6 +5846,8 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
         for (UINT i = 0; i < desc_count; ++i) {
             const auto& desc = descs[i];
             clean[i] = call.console_abi || desc.Layout == kXboxTiledResourceLayout ? pc_resource_desc(desc) : desc;
+            // A PC-ABI caller can name the same refused combination; the rule belongs to the host, not to the ABI.
+            rt::d3d12_xs::drop_depth_uav_flag(clean[i]);
         }
         descs = clean.get();
     }
@@ -5849,6 +5855,61 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, desc_count, descs);
     apply_console_placement(descs, desc_count, info, nullptr,
                             [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
+    // LEONIDA_LOG_ALLOC_REFUSED: the title asserts when this call answers with UINT64_MAX (its check at
+    // game_scarlett_master.exe+0x344196 reads SizeInBytes == UINT64_MAX right after a slot-25 call), so print which
+    // description the PC device refused and every field a refusal depends on. The title sets Alignment = 4096 on that
+    // description, which D3D12 only allows as 0, 4 or 65536.
+    if (std::getenv("LEONIDA_LOG_ALLOC_REFUSED") && info.SizeInBytes == UINT64_MAX) {
+        static std::atomic<int> shown{0};
+        const int nth = shown.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (nth <= 8 || nth % 500 == 0) {
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 25 refused a description (#%d, mask 0x%x, %u of them):\n", nth,
+                         mask, desc_count);
+            for (UINT i = 0; i < desc_count && i < 4; ++i) {
+                const D3D12_RESOURCE_DESC& d = descs[i];
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs:   [%u] dimension %u alignment 0x%llx width %llu height %u depth %u mips "
+                             "%u format %u samples %u/%u layout %u flags 0x%x\n",
+                             i, static_cast<unsigned>(d.Dimension), static_cast<unsigned long long>(d.Alignment),
+                             static_cast<unsigned long long>(d.Width), d.Height, d.DepthOrArraySize, d.MipLevels,
+                             static_cast<unsigned>(d.Format), d.SampleDesc.Count, d.SampleDesc.Quality,
+                             static_cast<unsigned>(d.Layout), d.Flags);
+            }
+            // Which field the host actually refuses: ask again with one candidate dropped at a time. D3D12 allows
+            // ALLOW_UNORDERED_ACCESS only for formats that have UAV support, and a depth format has none, so the two
+            // flags together on a depth texture are the first suspect.
+            if (nth <= 8) {
+                struct Variant {
+                    const char* what;
+                    D3D12_RESOURCE_DESC desc;
+                };
+                const D3D12_RESOURCE_DESC& base = descs[0];
+                Variant variants[5] = {
+                    {"as sent", base},
+                    {"without ALLOW_UNORDERED_ACCESS", base},
+                    {"without ALLOW_DEPTH_STENCIL", base},
+                    {"without either flag", base},
+                    {"as D32_FLOAT", base},
+                };
+                const auto keep_flags = [](D3D12_RESOURCE_DESC desc, UINT drop) {
+                    desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<UINT>(desc.Flags) & ~drop);
+                    return desc;
+                };
+                variants[1].desc = keep_flags(base, static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+                variants[2].desc = keep_flags(base, static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+                variants[3].desc = keep_flags(base, static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                                                                      D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+                variants[4].desc = variants[3].desc;
+                variants[4].desc.Format = DXGI_FORMAT_D32_FLOAT;
+                for (const Variant& variant : variants) {
+                    const D3D12_RESOURCE_ALLOCATION_INFO got = real->GetResourceAllocationInfo(mask, 1, &variant.desc);
+                    std::fprintf(stderr, "[rt] d3d12_xs:     %-32s -> size 0x%llx alignment 0x%llx\n", variant.what,
+                                 static_cast<unsigned long long>(got.SizeInBytes),
+                                 static_cast<unsigned long long>(got.Alignment));
+                }
+            }
+        }
+    }
     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = info;
     return call.ret;
 }
