@@ -120,3 +120,54 @@ $env:LEONIDA_CAPTURE_LIMIT='4'
 - 未跑完整 `ctest`：本轮的改动集中在 PresentX 呈现路径与 `tools/rdna2spirv.py`，串行 ctest 留待下一次。
 - 语料仍为 27,145（未新增条目）；`pipeline_cache.bin` 未重建。
 - 工作树只剩未跟踪的 `.idea/`、`tmp/`；**全部提交都在本地，未推送**。
+
+## 8. 2026-11-24 第二轮：帧为什么没送到 GPU
+
+第 7 节的窗口已经不白了（呈现路径本身可用），但帧仍然是全 0。这一轮把问题挖到"命令根本没执行"这一层。
+
+### 8.1 呈现路径是好的（先证明，别再猜）
+
+`LEONIDA_PRESENT_TINT=r,g,b`（`runtime/src/vulkan_present.h`）跳过 blit、直接把 swapchain 清成该颜色。
+运行后整个窗口变成洋红：swapchain、capture、窗口合成都是通的。**因此"黑窗口"只可能是标题交来的纹理是黑的。**
+
+### 8.2 三个真缺陷
+
+1. **清屏句柄没翻译**（console list slot 51/52）。`ClearRenderTargetView`/`ClearDepthStencilView` 的句柄是
+   按值传的 CPU 描述符句柄，和 slot 50 的 RTV 句柄一样需要 `translate_cpu_handle`。没翻译时图层把控制台堆的
+   字节当 `TargetView` 读，清屏指向"resource 1 / resource 2"，`clear_render_target` 拒绝，于是**每个清过屏的
+   list 都 Close 失败**：45 秒 18,000 个 list 里 17,929 个；里面记录的 draw 自然一个都没提交。
+2. **队列 slot 35 提交的不是这一帧**。实测参数：`a1=1`，`a2` 指向一个**固定 5 元数组**（10 万次提交内元素
+   从未变化），`a3` 是递增 token。被画过的 list 从不在这 5 个里面，所以旧实现"转发 a1 个 a2 元素"提交的是
+   一个空 list 并返回 S_OK。现在的语义是：**提交"上次提交之后所有被记录过、且被标题 Close 过"的 list**。
+3. **标题复用一个已 Close 的 list**。它记录一帧 → Close → 提交 → 继续往**同一个** list 里记录下一帧，
+   全程不调用 `Reset`。之前 `CommandList::append` 见 `closed_` 就丢弃，4,000 次 draw 里 3,988 次被丢。
+   现在：Close 后的第一次记录调用会用创建时的 allocator 重新 Reset 该 list，把控制台驱动的隐式重开补回来。
+
+副产物（都是 `LEONIDA_*` 环境变量探测，默认关闭）：`LEONIDA_LOG_CLEAR`、`LEONIDA_LOG_DRAW`、
+`LEONIDA_LOG_REPLAY_DRAW`、`LEONIDA_LOG_HELD`、`LEONIDA_LOG_MISSING`、`LEONIDA_LOG_PROXY`、
+`LEONIDA_LOG_UNMAPPED`、`LEONIDA_LOG_VIEWPORT`、`LEONIDA_LOG_REOPEN`、`LEONIDA_LOG_VB`、
+`LEONIDA_PRESENT_SCENE`（改为呈现离屏场景目标）。
+
+### 8.3 现状：draw 全部记录、部分提交，仍然黑
+
+60 秒运行：`13,500 / 13,500` 次 draw 全部进入 list（此前 4,000 次里 11 次），提交按 list 逐个下发。
+**新增的两个卡点**（有日志可定位）：
+
+- **顶点缓冲在 guest 内存里**。draw 的 `BufferLocation` 是 `0x166c2ef30` 这类地址：不在任何 upload chunk
+  内（`upload_translate` 原样返回），图层也不认识它，于是 plan 阶段报
+  `unknown resource; nothing was submitted`（50 秒里 5,022 次提交失败）。标题把顶点数据写进 guest 内存，
+  指望 GPU 直接从那里读——这是**统一内存**假设，本移植只在 CPU 侧接通了，buffer 侧还没建模。
+  这是下一个大件：要么把 guest 区间注册成 host-visible buffer 并在提交时拷贝，要么用
+  `VK_EXT_external_memory_host` 直接导入（Windows/AMD 一般不支持）。
+- **每帧 list 不自己设 viewport/scissor**。4,000 次 draw 里 3,988 次到 `record_draw` 时 viewport 是 0x0
+  （标题只在少数 list 上设过一次 3840x2160）。`LEONIDA_STICKY_VIEWPORT` 用来验证"控制台是否跨 list 继承
+  视口状态"。
+
+另外：7 个没能翻译的 FSPX compute shader 仍在建 PSO 时失败（`no translated compute shader for FSPX
+kind-6 and kind-0 sha256 ...`），其中 3 个的根因是 `v_cmp_gt_f32` 的 src0 编码为 249/250（两个解码器都
+判为非法保留值）。
+
+### 8.4 提交
+
+`45f49d3e4`（slot 51/52 句柄翻译 + 控制台 list 生命周期 + 探测）、`8202be192`（提交只执行标题已 Close 的
+list，去掉与记录线程的竞争）。都在本地，未推送。
