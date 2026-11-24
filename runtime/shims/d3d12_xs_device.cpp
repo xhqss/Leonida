@@ -277,7 +277,26 @@ constexpr unsigned kHeapWriteStats = 64;
 
 void note_descriptor_write(const DeviceProxy* device, SIZE_T handle) {
     DescriptorRange range{};
-    if (!find_descriptor_range(device, handle, &range) || !range.heap) return;
+    if (!find_descriptor_range(device, handle, &range) || !range.heap) {
+        // LEONIDA_LOG_SLOTWRITE: a Create*View destination outside every registered heap is written where the title's
+        // number points, i.e. into the title's own memory -- which is what the console does. The first 200 lines of the
+        // log cannot tell a one-off from thousands, so count them, and keep the last address and how many land in the
+        // region the root tables live in.
+        if (!std::getenv("LEONIDA_LOG_SLOTWRITE")) return;
+        static std::atomic<unsigned long long> unmatched{0};
+        static std::atomic<unsigned long long> last{0};
+        static std::atomic<unsigned long long> next_dump{0};
+        unmatched.fetch_add(1, std::memory_order_relaxed);
+        last.store(handle, std::memory_order_relaxed);
+        const unsigned long long at = GetTickCount64();
+        unsigned long long expected = next_dump.load(std::memory_order_relaxed);
+        if (at >= expected && next_dump.compare_exchange_strong(expected, at + 2000, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: %llu Create*View destination(s) outside every heap in the last 2 s; the last "
+                         "was 0x%llx\n",
+                         unmatched.exchange(0, std::memory_order_relaxed), last.load(std::memory_order_relaxed));
+        return;
+    }
     const int id = range.heap->log_id;
     if (id <= 0 || id >= static_cast<int>(kHeapWriteStats)) return;
     const std::uint64_t slot = (handle - range.custom_start) / 32;
@@ -1157,7 +1176,14 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
         }
     }
 
-    if (custom_cpu_start != 0 &&
+    // LEONIDA_XS_NO_HANDLE_TRANSLATE: do not register the title's XMem range as a descriptor range, so a Create*View
+    // destination stays the address the title passed and the layer writes its descriptor bytes into the title's own
+    // heap memory -- which is what the console does, and the only arrangement in which a title that copies descriptors
+    // from its heap into a table carries the layer's bytes. A diagnostic: the self-test for "does the title copy the
+    // descriptors it created into the tables it binds" (LEONIDA_LOG_TABLE4 shows whether the layer's T# encoding
+    // 01xxxxxx..9xxxxxxx appears in a table the title built).
+    const bool translate_handles = std::getenv("LEONIDA_XS_NO_HANDLE_TRANSLATE") == nullptr;
+    if (custom_cpu_start != 0 && translate_handles &&
         !register_descriptor_range(device, proxy, custom_cpu_start, custom_byte_size, real_cpu_start)) {
         delete proxy;
         proxy_release(device);

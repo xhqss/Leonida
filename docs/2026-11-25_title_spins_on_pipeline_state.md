@@ -320,13 +320,46 @@ presents 从 ~106/s 掉到 ~52/s。所以那一版是 opt-in。
    最多 19 秒，所以那 12 核里至少有一部分是真正的 shader 编译，不只是空转。如果要优化，
    应该查那几条为什么这么慢（缓存未命中？巨型 PSO？）。
 
-### 8.5 本轮新增开关
+### 8.5 描述符表这条线的三个**否定**结果（省下次的时间）
+
+用三个新探针把"表里的字节从哪来"逼到死角：
+
+1. **`LEONIDA_XS_NO_HANDLE_TRANSLATE=1`**（不注册标题 XMem 的 descriptor range，让层像 console 一样
+   把描述符直接写进标题自己的堆内存）之后，`LEONIDA_LOG_TABLE4` 看到的表内容**完全没变**：
+   仍是 `00000043 5909e6d3 c747ec34 2b2bddd0 …` 这类数据，**没有一条**是层的 T# 编码
+   （`01xxxxxx … 9xxxxxxx`）或 V# 编码（`… 300xxxxx`）。⇒ **标题不把 Create\*View 写出的描述符
+   拷进它 bind 的那些表。**
+
+2. **`LEONIDA_LOG_SLOTWRITE=1` 的新计数：`Create*View` 的目标落在"任何已注册 heap 之外"的次数是 0**
+   （20 秒运行，一次都没有）。也就是说每一次 `Create*View` 都写进了 arena 里的 heap，
+   **没有任何一次写进标题自己的内存**。整轮总量仍然是 **63 个描述符、最大槽号 103**。
+
+3. 而标题 `SetGraphicsRootDescriptorTable` 的 VA 换算成 heap 1 的槽号是 **368,373 / 368,504 + 4096·frame**。
+   ⇒ **标题 bind 的那些表槽，没有任何描述符 API 写过。** 这一条现在是有计数支撑的硬结论，
+   不再是"没观察到"。
+
+由此，"表里应该有什么"只剩两种可能：(a) 标题把描述符放进它自己内存的某个**不是我们看到的
+那个数值**的地址；(b) 表由 GPU 侧写入（compute/copy），而对应的 arena 偏移是 0（所以读到零）。
+这两种都要靠"把 `vkCmdCopyBuffer`/dispatch 的目标地址与表 VA 对起来"来区分，是本轮之后的第一件事。
+
+### 8.6 本轮之后的第一件事（建议）
+
+1. 在层里记录**每一条会写内存的命令**的目标 VA（`CopyBufferRegion`、`vkCmdCopyBuffer`、
+   compute 写 UAV 的绑定），和表 VA 比对 —— 看那张表是不是 GPU 写的（可能性 b）。
+2. 若都不是，就回到"标题自己算的地址是不是和我们算的一样"：在 `SetGraphicsRootDescriptorTable`
+   里把 a2 与 heap 的 GPU handle 起点、与标题 XMem 堆的地址各算一次差值，看哪个差值稳定
+   （0xb3ef00 这种）。差值的稳定性会直接指出标题用的是哪个基址。
+3. raw view 池（§8.3）已经默认打开并修好了 buffer 侧；描述符表侧要走同一套翻译，才能让
+   `LEONIDA_FALLBACK_TINT` 从"整屏洋红"变成别的颜色。
+
+### 8.7 本轮新增开关
 
 | 名字 | 位置 | 作用 |
 | --- | --- | --- |
 | `LEONIDA_PROFILE_LAYER` | `runtime/src/layer_profile.h` | submit / present / allocate / pipeline 的调用数、平均与最差耗时（每 2 s） |
 | `LEONIDA_LOG_SLOT70` | `d3d12_xs_device.cpp` | `=1` 打印 raw-word view 的成功/null 计数；`=2` 还打印解析不到的地址、宽度、是否 committed |
-| `LEONIDA_SLOT70_WINDOW` | `d3d12_xs_device.cpp` | 用标题内存窗口回退解析 raw-word view 的地址（有内存代价，见 §8.3） |
+| `LEONIDA_SLOT70_WINDOW` | `d3d12_xs_device.cpp` | raw view 的标题内存回退：**默认开**（固定 1 MiB 槽位池）；`=0` 关掉做 A/B |
+| `LEONIDA_XS_NO_HANDLE_TRANSLATE` | `d3d12_xs_device.cpp` | 不注册标题 XMem 的 descriptor range，让层把描述符写进标题自己的内存（console 语义，§8.5） |
 | `tmp/thread-map.ps1` | `tmp/` | 把进程**全部**线程映射到 模块+RVA，并按地址聚合计数（找自旋/锁竞争） |
 | `tmp/thread-stack.ps1` | `tmp/` | 读最热线程的栈切片，统计栈上各模块的返回地址数（判断是不是层调进去的） |
 
