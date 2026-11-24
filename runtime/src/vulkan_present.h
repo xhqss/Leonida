@@ -196,6 +196,8 @@ public:
             capture_dir_.clear();
             ok_ = recreate(true, false);
         }
+        std::fprintf(stderr, "[rt] present: swapchain %ux%u, format %d, capture %d\n", extent_.width, extent_.height,
+                     int(format_), capture_ ? 1 : 0);
     }
 
     ~VulkanPresenter() {
@@ -614,6 +616,12 @@ private:
             if (submitted == VK_SUCCESS) result = vkQueuePresentKHR_(queue_, &present);
         }
         if (submitted != VK_SUCCESS) return give_back(frame, submitted);
+        if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+            static int reported = 0;
+            if (reported++ < 8)
+                std::fprintf(stderr, "[rt] present: vkQueuePresentKHR returned %d (extent %ux%u, capture %d)\n",
+                             int(result), extent_.width, extent_.height, capture_ ? 1 : 0);
+        }
         ++frame_index_;
         // Only a present the engine took counts (SUBOPTIMAL is shown too). OUT_OF_DATE was not shown: the swapchain
         // is recreated next time, and the caller sees VK_SUCCESS, since its work was submitted.
@@ -627,6 +635,11 @@ private:
             if (capture_to_disk_ && capture_ && capture_ptr_ && capture_written_ < capture_limit_ &&
                 (presented_ - 1) % std::uint64_t(capture_every_) == 0)
                 pending_capture_ = frame.done;
+            if (presented_ == 1)
+                std::fprintf(stderr, "[rt] present: first frame shown (extent %ux%u, format %d): capture_to_disk %d, "
+                                     "capture %d, mapped %d, buffer %d\n",
+                             extent_.width, extent_.height, int(format_), capture_to_disk_ ? 1 : 0, capture_ ? 1 : 0,
+                             capture_ptr_ ? 1 : 0, capture_buffer_ ? 1 : 0);
         }
         if (capture_ && capture_ptr_) {
             captured_ = true;
@@ -1061,7 +1074,14 @@ private:
         const VkFormat format = captured_format_;
         const std::uint64_t number = presented_;
         const std::size_t texels = std::size_t(extent.width) * extent.height;
-        if (!capture_ptr_ || !texels || texels > capture_size_ / 4) return;
+        if (!capture_ptr_ || !texels || texels > capture_size_ / 4) {
+            static int reported = 0;
+            if (reported++ < 3)
+                std::fprintf(stderr, "[rt] present: capture skipped (mapped %d, extent %ux%u, buffer %llu bytes)\n",
+                             capture_ptr_ ? 1 : 0, extent.width, extent.height,
+                             static_cast<unsigned long long>(capture_size_));
+            return;
+        }
         std::vector<std::uint8_t> rgb(texels * 3);
         std::uint64_t sum[3] = {0, 0, 0};
         const std::uint8_t* src = capture_ptr_;
@@ -1108,7 +1128,9 @@ private:
             }
             break;
         }
-        default: return;  // not a format the capture can be written from (recreate() refused the others)
+        default:
+            std::fprintf(stderr, "[rt] present: capture cannot encode swapchain format %d\n", int(format));
+            return;  // not a format the capture can be written from (recreate() refused the others)
         }
         char name[64];
         std::snprintf(name, sizeof name, "frame_%05llu.ppm", static_cast<unsigned long long>(number));

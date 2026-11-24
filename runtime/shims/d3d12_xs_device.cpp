@@ -1418,10 +1418,19 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
         }
     }
     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
-    return hr_to_u64(state->xbox->PresentX(
-        static_cast<UINT>(plane_count),
-        reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
-        reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params)));
+    const HRESULT present_hr = state->xbox->PresentX(
+        static_cast<UINT>(plane_count), reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
+        reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params));
+    static std::atomic<std::uint64_t> failures{0};
+    if (FAILED(present_hr)) {
+        const std::uint64_t failed = failures.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (failed == 1 || failed % 600 == 0)
+            std::fprintf(stderr, "[rt] d3d12_xs: PresentX failed with 0x%08lx (%llu failure(s) so far)\n",
+                         static_cast<unsigned long>(present_hr), static_cast<unsigned long long>(failed));
+    } else if (present == 1) {
+        std::fprintf(stderr, "[rt] d3d12_xs: PresentX returned S_OK\n");
+    }
+    return hr_to_u64(present_hr);
 }
 
 #else  // !LEONIDA_VULKAN_DEVICE: this translation unit stands alone (mock and COM tests)
