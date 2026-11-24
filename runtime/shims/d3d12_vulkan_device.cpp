@@ -33,6 +33,7 @@
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
 #include "../src/vulkan13_features.h"
+#include "../src/pipeline_digest.h"
 
 #include <vulkan/vulkan_win32.h>
 #ifdef _MSC_VER
@@ -3379,7 +3380,8 @@ public:
         const leonida::Depth24Bias depth24_bias{desc.RasterizerState.DepthBias,
                                                 desc.RasterizerState.SlopeScaledDepthBias,
                                                 desc.RasterizerState.DepthBiasClamp};
-        const bool log_stage_names = std::getenv("LEONIDA_LOG_SHADERHASH") != nullptr;
+        const bool log_stage_names = std::getenv("LEONIDA_LOG_SHADERHASH") != nullptr ||
+                                     std::getenv("LEONIDA_LOG_DRAW_PIPELINE") != nullptr;
         std::string stage_names;  // LEONIDA_LOG_SHADERHASH: filled per stage, printed with the pipeline handle
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
@@ -3403,15 +3405,15 @@ public:
                 return E_INVALIDARG;
             }
             // LEONIDA_LOG_SHADERHASH: the translated stage a pipeline uses, by the FSSM hash the corpus names it with,
-            // so the .spvasm of a shader that draws nothing can be read (shaders/spirv-*/<hash>.spvasm).
+            // so the .spvasm of a shader that draws nothing can be read (shaders/spirv-*/<hash>.spvasm). The module
+            // digest that goes with it is added after the module bytes are loaded, below.
             if (log_stage_names) {
                 stage_names += stage.name;
                 stage_names += '=';
                 stage_names += stage.entry->name;
                 stage_names += '(';
                 stage_names += std::to_string(stage.entry->binding_count);
-                stage_names += " bindings) ";
-                recipe_.stage_names = stage_names;
+                stage_names += " bindings)";
             }
             if (stage.entry->binding_count) {
                 if (!device_.bindless) {
@@ -3440,6 +3442,20 @@ public:
             }
             stage.words = library->spirv(*stage.entry);
             if (stage.words.empty()) return E_FAIL;
+            // LEONIDA_LOG_DRAW_PIPELINE: the FNV-1a digest of the module bytes this pipeline is built from, so a draw
+            // named by LEONIDA_LOG_REPLAY_DRAW can be checked against a patched corpus module.
+            if (log_stage_names) {
+                std::uint32_t digest = 2166136261u;
+                for (const std::uint32_t word : stage.words)
+                    for (unsigned byte = 0; byte < 4; ++byte) {
+                        digest ^= (word >> (8 * byte)) & 0xFFu;
+                        digest *= 16777619u;
+                    }
+                char digest_text[16] = {};
+                std::snprintf(digest_text, sizeof(digest_text), "[%08x] ", digest);
+                stage_names += digest_text;
+                recipe_.stage_names = stage_names;
+            }
             // LEONIDA_LOG_MODULE: which bytes a pipeline's stage was built from, so a patched corpus module can be told
             // apart from the one the runtime actually reads.
             if (std::getenv("LEONIDA_LOG_MODULE")) {
@@ -4161,6 +4177,10 @@ private:
             if (logged.fetch_add(1, std::memory_order_relaxed) < 200000)
                 std::fprintf(stderr, "[rt] pipeline %p: %s\n", static_cast<void*>(pipeline), recipe_.stage_names.c_str());
         }
+        // LEONIDA_LOG_DRAW_PIPELINE: remember what a pipeline was built from, so a draw logged by
+        // LEONIDA_LOG_REPLAY_DRAW names its stages and module digests.
+        if (std::getenv("LEONIDA_LOG_DRAW_PIPELINE") && !recipe_.stage_names.empty())
+            leonida::set_pipeline_note(reinterpret_cast<std::uintptr_t>(pipeline), recipe_.stage_names);
         return pipeline;
     }
 

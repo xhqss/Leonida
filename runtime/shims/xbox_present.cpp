@@ -198,6 +198,19 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
         log_once(logged_planes_, "PresentX with 2 planes and no overlay flag on plane 1: only plane 0 is shown (plane 1 is taken "
                                  "as the GameDVR copy of the frame)");
     const bool compose = hdr0 || placement(planes[0]) || filter_of(planes[0]) != xbox_scale_filter_default || overlay;
+    // LEONIDA_LOG_PRESENT: which resource a frame is presented from, so the draws' render target (logged by
+    // LEONIDA_LOG_REPLAY_DRAW) can be compared with the texture that reaches the screen.
+    if (std::getenv("LEONIDA_LOG_PRESENT")) {
+        static std::atomic<int> shown{0};
+        if (shown.fetch_add(1, std::memory_order_relaxed) < 8) {
+            ID3D12Resource* source = planes[0].ppResources[0];
+            const D3D12_RESOURCE_DESC desc = source->GetDesc();
+            std::fprintf(stderr, "[rt] present: resource id %llu, %llux%u format %d, compose %d\n",
+                         static_cast<unsigned long long>(resource_id(source)),
+                         static_cast<unsigned>(desc.Width), static_cast<unsigned>(desc.Height),
+                         static_cast<int>(desc.Format), compose ? 1 : 0);
+        }
+    }
 
     if (compose) {
         // Every shown plane: a 2D texture, a source rectangle inside it, a placement inside the output.

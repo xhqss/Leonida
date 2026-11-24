@@ -1,6 +1,7 @@
 #pragma once
 
 #include "resource_tiling.h"
+#include "pipeline_digest.h"
 
 // Replays a closed CommandList (command_list.h) into a Vulkan command buffer.
 //
@@ -4152,15 +4153,26 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (std::getenv("LEONIDA_LOG_REPLAY_DRAW")) {
                 static std::atomic<unsigned long long> logged{0};
                 const unsigned long long nth = logged.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (nth <= 3 || nth % 600 == 0)
+                if (nth <= 30 || nth % 600 == 0) {
+                    const std::uintptr_t pipeline = reinterpret_cast<std::uintptr_t>(d.pipeline);
+                    std::string note;
+                    if (std::getenv("LEONIDA_LOG_DRAW_PIPELINE")) note = leonida::pipeline_note(pipeline);
                     std::fprintf(stderr,
                                  "[rt] replay draw #%llu: %u x %u, area %ux%u, %zu colour(s), viewport %g,%g %gx%g, "
-                                 "scissor %d,%d..%d,%d, pipeline %llu\n",
+                                 "scissor %d,%d..%d,%d, pipeline %llu%s%s%s\n",
                                  nth, draw->count, draw->instances, d.area.width, d.area.height, d.colors.size(),
                                  double(v.x), double(v.y), double(v.width), double(v.height), int(s.left),
-                                 int(s.top), int(s.right), int(s.bottom),
-                                 static_cast<unsigned long long>(
-                                     reinterpret_cast<std::uintptr_t>(d.pipeline)));
+                                 int(s.top), int(s.right), int(s.bottom), static_cast<unsigned long long>(pipeline),
+                                 note.empty() ? "" : " [", note.empty() ? "" : note.c_str(),
+                                 note.empty() ? "" : "]");
+                    // The colour attachments by resource id and Vulkan format: which target a draw really writes.
+                    if (!note.empty()) {
+                        for (std::size_t i = 0; i < d.colors.size(); ++i)
+                            std::fprintf(stderr, "[rt] replay draw #%llu: colour %zu id %llu format %d\n", nth, i,
+                                         static_cast<unsigned long long>(d.colors[i].id),
+                                         int(d.colors[i].binding.format));
+                    }
+                }
             }
             if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
