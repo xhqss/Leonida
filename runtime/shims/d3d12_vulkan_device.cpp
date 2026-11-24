@@ -3177,15 +3177,20 @@ void dump_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc) {
     std::fprintf(stderr, "\n");
 }
 
+// Pipeline state objects alive right now: with LEONIDA_LOG_PIPELINE_TIME=1 the build line prints it, which says whether
+// a title creating thousands of pipeline states a second keeps them (a leak) or releases them (a churn).
+std::atomic<long long> g_pipeline_states_live{0};
+
 class PipelineState final
     : public Child<PipelineState, XboxPipelineStateStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12PipelineState> {
 public:
     // {8d2f6c14-b0e7-4a93-9c58-1f4a7e3b6d20}
     static constexpr GUID kTag{0x8d2f6c14, 0xb0e7, 0x4a93, {0x9c, 0x58, 0x1f, 0x4a, 0x7e, 0x3b, 0x6d, 0x20}};
-    explicit PipelineState(DeviceState& device) : device_(device) {}
+    explicit PipelineState(DeviceState& device) : device_(device) { g_pipeline_states_live.fetch_add(1); }
 
     ~PipelineState() override {
+        g_pipeline_states_live.fetch_sub(1);
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         if (registered_) device_.context->remove_pipeline(id());
@@ -4122,8 +4127,9 @@ private:
                 const unsigned built_count = count.exchange(0, std::memory_order_relaxed);
                 const long long total = micros.exchange(0, std::memory_order_relaxed);
                 if (built_count)
-                    std::fprintf(stderr, "[rt] d3d12: %u graphics pipeline(s) built, %.1f ms each\n", built_count,
-                                 double(total) / 1000.0 / double(built_count));
+                    std::fprintf(stderr, "[rt] d3d12: %u graphics pipeline(s) built, %.1f ms each, %lld live\n",
+                                 built_count, double(total) / 1000.0 / double(built_count),
+                                 g_pipeline_states_live.load(std::memory_order_relaxed));
             }
         }
         if (built != VK_SUCCESS) return VK_NULL_HANDLE;
@@ -4949,6 +4955,49 @@ struct OwnedRuntime {
     VkDevice device = VK_NULL_HANDLE;
     VkInstance instance = VK_NULL_HANDLE;
 };
+
+// LEONIDA_LOG_PIPELINE_UNIQUE=1: how many of the pipeline states the title asks for are keys it has not asked for
+// before. Thousands of repeated keys are a retry loop in the title; thousands of distinct ones are a load enumerating
+// its own pipelines. The table is fixed-size and the probe never changes a result: it only counts.
+void note_pipeline_key(const PipelineStream& stream) {
+    const leonida::cached_pso::Key key = stream.has_cs ? pipeline_key(stream.compute) : pipeline_key(stream.graphics);
+    std::uint64_t hash = 1469598103934665603ull;
+    for (const char c : key) {
+        hash ^= static_cast<std::uint8_t>(c);
+        hash *= 1099511628211ull;
+    }
+    if (!hash) hash = 1;
+    static std::uint64_t table[8192] = {};
+    static std::mutex table_lock;
+    static std::atomic<unsigned> seen{0};
+    static std::atomic<unsigned> fresh{0};
+    static std::atomic<unsigned long long> next_dump{0};
+    bool inserted = false;
+    {
+        std::lock_guard guard(table_lock);
+        std::size_t at = static_cast<std::size_t>(hash) & 8191;
+        for (std::size_t probe = 0; probe < 8192; ++probe) {
+            if (table[at] == 0) {
+                table[at] = hash;
+                inserted = true;
+                break;
+            }
+            if (table[at] == hash) break;
+            at = (at + 1) & 8191;
+        }
+    }
+    seen.fetch_add(1, std::memory_order_relaxed);
+    if (inserted) fresh.fetch_add(1, std::memory_order_relaxed);
+    const unsigned long long now = GetTickCount64();
+    unsigned long long expected = next_dump.load(std::memory_order_relaxed);
+    if (now >= expected && next_dump.compare_exchange_strong(expected, now + 2000, std::memory_order_relaxed)) {
+        const unsigned total = seen.exchange(0);
+        const unsigned fresh_count = fresh.exchange(0);
+        if (total)
+            std::fprintf(stderr, "[rt] d3d12: %u CreatePipelineState, %u new key(s), %u repeat(s) in the last 2 s\n",
+                         total, fresh_count, total - fresh_count);
+    }
+}
 
 class Device final
     : public Object<Device, ID3D12Device11Stubs, ID3D12Object, ID3D12Device, ID3D12Device1, ID3D12Device2,
@@ -6155,6 +6204,7 @@ public:
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
         PipelineStream stream;
         if (const HRESULT hr = parse_pipeline_stream(*desc, stream); FAILED(hr)) return d3d12_trace::result(method, hr);
+        if (std::getenv("LEONIDA_LOG_PIPELINE_UNIQUE")) note_pipeline_key(stream);
         // LEONIDA_LOG_PIPELINE_TIME=1: the PSO objects the title asks for, in the same two-second window as the build
         // time above. Thousands a second means the title is churning pipelines, not building its scene.
         if (std::getenv("LEONIDA_LOG_PIPELINE_TIME")) {
