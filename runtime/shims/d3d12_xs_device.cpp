@@ -2340,7 +2340,21 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 // The six root descriptor setters (index, GPU VA): an upload-arena CPU pointer becomes the
                 // chunk's device address (d3d12_xs_console_abi.md §5.3 measures slots 41/43/45 for the compute
                 // side; the graphics setters interleave on even slots).
+                const std::uint64_t source = a2;
                 a2 = shader_address(self->device, a2, 64 << 10);  // a root CBV/SRV/UAV: at most a 64 KiB buffer
+                if (std::getenv("LEONIDA_LOG_ROOT")) {
+                    static std::atomic<int> logged{0};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 6) {
+                        std::uint32_t words[8] = {};
+                        leonida::copy_committed(reinterpret_cast<std::uint8_t*>(words), source, sizeof(words));
+                        std::fprintf(stderr,
+                                     "[rt] root descriptor %u: 0x%llx -> 0x%llx; first words %08x %08x %08x %08x "
+                                     "%08x %08x %08x %08x\n",
+                                     unsigned(Slot), static_cast<unsigned long long>(source),
+                                     static_cast<unsigned long long>(a2), words[0], words[1], words[2], words[3],
+                                     words[4], words[5], words[6], words[7]);
+                    }
+                }
             } else if constexpr (Slot == 47) {
                 // IASetIndexBuffer(pView): the view's BufferLocation is a GPU VA; translate in a copy so the
                 // title's struct is not written.
@@ -2361,11 +2375,21 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                         view.BufferLocation = shader_address(self->device, view.BufferLocation, view.SizeInBytes);
                     if (std::getenv("LEONIDA_LOG_VB")) {
                         static std::atomic<int> logged{0};
-                        if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
-                            std::fprintf(stderr, "[rt] vertex buffers: count %llu, view 0 at 0x%llx -> 0x%llx\n",
+                        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                            // The bytes the shader will read: the title's own memory at the view's address, so a view
+                            // that resolves to a buffer full of zeros (or to the wrong memory) is visible at once.
+                            std::uint32_t words[8] = {};
+                            leonida::copy_committed(reinterpret_cast<std::uint8_t*>(words), in[0].BufferLocation,
+                                                    sizeof(words));
+                            std::fprintf(stderr,
+                                         "[rt] vertex buffers: count %llu, view 0 at 0x%llx -> 0x%llx, %u bytes, "
+                                         "stride %u; first words %08x %08x %08x %08x %08x %08x %08x %08x\n",
                                          static_cast<unsigned long long>(a2),
                                          static_cast<unsigned long long>(in[0].BufferLocation),
-                                         static_cast<unsigned long long>(self->vb_scratch[0].BufferLocation));
+                                         static_cast<unsigned long long>(self->vb_scratch[0].BufferLocation),
+                                         in[0].SizeInBytes, in[0].StrideInBytes, words[0], words[1], words[2],
+                                         words[3], words[4], words[5], words[6], words[7]);
+                        }
                     }
                     return reinterpret_cast<ForwardFn>(real_vtable[pc])(
                         self->real, a1, a2, reinterpret_cast<std::uint64_t>(self->vb_scratch.data()), a4, a5,
@@ -2413,6 +2437,23 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 // a frame's colour target closed as invalid -- 17,929 of 18,000 in a 45 s run, with the draws those
                 // lists recorded never submitted. Translate it the way the device translated the view when it created it.
                 if (a1) a1 = translate_cpu_handle(self->device, D3D12_CPU_DESCRIPTOR_HANDLE{a1}).ptr;
+            } else if constexpr (Slot == 36) {
+                // SetGraphicsRootDescriptorTable(index, table GPU VA): the table holds the title's own console-format
+                // descriptors (a T# is 8 dwords), so what the shader will read can be dumped here when a draw shows
+                // nothing although its vertex data is there.
+                if (std::getenv("LEONIDA_LOG_ROOT")) {
+                    static std::atomic<int> logged{0};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 6) {
+                        std::uint32_t words[8] = {};
+                        leonida::copy_committed(reinterpret_cast<std::uint8_t*>(words), a2, sizeof(words));
+                        std::fprintf(stderr,
+                                     "[rt] root table: index %llu at 0x%llx; first descriptor %08x %08x %08x %08x "
+                                     "%08x %08x %08x %08x\n",
+                                     static_cast<unsigned long long>(a1),
+                                     static_cast<unsigned long long>(a2), words[0], words[1], words[2], words[3],
+                                     words[4], words[5], words[6], words[7]);
+                    }
+                }
             } else if constexpr (Slot == kConsoleSetDescriptorHeaps) {
                 UnwrappedArray heaps;
                 if (!heaps.fill(a2, a1)) return 0;  // void on the PC side; the call simply does not happen

@@ -3393,13 +3393,20 @@ public:
                                          static_cast<std::size_t>(stage.code.BytecodeLength));
                 return E_INVALIDARG;
             }
+            // LEONIDA_LOG_SHADERHASH: the translated stage a pipeline uses, by the FSSM hash the corpus names it with,
+            // so the .spvasm of a shader that draws nothing can be read (shaders/spirv-*/<hash>.spvasm).
+            if (std::getenv("LEONIDA_LOG_SHADERHASH")) {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 12)
+                    std::fprintf(stderr, "[rt] pipeline %s: %s (%u binding(s))\n", stage.name, stage.entry->name.c_str(),
+                                 stage.entry->binding_count);
+            }
             if (stage.entry->binding_count) {
                 if (!device_.bindless) {
                     std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the device has no bindless set 0\n",
                                  stage.entry->name.c_str());
                     return E_NOTIMPL;
-                }
-                uses_bindless = true;
+                }                uses_bindless = true;
                 register_literal_samplers(device_, *stage.entry);
             }
             if (stage.bit == VK_SHADER_STAGE_MESH_BIT_EXT) {
@@ -3631,7 +3638,11 @@ public:
         }
         VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         raster.polygonMode = r.FillMode == D3D12_FILL_MODE_WIREFRAME ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
-        raster.cullMode = r.CullMode == D3D12_CULL_MODE_FRONT  ? VK_CULL_MODE_FRONT_BIT
+        // LEONIDA_NO_CULL: a frame with no geometry at all can be every triangle culled, which says nothing about the
+        // shaders; with culling off, a triangle the shaders do emit shows up whatever its winding.
+        static const bool no_cull = std::getenv("LEONIDA_NO_CULL") != nullptr;
+        raster.cullMode = no_cull ? VK_CULL_MODE_NONE
+                          : r.CullMode == D3D12_CULL_MODE_FRONT  ? VK_CULL_MODE_FRONT_BIT
                           : r.CullMode == D3D12_CULL_MODE_BACK ? VK_CULL_MODE_BACK_BIT
                                                                : VK_CULL_MODE_NONE;
         // With the negative-height viewport, framebuffer winding matches D3D12's screen-space winding.
