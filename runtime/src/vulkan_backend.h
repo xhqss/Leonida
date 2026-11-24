@@ -1966,6 +1966,13 @@ public:
         std::vector<std::shared_ptr<void>> retired;  // destroyed after state_mutex_ is released
         {
             std::lock_guard state(state_mutex_);
+            if (std::getenv("LEONIDA_LOG_HELD")) {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 12)
+                    std::fprintf(stderr,
+                                 "[rt] queue: %zu list(s), %zu held op(s), %zu pending wait(s): %s\n", lists.size(),
+                                 held_.size(), waits_.size(), must_hold() ? "held" : "submitting");
+            }
             if (!must_hold()) {
                 result = execute_now(lists);
             } else if (context_.is_device_lost()) {
@@ -2176,6 +2183,19 @@ private:
 
     ReplayResult execute_now(std::span<const CommandList* const> lists) {
         if (context_.is_device_lost() || !wait_for_room()) return ReplayResult::unsupported;
+        if (std::getenv("LEONIDA_LOG_HELD")) {
+            std::size_t commands = 0;
+            std::size_t draws = 0;
+            for (const auto* list : lists) {
+                commands += list->commands().size();
+                for (const auto& command : list->commands())
+                    if (std::holds_alternative<Draw>(command)) ++draws;
+            }
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 12)
+                std::fprintf(stderr, "[rt] replay: %zu list(s) [%p], %zu command(s), %zu draw(s)\n", lists.size(),
+                             lists.empty() ? nullptr : static_cast<const void*>(lists.front()), commands, draws);
+        }
         if (kind_ != QueueKind::direct)
             for (const auto* list : lists)
                 for (const auto& command : list->commands())

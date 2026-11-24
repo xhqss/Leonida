@@ -2110,7 +2110,14 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         const TargetView& target = draw.views->render_targets[slot];
         if (!target.resource) continue;
         const ResourceBinding* binding = resolve(target.resource);
-        if (!binding) return ReplayResult::unresolved_resource;
+        if (!binding) {
+            // LEONIDA_LOG_MISSING: name the resource a submission died on ("unknown resource; nothing was submitted").
+            static std::atomic<int> missing{0};
+            if (std::getenv("LEONIDA_LOG_MISSING") && missing.fetch_add(1, std::memory_order_relaxed) < 12)
+                std::fprintf(stderr, "[rt] draw: no colour target %llu (slot %zu)\n",
+                             static_cast<unsigned long long>(target.resource), slot);
+            return ReplayResult::unresolved_resource;
+        }
         auto& a = p.colors[slot];
         a.binding = *binding;
         a.id = target.resource;
@@ -2127,7 +2134,13 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     }
     if (draw.depth.resource && pipeline->depth_format != VK_FORMAT_UNDEFINED) {
         const ResourceBinding* binding = resolve(draw.depth.resource);
-        if (!binding) return ReplayResult::unresolved_resource;
+        if (!binding) {
+            static std::atomic<int> missing{0};
+            if (std::getenv("LEONIDA_LOG_MISSING") && missing.fetch_add(1, std::memory_order_relaxed) < 12)
+                std::fprintf(stderr, "[rt] draw: no depth target %llu\n",
+                             static_cast<unsigned long long>(draw.depth.resource));
+            return ReplayResult::unresolved_resource;
+        }
         auto& a = p.depth;
         a.binding = *binding;
         a.id = draw.depth.resource;
@@ -4109,6 +4122,18 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 if (!d.vertex_buffers[slot]) continue;
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
+            }
+            if (std::getenv("LEONIDA_LOG_REPLAY_DRAW")) {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 12)
+                    std::fprintf(stderr,
+                                 "[rt] replay draw: %u x %u, area %ux%u, %zu colour(s), viewport %g,%g %gx%g, "
+                                 "scissor %d,%d..%d,%d, pipeline %llu\n",
+                                 draw->count, draw->instances, d.area.width, d.area.height, d.colors.size(),
+                                 double(v.x), double(v.y), double(v.width), double(v.height), int(s.left),
+                                 int(s.top), int(s.right), int(s.bottom),
+                                 static_cast<unsigned long long>(
+                                     reinterpret_cast<std::uintptr_t>(d.pipeline)));
             }
             if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);

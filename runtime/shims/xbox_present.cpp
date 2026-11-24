@@ -249,6 +249,14 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
 
     const XboxPresentPlaneParameters& plane = planes[0];
     ID3D12Resource* resource = plane.ppResources[0];
+    // LEONIDA_PRESENT_SCENE: show the scene pass (see scene_render_target) instead of what the title presents.
+    if (std::getenv("LEONIDA_PRESENT_SCENE")) {
+        const std::uint64_t scene = scene_render_target().load(std::memory_order_relaxed);
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 3)
+            std::fprintf(stderr, "[rt] present: the scene target is %llu\n", static_cast<unsigned long long>(scene));
+        if (scene) resource = reinterpret_cast<ID3D12Resource*>(scene);
+    }
     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return E_INVALIDARG;
     D3D12_HEAP_PROPERTIES heap{};

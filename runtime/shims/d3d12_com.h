@@ -12,6 +12,8 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -414,6 +416,15 @@ bool recorded_commands(ID3D12GraphicsCommandList* list, std::vector<leonida::Com
 
 inline leonida::ResourceId resource_id(const ID3D12Resource* resource) {
     return reinterpret_cast<leonida::ResourceId>(resource);
+}
+
+// LEONIDA_PRESENT_SCENE (diagnostic). The resource id of the last render target a draw bound together with a depth
+// attachment: the pass a title that renders its scene offscreen draws into. With the variable set, a present shows that
+// texture instead of the one the title presents. A frame of all zeros is either "the scene pass never wrote" or "the
+// composite after it lost the picture"; showing the scene pass itself separates the two.
+inline std::atomic<std::uint64_t>& scene_render_target() {
+    static std::atomic<std::uint64_t> target{0};
+    return target;
 }
 
 // A query heap's ID in the command-list IR and the VulkanContext: its pointer value, as for resources.

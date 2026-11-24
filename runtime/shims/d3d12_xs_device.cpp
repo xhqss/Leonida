@@ -104,11 +104,20 @@ struct DeviceProxy {
     std::atomic<std::uint32_t> frame_latency{1};
     std::atomic<bool> frame_event_scheduled{false};
     std::shared_ptr<leonida::FrameTokenSource> frame_tokens = std::make_shared<leonida::FrameTokenSource>();
+    // The lists the title has recorded into since the last console submit (queue slot 35), which is what that submit
+    // executes (see "The console list lifecycle" at console_begin_recording). Guarded by pending_mutex; a list removes
+    // itself when it is destroyed.
+    std::mutex pending_mutex;
+    std::vector<void*> pending_lists;
 };
 
 // Freed in proxy_release; defined where the states are complete.
 void destroy_present_state(void* present_state);
 void destroy_upload_state(void* upload_state);
+
+// The console's submit (queue slot 35): executes the lists recorded since the last submit. Defined with the list proxy,
+// which is what it walks (see console_begin_recording).
+void console_submit_batch(DeviceProxy* device, IUnknown* queue, void** queue_vtable);
 
 constexpr unsigned kHeapSlots = 11;  // IUnknown + ID3D12Object + DeviceChild + Pageable + GetDesc + 2 handles
 
@@ -1471,28 +1480,18 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         d3d12_trace::record(child_trace_name<K>(Slot));
         return fence_completed_value_address(self, a1, a2, a3);
     } else if constexpr (K == ChildKind::queue && Slot == 35) {
-        // The console's submit. The title records its drawing into command lists and hands them to the queue here, one
-        // batch per frame; the trace shows no ID3D12CommandQueue::ExecuteCommandLists call anywhere, so acknowledging
-        // this slot with S_OK (the old "console-only" answer) left every list unexecuted and the frame black.
-        // LEONIDA_SUBMIT_35=1 forwards the batch to the real queue's ExecuteCommandLists (PC order: 8 + 2).
+        // The console's submit. The title records its drawing into command lists and submits one batch per frame here;
+        // the trace shows no ID3D12CommandQueue::ExecuteCommandLists call anywhere.
+        //
+        // The arguments do not name the batch: a1 is 1, a2 is the address of a fixed array of five list proxies whose
+        // entries never change over 100,000 submits, and a3 counts up. A list drawn into is never among those five, so
+        // executing a1 entries of a2 ran a list that carried no command -- the submit "succeeded" and the frame stayed
+        // black. What the submit does carry is everything recorded since the last submit (console_begin_recording keeps
+        // that list), which is what this executes: the close first, because the layer executes a closed list, then the
+        // batch. LEONIDA_SUBMIT_35=1 enables it while the console submit is still being worked out.
         note_child_slot<K>(Slot);
-        static std::atomic<int> logged{0};
-        if (logged.fetch_add(1, std::memory_order_relaxed) < 3)
-            std::fprintf(stderr, "[rt] d3d12_xs: queue slot 35 submit: a1 0x%llx a2 0x%llx a3 0x%llx a4 0x%llx\n",
-                         static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
-                         static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
-        if (const char* submit = std::getenv("LEONIDA_SUBMIT_35"); submit && submit[0] == '1' && a1 > 0 && a1 <= 64 &&
-                                     a2 != 0) {
-            // The batch names this layer's list proxies; the real queue only executes its own lists ("list 0 is not a
-            // direct command list"), so each entry is replaced by the real list first, as queue slot 10 does.
-            UnwrappedArray lists;
-            if (lists.fill(a2, a1)) {
-                const std::uint64_t real_lists = lists.data() ? lists.data() : a2;
-                using ExecuteFn = void(WINAPI*)(IUnknown*, UINT, ID3D12CommandList* const*);
-                reinterpret_cast<ExecuteFn>(self->real_vtable[10])(self->real, static_cast<UINT>(a1),
-                                                                   reinterpret_cast<ID3D12CommandList* const*>(real_lists));
-            }
-        }
+        if (const char* submit = std::getenv("LEONIDA_SUBMIT_35"); submit && submit[0] == '1')
+            console_submit_batch(self->device, self->real, self->real_vtable);
         return hr_to_u64(S_OK);
     } else {
         note_child_slot<K>(Slot);
@@ -1912,6 +1911,13 @@ struct ListProxy {
     alignas(8) std::uint8_t console_fields[0x600];
     std::atomic<unsigned long> refs;    // past the console body
     unsigned pc_slot_count;             // slots the real list implements; mapped slots past it are refused
+    // The allocator CreateCommandList was given, kept for the Reset the console never asks for (console_begin_recording)
+    // and for teardown.
+    ID3D12CommandAllocator* real_allocator;
+    // The console Close (slot 9) was forwarded: the real list is closed until the next recording call reopens it.
+    std::atomic<bool> closed_by_title;
+    // This list is in its device's pending_lists.
+    std::atomic<bool> pending;
     std::vector<D3D12_VERTEX_BUFFER_VIEW> vb_scratch;  // slot-48 views with their VAs translated
     std::vector<D3D12_STREAM_OUTPUT_BUFFER_VIEW> so_scratch;  // slot-49 views, same treatment
 
@@ -1994,7 +2000,14 @@ unsigned long list_add_ref(ListProxy* self) { return self->refs.fetch_add(1, std
 void destroy_list(ListProxy* self) {
     IUnknown* real = self->real;
     DeviceProxy* device = self->device;
+    if (device && self->pending.load(std::memory_order_relaxed)) {
+        std::lock_guard lock(device->pending_mutex);
+        auto& pending = device->pending_lists;
+        pending.erase(std::remove(pending.begin(), pending.end(), static_cast<void*>(self)), pending.end());
+    }
+    ID3D12CommandAllocator* allocator = self->real_allocator;
     delete self;
+    if (allocator) allocator->Release();
     if (real) real->Release();
     if (device) proxy_release(device);
 }
@@ -2003,6 +2016,77 @@ unsigned long list_release(ListProxy* self) {
     const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (refs == 0) destroy_list(self);
     return refs;
+}
+
+// The console list lifecycle. The title records a frame into a list, closes it (slot 9), submits the batch through the
+// queue's console slot 35, and then records the next frame into the SAME list: it never calls Reset, so the console
+// driver must be reopening the list when recording starts again. Before this, every command after the first frame was
+// dropped by CommandList::append (`closed_`), so every list closed with zero commands, the submit executed an empty
+// batch, and the window stayed black however much the title drew. Two pieces replay that: the first recording call
+// after a close resets the list, and the submit executes every list recorded since the last submit.
+void console_note_recording(ListProxy* self) {
+    if (self->pending.load(std::memory_order_relaxed)) return;
+    self->pending.store(true, std::memory_order_relaxed);
+    DeviceProxy* device = self->device;
+    if (!device) return;
+    std::lock_guard lock(device->pending_mutex);
+    device->pending_lists.push_back(self);
+}
+
+// Reopens a list the title closed, if it did, so this recording call can append. False when the list stays closed (no
+// allocator to reset it with, or the reset failed): the call is then forwarded anyway and refused by the layer.
+bool console_begin_recording(ListProxy* self) {
+    if (!self->closed_by_title.load(std::memory_order_relaxed)) return true;
+    if (!self->real || !self->real_allocator) return false;
+    using ResetFn = HRESULT(WINAPI*)(IUnknown*, ID3D12CommandAllocator*, ID3D12PipelineState*);
+    auto** const vtable = *reinterpret_cast<void***>(self->real);
+    const HRESULT hr = reinterpret_cast<ResetFn>(vtable[10])(self->real, self->real_allocator, nullptr);
+    if (FAILED(hr)) return false;
+    self->closed_by_title.store(false, std::memory_order_relaxed);
+    return true;
+}
+
+// Closes a list whose commands the submit is about to execute. A list the title already closed answers E_FAIL, which is
+// not an error here: it is closed, which is what the layer wants.
+void console_close_for_submit(ListProxy* self) {
+    if (!self->real) return;
+    if (self->closed_by_title.load(std::memory_order_relaxed)) return;
+    using CloseFn = HRESULT(WINAPI*)(IUnknown*);
+    auto** const vtable = *reinterpret_cast<void***>(self->real);
+    const HRESULT hr = reinterpret_cast<CloseFn>(vtable[9])(self->real);
+    if (SUCCEEDED(hr)) self->closed_by_title.store(true, std::memory_order_relaxed);
+}
+
+// Queue slot 35 with LEONIDA_SUBMIT_35=1: the batch is everything recorded since the last submit, not the lists in the
+// slot's arguments (see the comment at the slot). Each list goes to the queue in its own ExecuteCommandLists call: the
+// layer refuses a whole batch for one unknown resource ("unknown resource; nothing was submitted"), and the first batch
+// after startup holds every list recorded so far, including commands whose resources no longer resolve. One submission
+// per list keeps one stale list from taking the frame with it.
+void console_submit_batch(DeviceProxy* device, IUnknown* queue, void** queue_vtable) {
+    if (!device || !queue || !queue_vtable) return;
+    std::vector<void*> batch;
+    {
+        std::lock_guard lock(device->pending_mutex);
+        batch.swap(device->pending_lists);
+    }
+    using ExecuteFn = void(WINAPI*)(IUnknown*, UINT, ID3D12CommandList* const*);
+    auto execute = reinterpret_cast<ExecuteFn>(queue_vtable[10]);
+    std::size_t submitted = 0;
+    for (void* entry : batch) {
+        auto* list = static_cast<ListProxy*>(entry);
+        list->pending.store(false, std::memory_order_relaxed);
+        if (!list->real) continue;
+        console_close_for_submit(list);
+        ID3D12CommandList* real = list->real;
+        execute(queue, 1, &real);
+        ++submitted;
+    }
+    static std::atomic<int> submits{0};
+    const int nth = submits.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (nth == 1 && submitted == 0)
+        std::fprintf(stderr, "[rt] d3d12_xs: the first console submit has no recorded list\n");
+    if (nth <= 3 || nth % 600 == 0)
+        std::fprintf(stderr, "[rt] d3d12_xs: console submit #%d executed %zu list(s)\n", nth, submitted);
 }
 
 HRESULT list_query_interface(ListProxy* self, const IID* riid, void** out) {
@@ -2062,8 +2146,26 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                                reinterpret_cast<void**>(a2)));
     } else {
         note_list_slot(Slot, a1, a2, a3, a4, self->device->console_layout.load(std::memory_order_relaxed));
+        if constexpr (Slot == 9 || Slot == 12) {
+            if (std::getenv("LEONIDA_LOG_PROXY")) {
+                static std::atomic<int> shown{0};
+                if (shown.fetch_add(1, std::memory_order_relaxed) < 24)
+                    std::fprintf(stderr, "[rt] xs list slot %u: proxy %p real %p\n", Slot,
+                                 static_cast<void*>(self), static_cast<void*>(self->real));
+            }
+        }
         constexpr unsigned pc = console_to_pc_list_slot(Slot);
         if constexpr (pc == kListNotForwarded) {
+            if (std::getenv("LEONIDA_LOG_UNMAPPED")) {
+                static std::atomic<int> shown{0};
+                if (shown.fetch_add(1, std::memory_order_relaxed) < 240)
+                    std::fprintf(stderr,
+                                 "[rt] xs unmapped list slot %u: list %p, args %llx %llx %llx %llx %llx %llx\n", Slot,
+                                 static_cast<void*>(self), static_cast<unsigned long long>(a1),
+                                 static_cast<unsigned long long>(a2), static_cast<unsigned long long>(a3),
+                                 static_cast<unsigned long long>(a4), static_cast<unsigned long long>(a5),
+                                 static_cast<unsigned long long>(a6));
+            }
             if constexpr (Slot == kConsoleAllocateUpload) {
                 return upload_alloc(self->device, a1, a2);  // (size, alignment); the comment at UploadChunk
             }
@@ -2085,6 +2187,18 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                                      std::uint64_t, std::uint64_t, std::uint64_t,
                                                      std::uint64_t, std::uint64_t);
             auto** const real_vtable = *reinterpret_cast<void***>(self->real);
+            // The console list lifecycle (console_begin_recording): a recording call reopens the list the title closed
+            // after the previous frame, and joins the batch the next console submit executes.
+            if constexpr (Slot != 9) console_begin_recording(self);
+            console_note_recording(self);
+            if constexpr (Slot == 9) {
+                // Close: the real list closes, and the next recording call reopens it.
+                const std::uint64_t closed = reinterpret_cast<ForwardFn>(real_vtable[pc])(
+                    self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+                if (SUCCEEDED(static_cast<HRESULT>(static_cast<std::uint32_t>(closed))))
+                    self->closed_by_title.store(true, std::memory_order_relaxed);
+                return closed;
+            }
             if constexpr (Slot == 10) {
                 // Reset(allocator, pso): the title hands its allocator proxy; the real list takes the real one.
                 a1 = unwrap_object(a1);
@@ -2151,6 +2265,14 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                         self->real, a1, reinterpret_cast<std::uint64_t>(translated), a3, depth_word, a5, a6, a7, a8,
                         a9, a10, a11, a12, a13, a14);
                 }
+            } else if constexpr (Slot == 51 || Slot == 52) {
+                // ClearDepthStencilView(view, ...) at 51 and ClearRenderTargetView(view, ...) at 52: the view is a
+                // descriptor handle by value, and it names a slot of the title's own heap for the same reason the
+                // slot-50 handles do. Untranslated, the layer reads the console heap's bytes as a TargetView: the
+                // clear then named resources 1 and 2, `clear_render_target` refused them, and every list that cleared
+                // a frame's colour target closed as invalid -- 17,929 of 18,000 in a 45 s run, with the draws those
+                // lists recorded never submitted. Translate it the way the device translated the view when it created it.
+                if (a1) a1 = translate_cpu_handle(self->device, D3D12_CPU_DESCRIPTOR_HANDLE{a1}).ptr;
             } else if constexpr (Slot == kConsoleSetDescriptorHeaps) {
                 UnwrappedArray heaps;
                 if (!heaps.fill(a2, a1)) return 0;  // void on the PC side; the call simply does not happen
@@ -2189,7 +2311,7 @@ IUnknown* list_real_or_null(const void* object) {
 
 // Wraps `created` (one reference, owned by the proxy on success, released on failure) and returns `riid` from the
 // proxy through `out`.
-HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void** out) {
+HRESULT wrap_list(IUnknown* created, DeviceProxy* device, IUnknown* allocator, const IID* riid, void** out) {
     if (!created) return E_FAIL;
     ListProxy* proxy = new (std::nothrow) ListProxy();  // (): the console body starts zeroed
     if (!proxy) {
@@ -2201,6 +2323,8 @@ HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void*
     proxy->device = device;
     proxy->refs.store(1, std::memory_order_relaxed);
     proxy->pc_slot_count = detect_list_slot_count(created);
+    proxy->real_allocator = static_cast<ID3D12CommandAllocator*>(allocator);
+    if (proxy->real_allocator) proxy->real_allocator->AddRef();
     proxy->pin_cursor_at_limit();
     proxy_add_ref(device);  // the list keeps its Xbox-ABI device alive for GetDevice
 
@@ -2243,7 +2367,8 @@ HRESULT proxy_create_command_list(DeviceProxy* self, std::uint64_t node_mask, st
         reinterpret_cast<ID3D12PipelineState*>(pso), __uuidof(ID3D12GraphicsCommandList), &created);
     if (FAILED(hr)) return hr;
     if (!created) return E_FAIL;
-    return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
+    return wrap_list(static_cast<IUnknown*>(created), self,
+                     reinterpret_cast<IUnknown*>(unwrap_object(allocator)), riid, out);
 }
 
 // Calls the real device's slot `Slot` with these five words in the positions the thunk received them (see "A thunk
@@ -2396,7 +2521,7 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
                                                    __uuidof(ID3D12GraphicsCommandList), &created);
     if (FAILED(hr)) return hr;
-    return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
+    return wrap_list(static_cast<IUnknown*>(created), self, allocator, riid, out);
 }
 
 // Xbox device slot 70: (texture_words, view_desc, destination), no return value. The retail executable's SRV writer

@@ -27,6 +27,46 @@
 
 namespace rt::d3d12 {
 
+namespace {
+
+// LEONIDA_STICKY_VIEWPORT (diagnostic, see GraphicsCommandList::record_draw): the last viewport and scissor any list
+// set. Lists record on several threads, so a mutex guards them; they are only written when the variable is set.
+std::mutex& sticky_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+leonida::Viewport& sticky_viewport_slot() {
+    static leonida::Viewport viewport{};
+    return viewport;
+}
+leonida::Rect& sticky_scissor_slot() {
+    static leonida::Rect scissor{};
+    return scissor;
+}
+bool sticky_viewport_set() {
+    std::lock_guard lock(sticky_mutex());
+    const leonida::Viewport& viewport = sticky_viewport_slot();
+    return viewport.width > 0 && viewport.height > 0;
+}
+leonida::Viewport sticky_viewport() {
+    std::lock_guard lock(sticky_mutex());
+    return sticky_viewport_slot();
+}
+leonida::Rect sticky_scissor() {
+    std::lock_guard lock(sticky_mutex());
+    return sticky_scissor_slot();
+}
+void remember_viewport(const leonida::Viewport& viewport) {
+    std::lock_guard lock(sticky_mutex());
+    sticky_viewport_slot() = viewport;
+}
+void remember_scissor(const leonida::Rect& scissor) {
+    std::lock_guard lock(sticky_mutex());
+    sticky_scissor_slot() = scissor;
+}
+
+}  // namespace
+
 struct TileGrid {
     std::uint64_t columns = 0;
     std::uint64_t rows = 0;
@@ -217,6 +257,14 @@ public:
     // reports it.
     HRESULT STDMETHODCALLTYPE Close() override {
         constexpr auto method = "ID3D12GraphicsCommandList::Close";
+        if (std::getenv("LEONIDA_LOG_CLOSE")) {
+            static std::atomic<unsigned long long> closes{0};
+            static std::atomic<int> logged{0};
+            const unsigned long long nth = closes.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (list_.commands().size() > 0 && logged.fetch_add(1, std::memory_order_relaxed) < 10)
+                std::fprintf(stderr, "[rt] close: list %p, %zu command(s), close #%llu\n", static_cast<const void*>(this),
+                             list_.commands().size(), nth);
+        }
         if (list_.queries_open()) invalid_ = true;
         if (render_pass_open_) invalid_ = true;  // a pass left open is a debug-layer error, as an open query is
         if (!list_.close()) return d3d12_trace::result(method, E_FAIL);
@@ -409,6 +457,20 @@ public:
 
     // A count of 0 unbinds the viewports; draws then rasterize nothing (record_draw).
     void STDMETHODCALLTYPE RSSetViewports(UINT count, const D3D12_VIEWPORT* viewports) override {
+        if (std::getenv("LEONIDA_LOG_VIEWPORT")) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 10) {
+                if (count && viewports)
+                    std::fprintf(stderr, "[rt] viewport: list %p, count %u: %g,%g %gx%g depth %g..%g\n",
+                                 static_cast<const void*>(this), count, double(viewports[0].TopLeftX),
+                                 double(viewports[0].TopLeftY), double(viewports[0].Width),
+                                 double(viewports[0].Height), double(viewports[0].MinDepth),
+                                 double(viewports[0].MaxDepth));
+                else
+                    std::fprintf(stderr, "[rt] viewport: list %p, count %u (unbound)\n",
+                                 static_cast<const void*>(this), count);
+            }
+        }
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!count) {
             viewport_ = {};
@@ -418,6 +480,7 @@ public:
         if (count > 1) stub("ID3D12GraphicsCommandList::RSSetViewports (more than one viewport; the first is used)");
         const D3D12_VIEWPORT& v = viewports[0];
         viewport_ = {v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth};
+        if (std::getenv("LEONIDA_STICKY_VIEWPORT")) remember_viewport(viewport_);
     }
 
     void STDMETHODCALLTYPE RSSetScissorRects(UINT count, const D3D12_RECT* rects) override {
@@ -431,6 +494,7 @@ public:
         if (!rects) return;
         if (count > 1) stub("ID3D12GraphicsCommandList::RSSetScissorRects (more than one rectangle; the first is used)");
         scissor_ = {rects[0].left, rects[0].top, rects[0].right, rects[0].bottom};
+        if (std::getenv("LEONIDA_STICKY_VIEWPORT")) remember_scissor(scissor_);
     }
 
     // D3D12 reads render-target and depth descriptors here, so their views are copied now.
@@ -475,10 +539,46 @@ public:
 
     void STDMETHODCALLTYPE DrawInstanced(UINT vertices, UINT instances, UINT first_vertex, UINT first_instance) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::DrawInstanced");
-        if (defer([=](GraphicsCommandList& l) { l.record_draw(false, vertices, instances, first_vertex, 0, first_instance); },
-                  true))
-            return;
-        record_draw(false, vertices, instances, first_vertex, 0, first_instance);
+        if (depth_.resource && render_targets_[0].resource)
+            scene_render_target().store(render_targets_[0].resource, std::memory_order_relaxed);
+        const bool probe = std::getenv("LEONIDA_LOG_DRAW") != nullptr;
+        const std::size_t before = probe ? list_.commands().size() : 0;
+        const bool deferred =
+            defer([=](GraphicsCommandList& l) { l.record_draw(false, vertices, instances, first_vertex, 0, first_instance); },
+                  true);
+        if (!deferred) record_draw(false, vertices, instances, first_vertex, 0, first_instance);
+        if (probe) {
+            static std::atomic<unsigned long long> calls{0};
+            static std::atomic<unsigned long long> recorded{0};
+            static std::atomic<int> logged{0};
+            const unsigned long long nth = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+            const std::size_t after = list_.commands().size();
+            if (after > before) recorded.fetch_add(1, std::memory_order_relaxed);
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 12)
+                std::fprintf(stderr,
+                             "[rt] draw: list %p, %u vertices, %u instance(s), rtv %llu depth %llu, %s, commands %zu "
+                             "-> %zu, %s\n",
+                             static_cast<const void*>(this), vertices, instances,
+                             static_cast<unsigned long long>(render_targets_[0].resource),
+                             static_cast<unsigned long long>(depth_.resource),
+                             deferred ? "deferred (bundle)" : "recorded", before, after,
+                             list_.closed() ? "list closed" : "list open");
+            if (nth % 500 == 0)
+                std::fprintf(stderr, "[rt] draws so far: %llu of %llu recorded\n",
+                             recorded.load(std::memory_order_relaxed), nth);
+            if (after == before) {
+                static std::atomic<int> dropped{0};
+                if (dropped.fetch_add(1, std::memory_order_relaxed) < 8)
+                    std::fprintf(stderr,
+                                 "[rt] draw dropped: viewport %gx%g, scissor %d,%d..%d,%d, pipeline %p, layout %p, "
+                                 "topology %u, closed %d\n",
+                                 double(viewport_.width), double(viewport_.height), int(scissor_.left),
+                                 int(scissor_.top), int(scissor_.right), int(scissor_.bottom),
+                                 reinterpret_cast<const void*>(graphics_pipeline_),
+                                 reinterpret_cast<const void*>(graphics_.layout), unsigned(topology_),
+                                 list_.closed() ? 1 : 0);
+            }
+        }
     }
 
     void STDMETHODCALLTYPE DrawIndexedInstanced(UINT indices, UINT instances, UINT first_index, INT base_vertex,
@@ -696,6 +796,15 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearRenderTargetView");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr || !color) return check(false);
+        if (std::getenv("LEONIDA_LOG_CLEAR")) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+                const auto& tv = *reinterpret_cast<const leonida::TargetView*>(view.ptr);
+                std::fprintf(stderr, "[rt] clear rtv: handle %llu resource %llu colour %g %g %g %g\n",
+                             static_cast<unsigned long long>(view.ptr),
+                             static_cast<unsigned long long>(tv.resource), color[0], color[1], color[2], color[3]);
+            }
+        }
         check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(view.ptr),
                                         {color[0], color[1], color[2], color[3]}, to_rects(count, rects)));
     }
@@ -1068,7 +1177,14 @@ private:
     }
 
     void check(bool ok) {
-        if (!ok) invalid_ = true;
+        if (ok) return;
+        if (!invalid_ && std::getenv("LEONIDA_LOG_INVALID")) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 24)
+                std::fprintf(stderr, "[rt] list invalid: the first refused command was %s\n",
+                             d3d12_trace::last_method ? d3d12_trace::last_method : "?");
+        }
+        invalid_ = true;
     }
 
     void stop_recording() {
@@ -1408,6 +1524,14 @@ private:
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
         note_direct_heap_indexing(graphics_.layout);
+        // LEONIDA_STICKY_VIEWPORT: look at whether the console carries a list's viewport and scissor over from the list
+        // that set them. The title's per-frame lists never call RSSetViewports/RSSetScissorRects -- 3,988 of 4,000 draws
+        // reached here with a 0x0 viewport and an empty scissor, and such a draw rasterizes nothing, which is a black
+        // frame with the commands otherwise in place.
+        if (std::getenv("LEONIDA_STICKY_VIEWPORT") && !(viewport_.width > 0) && sticky_viewport_set()) {
+            viewport_ = sticky_viewport();
+            if (!(scissor_.right > scissor_.left) || !(scissor_.bottom > scissor_.top)) scissor_ = sticky_scissor();
+        }
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;

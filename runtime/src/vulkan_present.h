@@ -261,6 +261,10 @@ public:
     // `tear` (only with vsync): queue the present in tear_mode() instead of FIFO when the swapchain can, so a frame
     // that missed its vblank is shown at once; last_present_tore() says whether it was.
     VkResult present(ResourceId source, bool vsync, const PresentRect* source_rect = nullptr, bool tear = false) {
+        // LEONIDA_PRESENT_TINT=r,g,b: skip the blit and clear the swapchain to that colour instead. A window that
+        // shows the colour proves the swapchain and the capture write what they are handed, so a black window then
+        // means the texture the title presents is itself black.
+        if (std::getenv("LEONIDA_PRESENT_TINT")) return submit(nullptr, ResourceId{}, vsync, nullptr, false, tear);
         ResourceBinding binding;
         {
             std::shared_lock lock(context_.resource_mutex_);  // the resource table (vulkan_backend.h)
@@ -951,7 +955,7 @@ private:
         }
     }
 
-    // Clears the swapchain image to opaque black.
+    // Clears the swapchain image to opaque black, or to LEONIDA_PRESENT_TINT ("r,g,b", 0..1 each) when it is set.
     void record_blank(VkCommandBuffer commands, std::uint32_t image) {
         auto& vk = context_.vk;
         const ReplayFunctions& fn = context_.replay_;
@@ -963,7 +967,15 @@ private:
         detail::image_barrier(fn, commands, target_of(image), range, VK_IMAGE_LAYOUT_UNDEFINED,
                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
                               VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-        const VkClearColorValue black{{0.0f, 0.0f, 0.0f, 1.0f}};
+        VkClearColorValue black{{0.0f, 0.0f, 0.0f, 1.0f}};
+        if (const char* tint = std::getenv("LEONIDA_PRESENT_TINT")) {
+            float r = 0.0f, g = 0.0f, b = 0.0f;
+            if (std::sscanf(tint, "%f,%f,%f", &r, &g, &b) == 3) {
+                black.float32[0] = r;
+                black.float32[1] = g;
+                black.float32[2] = b;
+            }
+        }
         vkCmdClearColorImage_(commands, images_[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
         finish_image(commands, image);
         vk.vkEndCommandBuffer(commands);
