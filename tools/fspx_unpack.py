@@ -183,6 +183,9 @@ def main(argv=None) -> int:
     ap.add_argument("--mcpu", default="gfx1030",
                     help="llvm-mc CPU for --disasm (default gfx1030: the programs use v_dot4 instructions, which "
                          "gfx1010 and gfx1013 do not decode)")
+    ap.add_argument("--backend", default="llvm-mc", choices=("llvm-mc", "python"),
+                    help="disassembler for --disasm: llvm-mc, or the in-house decoder (tools/rdna2_decode.py), which "
+                         "decodes the whole word stream where llvm-mc leaves 'invalid instruction encoding' holes")
     a = ap.parse_args(argv)
     # An output in the input folder can replace a .dxbc input and, when the input is the folder itself,
     # os.makedirs writes there before open() tries to read the folder as a file. Refuse before either.
@@ -254,7 +257,7 @@ def main(argv=None) -> int:
             listing = None
             if disasm and meta["code"]["end"]:
                 start, end = meta["code"]["start"], meta["code"]["end"]
-                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
+                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu, backend=a.backend)
                 if not asm.strip():
                     reason = (err.strip().splitlines() or ["no output"])[0]
                     print(f"{name}: {reason}", file=sys.stderr)

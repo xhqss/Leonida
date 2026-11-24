@@ -60,17 +60,17 @@ def base_op(op):
     return op
 
 
-def kind(state, a):
+def kind(state, a, wave64=True):
     if a["k"] == "special":
         t = a.get("t", "")
-        if t == "exec_lo":
-            return MASK_LO
-        if t == "exec_hi":
-            return MASK_HI
-        if t == "exec":
-            return MASK
-        if t == "vcc":
+        if t in ("exec_lo", "exec_hi", "exec"):
+            if not wave64:
+                return MASK
+            return MASK_LO if t == "exec_lo" else (MASK_HI if t == "exec_hi" else MASK)
+        if t == "vcc" or (not wave64 and t == "vcc_lo"):
             return state.get("vcc")
+        if not wave64 and t == "vcc_hi":
+            return state.get("vcc_hi")
         if t in ("vcc_lo", "vcc_hi"):
             vk = state.get("vcc")
             if vk in MASK_KINDS:
@@ -92,7 +92,7 @@ def kind(state, a):
     return None
 
 
-def put(state, a, k):
+def put(state, a, k, wave64=True):
     if a["k"] == "sgpr":
         n = a.get("n", 1)
         if k == MASK and n == 2:
@@ -101,9 +101,14 @@ def put(state, a, k):
             return
         regs = [a["r"] + i for i in range(n)]
     elif a["k"] == "slist":
-        regs = [r if isinstance(r, int) else "vcc" for r in a["r"]]
-    elif a["k"] == "special" and a.get("t") == "vcc":
+        regs = [
+            r if isinstance(r, int) else ("vcc_hi" if (r == "vcc_hi" and not wave64) else "vcc")
+            for r in a["r"]
+        ]
+    elif a["k"] == "special" and (a.get("t") == "vcc" or (not wave64 and a.get("t") == "vcc_lo")):
         regs = ["vcc"]
+    elif a["k"] == "special" and not wave64 and a.get("t") == "vcc_hi":
+        regs = ["vcc_hi"]
     elif a["k"] == "special" and a.get("t") in ("vcc_lo", "vcc_hi"):
         # A mask / 0 / -1 half-write updates that half of %vcc in wave64 (put_mask), keeping VCC a lane mask;
         # a plain-data half-write (k is None) ends VCC's life as one lane mask.
@@ -152,22 +157,22 @@ def step(state, ins, wave64=True):
     if op.startswith("ds_") and not op.startswith(DS_HAS_DST) and "_rtn" not in op:
         return
     if op == "v_readfirstlane_b32" and len(a) == 2:                             # sD = vS, the same in every lane
-        put(state, a[0], kind(state, a[1]))
+        put(state, a[0], kind(state, a[1], wave64), wave64)
         return
     if op == "v_writelane_b32" and len(a) == 3 and lane_slot(a[0], a[2]):       # vD[lane] = sS
         state.pop(("v", a[0]["r"]), None)
-        k = kind(state, a[1])
+        k = kind(state, a[1], wave64)
         if k is None:
             state.pop(lane_slot(a[0], a[2]), None)
         else:
             state[lane_slot(a[0], a[2])] = k
         return
     if op == "v_readlane_b32" and len(a) == 3:                                  # sD = vS[lane]
-        put(state, a[0], state.get(lane_slot(a[1], a[2])))
+        put(state, a[0], state.get(lane_slot(a[1], a[2])), wave64)
         return
     if op.startswith("v_cmp"):
         # Handle v_cmp before VGPR clobber (defensive for 2-operand forms with implicit vcc).
-        put(state, {"k": "special", "t": "vcc"} if len(a) == 2 else a[0], MASK)
+        put(state, {"k": "special", "t": "vcc"} if len(a) == 2 else a[0], MASK, wave64)
         return
     if op == "v_swap_b32":
         written = set()
@@ -198,7 +203,7 @@ def step(state, ins, wave64=True):
                       and not ins["op"].endswith(("_sdwa", "_dpp", "_dpp8"))
                       and not mods
                       and not any(x.get("neg") or x.get("abs") or x.get("sext") for x in a[1:]))
-        kinds = [kind(state, x) for x in a[1:]] if plain_valu else [None]
+        kinds = [kind(state, x, wave64) for x in a[1:]] if plain_valu else [None]
         written = range(a[0]["r"], a[0]["r"] + a[0].get("n", 1))
         for key in [k for k in state if isinstance(k, tuple) and k[1] in written]:
             del state[key]
@@ -210,45 +215,45 @@ def step(state, ins, wave64=True):
             # because whole-wave readers (wave_mask, v_readfirstlane) read every lane's bit.
             return op != "v_mov_b32"
     if "_saveexec_b" in op or "_wrexec_b" in op:
-        put(state, a[0], MASK_LO if op.endswith("_b32") else MASK)
+        put(state, a[0], MASK_LO if (wave64 and op.endswith("_b32")) else MASK, wave64)
     elif op == "s_bfm_b64":
         # In wave32 code it is 64-bit data, e.g. the first two words of an S# built in place (the pipeline library's
         # wave32 compute programs: s_bfm_b64 s[88:89], 2, 54); rdna2spirv computes the value there.
-        put(state, a[0], MASK if wave64 else None)
+        put(state, a[0], MASK if wave64 else None, wave64)
     elif op.startswith(COPIES) and len(a) > 1:
-        k = kind(state, a[1])
+        k = kind(state, a[1], wave64)
         dst_t = a[0].get("t") if a[0]["k"] == "special" else None
         if k in (None, EITHER) and op.endswith("b64") and dst_t in ("vcc", "vcc_lo") and a[1]["k"] == "imm":
             k = MASK
         elif op == "s_not_b32" and dst_t in ("vcc", "vcc_lo") and _maskable_b32(a[1]):
             k = MASK
-        elif op == "s_not_b32" and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS and _maskable_b32(a[1]):
+        elif op == "s_not_b32" and dst_t == "vcc_hi" and wave64 and state.get("vcc") in MASK_KINDS and _maskable_b32(a[1]):
             return
-        put(state, a[0], k)
+        put(state, a[0], k, wave64)
     elif op.startswith(BITWISE):
-        kinds = [kind(state, x) for x in a[1:]]
+        kinds = [kind(state, x, wave64) for x in a[1:]]
         ms = {k for k in kinds if k in MASK_KINDS}
         dst_t = a[0].get("t") if a[0]["k"] == "special" else None
         if None not in kinds:
-            if op.endswith("b32") and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS:
+            if op.endswith("b32") and dst_t == "vcc_hi" and wave64 and state.get("vcc") in MASK_KINDS:
                 return
             fallback = MASK if op.endswith("b64") and dst_t in ("vcc", "vcc_lo") else EITHER
-            put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else fallback)
+            put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else fallback, wave64)
         elif op.endswith("b64") and (ms or dst_t in ("vcc", "vcc_lo")) and \
                 all(k is not None or x["k"] == "imm" for k, x in zip(kinds, a[1:])):
-            put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else MASK)
+            put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else MASK, wave64)
         elif op.endswith("b32") and dst_t in ("vcc", "vcc_lo") and all(_maskable_b32(x) for x in a[1:]):
-            put(state, a[0], MASK)
-        elif op.endswith("b32") and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS and \
+            put(state, a[0], MASK, wave64)
+        elif op.endswith("b32") and dst_t == "vcc_hi" and wave64 and state.get("vcc") in MASK_KINDS and \
                 all(_maskable_b32(x) for x in a[1:]):
             return
         else:
-            put(state, a[0], None)
+            put(state, a[0], None, wave64)
     else:
-        put(state, a[0], None)
+        put(state, a[0], None, wave64)
         if ((op.startswith("v_") and "_co_" in op)
                 or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64")) and len(a) > 1:
-            put(state, a[1], MASK)                      # carry/sign/scale lane mask of VOP3b ops
+            put(state, a[1], MASK, wave64)                      # carry/sign/scale lane mask of VOP3b ops
 
 
 def parked(blocks, masks):
