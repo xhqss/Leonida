@@ -293,3 +293,52 @@ device fault: GPU page fault detected
    XMem backing 地址（console 统一内存），`Create*View` 也直接写到 backing，表 VA 就是 backing 地址，
    着色器用 guest window 读它。这样"标题自己写的"和"层写的"描述符天然是同一块内存。
    （注意 RTV/DSV 等非 shader-visible heap 不能跟着改，它们的数据是层自己读的。）
+
+---
+
+# 追加：第三轮（2026-11-24 23:15–23:30）—— 表条目不是 gfx10 V#
+
+## 1. 这一轮确认的事
+
+- 合成 VS 的位置 = `s16..s27` 的四行矩阵 × 顶点寄存器 `v4..v7`（反汇编 825-1218 行）。矩阵不是根常量，
+  而是着色器**从描述符表里那个 V# 指向的缓冲区自己读出来的**：prologue 依次从 `V#base + 0x00/0x10/0x20/0x30`
+  读 4×4 个 dword 存进 `s16..s31`，每一步都带 `records/stride` 边界检查。
+- 表条目的 base 是**标题自己的宿主地址**（`is_committed(base)` 为真）：把它们 `guest_translate` 成窗口后，
+  层里出现了 0x8cc00000 / 0xb5000000 / 0x30000000 / 0xffc00000 这些窗口（4 MiB 一个）。
+- 但条目里 `base` 后面的 dword（着色器当 `NUM_RECORDS` 用）就是**同一个指针值**：表内容形如
+  `{ptr, 0, ptr, 0}`（`ptr` 在 0x8e..-0xc2.. 之间重复），不是 gfx10 的
+  `{base_lo, base_hi|stride, num_records, sel}`。把 base 改成窗口地址后，`records` 变成天文数字，
+  着色器/计算着色器按它循环 → **GPU 挂住**（mag2 运行卡在 `queue slot 31` 后的提交，80 秒没再出现 present）。
+- 用"合成 PS 强制洋红"做判定：`tmp/composite-ps-magenta.spv`（校验通过，只在原 PS 尾部多一条
+  `OpStore %3 %49`，%49=(1,0,1,1)）替换语料后，帧仍是 **min=0 max=0**。即：合成 draw 一个像素都没写出来，
+  VS 算出的位置仍然退化 —— 与"矩阵读成 0"一致。**语料已按 sha256 还原**
+  （`default_ps_tex_c32788bc_Wrapped.spv` = `E231E529…BAA3`）。
+
+## 2. 新结论
+
+1. 表条目**不是** gfx10 16 字节 V#。至少对合成 draw，1) 16 字节窗口解出的 `base` 是标题宿主地址（合理），
+   2) 紧随其后的 dword 是同一个指针（被当成 `NUM_RECORDS` 完全不讲道理），3) 相邻条目里多数是
+   `{ptr, ptr}` 对、少数是 `{ptr1, ptr2}` 两个不同指针——更像**指针数组/范围对**，不是硬件描述符。
+2. 因此 `LEONIDA_XS_TABLE_FIX` 现在的"改写 base + 保留 records"会制造 GPU 挂死。**该开关目前只适合
+   配合更保守的策略使用**（例如只改 base、把 records 一并改成一个小值，或者干脆只读前 64 字节）。
+   默认关闭，不影响稳定跑法。
+3. `LEONIDA_XS_TABLE_STRICT=1` 会让 sanitize 按 `base+records` 判越界；第三轮的
+   `LEONIDA_XS_TABLE_FIX` 已改为"base 是标题内存就翻译，否则按 arena 判"，这一条需要下一步重新设计。
+
+## 3. 下一步（留给下一位）
+
+1. **先弄清指针表的语义**，不要再猜 gfx10：表里 `{ptr, ptr}` 的对很可能是引擎自己的"资源范围对"
+   （begin/end）或"句柄+映射地址"。最直接的办法仍是给表页下写监视（VEH + PAGE_GUARD）抓写它的 RIP，
+   或者从 `tools/rdna2spirv.py` 侧确认这个 draw 的 VS 真的应当从表里读 V#（也可能是翻译器多了/少了一层
+   间接）。
+2. 在弄清之前，`LEONIDA_XS_TABLE_FIX` 先只做"窗口拷贝 + base 翻译 + records 归零（或 clamp 到 64）"，
+   保证不挂 GPU；再用"洋红 PS"判定位置是否终于非退化。
+3. 如果确认是翻译器问题（console shader 其实读的是 8 字节指针而不是 V#），改法在
+   `tools/rdna2spirv.py` 的 buffer op 翻译处，语料需要按 `docs/shader_library.md` 的流程重生成，
+   那是比层里打补丁更根本的修法。
+4. 恢复语料的检查命令（每轮实验后都要跑）：
+   ```powershell
+   (Get-FileHash 'E:\temp\wait_work\leonida-work\shaders\spirv-561b65a\default_ps_tex_c32788bc_Wrapped.spv').Hash
+   # 期望 E231E529E80341216949C62E8127163AD3F7EFDBC8DA29E77247114F41A0BAA3
+   ```
+
