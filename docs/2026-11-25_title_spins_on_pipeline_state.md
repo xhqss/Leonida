@@ -1257,3 +1257,46 @@ graphics 侧不持锁是**对**的（48,000 个状态几乎全不同，串行化
 - 或者给 `write_committed` 之外再加一个"**我们的 shim 里谁被高频调用**"的普查
   （`LEONIDA_LOG_CALL_RATE`），找出标题在**轮询**哪个 API —— 轮询的对象就是它在等的东西。
 
+### 18.6 稳态的调用画像（`LEONIDA_SLOT_PROFILE`，每秒一次，这是本轮第二个实证）
+
+```
+device slot 80  WaitFrameEventX                 480/s
+device slot 17  CreateConstantBufferView        478/s
+device slot 81  （未知名，见 18.7）              241/s
+device slot 70  SRV from raw words              239/s
+list   slot 146 Barrier (group)                1195/s
+list   slot 72  bottom-of-pipe qword write      957/s
+list   slot 12  DrawInstanced                   717/s
+list   slot 25  (per-draw setup)                717/s
+list   slot 32  SetDescriptorHeaps              717/s
+list   slot 34  (per-draw root table)           717/s
+```
+
+⇒ **这是一个活着的、最小的渲染循环**：每秒 717 个 draw（≈ 3.7 个/帧，正好是那 4 个全屏 blit）、
+每秒重建 478 个 CBV 和 239 个 SRV（环形缓冲描述符的正常抖动）、每秒 1195 次 barrier。
+它**不是在等**，它在**稳定地画空内容**。所以"标题停滞"这个说法要再修一次：
+**它进入了一个固定点，画的东西是空的。**
+
+### 18.7 `device slot 81` 是稳态里**唯一**被我们拒绝的调用（241/s）—— 测了，不是它
+
+这个槽（`runtime/shims/d3d12_xs_device.cpp:5587`）是标题的**资源终结器**：传一个环形缓冲 token、
+`flags 0x11100`、`&count`（进来时 `*count = 6`）和一个 `out[]`，然后按 `0x38` 步长读
+`out[i]+0` 当页大小、`+8` 当标志字节、`+0x18` 当 handle；**count 非零就继续写页表项**。
+默认它是 `E_NOTIMPL`，而它每秒被调用 241 次。
+
+| `LEONIDA_SLOT81` | 入口点 | presents / 30 s | assert |
+| --- | --- | --- | --- |
+| 未设（`E_NOTIMPL`） | 85 | 5940 / 40 s（148 Hz） | 0 |
+| `zero`（S_OK，没有页可回收） | **85** | 3900（130 Hz） | 0 |
+| `page64`（S_OK，一页 64 KiB、handle 空） | **85** | 3780（126 Hz） | 0 |
+
+⇒ **两种回答都不改变标题的行为**（入口点一个没多、画面仍黑）。这条也划掉。
+
+### 18.8 结论（本轮结束时）
+
+标题：读完 3.76 GB → 建完 49,152 个图形 PSO → **进入固定点**：每秒 717 个 draw、
+~195 Hz 呈现、2.4 核、4 个全屏 blit 全黑、**85 个 D3D12 入口点不再增加**。
+它没有在等我们漏掉的 API（稳态里唯一被拒的 slot 81 两种回答都试过），也没有在等时间。
+**它是在稳定地画空内容** ⇒ 剩下的问题在标题自己的游戏逻辑一侧，
+不是 GPU 侧、不是 CPU 侧、不是我们拒绝过什么。
+
