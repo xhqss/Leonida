@@ -378,4 +378,25 @@ rewrite +0x0: 6d03c230 00000000 00001000 00000000 from 0x90d2110; data 0993c230 
   3. 层侧只保留"窗口拷贝 + base 翻译 + records clamp"的稳定版本，别再叠加猜测性的层级。
 - 稳定跑法不变（默认无设备丢失、无挂死）；语料已还原并核验（`E231E529…BAA3`）。
 
+## 3. 从 xcl 抄到的重要事实（下一轮直接用）
+
+读了 `E:\temp\wait_work\xcl\crates\xcl\src\hle\d3d12x\console_heap.rs` 的头注释，它把 console 的真实约定写清楚了：
+
+> On the console a descriptor is GPU-readable memory: **32 bytes per CBV/SRV/UAV slot (T# / V#)**, 16 per
+> sampler (S#), and a descriptor table in a root argument is a **32-bit GPU address** (shaders load it with the
+> high half 0). … XCL gives console code heaps whose slots live in **unified memory** (so the table addresses
+> console code computes from the heap start work as they are in the recompiler's `mem` model) …
+
+对我们有三点直接用处：
+
+1. **槽位是 32 字节**，不是 16。合成 VS 读 `s8+0` 和 `s8+0x40` 正好是 slot 0 和 slot 2 —— 说明它的根签名有两个
+   范围、各 1 个描述符，位置在 slot0 / slot2 的**前 16 字节**（gfx10 V#）。
+2. **表地址是 32 位 GPU 地址，统一内存**：所以标题把 `base` 写成宿主地址是对的，我们 `guest_translate` 的方向
+   也对；问题只在**槽位内容**。
+3. xcl 的结论是"console 标题自己把描述符当内存复制"（inline `CopyDescriptorsSimple`），所以表里应当是
+   **硬件 V#**。但实测 slot0 的前 16 字节是 `{0x8ed1e20, 0, 0x8ed1e20, 0}`：base 合理、`dst_sel/format` 全 0、
+   `NUM_RECORDS` 等于 base —— 这提示我们看到的可能是**比 32 字节槽更靠前的偏移**（表 VA 不是 slot 起点），
+   或者 slot 内 V# 在**后 16 字节**。下一轮先把表 VA 前后各扫 0x40 字节、按 16/32 两种步长解码，确认 V# 到底在哪。
+
+
 
