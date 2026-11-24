@@ -171,8 +171,26 @@ int main() {
           "the query has no products and no further pages");
     at<Close>(store, 19)(store, products);
 
-    // ---- what needs the service fails before starting ----
-    check(at<NoArgs>(store, 49)(store) == E_FAIL, "XStoreShowPurchaseUIAsync is not available offline");
+    // ---- what needs the service is started and completes with E_FAIL (review M11) ----
+    // A caller that ignores the Async HRESULT and waits on the block must get an answer, not hang: the block completes.
+    using PurchaseUiAsync =
+        HRESULT(STDMETHODCALLTYPE*)(void*, Handle, const char*, const char*, const char*, XAsyncBlock*);
+    async = XAsyncBlock{};
+    check(at<PurchaseUiAsync>(store, 49)(store, context, "9NBLGGH4R315", "name", nullptr, &async) == S_OK &&
+              finished(&async) && XAsyncGetStatus(&async, false) == E_FAIL,
+          "XStoreShowPurchaseUIAsync starts and completes with E_FAIL offline (the block does not hang)");
+    using RateAsync = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, XAsyncBlock*);
+    async = XAsyncBlock{};
+    check(at<RateAsync>(store, 51)(store, context, &async) == S_OK && finished(&async) &&
+              XAsyncGetStatus(&async, false) == E_FAIL,
+          "XStoreShowRateAndReviewUIAsync (block as 2nd argument) completes with E_FAIL");
+    using RedeemAsync =
+        HRESULT(STDMETHODCALLTYPE*)(void*, Handle, const char*, const char**, size_t, bool, XAsyncBlock*);
+    async = XAsyncBlock{};
+    check(at<RedeemAsync>(store, 53)(store, context, "token", nullptr, 0, false, &async) == S_OK && finished(&async) &&
+              XAsyncGetStatus(&async, false) == E_FAIL,
+          "XStoreShowRedeemTokenUIAsync (block as 6th argument, on the stack) completes with E_FAIL");
+    check(at<NoArgs>(store, 50)(store) == E_FAIL, "its Result partner returns E_FAIL");
     check(at<NoArgs>(store, 46)(store) == E_NOTIMPL, "an undocumented slot answers E_NOTIMPL");
 
     check(at<Register>(store, 66)(store, context, nullptr, nullptr, on_change, &token) == S_OK &&
