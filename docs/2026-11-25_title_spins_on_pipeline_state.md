@@ -610,3 +610,19 @@ as D32_FLOAT                     -> size 0xf00000         alignment 0x10000
 也就是说：**这个断言只是"宿主给的分配信息非法"这条独立 bug，不是"没有场景渲染"的原因。**
 §8.5 / §11 描述的"描述符表到底在哪"仍然是黑屏的主线。
 
+### 12.5 顺手排除：`CreateLifetimeTracker` 的 10,240 次调用不是循环
+
+新开关 `LEONIDA_LOG_FAILED_CALLS=1`（`d3d12_trace::result` 里的按方法计数，每 2 秒打印一次）
+一开就抓到一个吓人的数字：
+
+```
+[rt] d3d12_xs: failed calls: ID3D12Device5::CreateLifetimeTracker ok 0, failed 0 (last 0x80004001), unsupported 1
+[rt] d3d12_xs: failed calls: ID3D12Device5::CreateLifetimeTracker ok 0, failed 0 (last 0x80004001), unsupported 10240
+（之后 30 秒内再无输出）
+```
+
+第一眼看像"标题每秒重试 5,000 次"。**但它只出现了一个 2 秒窗口，随后彻底停止** ——
+和 §8.1 里那个 ~5 万个 PSO 的启动期洪水是同一件事（基本上是"每个 PSO 一次"）。
+所以：`CreateLifetimeTracker` 返回 `E_NOTIMPL` **不是**渲染器停住的原因，不需要去实现它
+（实现它只是把这个 API 补完整，对画面没有帮助）。**省下这个方向。**
+
