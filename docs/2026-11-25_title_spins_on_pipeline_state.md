@@ -626,3 +626,93 @@ as D32_FLOAT                     -> size 0xf00000         alignment 0x10000
 所以：`CreateLifetimeTracker` 返回 `E_NOTIMPL` **不是**渲染器停住的原因，不需要去实现它
 （实现它只是把这个 API 补完整，对画面没有帮助）。**省下这个方向。**
 
+---
+
+## 13. 兄弟库调研（2026-11-25 04:25）：**同题已经有能跑的解法**
+
+### 13.1 四个库的定位与实测状态
+
+| 库 | 是什么 | 图形 API | GTA6 1.0.2.1 的状态 |
+| --- | --- | --- | --- |
+| **Leonida**（本库） | Xbox→PC 兼容层，D3D12→**Vulkan** | Vulkan | 启动、菜单、每帧 **4 个 blit**、画面全黑 |
+| **victory-gta6**（`fxceless` 对 VIctory 的 fork） | Xbox→PC 兼容层，**自带着色器重编译器**（console ISA → DXIL） | **D3D12** | **世界能渲染出来**：2–4 fps，可玩约 13 分钟（其 README） |
+| **AnyXboxX** | Xbox Series X 模拟器（Unicorn 跑标题代码），图形/shaders 直接用 victory-gta6 | D3D12 | 同上；`docs/running-gta6.md`：**每帧约 4,580 个 draw**、428 个 draw 因缺管线被丢 |
+| **xcl** | Xbox 兼容层（Rust） | **D3D12** | 参考实现（console 描述符堆语义） |
+| ~~VIctory 上游~~ | 已被 fork 取代 | D3D12 | 用户明确说过时，忽略 |
+
+**第一件必须记住的事**：两个能出画面的实现都是 **D3D12**，而且**自己编译着色器**。
+Leonida 是唯一的 Vulkan 实现，且用的是**预生成的 SPIR-V 语料**（`heap_base + va` 契约被固化进
+54,820 个文件里）。这决定了下面的取舍。
+
+同样重要的一组对比数字：**victory-gta6 的世界每帧约 4,580 个 draw，我们每帧 4 个**
+⇒ 我们的标题**根本没进场景渲染**，这和 §8.1 的结论一致，但现在有了外部参照。
+
+### 13.2 它们解决"我们的卡点"的三个架构答案
+
+**① 它们不改"地址模型"，它们改"着色器"。**
+`victory-gta6/crates/victory-gpu/src/memory.rs` 头注释写得很清楚：给需要按**原始 40 位地址**
+读写的着色器，做一张**目录** —— "per 64 KiB page of title address space the number of the copy
+that holds the page (0: none) and the page's byte offset in it"，外加每个视图堆里一串 raw UAV
+（每个 copy 一个），以及一份 **fault 表**（"A page that is not there when a shader touches it is
+a lost access"）。因为着色器是它们自己重编译的（`victory-shader`），它们可以在着色器里
+**查目录**而不是 `heap_base + va`。
+⇒ Leonida 要做同样的事，只能改 `tools/rdna2spirv.py` 再重生成语料（这是本项目的"正解"，
+但工作量最大）。
+
+**② 它们**不让标题的描述符表进着色器**。**
+`victory-gpu/src/descriptor/host.rs` 的 `mirror(index, handle, for_draw)`：宿主从**标题内存**里
+`handle` 处读 12 字节记录 `{tag, i, generation}`（是宿主自己在 `Create*View` 时写进去的），
+用它查自己的 `View` 记录，再 `make(&view, cpu(index))` 在**宿主自己的 shader-visible heap** 里
+生成真 PC 描述符；`draw.rs` 的 `root_srv_table`/`root_uav_table` 最后 bind 的是
+`host.gpu_handle(index)` —— **宿主堆的 handle，不是标题的 VA**。
+⇒ 着色器读到的永远是宿主写的字节，所以不会有"表里是垃圾"这回事。
+
+**③ console 描述符堆是"统一内存"**：`xcl/crates/xcl/src/hle/d3d12x/console_heap.rs` 里
+槽位就在 GPU 可读内存里，**T# 的 word 0 是共享 PC 堆里的索引**，所以"描述符随便拷到哪都还指向它"。
+
+### 13.3 给 Leonida 的具体思路（按性价比）
+
+**I1（最便宜、且已经有一半代码）—— 让标题的描述符堆**就是** arena。**
+这正是 `LEONIDA_XS_CPU_HANDLE_ARENA`：`GetCPUDescriptorHandleForHeapStart` 返回 arena 的 host
+指针。这样标题自己写描述符就写进了 GPU 可见内存，表 VA 天然就是 arena 偏移，`Create*View`
+也写在同一处，**三边天然对齐**（和 ①③ 的模型一致）。
+本轮实测：它**不崩**，而且**走得比默认路径更远** —— 一路走到 `DeserializeComputePipelineStateX`
+（设备 slot 67）才因为**语料缺一个 compute 程序**退出：
+`no translated compute shader for FSPX kind-6 and kind-0 sha256 7a79b887…`。
+⇒ 这条应该**继续调**，而不是像旧文档那样标成"会崩，未解决"。
+
+**I2（不需要改翻译器）—— bind 表时把标题的表翻译成宿主自己的表。**
+用 VIctory 的 `descriptor/host.rs`（`srv_desc`/`uav_desc`/`View`/`pc_format`，**按 10 个 dword**
+解 console 描述符）当参考，解出标题槽位指向的资源，然后在 scratch 表里写**层的编码**再 bind。
+这样着色器哈希的一定是层写进去的字节 ⇒ 必命中。**但前提是能读到标题的槽位内容**（见下面的否定结果）。
+
+**I3（结构性，最大）—— 把 `rdna2spirv.py` 的地址模型改成"页目录"。**
+照着 `memory.rs` 做：per-64 KiB 页目录 + 每个 copy 一个 raw UAV + fault 回收。这是唯一能让
+**任意** 64 位标题地址可读的办法（我们现在受限于 2 GiB arena + `heap_base + va`）。
+代价：重新生成 54,820 个 shader，并重写层里所有 `guest_translate`/window 相关代码。
+
+**I4** xcl 的"4 GiB raw UAV 窗口"是 D3D12 专有原语，Vulkan 没有等价物；
+Vulkan 侧的等价物就是 I3 的"大 buffer + 目录"。
+
+### 13.4 本轮做掉的实验（都是否定结果，省下次时间）
+
+| 实验 | 结果 |
+| --- | --- |
+| `LEONIDA_XS_TITLE_HANDLES=1`（层把描述符直接写进标题自己的描述符内存）+ `XS_TABLE_MIRROR` | 表里的普查**仍是** 1836 个 `{ptr,ptr}`、**0 个 T#** ⇒ **标题不会把我们写的描述符拷进它 bind 的表**；它表里放的是它自己的结构。所以只改"写哪里"不够，必须让**着色器读的位置**就是层写的位置（= I1） |
+| `LEONIDA_XS_CPU_HANDLE_ARENA=1` | 不崩；只 180 presents/24 s（慢），随后在 slot 67 因**缺 FSPX kind-6/kind-0 程序**退出 ⇒ **比默认路径走得远**，是新的线索 |
+| 给窗口发 space/enter（`mcp__windows__` 输入工具，窗口标题 `Americas`） | 无变化；日志里**没有任何 GameInput/XInput 调用** ⇒ 标题**不是在等按键**，它没有轮询输入 |
+| `LEONIDA_LOG_FAILED_CALLS=1` | 除 `CreateLifetimeTracker`（见 §12.5）外**没有别的被拒调用** ⇒ 没有第二个"静默失败"藏着 |
+
+### 13.5 语料缺口（独立于描述符的线索）
+
+所有配置下都有这两行：
+
+```
+[rt] d3d12: no translated compute shader for FSPX kind-6 and kind-0 sha256 7a79b887…
+[rt] d3d12_xs: slot 67 call … failed with 0x80070057 (kind 0 28 B, kind 1 20 B, kind 6 296 B, kind 7 120 B)
+```
+
+那是 `DeserializeComputePipelineStateX` 拿来的一段 console compute 程序，语料里没有对应翻译。
+victory-gta6 的经验是这类"程序没翻译"是**成片**的（它们修了 730 个 compute 程序的隐式 mip 采样）。
+⇒ 值得用 `tools/rdna2spirv.py` 的诊断对这批 kind-6/kind-0 做一次普查，看缺多少、缺在哪。
+

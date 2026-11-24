@@ -233,6 +233,13 @@ void unregister_descriptor_range(const HeapProxy* heap) {
 
 D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_handle(const DeviceProxy* device, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
     if (handle.ptr == 0 || g_custom_range_count.load(std::memory_order_acquire) == 0) return handle;
+    // LEONIDA_XS_TITLE_HANDLES: write the descriptor where the title pointed, in the title's own descriptor memory, as
+    // the console does. The layer's arena heap then stays empty instead, and the title's copy of the descriptor -- into
+    // whatever table it builds -- carries the bytes the layer wrote. Combined with LEONIDA_XS_TABLE_MIRROR (which puts
+    // the title's table back into the arena at the same offset) the shader reads the layer's own encoding. This is the
+    // ordering VIctory relies on: the host writes the view record into title memory, the title copies it into its own
+    // table, and the host reads those tables.
+    if (std::getenv("LEONIDA_XS_TITLE_HANDLES")) return handle;
     std::lock_guard lock(descriptor_range_mutex());
     const auto& ranges = descriptor_ranges();
     for (auto it = ranges.rbegin(); it != ranges.rend(); ++it) {
