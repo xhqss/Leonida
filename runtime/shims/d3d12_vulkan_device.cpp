@@ -3651,6 +3651,18 @@ public:
         depth.back = stencil_face(ds.BackFace, ds.StencilReadMask, ds.StencilWriteMask);
 
         std::vector<VkPipelineColorBlendAttachmentState> blends(desc.NumRenderTargets);
+        if (std::getenv("LEONIDA_LOG_PSO")) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr,
+                             "[rt] pso: %u target(s), format %u, write mask 0x%x, blend %d, depth %d (write %d, func "
+                             "%d), samples %u\n",
+                             desc.NumRenderTargets, unsigned(desc.RTVFormats[0]),
+                             desc.BlendState.RenderTarget[0].RenderTargetWriteMask,
+                             int(desc.BlendState.RenderTarget[0].BlendEnable), int(desc.DepthStencilState.DepthEnable),
+                             int(desc.DepthStencilState.DepthWriteMask), int(desc.DepthStencilState.DepthFunc),
+                             desc.SampleDesc.Count);
+        }
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
             const D3D12_RENDER_TARGET_BLEND_DESC& b =
                 desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable ? i : 0];

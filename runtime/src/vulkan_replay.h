@@ -4142,12 +4142,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
             }
             if (std::getenv("LEONIDA_LOG_REPLAY_DRAW")) {
-                static std::atomic<int> logged{0};
-                if (logged.fetch_add(1, std::memory_order_relaxed) < 12)
+                static std::atomic<unsigned long long> logged{0};
+                const unsigned long long nth = logged.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (nth <= 3 || nth % 600 == 0)
                     std::fprintf(stderr,
-                                 "[rt] replay draw: %u x %u, area %ux%u, %zu colour(s), viewport %g,%g %gx%g, "
+                                 "[rt] replay draw #%llu: %u x %u, area %ux%u, %zu colour(s), viewport %g,%g %gx%g, "
                                  "scissor %d,%d..%d,%d, pipeline %llu\n",
-                                 draw->count, draw->instances, d.area.width, d.area.height, d.colors.size(),
+                                 nth, draw->count, draw->instances, d.area.width, d.area.height, d.colors.size(),
                                  double(v.x), double(v.y), double(v.width), double(v.height), int(s.left),
                                  int(s.top), int(s.right), int(s.bottom),
                                  static_cast<unsigned long long>(

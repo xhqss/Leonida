@@ -11,6 +11,7 @@
 #endif
 #include "binary_occlusion_spirv.h"
 #include "buffer_va_index.h"
+#include "guest_memory.h"
 #include "occlusion_sum_spirv.h"
 #include "queue_holds.h"
 #include "retire_tickets.h"
@@ -978,7 +979,7 @@ public:
         // buffer as out of bounds, which is no reason to drop the submission.
         replay_.buffer_at = [this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
             BufferVaIndex<ResourceId>::Hit hit{};
-            if (!buffer_vas_.find(va, hit, size)) return false;  // prefers an aliasing buffer that holds all of it
+            if (!buffer_vas_.find(va, hit, size)) return guest_buffer(va, size, buffer, offset);
             const ResourceBinding* b = resolve(hit.id);
             if (!b) return false;
             buffer = b->buffer;
@@ -1660,11 +1661,100 @@ private:
     alignas(64) std::mutex submit_mutex_;
     RetireTickets<VkSemaphore> retire_tickets_;
     std::atomic<std::uint64_t> submitted_ticket_{0};
+    // A GPU address that no resource covers: title memory the title's own allocator handed out and then used as GPU
+    // memory (Grand Theft Auto VI's interface vertices are such addresses). The host GPU cannot read title memory, so
+    // the 4 MiB window the address lands in gets a host-visible buffer, and the bytes the caller names are copied into
+    // it from title memory on every call: the title may have written them since the last submission. Copied ranges are
+    // small (a vertex or index view, a constant buffer), so this is a per-view memcpy. VIctory solves the same problem
+    // with the same shape (crates/victory-gpu/src/shadow.rs, "titles also use memory outside any buffer object").
+    struct GuestWindow {
+        std::uint64_t len = 0;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        std::uint8_t* mapped = nullptr;
+    };
+
+    bool guest_buffer(std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
+        constexpr std::uint64_t window_bits = 22;  // 4 MiB, the window size VIctory measured as enough for the title
+        constexpr std::uint64_t window = 1ull << window_bits;
+        if (!va || !size) return false;
+        const std::uint64_t start = va & ~(window - 1);
+        std::uint64_t len = window;
+        while (va + size > start + len) len <<= 1;
+        std::lock_guard lock(guest_mutex_);
+        auto it = guest_windows_.find(start);
+        if (it == guest_windows_.end()) {
+            GuestWindow created;
+            created.len = len;
+            if (!create_guest_window(created)) {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+                    std::fprintf(stderr, "[rt] d3d12: no guest buffer for 0x%llx (+0x%llx)\n",
+                                 static_cast<unsigned long long>(va), static_cast<unsigned long long>(size));
+                return false;
+            }
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr, "[rt] d3d12: guest buffer for 0x%llx (%llu bytes)\n",
+                             static_cast<unsigned long long>(start), static_cast<unsigned long long>(len));
+            it = guest_windows_.emplace(start, created).first;
+        }
+        GuestWindow& entry = it->second;
+        const std::uint64_t offset_in_window = va - start;
+        if (offset_in_window >= entry.len) return false;
+        const std::uint64_t bytes = std::min<std::uint64_t>(size, entry.len - offset_in_window);
+        copy_committed(entry.mapped + offset_in_window, va, bytes);
+        buffer = entry.buffer;
+        offset = offset_in_window;
+        size = bytes;
+        return true;
+    }
+
+    // The host buffer a guest window is copied into: host visible and coherent, with a device address and every usage
+    // a title buffer can be bound as.
+    bool create_guest_window(GuestWindow& window_out) {
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.size = window_out.len;
+        info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (vk.vkCreateBuffer(device_, &info, nullptr, &window_out.buffer) != VK_SUCCESS) return false;
+        VkMemoryRequirements requirements{};
+        vk.vkGetBufferMemoryRequirements(device_, window_out.buffer, &requirements);
+        constexpr VkMemoryPropertyFlags host_flags =
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        std::uint32_t type = occlusion_resolve_memory_.memoryTypeCount;
+        for (std::uint32_t i = 0; i < occlusion_resolve_memory_.memoryTypeCount; ++i) {
+            if (!(requirements.memoryTypeBits & (1u << i))) continue;
+            if ((occlusion_resolve_memory_.memoryTypes[i].propertyFlags & host_flags) == host_flags) {
+                type = i;
+                break;
+            }
+        }
+        if (type == occlusion_resolve_memory_.memoryTypeCount) return false;
+        VkMemoryAllocateFlagsInfo allocate_flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+        allocate_flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &allocate_flags};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = type;
+        if (vk.vkAllocateMemory(device_, &allocation, nullptr, &window_out.memory) != VK_SUCCESS) return false;
+        if (vk.vkBindBufferMemory(device_, window_out.buffer, window_out.memory, 0) != VK_SUCCESS) return false;
+        void* mapped = nullptr;
+        if (vk.vkMapMemory(device_, window_out.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) return false;
+        window_out.mapped = static_cast<std::uint8_t*>(mapped);
+        return true;
+    }
+
     DeferredDeletionQueue deletion_queue_;
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
     QueueHolds<VkSemaphore> holds_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
     BufferVaIndex<ResourceId> buffer_vas_;  // the addressable buffers of resources_, by VA range (buffer_at)
+    // Host copies of title memory that no resource covers, for the GPU addresses a title passes that are title memory
+    // itself (see guest_buffer). Keyed by the aligned window's start; guarded by guest_mutex_ (a leaf lock).
+    std::mutex guest_mutex_;
+    std::map<std::uint64_t, GuestWindow> guest_windows_;
     std::unordered_map<ResourceId, std::shared_ptr<SparseResource>> sparse_resources_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
@@ -2192,7 +2282,8 @@ private:
                     if (std::holds_alternative<Draw>(command)) ++draws;
             }
             static std::atomic<int> logged{0};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 12)
+            const int nth = logged.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (nth <= 3 || nth % 600 == 0)
                 std::fprintf(stderr, "[rt] replay: %zu list(s) [%p], %zu command(s), %zu draw(s)\n", lists.size(),
                              lists.empty() ? nullptr : static_cast<const void*>(lists.front()), commands, draws);
         }

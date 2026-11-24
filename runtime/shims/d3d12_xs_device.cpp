@@ -2115,7 +2115,8 @@ void console_submit_batch(DeviceProxy* device, IUnknown* queue, void** queue_vta
     if (nth == 1 && submitted == 0)
         std::fprintf(stderr, "[rt] d3d12_xs: the first console submit has no finished list\n");
     if (nth <= 3 || nth % 600 == 0)
-        std::fprintf(stderr, "[rt] d3d12_xs: console submit #%d executed %zu list(s)\n", nth, submitted);
+        std::fprintf(stderr, "[rt] d3d12_xs: console submit #%d executed %zu of %zu list(s)\n", nth, submitted,
+                     batch.size());
 }
 
 HRESULT list_query_interface(ListProxy* self, const IID* riid, void** out) {
