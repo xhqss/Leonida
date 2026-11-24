@@ -2212,6 +2212,27 @@ public:
     // WriteToSubresource/ReadFromSubresource.
     HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* read, void** data) override {
         if (image_) {
+            // LEONIDA_XS_TEXTURE_MAP (default on): a texture's Map hands out host memory, because on the console a
+            // texture's bytes are memory the title writes whenever it likes. Measured: the title asks for it twice in a
+            // boot and this refused both times with E_INVALIDARG ("texture Map (subresource 0, wants memory): 2
+            // refused"), and five-star-recomp's docs/gpu-resources.md records what that map is for -- "Bink decodes
+            // every video frame into its Y, Cr and Cb planes (1920x1080 and 3840x2160 R8, mapped once)". A refused map
+            // leaves the image holding the zeros it was created with, which is a black video frame. The shadow is
+            // packed at the layer's own pitches and goes into the image on Unmap.
+            if (data && subresource != leonida::all_subresources) {
+                Region mapped{};
+                if (!region(subresource, nullptr, mapped) || !mapped.rows) return E_INVALIDARG;
+                const std::uint64_t row_pitch = mapped.row_bytes;
+                const std::uint64_t depth_pitch = row_pitch * mapped.rows;
+                const std::uint64_t bytes = depth_pitch * mapped.slices;
+                if (bytes > (std::uint64_t{1} << 31)) return E_INVALIDARG;  // larger than any mapped texture we expect
+                if (texture_map_.size() < bytes) texture_map_.assign(std::size_t(bytes), std::byte{0});
+                texture_map_subresource_ = subresource;
+                texture_map_row_pitch_ = row_pitch;
+                texture_map_depth_pitch_ = depth_pitch;
+                *data = texture_map_.data();
+                return S_OK;
+            }
             VkImageSubresourceRange range{};
             return !data && cpu_visible() && subresource != leonida::all_subresources &&
                            leonida::image_range(binding_, subresource, range)
@@ -2223,7 +2244,26 @@ public:
         if (data) *data = mapped_;
         return S_OK;
     }
-    void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE*) override {}
+    void STDMETHODCALLTYPE Unmap(UINT subresource, const D3D12_RANGE*) override {
+        // The bytes the title wrote through the mapped pointer go into the image here, the way the console's unified
+        // memory already had them (LEONIDA_XS_TEXTURE_MAP, see Map).
+        if (!image_ || texture_map_.empty() || subresource != texture_map_subresource_) return;
+        // LEONIDA_LOG_TEXTURE_MAP: is the title actually writing through the pointer? A mapped texture whose shadow
+        // stays zero is a map the title does not use, and uploading it would only cost time.
+        if (std::getenv("LEONIDA_LOG_TEXTURE_MAP")) {
+            static std::atomic<unsigned> unmaps{0};
+            std::size_t nonzero = 0;
+            for (std::byte byte : texture_map_)
+                if (byte != std::byte{0}) ++nonzero;
+            const unsigned nth = unmaps.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (nth <= 8 || nth % 200 == 0)
+                std::fprintf(stderr, "[rt] d3d12: texture Unmap %u: %zu of %zu bytes non-zero\n", nth, nonzero,
+                             texture_map_.size());
+        }
+        cpu_copy(true, subresource, nullptr, texture_map_.data(), static_cast<UINT>(texture_map_row_pitch_),
+                 static_cast<UINT>(texture_map_depth_pitch_));
+        texture_map_subresource_ = kNoSubresource;
+    }
 
     // CPU copies into and out of a texture subresource. D3D12 completes them before returning and leaves it to
     // the application to keep the GPU off the subresource meanwhile, so a blocking copy is the whole contract.
@@ -2237,6 +2277,14 @@ public:
     }
 
 private:
+    // A texture Map's host shadow (LEONIDA_XS_TEXTURE_MAP): the subresource it belongs to and the pitches Unmap hands
+    // back to cpu_copy. Cleared to kNoSubresource when there is nothing to upload.
+    static constexpr UINT kNoSubresource = 0xFFFFFFFFu;
+    std::vector<std::byte> texture_map_;
+    UINT texture_map_subresource_ = kNoSubresource;
+    std::uint64_t texture_map_row_pitch_ = 0;
+    std::uint64_t texture_map_depth_pitch_ = 0;
+
     // One subresource region in copy units: rows of texels, or of 4x4 blocks for block-compressed formats.
     struct Region {
         VkImageSubresourceLayers layers;

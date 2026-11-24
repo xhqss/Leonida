@@ -1300,6 +1300,56 @@ list   slot 34  (per-draw root table)           717/s
 **它是在稳定地画空内容** ⇒ 剩下的问题在标题自己的游戏逻辑一侧，
 不是 GPU 侧、不是 CPU 侧、不是我们拒绝过什么。
 
+---
+
+## 19. 第九轮（2026-11-25 07:00）：每帧那 4 个 draw 是 `VS_Blit`/`PS_BlitColour`，**纹理 Map 也是空的**
+
+### 19.1 每帧那 4 个 draw 到底是什么（`LEONIDA_LOG_REPLAY_DRAW` + `LOG_DRAW_PIPELINE`）
+
+```
+replay draw #11400: 3 x 1, area 3840x2160, 1 colour(s), viewport 0,0 3840x2160, scissor 0,0..3840,2160,
+  pipeline 351397348368 [vs=VS_Blit_6e5520d1_Wrapped(0 bindings)[a4265d09]
+                        ps=PS_BlitColour_6e5520d1_Wrapped(0 bindings)[b629398a] ]
+replay draw #11400: colour 0 id 334934373712 format 37
+```
+
+⇒ 稳态的全部 GPU 工作就是**用 `VS_Blit` + `PS_BlitColour` 往同一个 3840×2160 目标上做全屏 blit**，
+两个 stage 都是 **0 个 set-0 绑定**（不采样任何纹理）。也就是说**这是"把目标刷成一个颜色"的清除**，
+不是内容。标题的帧 = 清空 + 呈现。
+
+### 19.2 试了 five-star-recomp 记录的那个坑：**纹理 Map**（已实现，默认为开，但不是它）
+
+它们的 `docs/gpu-resources.md` 写得很具体："**Bink decodes every video frame into its Y, Cr and Cb
+planes** (1920x1080 and 3840x2160 R8, **mapped once**)"，以及"Before this the planes kept the zeros of
+their creation." —— 而我们层里**纹理的 `Map` 直接返回 `E_INVALIDARG`**：
+
+```
+[rt] d3d12: texture Map (subresource 0, wants memory): 2 refused, 0 range-only
+```
+
+⇒ **标题确实会对纹理要内存，而我们两次都拒绝了它。** 这完全对得上"mapped once"的模式，
+所以实现了 `LEONIDA_XS_TEXTURE_MAP`（默认开）：`Map` 给一块按层自己 pitch 打包的 host 影子，
+`Unmap` 时用现成的 `cpu_copy` 推进图里。
+
+**实测：这条也不是它。** 标题确实 map 了两张纹理，但**一字节都没写**：
+
+```
+[rt] d3d12: texture Unmap 1: 0 of 4194304 bytes non-zero
+[rt] d3d12: texture Unmap 2: 0 of 1048576 bytes non-zero
+```
+
+两张（4 MiB 和 1 MiB）都是 map → 不写 → unmap，之后行为不变（85 个入口点、仍全黑）。
+所以这是一次"读"或者"清一下就走"，**不是视频帧的去处**。改动保留（它更接近 console 语义，无害），
+但这条线索**关闭**。
+
+### 19.3 现在的判断
+
+标题的帧就是：**清成黑色 → 呈现**，每秒 195 次；没有任何东西往那个目标里画。
+`VS_Blit`/`PS_BlitColour` 两个 stage 都是 0 绑定，说明它连"拿来拷贝的源"都没有 ——
+**标题自己就认为这一帧是空的**。下一个能问的问题就只剩一个：
+**`PS_BlitColour` 用的是哪个颜色？** 如果那个颜色就是黑，标题是故意清黑（那我们只能等它的
+游戏逻辑产出内容）；如果不是黑，那就是我们把它要的颜色丢了（`LOG_ROOT` 能看根参数）。
+
 **稳态的表也复查了一次**（150 秒的 run，`LOG_TABLE4` 在第 44,000 / 46,000 次 bind 采样，
 即启动完全结束之后）：
 
