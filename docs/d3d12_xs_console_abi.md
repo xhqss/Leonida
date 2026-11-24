@@ -171,6 +171,48 @@ Layout shift on the list tail (sibling layer): from `CopyTextureRegionX` on, met
 later in the newer layout — newer→older pairs 85→83, 86→84, 87→85, 90→88, 91→89, 92→90, 95→93,
 96→94.
 
+Slots 56-59 are **not** shifted by the console's four extra methods at 27-30: the older layout keeps
+`ExecuteIndirect` at 59, which is PC's own slot, and the newer layout moves it to 61 (+2 of the
+older 59). The command list proxy used to file 56-59 under the block's −4, which would forward a
+title's `ExecuteIndirect` to PC 55 (`SetPredication`).
+
+### 5.3a What this title calls (measured 2026-11-24)
+
+`LEONIDA_LOG_SLOTS=1` prints the console list slot histogram every two seconds. Over the first
+minutes of a run (before the 3D frame starts) the retail title calls exactly:
+
+| Slots | Per frame | Reading |
+|---|---:|---|
+| 9, 12 | 2, 3 | `Close`, three `DrawInstanced` of 3 vertices |
+| 20-25 | 1 each | topology, viewport, scissor, blend factor, stencil ref, pipeline state (×3) |
+| 32, 34, 36 | 3, 3, 2 | descriptor heaps, graphics root signature, root descriptor table |
+| 44, 47, 48, 50, 52 | 1, 1, 2, 3, 1 | root SRV, index buffer, vertex buffers, render targets, clear |
+| 70, 71, 72, 74, 75, 126, 139, 142 | 3, 2, 4, 1, 1, 1, 2, 1 | console-only tail, see below |
+| 146 | 6 | enhanced barrier |
+
+No `DrawIndexedInstanced` (13), no `Dispatch` (14) and no `ExecuteIndirect` (61) in that phase: the
+title is not submitting geometry yet, which is what a black screen looks like from the list's side.
+
+The tail calls are the newer layout's console-only methods, and the list proxy now runs them:
+
+| Slot | Method (older layout's number) | What the proxy does |
+|---:|---|---|
+| 71 | `Write32BitValueBottomOfPipeX` (69) | write into title memory, the bytes the title reads back |
+| 72 | `Write64BitValueBottomOfPipeX` (70) | same, 64-bit; a timestamp flag writes the clock |
+| 74 | `Wait64BitValueX` (72) | answered rather than hung (§8: no zero-copy GPU write into title memory on Windows) |
+| 70 | depth bounds (68) | `OMSetDepthBounds` |
+| 139 | `Reset` with the allocator (10) | `Reset` on the real list; also the layout evidence a list can see itself |
+| 75, 126, 142 | unmeasured console methods | recorded and ignored |
+
+Slot 139 is at 139 in the newer layout only, so a list that sees a slot past both layouts' tails
+(≥128) knows the title has the newer layout even when the queue call trace of §1.1 has not said so.
+
+The title also records copy (DMA) lists and submits them through one console submit. A PC queue
+refuses a list of another type — the layer logged `list 0 has type 2, the queue type 0` and executed
+nothing, which is how none of the title's uploads ran. The submit now routes each list to a queue of
+its own type.
+
+
 The shim hands out console-shaped command lists by default: `GetCommandList`-shaped queries build
 the proxy with the console vtable above. `LEONIDA_D3D12_LISTS=pc` makes it hand out PC-shaped lists
 instead, for guests compiled against the PC headers (the `tiny_frame` test fixture calls through PC
@@ -267,8 +309,9 @@ translator docs they are mostly confirmed here.
 The sibling-layer measurements above were made on retail Series titles and that project's own
 host runtime, not on this package or this layer. Still to be measured on this package:
 
-- **which runtime layout this title uses** — the older/newer detection rule of §1.1 needs a queue
-  call trace;
+- **which runtime layout this title uses** — **measured 2026-11-24: the newer one.** Its console-only
+  list methods sit at 71/72/74 (Write{32,64}BitValueBottomOfPipeX, Wait64BitValueX) and its `Reset`
+  at 139, which only the newer layout has; the list proxy detects it from the slot itself (§5.3a);
 - **draw-record encodings for graphics** — only compute dispatches and copies were measured; the
   graphics draw records and their sizes are unknown;
 - the `PresentX` signature and plane struct (no signature is recovered anywhere;

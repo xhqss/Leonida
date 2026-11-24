@@ -4098,9 +4098,35 @@ private:
         info.pDynamicState = &dynamic;
         info.layout = graphics_.layout;
         VkPipeline pipeline = VK_NULL_HANDLE;
-        if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, device_.pipeline_cache(), 1,
-                                                          &info, nullptr, &pipeline) != VK_SUCCESS)
-            return VK_NULL_HANDLE;
+        // LEONIDA_LOG_PIPELINE_TIME=1: how many graphics pipelines are built and how long each takes. The AMD driver
+        // compiles shaders on its own worker threads, so a slow load shows up as CPU on those threads and only the
+        // build wall time here says whether the title is waiting on compilation.
+        const bool timed = std::getenv("LEONIDA_LOG_PIPELINE_TIME") != nullptr;
+        LARGE_INTEGER started{};
+        if (timed) QueryPerformanceCounter(&started);
+        const VkResult built = device_.context->vk.vkCreateGraphicsPipelines(
+            device_.info.device, device_.pipeline_cache(), 1, &info, nullptr, &pipeline);
+        if (timed) {
+            LARGE_INTEGER now{}, frequency{};
+            QueryPerformanceCounter(&now);
+            QueryPerformanceFrequency(&frequency);
+            static std::atomic<long long> micros{0};
+            static std::atomic<unsigned> count{0};
+            static std::atomic<unsigned long long> next_dump{0};
+            micros.fetch_add((now.QuadPart - started.QuadPart) * 1000000 / frequency.QuadPart,
+                             std::memory_order_relaxed);
+            count.fetch_add(1, std::memory_order_relaxed);
+            const unsigned long long at = GetTickCount64();
+            unsigned long long expected = next_dump.load(std::memory_order_relaxed);
+            if (at >= expected && next_dump.compare_exchange_strong(expected, at + 2000, std::memory_order_relaxed)) {
+                const unsigned built_count = count.exchange(0, std::memory_order_relaxed);
+                const long long total = micros.exchange(0, std::memory_order_relaxed);
+                if (built_count)
+                    std::fprintf(stderr, "[rt] d3d12: %u graphics pipeline(s) built, %.1f ms each\n", built_count,
+                                 double(total) / 1000.0 / double(built_count));
+            }
+        }
+        if (built != VK_SUCCESS) return VK_NULL_HANDLE;
         return pipeline;
     }
 
@@ -6017,6 +6043,19 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (!desc) return E_INVALIDARG;
+        // LEONIDA_LOG_PIPELINE_TIME=1: how many PSO objects the title asks for, the same interval the build time uses.
+        // Thousands a second means the title is churning pipelines rather than building its scene.
+        if (std::getenv("LEONIDA_LOG_PIPELINE_TIME")) {
+            static std::atomic<unsigned> made{0};
+            static std::atomic<unsigned long long> next_dump{0};
+            made.fetch_add(1, std::memory_order_relaxed);
+            const unsigned long long at = GetTickCount64();
+            unsigned long long expected = next_dump.load(std::memory_order_relaxed);
+            if (at >= expected && next_dump.compare_exchange_strong(expected, at + 2000, std::memory_order_relaxed)) {
+                const unsigned count = made.exchange(0, std::memory_order_relaxed);
+                if (count) std::fprintf(stderr, "[rt] d3d12: %u CreateGraphicsPipelineState in the last 2 s\n", count);
+            }
+        }
         leonida::cached_pso::Key key = pipeline_key(*desc);
         if (const HRESULT hr = check_cached_pso(state_.pso_identity, key, desc->CachedPSO); FAILED(hr)) return hr;
         auto* pipeline = new PipelineState(state_);
@@ -6116,6 +6155,19 @@ public:
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
         PipelineStream stream;
         if (const HRESULT hr = parse_pipeline_stream(*desc, stream); FAILED(hr)) return d3d12_trace::result(method, hr);
+        // LEONIDA_LOG_PIPELINE_TIME=1: the PSO objects the title asks for, in the same two-second window as the build
+        // time above. Thousands a second means the title is churning pipelines, not building its scene.
+        if (std::getenv("LEONIDA_LOG_PIPELINE_TIME")) {
+            static std::atomic<unsigned> made{0};
+            static std::atomic<unsigned long long> next_dump{0};
+            made.fetch_add(1, std::memory_order_relaxed);
+            const unsigned long long at = GetTickCount64();
+            unsigned long long expected = next_dump.load(std::memory_order_relaxed);
+            if (at >= expected && next_dump.compare_exchange_strong(expected, at + 2000, std::memory_order_relaxed)) {
+                const unsigned count = made.exchange(0, std::memory_order_relaxed);
+                if (count) std::fprintf(stderr, "[rt] d3d12: %u CreatePipelineState in the last 2 s\n", count);
+            }
+        }
         // A primitive topology this layer has no Vulkan equivalent for: print the console's own bytes, the only place
         // its layout can be read from. One dump per process.
         if (!stream.has_cs &&
