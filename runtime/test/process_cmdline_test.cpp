@@ -399,6 +399,11 @@ int main() {
                 }
             }
             // A mask the host accepts is applied; the answer is the affinity the thread had.
+            // The core probe above may have been *applied*: SetThreadGroupAffinity accepts a core that is enabled on
+            // the machine even when the process mask excludes it (only SetThreadAffinityMask rejects that), and this
+            // test can run in a process whose mask is narrower than the machine's. The thread is put back before the
+            // next case, which is what its own answer promises.
+            set_group(self, &own, nullptr);
             const KAFFINITY lowest = own.Mask & (~own.Mask + 1);
             GROUP_AFFINITY one = {lowest, own.Group, {}}, prior = {};
             GROUP_AFFINITY now = {};
