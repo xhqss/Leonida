@@ -278,6 +278,16 @@ public:
                             std::uint32_t(source_rect->right) > binding.width ||
                             std::uint32_t(source_rect->bottom) > binding.height))
             return VK_ERROR_UNKNOWN;
+        if (std::getenv("LEONIDA_LOG_PRESENT_LAYOUT")) {
+            static int logged = 0;
+            if (logged++ < 6) {
+                std::lock_guard track(context_.tracker_mutex_);
+                std::fprintf(stderr, "[rt] present: source %llu tracked %d layout %d\n",
+                             static_cast<unsigned long long>(source),
+                             context_.tracker_.tracked(source) ? 1 : 0,
+                             int(context_.tracker_.layout(source, 0)));
+            }
+        }
         return submit(&binding, source, vsync, source_rect, detail::is_srgb_format(binding.format), tear);
     }
 

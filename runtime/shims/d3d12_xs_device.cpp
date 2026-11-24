@@ -1483,9 +1483,15 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                          static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
         if (const char* submit = std::getenv("LEONIDA_SUBMIT_35"); submit && submit[0] == '1' && a1 > 0 && a1 <= 64 &&
                                      a2 != 0) {
-            using ExecuteFn = void(WINAPI*)(IUnknown*, UINT, ID3D12CommandList* const*);
-            reinterpret_cast<ExecuteFn>(self->real_vtable[10])(self->real, static_cast<UINT>(a1),
-                                                               reinterpret_cast<ID3D12CommandList* const*>(a2));
+            // The batch names this layer's list proxies; the real queue only executes its own lists ("list 0 is not a
+            // direct command list"), so each entry is replaced by the real list first, as queue slot 10 does.
+            UnwrappedArray lists;
+            if (lists.fill(a2, a1)) {
+                const std::uint64_t real_lists = lists.data() ? lists.data() : a2;
+                using ExecuteFn = void(WINAPI*)(IUnknown*, UINT, ID3D12CommandList* const*);
+                reinterpret_cast<ExecuteFn>(self->real_vtable[10])(self->real, static_cast<UINT>(a1),
+                                                                   reinterpret_cast<ID3D12CommandList* const*>(real_lists));
+            }
         }
         return hr_to_u64(S_OK);
     } else {
@@ -2124,6 +2130,26 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                     return reinterpret_cast<ForwardFn>(real_vtable[pc])(
                         self->real, a1, a2, reinterpret_cast<std::uint64_t>(self->so_scratch.data()), a4, a5,
                         a6, a7, a8, a9, a10, a11, a12, a13, a14);
+                }
+            } else if constexpr (Slot == 50) {
+                // OMSetRenderTargets(count, handles, single_range, depth): the handles name descriptors in the title's
+                // own heap, while the layer wrote its TargetViews into the translated heap (the mapping the device
+                // applies when it creates a view). Handed the raw handle, the layer read the console heap's bytes as a
+                // TargetView and the lists bound resource ids 15/2/1 where the presented texture is 5725022816.
+                if (a1 > 0 && a1 <= 8 && a2) {
+                    const auto* handles = reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(a2);
+                    D3D12_CPU_DESCRIPTOR_HANDLE translated[8];
+                    for (std::uint64_t i = 0; i < a1; ++i) translated[i] = translate_cpu_handle(self->device, handles[i]);
+                    D3D12_CPU_DESCRIPTOR_HANDLE depth{};
+                    std::uint64_t depth_word = a4;
+                    if (a4) {
+                        depth = translate_cpu_handle(self->device,
+                                                     *reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(a4));
+                        depth_word = reinterpret_cast<std::uint64_t>(&depth);
+                    }
+                    return reinterpret_cast<ForwardFn>(real_vtable[pc])(
+                        self->real, a1, reinterpret_cast<std::uint64_t>(translated), a3, depth_word, a5, a6, a7, a8,
+                        a9, a10, a11, a12, a13, a14);
                 }
             } else if constexpr (Slot == kConsoleSetDescriptorHeaps) {
                 UnwrappedArray heaps;
