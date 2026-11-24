@@ -99,7 +99,7 @@ struct VulkanDeviceFunctions {
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                                                        \
     X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
-    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
+    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkGetDeviceFaultInfoEXT)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -1512,8 +1512,52 @@ public:
     // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
     std::mutex& submit_mutex() { return submit_mutex_; }
 
+    // LEONIDA_DEVICE_FAULT: with VK_EXT_device_fault enabled (the d3d12 device asks for it when that variable is set)
+    // the driver says which address the faulting shader read or wrote and how precisely. Printed once, and reported
+    // relative to the GPU address arena, so `address - heap_base` is the console VA a descriptor named.
+    void report_device_fault() noexcept {
+        static std::atomic<bool> reported{false};
+        bool expected = false;
+        if (!reported.compare_exchange_strong(expected, true, std::memory_order_relaxed)) return;
+        if (!vk.vkGetDeviceFaultInfoEXT || !device_) return;
+        VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+        if (vk.vkGetDeviceFaultInfoEXT(device_, &counts, nullptr) != VK_SUCCESS) return;
+        VkDeviceFaultInfoEXT fault{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+        VkDeviceFaultAddressInfoEXT addresses[8]{};
+        fault.pAddressInfos = addresses;
+        counts.addressInfoCount = std::min(counts.addressInfoCount, std::uint32_t(8));
+        counts.vendorInfoCount = 0;      // no room for vendor info here; the counts are the second call's capacity
+        counts.vendorBinarySize = 0;
+        if (vk.vkGetDeviceFaultInfoEXT(device_, &counts, &fault) != VK_SUCCESS) return;
+        const std::uint32_t address_count = std::min(counts.addressInfoCount, std::uint32_t(8));
+        const std::uint64_t base = replay_.heap_base;
+        std::fprintf(stderr, "[rt] d3d12: device fault: %s\n", fault.description);
+        for (std::uint32_t i = 0; i < address_count; ++i) {
+            const char* type = "unknown";
+            switch (addresses[i].addressType) {
+            case VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT: type = "none"; break;
+            case VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT: type = "read invalid"; break;
+            case VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT: type = "write invalid"; break;
+            case VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT: type = "execute invalid"; break;
+            case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT: type = "shader pointer"; break;
+            case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT: type = "shader pointer invalid"; break;
+            case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT: type = "shader pointer fault"; break;
+            }
+            const std::uint64_t address = addresses[i].reportedAddress;
+            const std::uint64_t arena_offset = address - base;
+            std::fprintf(stderr,
+                         "[rt] d3d12:   fault address %u: 0x%llx (%s, precision 0x%llx); heap_base 0x%llx; "
+                         "console VA 0x%llx%s\n",
+                         i, static_cast<unsigned long long>(address), type,
+                         static_cast<unsigned long long>(addresses[i].addressPrecision),
+                         static_cast<unsigned long long>(base), static_cast<unsigned long long>(arena_offset),
+                         address >= base && arena_offset < 0x100000000ull ? " (in the arena's 4 GiB)" : "");
+        }
+    }
+
     void mark_device_lost() noexcept {
         device_lost_.store(true, std::memory_order_release);
+        report_device_fault();
         if (fence_dispatcher_) {
             try {
                 fence_dispatcher_->notify_device_lost();

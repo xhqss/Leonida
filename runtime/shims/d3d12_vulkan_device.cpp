@@ -1708,6 +1708,12 @@ public:
             in_arena_ = true;
             cpu_ = device.arena.mapped + arena_offset_;
             std::memset(cpu_, 0, std::size_t(bytes));
+            // LEONIDA_LOG_TABLE: where a shader-visible heap sits in the console VA space. A table VA a title passes to
+            // a root descriptor table is the heap's GPU handle (this offset) plus a descriptor offset.
+            if (std::getenv("LEONIDA_LOG_TABLE"))
+                std::fprintf(stderr, "[rt] d3d12: descriptor heap %u x 0x%llx at arena 0x%llx\n", desc.NumDescriptors,
+                             static_cast<unsigned long long>(kDescriptorSize),
+                             static_cast<unsigned long long>(arena_offset_));
         } else {
             storage_.reset(new std::byte[std::size_t(bytes)]());
             cpu_ = reinterpret_cast<std::uint8_t*>(storage_.get());
@@ -9812,6 +9818,25 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                      "[rt] d3d12: no VK_EXT_custom_border_color; custom sampler border colours fall back to transparent black\n");
     }
 
+    // LEONIDA_DEVICE_FAULT: VK_EXT_device_fault lets the driver report the address a faulting shader read or wrote.
+    // report_device_fault (vulkan_backend.h) prints it relative to heap_base when the device is lost, which is how a
+    // descriptor whose address is wrong finds itself. A debug aid: off unless the variable is set and the driver has it.
+    bool device_fault_requested =
+        std::getenv("LEONIDA_DEVICE_FAULT") &&
+        std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_EXT_DEVICE_FAULT_EXTENSION_NAME) == 0;
+        });
+    VkPhysicalDeviceFaultFeaturesEXT device_fault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    if (device_fault_requested) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &device_fault};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        device_fault_requested = device_fault.deviceFault == VK_TRUE;
+    }
+    if (device_fault_requested) {
+        device_fault.pNext = *v13.next();
+        *v13.next() = &device_fault;
+    }
+
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
     device_info.pQueueCreateInfos = queue_infos.data();
@@ -9850,6 +9875,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.presentation = has_swapchain && instance_has_surface;
     info.swapchain_colorspace = info.presentation && swapchain_colorspace_enabled;
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
+    if (device_fault_requested) device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)

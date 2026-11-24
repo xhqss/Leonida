@@ -4114,11 +4114,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             data.code_base = graphics.code_base;
             if (std::getenv("LEONIDA_LOG_USERDATA")) {
                 static std::atomic<int> logged{0};
-                if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 16)
                     std::fprintf(stderr,
-                                 "[rt] user data: %08x %08x %08x %08x %08x %08x %08x %08x | %08x %08x %08x %08x\n",
+                                 "[rt] user data: %08x %08x %08x %08x %08x %08x %08x %08x | %08x %08x %08x %08x | "
+                                 "%08x %08x %08x %08x\n",
                                  data.s[0], data.s[1], data.s[2], data.s[3], data.s[4], data.s[5], data.s[6], data.s[7],
-                                 data.s[8], data.s[9], data.s[10], data.s[11]);
+                                 data.s[8], data.s[9], data.s[10], data.s[11], data.s[12], data.s[13], data.s[14],
+                                 data.s[15]);
             }
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
             if (graphics.bindless_set) {
