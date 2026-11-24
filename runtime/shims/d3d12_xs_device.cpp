@@ -2751,7 +2751,12 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 a2 = shader_address(self->device, a2, 64 << 10);  // a root CBV/SRV/UAV: at most a 64 KiB buffer
                 if (std::getenv("LEONIDA_LOG_ROOT")) {
                     static std::atomic<int> logged{0};
-                    if (logged.fetch_add(1, std::memory_order_relaxed) < 2) {
+                    const int nth = logged.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (nth <= 24)
+                        std::fprintf(stderr, "[rt] root descriptor %u: 0x%llx -> 0x%llx\n", unsigned(Slot),
+                                     static_cast<unsigned long long>(source),
+                                     static_cast<unsigned long long>(a2));
+                    if (nth <= 2) {
                         std::uint32_t words[32] = {};
                         leonida::copy_committed(reinterpret_cast<std::uint8_t*>(words), source, sizeof(words));
                         std::fprintf(stderr,
@@ -2786,20 +2791,22 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                         view.BufferLocation = shader_address(self->device, view.BufferLocation, view.SizeInBytes);
                     if (std::getenv("LEONIDA_LOG_VB")) {
                         static std::atomic<int> logged{0};
-                        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                        if (logged.fetch_add(1, std::memory_order_relaxed) < 40) {
                             // The bytes the shader will read: the title's own memory at the view's address, so a view
                             // that resolves to a buffer full of zeros (or to the wrong memory) is visible at once.
-                            std::uint32_t words[8] = {};
+                            std::uint32_t words[16] = {};
                             leonida::copy_committed(reinterpret_cast<std::uint8_t*>(words), in[0].BufferLocation,
                                                     sizeof(words));
                             std::fprintf(stderr,
                                          "[rt] vertex buffers: count %llu, view 0 at 0x%llx -> 0x%llx, %u bytes, "
-                                         "stride %u; first words %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                         "stride %u; first words %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x "
+                                         "%08x %08x %08x %08x %08x %08x\n",
                                          static_cast<unsigned long long>(a2),
                                          static_cast<unsigned long long>(in[0].BufferLocation),
                                          static_cast<unsigned long long>(self->vb_scratch[0].BufferLocation),
                                          in[0].SizeInBytes, in[0].StrideInBytes, words[0], words[1], words[2],
-                                         words[3], words[4], words[5], words[6], words[7]);
+                                         words[3], words[4], words[5], words[6], words[7], words[8], words[9],
+                                         words[10], words[11], words[12], words[13], words[14], words[15]);
                         }
                     }
                     return reinterpret_cast<ForwardFn>(real_vtable[pc])(
