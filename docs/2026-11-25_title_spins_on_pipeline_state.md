@@ -1095,3 +1095,93 @@ call 15: code 8ea9ce4b880bbccd rs 0x7cce7ec0 kind6 768 B
 5. `XS_EMPTY_CS` 还开着（默认关）：语料仍缺那个 FLT_MAX 程序（§15.1），
    修 `tools/fspx_unpack.py` 的头部反汇编后再补。
 
+---
+
+## 17. 第七轮（2026-11-25 06:40）：**图形管线风暴（50,432 个）+ 两条旧结论被推翻**
+
+### 17.1 先纠正两条：标题**读过盘**，而且读了很多
+
+上一轮把"0 次文件读 ⇒ 资产加载没开始"写进了嫌疑名单。**这是错的。** 用进程 I/O 计数器量
+（`Win32_PerfRawData_PerfProc_Process` 的 `IOReadOperations`/`IOReadBytes`）：
+
+| 时刻 | 读操作 | 读字节 |
+| --- | --- | --- |
+| 稳态 t0 | 833,589 | **3,764,196,950**（3.76 GB） |
+| 25 s 后 t1 | 833,595 | 3,764,506,540 |
+| 增量 | **+6 次** | **+310 KB** |
+
+⇒ 标题在启动阶段**读了 3.76 GB**，然后**几乎完全停止**（25 秒里 6 次、310 KB）。
+所以"没读盘"只在**稳态**成立：**它已经把该读的读完/停在某个点上**，
+而不是"还没开始读"。DirectStorage 的 enqueue 计数仍然为 0（那条另有解释：它的读走的是
+同步 `ReadFile` 路径，不是 storage queue）。
+
+### 17.2 真正的 CPU 大头：**图形管线每 2 ms 建一个**
+
+`LEONIDA_LOG_PSO_COUNT`（新增）在槽 86 上计数。一个 ~71 秒的 run 里：
+
+```
+graphics pipeline state #49408 / #49664 / #49920 / #50176 / #50432
+```
+
+⇒ **50,432 个图形 PSO，约 710 个/秒，连续不断**。而 compute 侧只有 64 个
+（§16 那 300 个是 FSR 的一族，早建完了）。
+
+对照第一轮就记下的"~5 万个 PSO 的启动期洪水"——**那个数字是真的，而且它不是"启动期"**：
+它一直在建。这也是 §16 里"CPU 全在驱动里"的真正来源（每个 PSO 都要 amdvlk 编译一次）。
+
+### 17.3 修法：图形 PSO 也串行化 + 按流去重（默认生效）
+
+`proxy_create_pipeline_state`（槽 86）：
+
+- 按 **pipeline state stream 的 sha256** 做键（stream 就是整个 PSO 定义，字节相同就是同一个状态），
+  命中就 `AddRef` 并把第一次建出来的对象还回去；
+- 同一把 `std::mutex` **跨**驱动的 `CreatePipelineState` 持有 —— 和 §16 的 compute 侧一致，
+  等锁的线程在内核里睡，不在 amdvlk 里转。
+- `LEONIDA_LOG_PSO_COUNT` 每 4096 次调用打印 `calls / distinct / hits`：distinct ≈ calls 说明
+  标题**确实有这么多不同的状态**（预编译整库），distinct 很小说明它在反复要同样的东西。
+
+实测 CPU 从 §16 的 1600% 量级降到 **244%**，present 6780/60 s（113 Hz）。
+
+### 17.4 答案：**标题确实有 5 万个不同的 PSO**（不是重复要同一个）
+
+`LEONIDA_LOG_PSO_COUNT` 的 census（每 4096 次调用一行，40 秒的 run）：
+
+```
+4096 calls, 4026 distinct, 69 hits
+8192 calls, 8115 distinct, 76 hits
+...
+49152 calls, 48205 distinct, 946 hits
+```
+
+**49,152 次调用里 48,205 个是不同 的（hits 只占 1.9%）** ⇒ 标题在**预编译整库**，
+不是泄漏也不是反复要同一个。每个 PSO 在这边都是一次 SPIR-V 编译，在 console 上只是
+"把 native 代码拼成状态"，这就是为什么它在这边慢到 3 分钟还没建完。
+
+**这是本轮最重要的结论**：标题不是"卡住"，是**在干一件这边比 console 慢上千倍的事**。
+把它跑完需要的时间 = 50,000 × 每次编译耗时；想让它"能玩"，几乎肯定需要
+**跨运行的 PSO 缓存**（five-star-recomp 也有 "a disk cache"，它的 README 明写
+"its pipelines build from the translated shaders (with a disk cache)"）。
+
+### 17.5 试过但**失败**的：把 Vulkan pipeline cache 存回磁盘（已回滚）
+
+层里**已经**会在启动时读 `pipeline_cache.bin`（`create_seeded_pipeline_cache`，带设备身份校验），
+但**从来不写**（`pipeline_cache.bin` 根本不存在）。于是加了两处：
+
+- `vkGetPipelineCacheData` → 原子写回 `pipeline_cache.bin`（在 `gta6rt.exe` 旁边，不动游戏包）；
+- 每 2048 次建成就存一次（这样被 kill 的 run 也能攒下成果）。
+
+**结果：进程在启动早期 32 秒时 `0xc0000005` 崩掉**，稳定复现。
+最可疑的是把 `vkGetPipelineCacheData` 加进了 `LEONIDA_VK_FUNCTIONS` 那张表
+（加完就崩，回滚就好）；另一个已知的真实隐患是 **VkPipelineCache 没有外部同步**，
+周期性地在别的线程正在 `vkCreateGraphicsPipelines` 时把它交给 `vkGetPipelineCacheData`
+是未定义行为。**两个隐患都要处理**再重做，所以整块回滚了，
+只留下 `note_pipeline_created()` 的计数思路在注释里。
+
+### 17.6 踩到的坑（本轮）
+
+**不要在测量跑动的时候 build。** `tmp\build-gta6rt.cmd` 前面那句
+`Get-Process gta6rt | Stop-Process -Force` 会把正在跑的长测**杀掉** ——
+一个"200 秒"的 run 就这样在 71 秒被自己终止，`run-probe.ps1` 报的是
+`exited on its own after 71s`，而日志里没有任何退出原因（因为根本不是它自己退的）。
+判据：日志末尾在 present 中途截断、没有 assert/exit 行 ⇒ 先怀疑自己。**这一轮犯了两次。**
+

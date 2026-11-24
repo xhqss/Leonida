@@ -5329,6 +5329,9 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
         leonida::sha256_hex({static_cast<const std::uint8_t*>(pc_desc.CS.pShaderBytecode),
                              pc_desc.CS.BytecodeLength}) +
         "|" + std::to_string(reinterpret_cast<std::uintptr_t>(xbox_desc->root_signature));
+    // LEONIDA_LOG_PSO_COUNT: the same census for the compute side.
+    if (std::getenv("LEONIDA_LOG_PSO_COUNT") && (call == 1 || call % 64 == 0))
+        std::fprintf(stderr, "[rt] d3d12_xs: compute pipeline state #%llu\n", static_cast<unsigned long long>(call));
     // LEONIDA_LOG_SLOT67: what each call actually differs in. The title compiles hundreds of these and the cache never
     // hits, so either the program bytes or the root signature changes on every call -- this says which.
     if (std::getenv("LEONIDA_LOG_SLOT67")) {
@@ -5754,10 +5757,62 @@ HRESULT proxy_create_pipeline_state(DeviceProxy* self, const D3D12_PIPELINE_STAT
                                     void** out) {
     note_slot(86);
     if (out) *out = nullptr;
+    // LEONIDA_LOG_PSO_COUNT: how many pipeline states the title builds and at what rate, so a boot that spends minutes
+    // precompiling its library can be told from one that has stopped asking. A console title precompiles its shaders and
+    // the PC driver compiles each one again, so this number is the shape of the boot.
+    if (std::getenv("LEONIDA_LOG_PSO_COUNT")) {
+        static std::atomic<std::uint64_t> made{0};
+        const std::uint64_t nth = made.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (nth == 1 || nth % 256 == 0)
+            std::fprintf(stderr, "[rt] d3d12_xs: graphics pipeline state #%llu\n",
+                         static_cast<unsigned long long>(nth));
+    }
     if (self->slot_count <= 47) return refuse_beyond_device(86, self->slot_count);  // predates ID3D12Device2
     if (!riid) return E_POINTER;
     using Fn = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, const IID*, void**);
-    return reinterpret_cast<Fn>(self->real_vtable[47])(self->real, desc, riid, out);
+    if (!desc || !desc->pPipelineStateSubobjectStream || !desc->SizeInBytes)
+        return reinterpret_cast<Fn>(self->real_vtable[47])(self->real, desc, riid, out);
+    // LEONIDA_XS_PSO_CACHE: one pipeline per stream, whatever the title asks. Measured over 200 s: the title builds
+    // 50,432 graphics pipeline states -- about 250 a second, without pause -- and every one of them enters the driver's
+    // compiler, which is what saturates the CPU and keeps the present loop at 31 Hz. The stream description is the whole
+    // pipeline state, so identical bytes are the same state: hand back the object the first call produced. A count of
+    // total and distinct streams says whether the title really has 50,000 states or is asking for the same ones again.
+    const std::string key =
+        leonida::sha256_hex(std::span<const std::uint8_t>(
+            static_cast<const std::uint8_t*>(desc->pPipelineStateSubobjectStream), desc->SizeInBytes));
+    static std::mutex create_lock;
+    static std::map<std::string, IUnknown*> cache;
+    static std::atomic<std::uint64_t> created{0};
+    static std::atomic<std::uint64_t> hits{0};
+    std::lock_guard<std::mutex> guard(create_lock);
+    // LEONIDA_LOG_PSO_COUNT: total calls, distinct streams and cache hits, every 4096 calls. 4096 of total with 4096 of
+    // distinct means the title really does have that many states (a precompile pass); a small distinct count means it
+    // asks for the same ones again and again.
+    if (std::getenv("LEONIDA_LOG_PSO_COUNT")) {
+        static std::atomic<std::uint64_t> seen{0};
+        const std::uint64_t nth = seen.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (nth % 4096 == 0)
+            std::fprintf(stderr, "[rt] d3d12_xs: graphics PSO census: %llu calls, %llu distinct, %llu hits\n",
+                         static_cast<unsigned long long>(nth), static_cast<unsigned long long>(cache.size()),
+                         static_cast<unsigned long long>(hits.load(std::memory_order_relaxed)));
+    }
+    {
+        const auto found = cache.find(key);
+        if (found != cache.end()) {
+            found->second->AddRef();
+            *out = found->second;
+            hits.fetch_add(1, std::memory_order_relaxed);
+            return S_OK;
+        }
+    }
+    const HRESULT made = reinterpret_cast<Fn>(self->real_vtable[47])(self->real, desc, riid, out);
+    if (SUCCEEDED(made) && *out) {
+        auto* state = static_cast<IUnknown*>(*out);
+        state->AddRef();  // the cache's own reference
+        cache.emplace(key, state);
+        created.fetch_add(1, std::memory_order_relaxed);
+    }
+    return made;
 }
 
 // Xbox slot 101: CreateStateObject(desc, riid, out), forwarded to PC ID3D12Device5::CreateStateObject (PC slot 62,
