@@ -3802,8 +3802,31 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                      queried == sizeof(info) ? static_cast<unsigned long>(info.State) : 0ul,
                                      queried == sizeof(info) ? static_cast<unsigned long>(info.Protect) : 0ul,
                                      queried == sizeof(info) ? static_cast<unsigned long>(info.Type) : 0ul);
+                        // Where the title keeps its own copy of this heap. The arena is what the shader reads; the
+                        // title's XMem backing is what the title itself wrote. The range with a backing_start is the
+                        // heap's GPU-handle range, so the title-side address of an arena offset is
+                        // backing_start + (offset - that range's console start).
+                        SIZE_T title_at = 0;
+                        {
+                            std::lock_guard guard(descriptor_range_mutex());
+                            for (const auto& range : descriptor_ranges()) {
+                                if (range.backing_start && table_va >= range.custom_start &&
+                                    table_va < range.custom_end) {
+                                    title_at = range.backing_start + (table_va - range.custom_start);
+                                    break;
+                                }
+                            }
+                        }
+                        std::fprintf(stderr,
+                                     "[rt] table4 bind %llu: arena base 0x%llx size 0x%llx, title copy 0x%llx\n",
+                                     static_cast<unsigned long long>(bind),
+                                     static_cast<unsigned long long>(
+                                         reinterpret_cast<SIZE_T>(leonida::arena_host_base)),
+                                     static_cast<unsigned long long>(leonida::arena_host_size),
+                                     static_cast<unsigned long long>(title_at));
                         std::uint32_t t[80] = {};
-                        leonida::copy_committed(reinterpret_cast<std::uint8_t*>(t), table_va, sizeof(t));
+                        if (title_at)
+                            leonida::copy_committed(reinterpret_cast<std::uint8_t*>(t), title_at, sizeof(t));
                         std::uint32_t g[80] = {};
                         const bool have_arena = leonida::arena_host_base && a2 + sizeof(g) <= leonida::arena_host_size;
                         if (have_arena) std::memcpy(g, leonida::arena_host_base + a2, sizeof(g));
@@ -3829,55 +3852,82 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                         // census over the whole table can say whether the title ever put real descriptors in it.
                         std::vector<std::uint32_t> all(kMirrorTableBytes / 4, 0);
                         const std::uint64_t whole =
-                            table_va < leonida::arena_host_size
-                                ? std::min<std::uint64_t>(kMirrorTableBytes, leonida::arena_host_size - table_va)
+                            a2 < leonida::arena_host_size
+                                ? std::min<std::uint64_t>(kMirrorTableBytes, leonida::arena_host_size - a2)
                                 : 0;
-                        leonida::copy_committed(reinterpret_cast<std::uint8_t*>(all.data()), table_va, whole);
-                        unsigned slots = 0, zeros = 0, pairs = 0, tsharps = 0, other = 0, shown = 0;
-                        for (std::uint64_t at = 0; at + 32 <= whole; at += 32) {
-                            const std::uint32_t* w = all.data() + at / 4;
-                            ++slots;
-                            if (!w[0] && !w[1] && !w[2] && !w[3]) {
-                                ++zeros;
-                                continue;
+                        // `what` says whose copy this is: "arena" is what the shader reads, "title" is what the
+                        // title's own code wrote. Only a census over the whole table can say whether the title ever
+                        // put real descriptors in it, and whether they ever reach the shader.
+                        const auto census = [&](const char* what, SIZE_T base, std::uint64_t bytes) {
+                            if (!base || bytes < 32) {
+                                std::fprintf(stderr, "[rt] table4 bind %llu census %s: no memory\n",
+                                             static_cast<unsigned long long>(bind), what);
+                                return;
                             }
-                            if (!w[1] && w[0] == w[2] && !w[3]) {
-                                ++pairs;
-                                continue;
-                            }
-                            if ((w[3] >> 28) & 0xf) {
-                                ++tsharps;
-                                if (tsharps <= 6) {
-                                    const std::uint64_t addr =
-                                        ((static_cast<std::uint64_t>(w[1] & 0xff) << 32) | w[0]) << 8;
-                                    std::fprintf(stderr,
-                                                 "[rt] table4 bind %llu +0x%llx T#: %08x %08x %08x %08x %08x %08x "
-                                                 "%08x %08x (address 0x%llx)\n",
-                                                 static_cast<unsigned long long>(bind),
-                                                 static_cast<unsigned long long>(at), w[0], w[1], w[2], w[3], w[4],
-                                                 w[5], w[6], w[7], static_cast<unsigned long long>(addr));
+                            std::fill(all.begin(), all.end(), 0u);
+                            std::uint64_t span = std::min<std::uint64_t>(kMirrorTableBytes, bytes);
+                            span &= ~std::uint64_t{31};
+                            leonida::copy_committed(reinterpret_cast<std::uint8_t*>(all.data()), base, span);
+                            unsigned slots = 0, zeros = 0, pairs = 0, tsharps = 0, other = 0, shown = 0;
+                            for (std::uint64_t at = 0; at + 32 <= span; at += 32) {
+                                const std::uint32_t* w = all.data() + at / 4;
+                                ++slots;
+                                if (!w[0] && !w[1] && !w[2] && !w[3]) {
+                                    ++zeros;
+                                    continue;
                                 }
-                                continue;
+                                if (!w[1] && w[0] == w[2] && !w[3]) {
+                                    ++pairs;
+                                    continue;
+                                }
+                                if ((w[3] >> 28) & 0xf) {
+                                    ++tsharps;
+                                    if (tsharps <= 6) {
+                                        const std::uint64_t addr =
+                                            ((static_cast<std::uint64_t>(w[1] & 0xff) << 32) | w[0]) << 8;
+                                        std::fprintf(stderr,
+                                                     "[rt] table4 bind %llu %s +0x%llx T#: %08x %08x %08x %08x "
+                                                     "%08x %08x %08x %08x (address 0x%llx)\n",
+                                                     static_cast<unsigned long long>(bind), what,
+                                                     static_cast<unsigned long long>(at), w[0], w[1], w[2], w[3],
+                                                     w[4], w[5], w[6], w[7],
+                                                     static_cast<unsigned long long>(addr));
+                                    }
+                                    continue;
+                                }
+                                ++other;
+                                if (shown < 12) {
+                                    ++shown;
+                                    const std::uint64_t base_va =
+                                        (std::uint64_t(w[1] & 0xffff) << 32) | (w[0] & 0xfffffffcull);
+                                    std::fprintf(stderr,
+                                                 "[rt] table4 bind %llu %s +0x%llx other: %08x %08x %08x %08x "
+                                                 "V# base 0x%llx committed %d\n",
+                                                 static_cast<unsigned long long>(bind), what,
+                                                 static_cast<unsigned long long>(at), w[0], w[1], w[2], w[3],
+                                                 static_cast<unsigned long long>(base_va),
+                                                 base_va && leonida::is_committed(
+                                                                reinterpret_cast<const void*>(base_va))
+                                                     ? 1
+                                                     : 0);
+                                }
                             }
-                            ++other;
-                            if (shown < 12) {
-                                ++shown;
-                                const std::uint64_t base =
-                                    (std::uint64_t(w[1] & 0xffff) << 32) | (w[0] & 0xfffffffcull);
-                                std::fprintf(stderr,
-                                             "[rt] table4 bind %llu +0x%llx other: %08x %08x %08x %08x V# base 0x%llx "
-                                             "committed %d\n",
-                                             static_cast<unsigned long long>(bind),
-                                             static_cast<unsigned long long>(at), w[0], w[1], w[2], w[3],
-                                             static_cast<unsigned long long>(base),
-                                             base && leonida::is_committed(reinterpret_cast<const void*>(base)) ? 1 : 0);
-                            }
-                        }
-                        std::fprintf(stderr,
-                                     "[rt] table4 bind %llu census of 0x%llx: %u slots, %u zero, %u {ptr,ptr} pairs, "
-                                     "%u T#, %u other\n",
-                                     static_cast<unsigned long long>(bind),
-                                     static_cast<unsigned long long>(table_va), slots, zeros, pairs, tsharps, other);
+                            std::fprintf(stderr,
+                                         "[rt] table4 bind %llu census %s of 0x%llx: %u slots, %u zero, %u "
+                                         "{ptr,ptr} pairs, %u T#, %u other\n",
+                                         static_cast<unsigned long long>(bind), what,
+                                         static_cast<unsigned long long>(base), slots, zeros, pairs, tsharps,
+                                         other);
+                        };
+                        // `a2` is what the shim actually hands the layer, i.e. the arena offset the shader's
+                        // heap_base + va reaches; `table_va` is the value the title passed. Reading `table_va` as a
+                        // host address (what this probe did until 2026-11-25) reads an unrelated region and made
+                        // "the title's table holds {ptr,ptr} pairs" look like a fact; it was not.
+                        census("arena", leonida::arena_host_base
+                                           ? reinterpret_cast<SIZE_T>(leonida::arena_host_base) + a2
+                                           : 0,
+                               whole);
+                        if (title_at) census("title", title_at, whole);
                     }
                 }
                 if (std::getenv("LEONIDA_LOG_ROOT")) {

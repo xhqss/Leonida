@@ -638,6 +638,7 @@ as D32_FLOAT                     -> size 0xf00000         alignment 0x10000
 | **victory-gta6**（`fxceless` 对 VIctory 的 fork） | Xbox→PC 兼容层，**自带着色器重编译器**（console ISA → DXIL） | **D3D12** | **世界能渲染出来**：2–4 fps，可玩约 13 分钟（其 README） |
 | **AnyXboxX** | Xbox Series X 模拟器（Unicorn 跑标题代码），图形/shaders 直接用 victory-gta6 | D3D12 | 同上；`docs/running-gta6.md`：**每帧约 4,580 个 draw**、428 个 draw 因缺管线被丢 |
 | **xcl** | Xbox 兼容层（Rust） | **D3D12** | 参考实现（console 描述符堆语义） |
+| **five-star-recomp**（2026-11-25 新增调研，见 §14） | Xbox→PC 重实现（C#/.NET 10，GPL-3.0），**自己的 RDNA→HLSL 翻译器** + 自己的 loader + D3D12.X shim | **D3D12** | 它的 README：**"GTA VI does not run yet"**；能显示 logo/开场/菜单、载入故事模式到 title card，然后停 |
 | ~~VIctory 上游~~ | 已被 fork 取代 | D3D12 | 用户明确说过时，忽略 |
 
 **第一件必须记住的事**：两个能出画面的实现都是 **D3D12**，而且**自己编译着色器**。
@@ -698,7 +699,7 @@ Vulkan 侧的等价物就是 I3 的"大 buffer + 目录"。
 
 | 实验 | 结果 |
 | --- | --- |
-| `LEONIDA_XS_TITLE_HANDLES=1`（层把描述符直接写进标题自己的描述符内存）+ `XS_TABLE_MIRROR` | 表里的普查**仍是** 1836 个 `{ptr,ptr}`、**0 个 T#** ⇒ **标题不会把我们写的描述符拷进它 bind 的表**；它表里放的是它自己的结构。所以只改"写哪里"不够，必须让**着色器读的位置**就是层写的位置（= I1） |
+| `LEONIDA_XS_TITLE_HANDLES=1`（层把描述符直接写进标题自己的描述符内存）+ `XS_TABLE_MIRROR` | ⚠ **本行结论已作废，见 §14.4**：这里的普查读错了地址（把 arena 偏移当 host 地址），"1836 个 `{ptr,ptr}`"是无关内存里的区间表。改正后：着色器读的位置**全零**，标题自己那份只有 7 个非零槽、里面是 drawable 头 `0x8e3/0xee4` |
 | `LEONIDA_XS_CPU_HANDLE_ARENA=1` | 不崩；只 180 presents/24 s（慢），随后在 slot 67 因**缺 FSPX kind-6/kind-0 程序**退出 ⇒ **比默认路径走得远**，是新的线索 |
 | 给窗口发 space/enter（`mcp__windows__` 输入工具，窗口标题 `Americas`） | 无变化；日志里**没有任何 GameInput/XInput 调用** ⇒ 标题**不是在等按键**，它没有轮询输入 |
 | `LEONIDA_LOG_FAILED_CALLS=1` | 除 `CreateLifetimeTracker`（见 §12.5）外**没有别的被拒调用** ⇒ 没有第二个"静默失败"藏着 |
@@ -715,4 +716,143 @@ Vulkan 侧的等价物就是 I3 的"大 buffer + 目录"。
 那是 `DeserializeComputePipelineStateX` 拿来的一段 console compute 程序，语料里没有对应翻译。
 victory-gta6 的经验是这类"程序没翻译"是**成片**的（它们修了 730 个 compute 程序的隐式 mip 采样）。
 ⇒ 值得用 `tools/rdna2spirv.py` 的诊断对这批 kind-6/kind-0 做一次普查，看缺多少、缺在哪。
+
+---
+
+## 14. 第四轮（2026-11-25 05:00）：five-star-recomp + I1/I2 实做，**并纠正 §13.4 的一个假事实**
+
+### 14.1 five-star-recomp：有用，而且是这五个库里**最完整**的那个
+
+| 项 | 值 |
+| --- | --- |
+| 位置 | `E:\temp\wait_work\five-star-recomp` |
+| 语言/构建 | C# / .NET 10 SDK，`dotnet build FiveStar.slnx`；GPL-3.0-or-later |
+| 体积 | 2,044 个文件 / 7.5 MB |
+| 图形 API | 桌面 **D3D12**（`src/FiveStar.Loader/Shims/D3D12X/`） |
+| 着色器 | **自己的 RDNA→HLSL 翻译器**（`src/FiveStar.Shaders`，25,908 个程序全编译；可选自带 DXIL 后端，不用 dxc） |
+| 它自己的状态 | README：**"GTA VI does not run yet."** 已到"故事模式加载 → 故事 intro 的 title card"，然后停 |
+
+**它比 victory-gta6 走得远的地方**：完整 loader、资源/纹理/模型/音频格式、PSO 磁盘缓存、
+DirectStorage、XG 布局与 detile、BCPack 纹理。**它没做到的地方**：跑不进游戏（victory-gta6 能出世界）。
+
+对我们真正有用的是它的 **D3D12.X shim 的语义层**——它是唯一一个把"标题的描述符内存模型"
+写成文档的库（`docs/d3d12x-shim.md` 66 KB + `docs/gpu-resources.md`）。
+
+### 14.2 它给出的描述符模型（可以直接照抄的骨架）
+
+1. **描述符堆 = 标题内存。** 标题的 shader-visible view/sampler 堆直接从标题自己的分配钩子
+   （allocator id 128 / object type 4）取内存，所以 **CPU handle == GPU handle == 记录地址**，
+   一个槽 32 字节，和 console 一样。
+2. **记录 dword 0 = 桌面堆索引。** 槽 17..22 / 61 / 70 写描述符时顺手把 dword 0 写成
+   "这个描述符在宿主 shader-visible 堆里的索引"，dwords 1..3 写 V# 的 stride / count / format。
+3. **CPU-only 堆也这么做。** "the game creates eleven of 3,128 descriptors and copies their
+   32-byte records into its per-draw tables itself, 0x144d9efc0"。
+4. **descriptor window。** 一个 GPU 可读写的 buffer（write-combined 系统内存），按**游戏槽号**
+   排的 32 字节镜像（前面留 sampler 记录、1024 条 null table、几个保留槽）。**bind 表时把
+   window 的偏移当表指针传下去**，所以程序 `MemLoad(table + k*32)` 读到的是**镜像**，
+   dword 0 就是它要的桌面索引。
+5. **镜像时机：写描述符时 + bind 表时**，bind 时**至少 16 条、最多 1024 条**。原因写在常量注释里：
+   "The game places a table's descriptors at the offsets of its own binding entries, not where the
+   root signature's ranges say: `default_ps_tex` reads its T# at record 1 of a table whose root
+   signature spans one."（`Binding/DescriptorWindow.cs` 的 `MinTableRecords`/`MaxTableRecords`）
+6. **64 位地址另走一张页表**（`GameMemoryViews`）：per-64 KiB 页 → {raw SRV/UAV 对, 偏移}，
+   写在一个 write-combined buffer 里，着色器查它。这和 victory-gta6 的 `memory.rs` 是同一招。
+
+**和我们标题的对应关系（本轮实测，很有说服力）**：我们启动时创建的堆是
+`heap 6..16`，每个 **0x18700 字节 = 3,128 × 32** —— **正好十一个**，和 five-star-recomp 记录的
+"十一个 3,128 个描述符的 CPU-only 堆"完全对上。⇒ 两个标题用的是同一个机制，
+**我们的 per-draw 表应该就是标题从这十一堆里拷过去的**。而我们的层把这些堆的记录写在
+**PC 堆**里（`heap 6 ... real 0x4e251bb010`，不在标题内存），所以标题拷进表里的是 0。
+
+### 14.3 I1 实测：不崩，但**光改 getter 不够**（原因已查明）
+
+| 配置 | 结果 |
+| --- | --- |
+| `XS_CPU_HANDLE_ARENA=1` | 不崩；**180 presents / 30 s**；表 VA 仍是 `0x10b3ef00`；停在 slot 67（语料缺 compute） |
+| `XS_CPU_HANDLE_ARENA=1` + `XS_GPU_HANDLE_ARENA=1` | 表 VA 变成 **`0x4de0c2ef00`** = 标题自己的 XMem 地址（type `0x40000` = `MEM_MAPPED`，base `0x4de0c20000`） |
+
+**原因**：标题**不是**用 `GetCPUDescriptorHandleForHeapStart` 当基，而是用**它自己分配钩子
+返回的地址**（`0x4de00f0000`）当 console 的"统一地址"基，再加上槽偏移算出表的 GPU VA。
+所以只改 getter 的返回值**不能**把标题的写入搬进 arena。要让两边重合只有两条路：
+
+- 让分配钩子返回 arena 内存 —— 做不到，`__XMemAllocationHooks__` 是标题自己的函数；
+- **bind 时把标题那边的字节拷到 arena**（= `XS_TABLE_MIRROR`）或者
+  **让 shader 读一个窗口**（= `XS_TABLE_VA`）。两者都已有开关。
+
+### 14.4 I2 实测 + **两处旧结论纠正**（本轮最重要的产出）
+
+**§13.4 里"表里仍是 1836 个 `{ptr,ptr}`、0 个 T#"是测量错误。** 原因：`table4` 普查用
+`copy_committed(t, table_va, …)`，把 arena 的**偏移**当成了 host 地址去读，读到的是
+`0x5000000` 起的那段**无关内存**。已修：普查现在读 `arena_host_base + a2`（a2 = 实际交给
+层的值 = 着色器真正读的偏移），并额外打一份"标题自己那份"。
+
+改正之后的事实（`LOG_TABLE4` 普查 2048 槽 × 32 B × 每个环槽）：
+
+| 读的是谁 | 内容 |
+| --- | --- |
+| **arena + a2**（着色器真正读的位置） | **2048/2048 全零**，每一帧、每个环槽都一样 |
+| **标题自己那份**（`0x4de00f0000 + slot*32`） | **2038 零 + 7 个"T#" + 3 个 other** |
+| 那 7 个非零槽 | 里面是 **`0x8e3` / `0xee4` 两个头** —— five-star-recomp 文档写明这是
+slot-133 池里 **drawable 的头**（`0x8e3` = 位置从 +16 起、28 字节一个；`0xee4` = 颜色从 +28 起），
+**不是描述符** |
+| 被误当成"表内容"的 1836 个 `{ptr,ptr}` | 是 `{start, end}` 指针对，**大多数 start == end = 空区间**
+—— 那是标题低地址内存里的一张**区间/分配器表**，和描述符无关 |
+
+⇒ **结论翻转：黑屏不是"描述符编码对不上"，是那张表里根本没有描述符。**
+我们前三轮一直在追一个不存在的东西。
+
+其它实测：
+- `XS_TABLE_MIRROR=1`（把标题的表按同样偏移拷进 arena）：arena 变成那 1836 对，
+  但**只 1 present 就停** —— 拷进去的是区间表，装不了描述符。
+- `XS_TABLE_VA=1`（把表 VA 换成标题页的窗口）：窗口偏移 `0x2fa0ef00` **超出 arena 的
+  `0x10000000`**（窗口在另一块映射里），同样 **1 present 就停**。
+- 两个"能读到真 T#"的历史记录（§11 说 `LOG_ROOT` 能看到真 console T#）也建立在这个错读之上，
+  **不要再用它当依据**。
+
+### 14.5 I3 评估（本轮**不执行**）
+
+照 `memory.rs` 把 `rdna2spirv.py` 的 `heap_base + va` 换成 per-64 KiB 页目录 + raw UAV 对，
+再重生成 54,820 个 shader。这仍然是**能让任意 64 位地址可读的唯一办法**，但它解决的是
+**缓冲区地址**，**不解决"表里没有描述符"**。→ 在 14.4 的结论下，它不该是下一步。
+
+### 14.6 下一步（按价值重排，替换 §11 的入口）
+
+1. **回答"为什么只有 4 个全屏 blit"** —— 这是现在唯一真问题。已知线索：
+   - 整轮只创建 **63 个描述符**（真实一帧要几千个）；
+   - 每帧 4 个 3-vertex 全屏 blit，表和 V# 全零 ⇒ 画的是**空**；
+   - `DeserializeComputePipelineStateX`（slot 67）**每轮都失败** `0x80070057`，
+     缺 `FSPX kind-6 / kind-0` 的 compute 程序（§13.5）；
+   - 12.3 核 CPU、GPU 3D 引擎 8%、12 个 amdvlk 线程自旋 ⇒ 标题在**等/重试**，不是在建场景。
+   ⇒ 先修 slot 67 的语料缺口（用 `LEONIDA_DUMP_SHADERS` 把那批程序导出来，再
+   `tools/rdna2spirv.py` 补翻译）。victory-gta6 修了 **730 个**这类程序，说明这是成片的。
+2. **把 11 个 CPU-only 堆的记录写进标题内存**（five-star-recomp 模型的第 1、3 条）：
+   现在 `XS_TITLE_HANDLES` 是"所有堆都写标题内存"，应该收敛成"CPU-only 堆写标题内存、
+   CPU handle 仍返回标题的地址"，这样标题 memcpy 的源就是它自己内存里那份，
+   它拷进 per-draw 表的记录才会带上层的编码。
+3. **bind 时按"至少 16 条"镜像，而不是按根签名 range**（五个库共同的坑）。
+4. 描述符链路本身**暂时冻结**：除非 1 有进展（标题真的开始建场景），否则再动它没有意义。
+
+### 14.7 关于"D3D12 退路"的评估（用户提出的备选）
+
+- 三个能跑到"有画面/有世界"的实现（victory-gta6、AnyXboxX、five-star-recomp）**全是 D3D12**，
+  而且**全都自己编译着色器**。这不是巧合：描述符槽就是 GPU 内存里的 32 字节记录，
+  着色器直接把 dword 0 当索引读，**根本不需要"把描述符字节塞进 bindless 哈希表"这种发明**。
+- 我们这条路（预生成 SPIR-V + 8-dword FNV 哈希 + 2 GiB arena）每一个设计点都和 console 语义
+  有点偏差，每个偏差都要单独修。
+- 但**换成 D3D12 不是"改个后端"**：要重写 `runtime/shims/d3d12_vulkan_device.cpp`
+  的全部资源/管线/描述符/障碍物语义，还要把 `rdna2spirv.py` 的输出从 SPIR-V 换成 HLSL/DXIL
+  并重生成 54,820 个程序。参考实现在那里（five-star-recomp 是 GPL-3.0，可以直接读它的
+  `docs/d3d12x-shim.md` 当规格书），但这是一个**以周计**的工程，不是一轮能做完的事。
+- 折中的中间态：**保留 Vulkan 后端，但把描述符模型换成 five-star-recomp 的 window 模型**
+  （14.2 全部 6 条都能在 Vulkan 上实现：window 就是一个 storage buffer，
+  着色器查它 → 拿 bindless 索引 → 索引 `images[]`/`samplers[]`）。
+  **这条不需要改后端，只需要改 `rdna2spirv.py` 的 `desc_lookup` 入参来源**：
+  现在它哈希"标题的 8 个 dword"，改成"从 window 里读 dword 0 当索引"。这是最小改动、
+  且和已经验证可行的模型一致。→ **推荐这一条，而不是换 D3D12。**
+
+### 14.8 本轮的工具改动（都已提交）
+
+- `table4` 普查修正：读 `arena_host_base + a2`（原来错读 `table_va` 当 host 地址），
+  并新增"标题自己那份"的独立普查 + `arena_host_base/size` 打印。
+- 无新增开关；所有行为变化只在 `LEONIDA_LOG_TABLE4` 打开时可见。
 
