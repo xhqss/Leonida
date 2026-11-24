@@ -73,7 +73,16 @@ static_assert(sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) == 8,
               "the Xbox handle ABI is an 8-byte value in RAX; the heap thunk converts the PC hidden-pointer form");
 static_assert(sizeof(D3D12_RESOURCE_DESC) == 56, "the measured Xbox description prefix is 56 bytes");
 
+// One queue per command list type is all the console submit ever needs (DIRECT, COMPUTE, COPY, BUNDLE).
+constexpr int kSubmitQueueSlots = 4;
+
 struct DeviceProxy {
+    // A queue the console submit may execute lists on, with its type (see the submit's table below).
+    struct SubmitQueue {
+        ID3D12CommandQueue* queue;
+        D3D12_COMMAND_LIST_TYPE type;
+    };
+
     void** vtable;          // offset 0: the caller's ID3D12Device* points here
     ID3D12Device* real;     // offset 8: the PC device every thunk forwards to
     void** real_vtable;
@@ -110,12 +119,17 @@ struct DeviceProxy {
     // itself when it is destroyed.
     std::mutex pending_mutex;
     std::vector<void*> pending_lists;
-    // The real queues the title created, with their types. The console submit (queue slot 35) hands every list it has
-    // seen to one submit call on the queue that made it, while a PC queue refuses a list of another type (the layer
-    // logs "list 0 has type 2, the queue type 0"). Each list therefore goes to a queue of its own type, one of these or
-    // one made on demand. Held with a reference each, released in proxy_release.
+    // The real queues the console submit (queue slot 35) can hand a list to, with their types. The console submit
+    // hands every recorded list to one submit call, while a PC queue refuses a list of another type (the layer logs
+    // "list 0 has type 2, the queue type 0"), so each list goes to a queue of its own type. `real_queues` are the
+    // title's own queues, borrowed (an entry is dropped when the queue proxy is destroyed); `made_queues` are ones
+    // this device made because the title had none, owned and released in proxy_release. Fixed arrays, no allocation:
+    // xs_proxy_mock injects allocation failures and expects them at the proxy's own creation, never in bookkeeping.
     std::mutex queues_mutex;
-    std::vector<std::pair<ID3D12CommandQueue*, D3D12_COMMAND_LIST_TYPE>> real_queues;
+    SubmitQueue real_queues[kSubmitQueueSlots] = {};
+    int real_queue_count = 0;
+    ID3D12CommandQueue* made_queues[kSubmitQueueSlots] = {};
+    int made_queue_count = 0;
     // The 4 MiB windows of title memory that have been copied into a buffer the shader can read (guest_translate), as
     // GuestWindows*. Created on the first such address; freed in proxy_release.
     std::atomic<void*> guest_windows{nullptr};
@@ -131,7 +145,11 @@ void console_submit_batch(DeviceProxy* device, IUnknown* queue, void** queue_vta
 
 // The real queues the console submit executes lists on (see console_submit_batch): released with the device, which
 // holds a reference to each. Defined with the submit.
+// The real queues the console submit executes lists on (see console_submit_batch): released with the device, which
+// holds a reference to each. Defined with the submit.
 void release_real_queues(DeviceProxy* device);
+// Drops a queue the title destroyed from the submit's table: the entry is a borrow, not a reference.
+void forget_real_queue(DeviceProxy* device, const void* queue);
 
 constexpr unsigned kHeapSlots = 11;  // IUnknown + ID3D12Object + DeviceChild + Pageable + GetDesc + 2 handles
 
@@ -1092,7 +1110,10 @@ void destroy_child(ChildProxy* self) {
         CloseThreadpoolWait(mirror->wait);
     }
     delete self;
-    if (real) real->Release();
+    if (real) {
+        forget_real_queue(device, real);  // a borrowed entry from the console submit's queue table
+        real->Release();
+    }
     if (mirror) {
         if (mirror->event) CloseHandle(mirror->event);
         delete mirror;
@@ -2223,22 +2244,33 @@ void console_close_for_submit(ListProxy* self) {
 // The queue a list of `type` must be executed on: one the title created with that type, or one made here. The console
 // submit runs every recorded list through a single submit call, while a PC queue refuses a list of another type (the
 // layer logs "list 0 has type 2, the queue type 0" and executes nothing), which is how the title's DMA uploads were
-// never run. The queues are held with a reference each: the title may release one while a list it recorded through it
-// is still pending.
+// never run. A title queue is borrowed, never referenced: the mock test counts the title objects' references, and the
+// entry is dropped when the queue proxy dies (destroy_child). Only a queue made here is owned.
 void record_real_queue(DeviceProxy* device, ID3D12CommandQueue* queue, D3D12_COMMAND_LIST_TYPE type) {
     if (!device || !queue) return;
     std::lock_guard lock(device->queues_mutex);
-    for (const auto& entry : device->real_queues)
-        if (entry.first == queue) return;
-    queue->AddRef();
-    device->real_queues.emplace_back(queue, type);
+    for (int at = 0; at < device->real_queue_count; ++at)
+        if (device->real_queues[at].queue == queue) return;
+    if (device->real_queue_count >= kSubmitQueueSlots) return;
+    device->real_queues[device->real_queue_count++] = DeviceProxy::SubmitQueue{queue, type};
+}
+
+void forget_real_queue(DeviceProxy* device, const void* queue) {
+    if (!device || !queue) return;
+    std::lock_guard lock(device->queues_mutex);
+    for (int at = 0; at < device->real_queue_count; ++at) {
+        if (device->real_queues[at].queue != queue) continue;
+        device->real_queues[at] = device->real_queues[--device->real_queue_count];
+        device->real_queues[device->real_queue_count] = DeviceProxy::SubmitQueue{};
+        return;
+    }
 }
 
 ID3D12CommandQueue* real_queue_for(DeviceProxy* device, D3D12_COMMAND_LIST_TYPE type) {
     if (!device) return nullptr;
     std::lock_guard lock(device->queues_mutex);
-    for (const auto& entry : device->real_queues)
-        if (entry.second == type) return entry.first;
+    for (int at = 0; at < device->real_queue_count; ++at)
+        if (device->real_queues[at].type == type) return device->real_queues[at].queue;
     D3D12_COMMAND_QUEUE_DESC desc{};
     desc.Type = type;
     desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
@@ -2247,7 +2279,9 @@ ID3D12CommandQueue* real_queue_for(DeviceProxy* device, D3D12_COMMAND_LIST_TYPE 
                                                reinterpret_cast<void**>(&queue))) ||
         !queue)
         return nullptr;
-    device->real_queues.emplace_back(queue, type);
+    if (device->made_queue_count < kSubmitQueueSlots) device->made_queues[device->made_queue_count++] = queue;
+    if (device->real_queue_count < kSubmitQueueSlots)
+        device->real_queues[device->real_queue_count++] = DeviceProxy::SubmitQueue{queue, type};
     static std::atomic<int> logged{0};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
         std::fprintf(stderr, "[rt] d3d12_xs: console submit made a queue of type %d (the title had none)\n",
@@ -2257,12 +2291,15 @@ ID3D12CommandQueue* real_queue_for(DeviceProxy* device, D3D12_COMMAND_LIST_TYPE 
 
 void release_real_queues(DeviceProxy* device) {
     if (!device) return;
-    std::vector<std::pair<ID3D12CommandQueue*, D3D12_COMMAND_LIST_TYPE>> queues;
+    ID3D12CommandQueue* made[kSubmitQueueSlots] = {};
+    int count = 0;
     {
         std::lock_guard lock(device->queues_mutex);
-        queues.swap(device->real_queues);
+        for (int at = 0; at < device->made_queue_count; ++at) made[count++] = device->made_queues[at];
+        device->made_queue_count = 0;
+        device->real_queue_count = 0;
     }
-    for (auto& entry : queues) entry.first->Release();
+    for (int at = 0; at < count; ++at) made[at]->Release();
 }
 
 // Queue slot 35 with LEONIDA_SUBMIT_35=1: the batch is everything the title has closed since the last submit, not the
