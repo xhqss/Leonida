@@ -2190,8 +2190,13 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         }
         const VertexBufferView& view = draw.views->vertex_buffers[slot];
         std::uint64_t size = view.size;
-        if (!vk.buffer_at(view.va, size, p.vertex_buffers[slot], p.vertex_offsets[slot]))
+        if (!vk.buffer_at(view.va, size, p.vertex_buffers[slot], p.vertex_offsets[slot])) {
+            static std::atomic<int> missing{0};
+            if (std::getenv("LEONIDA_LOG_MISSING") && missing.fetch_add(1, std::memory_order_relaxed) < 12)
+                std::fprintf(stderr, "[rt] draw: no buffer for vertex slot %u at va 0x%llx\n", slot,
+                             static_cast<unsigned long long>(view.va));
             return ReplayResult::unresolved_resource;
+        }
         p.vertex_sizes[slot] = size;
         p.vertex_strides[slot] = (pipeline->zero_step_slots & (1u << slot)) ? 0 : view.stride;
     }
@@ -2205,8 +2210,13 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             p.index_offset = vk.zero_offset;
         } else {
             std::uint64_t size = draw.index.size;
-            if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset))
+            if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset)) {
+                static std::atomic<int> missing{0};
+                if (std::getenv("LEONIDA_LOG_MISSING") && missing.fetch_add(1, std::memory_order_relaxed) < 12)
+                    std::fprintf(stderr, "[rt] draw: no buffer for the index view at va 0x%llx\n",
+                                 static_cast<unsigned long long>(draw.index.va));
                 return ReplayResult::unresolved_resource;
+            }
         }
     }
     return ReplayResult::success;
@@ -2596,6 +2606,14 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         auto& p = out.commands[i];
         const auto bind = [&](ResourceId id) {
             const ResourceBinding* binding = resolve(id);
+            if (!binding) {
+                // LEONIDA_LOG_MISSING: name the resource that fails a submission ("unknown resource; nothing was
+                // submitted"), with the command that named it and its index in the list.
+                static std::atomic<int> missing{0};
+                if (std::getenv("LEONIDA_LOG_MISSING") && missing.fetch_add(1, std::memory_order_relaxed) < 12)
+                    std::fprintf(stderr, "[rt] replay: no resource %llu (command %zu, kind %zu)\n",
+                                 static_cast<unsigned long long>(id), i, command.index());
+            }
             if (binding) p.binding = *binding;
             return binding != nullptr;
         };

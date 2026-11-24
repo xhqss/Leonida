@@ -2037,11 +2037,27 @@ void console_note_recording(ListProxy* self) {
 // allocator to reset it with, or the reset failed): the call is then forwarded anyway and refused by the layer.
 bool console_begin_recording(ListProxy* self) {
     if (!self->closed_by_title.load(std::memory_order_relaxed)) return true;
-    if (!self->real || !self->real_allocator) return false;
+    if (!self->real || !self->real_allocator) {
+        if (std::getenv("LEONIDA_LOG_REOPEN")) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr, "[rt] reopen: list %p has no allocator (real %p)\n", static_cast<void*>(self),
+                             static_cast<void*>(self->real));
+        }
+        return false;
+    }
     using ResetFn = HRESULT(WINAPI*)(IUnknown*, ID3D12CommandAllocator*, ID3D12PipelineState*);
     auto** const vtable = *reinterpret_cast<void***>(self->real);
     const HRESULT hr = reinterpret_cast<ResetFn>(vtable[10])(self->real, self->real_allocator, nullptr);
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        if (std::getenv("LEONIDA_LOG_REOPEN")) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr, "[rt] reopen: list %p reset failed 0x%08lx\n", static_cast<void*>(self),
+                             static_cast<unsigned long>(hr));
+        }
+        return false;
+    }
     self->closed_by_title.store(false, std::memory_order_relaxed);
     return true;
 }
@@ -2057,11 +2073,12 @@ void console_close_for_submit(ListProxy* self) {
     if (SUCCEEDED(hr)) self->closed_by_title.store(true, std::memory_order_relaxed);
 }
 
-// Queue slot 35 with LEONIDA_SUBMIT_35=1: the batch is everything recorded since the last submit, not the lists in the
-// slot's arguments (see the comment at the slot). Each list goes to the queue in its own ExecuteCommandLists call: the
-// layer refuses a whole batch for one unknown resource ("unknown resource; nothing was submitted"), and the first batch
-// after startup holds every list recorded so far, including commands whose resources no longer resolve. One submission
-// per list keeps one stale list from taking the frame with it.
+// Queue slot 35 with LEONIDA_SUBMIT_35=1: the batch is everything the title has closed since the last submit, not the
+// lists in the slot's arguments (see the comment at the slot). A list the title closed is finished; closing one here
+// instead raced with the thread still recording into it, which then saw a closed list and lost its frame. Each finished
+// list goes to the queue in its own ExecuteCommandLists call: the layer refuses a whole batch for one unknown resource
+// ("unknown resource; nothing was submitted"), and the first batch after startup holds every list recorded so far,
+// including commands whose resources no longer resolve.
 void console_submit_batch(DeviceProxy* device, IUnknown* queue, void** queue_vtable) {
     if (!device || !queue || !queue_vtable) return;
     std::vector<void*> batch;
@@ -2071,20 +2088,32 @@ void console_submit_batch(DeviceProxy* device, IUnknown* queue, void** queue_vta
     }
     using ExecuteFn = void(WINAPI*)(IUnknown*, UINT, ID3D12CommandList* const*);
     auto execute = reinterpret_cast<ExecuteFn>(queue_vtable[10]);
+    std::vector<void*> unfinished;
     std::size_t submitted = 0;
     for (void* entry : batch) {
         auto* list = static_cast<ListProxy*>(entry);
+        if (!list->real || !list->closed_by_title.load(std::memory_order_relaxed)) {
+            list->pending.store(false, std::memory_order_relaxed);
+            unfinished.push_back(entry);
+            continue;
+        }
         list->pending.store(false, std::memory_order_relaxed);
-        if (!list->real) continue;
-        console_close_for_submit(list);
         ID3D12CommandList* real = list->real;
         execute(queue, 1, &real);
         ++submitted;
     }
     static std::atomic<int> submits{0};
     const int nth = submits.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!unfinished.empty()) {  // still being recorded: the next submit picks them up
+        std::lock_guard lock(device->pending_mutex);
+        for (void* entry : unfinished) {
+            auto* list = static_cast<ListProxy*>(entry);
+            list->pending.store(true, std::memory_order_relaxed);
+            device->pending_lists.push_back(entry);
+        }
+    }
     if (nth == 1 && submitted == 0)
-        std::fprintf(stderr, "[rt] d3d12_xs: the first console submit has no recorded list\n");
+        std::fprintf(stderr, "[rt] d3d12_xs: the first console submit has no finished list\n");
     if (nth <= 3 || nth % 600 == 0)
         std::fprintf(stderr, "[rt] d3d12_xs: console submit #%d executed %zu list(s)\n", nth, submitted);
 }
@@ -2227,6 +2256,14 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                     self->vb_scratch.assign(in, in + a2);
                     for (auto& view : self->vb_scratch)
                         view.BufferLocation = upload_translate(self->device, view.BufferLocation);
+                    if (std::getenv("LEONIDA_LOG_VB")) {
+                        static std::atomic<int> logged{0};
+                        if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+                            std::fprintf(stderr, "[rt] vertex buffers: count %llu, view 0 at 0x%llx -> 0x%llx\n",
+                                         static_cast<unsigned long long>(a2),
+                                         static_cast<unsigned long long>(in[0].BufferLocation),
+                                         static_cast<unsigned long long>(self->vb_scratch[0].BufferLocation));
+                    }
                     return reinterpret_cast<ForwardFn>(real_vtable[pc])(
                         self->real, a1, a2, reinterpret_cast<std::uint64_t>(self->vb_scratch.data()), a4, a5,
                         a6, a7, a8, a9, a10, a11, a12, a13, a14);
