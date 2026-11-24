@@ -45,6 +45,22 @@ LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
                      static_cast<unsigned long long>(words[0]), static_cast<unsigned long long>(words[1]),
                      static_cast<unsigned long long>(words[2]), static_cast<unsigned long long>(words[3]),
                      static_cast<unsigned long long>(words[4]), static_cast<unsigned long long>(words[5]));
+        // The compiled check reads its operands through registers that are not arguments: the assert at
+        // game_scarlett_master.exe+0x344196 is `cmp dword [rsi+4], 0; je +1; int3`, so rsi names the record the title
+        // is checking. Printing rsi/rdi/rbp and the first 32 bytes at each is what turns "the title asserted about
+        // something" into the value it compared.
+        std::fprintf(stderr, "[rt] assert pointer registers: rsi %llx rdi %llx rbp %llx rsp %llx\n",
+                     static_cast<unsigned long long>(c.Rsi), static_cast<unsigned long long>(c.Rdi),
+                     static_cast<unsigned long long>(c.Rbp), static_cast<unsigned long long>(c.Rsp));
+        const DWORD64 pointers[3] = {c.Rsi, c.Rdi, c.Rbp};
+        for (int i = 0; i < 3; ++i) {
+            if (!readable(reinterpret_cast<const void*>(pointers[i]))) continue;
+            std::uint32_t record[8] = {};
+            std::memcpy(record, reinterpret_cast<const void*>(pointers[i]), sizeof(record));
+            std::fprintf(stderr,
+                         "[rt] assert at %s: %08x %08x %08x %08x %08x %08x %08x %08x\n", i == 0 ? "rsi" : (i == 1 ? "rdi" : "rbp"),
+                         record[0], record[1], record[2], record[3], record[4], record[5], record[6], record[7]);
+        }
         std::uint64_t back[4] = {};
         if (readable(reinterpret_cast<const void*>(c.Rsp))) {
             std::memcpy(back, reinterpret_cast<const void*>(c.Rsp), sizeof(back));

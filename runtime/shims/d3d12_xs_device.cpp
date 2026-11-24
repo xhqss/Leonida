@@ -4385,6 +4385,17 @@ const char* parse_raw_srv(std::uint64_t texture_words, std::uint64_t view_desc, 
 }
 
 void write_null_srv(DeviceProxy* self, std::uint64_t destination) {
+    // LEONIDA_SLOT70_ZERO_NULL: write 32 zero dwords instead of a view over a null resource. Measured: this does NOT
+    // clear the title's own check at game_scarlett_master.exe+0x344196 (`cmp dword [rsi+4], 0`, which reads
+    // 0xffffffff on a record whose first two words are both -1). That record is not a slot-70 null view: the assert
+    // fires at the same place with and without this, right before the swapchain is created. Kept as an opt-in because
+    // it is the cheaper way to express "no resource" and it says the two are unrelated.
+    if (std::getenv("LEONIDA_SLOT70_ZERO_NULL")) {
+        const D3D12_CPU_DESCRIPTOR_HANDLE where =
+            translate_cpu_handle(self, D3D12_CPU_DESCRIPTOR_HANDLE{destination});
+        if (where.ptr) std::memset(reinterpret_cast<void*>(where.ptr), 0, 32);
+        return;
+    }
     D3D12_SHADER_RESOURCE_VIEW_DESC null_view{};
     null_view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     null_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
