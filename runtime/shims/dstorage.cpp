@@ -407,6 +407,19 @@ bool guarded_move(void* destination, const void* source, size_t size) {
     }
 }
 
+// Reads one byte of every 4 KiB page of the range from user mode. Title memory that xmem maps from physical pages is
+// committed by a vectored handler on first touch; a kernel write (ReadFile) raises no user-mode fault and fails with
+// ERROR_NOACCESS instead. No C++ objects here: the function has __try.
+void touch_pages(void* buffer, size_t size) {
+    const uintptr_t start = reinterpret_cast<uintptr_t>(buffer);
+    for (uintptr_t page = start & ~uintptr_t{0xfff}; page < start + size; page += 0x1000) {
+        __try {
+            (void)*reinterpret_cast<volatile const unsigned char*>(page < start ? start : page);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+}
+
 HRESULT read_error(DWORD error) {
     switch (error) {
         case ERROR_NOACCESS:
@@ -430,7 +443,16 @@ HRESULT read_file_range(HANDLE handle, uint64_t offset, void* destination, uint3
         at.Offset = static_cast<DWORD>(position);
         at.OffsetHigh = static_cast<DWORD>(position >> 32);
         DWORD got = 0;
-        if (!ReadFile(handle, out + done, size - done, &got, &at)) return read_error(GetLastError());
+        if (!ReadFile(handle, out + done, size - done, &got, &at)) {
+            const DWORD error = GetLastError();
+            if (error != ERROR_NOACCESS) return read_error(error);
+            // Destination pages not committed yet (see touch_pages): commit them from user mode and read again once.
+            touch_pages(out + done, size - done);
+            at = OVERLAPPED{};
+            at.Offset = static_cast<DWORD>(position);
+            at.OffsetHigh = static_cast<DWORD>(position >> 32);
+            if (!ReadFile(handle, out + done, size - done, &got, &at)) return read_error(GetLastError());
+        }
         if (got == 0) return E_DSTORAGE_END_OF_FILE;  // the file shrank since the size check
         done += got;
     }

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <clocale>
+#include <cstring>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
@@ -183,6 +184,63 @@ bool host_renames_case(const std::filesystem::path& folder) {
 
 void run_checks(const std::filesystem::path& root);
 
+// Title memory committed on first touch, as xmem maps physical pages: a view of a reserve-only pagefile section whose
+// pages a vectored handler commits when user-mode code faults on them. The kernel's write in ReadFile raises no such
+// fault, so the host ReadFile fails with ERROR_NOACCESS; the shim commits the pages and reads again.
+char* g_first_touch = nullptr;
+SIZE_T g_first_touch_size = 0;
+
+LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS* info) {
+    const EXCEPTION_RECORD* r = info->ExceptionRecord;
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    auto* at = reinterpret_cast<char*>(r->ExceptionInformation[1]);
+    if (at < g_first_touch || at >= g_first_touch + g_first_touch_size) return EXCEPTION_CONTINUE_SEARCH;
+    auto* page = reinterpret_cast<char*>(reinterpret_cast<uintptr_t>(at) & ~uintptr_t{0xfff});
+    return VirtualAlloc(page, 0x1000, MEM_COMMIT, PAGE_READWRITE) ? EXCEPTION_CONTINUE_EXECUTION
+                                                                  : EXCEPTION_CONTINUE_SEARCH;
+}
+
+void check_read_file_first_touch(const std::filesystem::path& root) {
+    using ReadFileFn = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+    const auto shim_read = reinterpret_cast<ReadFileFn>(rt::shims::find("kernel32.dll", "ReadFile"));
+    check(shim_read != nullptr, "ReadFile is served by the file shims");
+    if (!shim_read) return;
+
+    std::filesystem::create_directories(root);
+    const std::filesystem::path file = root / "first_touch.bin";
+    constexpr DWORD kSize = 3 * 0x10000 + 123;  // crosses several pages and ends inside one
+    std::vector<unsigned char> data(kSize);
+    for (DWORD i = 0; i < kSize; ++i) data[i] = static_cast<unsigned char>(i * 7 + 3);
+    std::ofstream(file, std::ios::binary).write(reinterpret_cast<const char*>(data.data()), kSize);
+
+    g_first_touch_size = 4 * 0x10000;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE, 0,
+                                        static_cast<DWORD>(g_first_touch_size), nullptr);
+    g_first_touch = section ? static_cast<char*>(MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 0)) : nullptr;
+    check(g_first_touch != nullptr, "a reserve-only section view stands in for first-touch title memory");
+    if (!g_first_touch) return;
+    void* const handler = AddVectoredExceptionHandler(1, &commit_on_touch);
+
+    auto read_into_view = [&](ReadFileFn read) {
+        HANDLE h = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        DWORD got = 0;
+        const BOOL ok = read(h, g_first_touch + 0x800, kSize, &got, nullptr);
+        const DWORD error = ok ? 0 : GetLastError();
+        CloseHandle(h);
+        return std::make_pair(ok ? got : 0, error);
+    };
+    const auto host = read_into_view(&::ReadFile);
+    check(host.second == ERROR_NOACCESS, "the host ReadFile into uncommitted pages fails with ERROR_NOACCESS");
+    const auto shimmed = read_into_view(shim_read);
+    check(shimmed.second == 0 && shimmed.first == kSize, "the shimmed ReadFile commits the pages and reads it all");
+    check(std::memcmp(g_first_touch + 0x800, data.data(), kSize) == 0, "the bytes read are the file's");
+
+    RemoveVectoredExceptionHandler(handler);
+    UnmapViewOfFile(g_first_touch);
+    CloseHandle(section);
+    g_first_touch = nullptr;
+}
+
 }  // namespace
 
 int main() {
@@ -198,6 +256,7 @@ int main() {
     // An exception from one check (std::filesystem throws on a host error) ends the checks, not the run: it is a
     // failure, the folder is still removed and the summary is still printed.
     try {
+        check_read_file_first_touch(root / "first_touch");
         run_checks(root);
     } catch (const std::exception& e) {
         check(false, (std::string("the checks run to the end (stopped by: ") + e.what() + ")").c_str());

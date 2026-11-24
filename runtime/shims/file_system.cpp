@@ -654,6 +654,41 @@ void note_open_failure(const char* api, LPCWSTR name, DWORD error, const void* c
             rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
 }
 
+// Reads one byte of every 4 KiB page of [buffer, buffer + size) from user mode, so that pages committed on first
+// touch (xmem's physical-page views: a reserve-only section committed by its vectored handler) are committed before
+// the kernel writes into them. A page that is not valid at all is left for the caller's ReadFile to refuse. No C++
+// objects here: the function has __try.
+bool touch_pages(void* buffer, DWORD size) {
+    auto* p = static_cast<volatile const unsigned char*>(buffer);
+    const uintptr_t first = reinterpret_cast<uintptr_t>(buffer) & ~uintptr_t{0xfff};
+    const uintptr_t end = reinterpret_cast<uintptr_t>(buffer) + size;
+    bool all = true;
+    for (uintptr_t page = first; page < end; page += 0x1000) {
+        const uintptr_t at = page < reinterpret_cast<uintptr_t>(p) ? reinterpret_cast<uintptr_t>(p) : page;
+        __try {
+            (void)*reinterpret_cast<volatile const unsigned char*>(at);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            all = false;
+        }
+    }
+    return all;
+}
+
+// ReadFile with one retry for a destination the kernel cannot write yet. The retail title reads into title memory
+// that xmem maps from physical pages committed on first touch; the kernel's write raises no user-mode fault, so
+// ReadFile fails with ERROR_NOACCESS (998), and the title's read loop sleeps 1 ms and retries forever (measured on
+// 1.0.2.1, native Windows). Touching the pages from user mode commits them; the read is then retried once.
+BOOL WINAPI read_file(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read, LPOVERLAPPED overlapped) {
+    if (ReadFile(file, buffer, size, read, overlapped)) return TRUE;
+    if (GetLastError() != ERROR_NOACCESS || !buffer || !size) return FALSE;
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true))
+        std::fprintf(stderr, "[rt] fs: ReadFile into uncommitted title memory (ERROR_NOACCESS): committing the "
+                             "destination pages and retrying (logged once)\n");
+    touch_pages(buffer, size);
+    return ReadFile(file, buffer, size, read, overlapped);
+}
+
 HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes,
                             DWORD disposition, DWORD flags, HANDLE template_file) {
     if (!name) {
@@ -1348,6 +1383,7 @@ using namespace rt::fs;
     {dll, "CreateFileA", reinterpret_cast<void*>(&create_file_a)},                                       \
         {dll, "CreateFileW", reinterpret_cast<void*>(&create_file_w)},                                   \
         {dll, "CreateFile2", reinterpret_cast<void*>(&create_file2)},                                    \
+        {dll, "ReadFile", reinterpret_cast<void*>(&read_file)},                                          \
         {dll, "FindFirstFileA", reinterpret_cast<void*>(&find_first_file_a)},                            \
         {dll, "FindFirstFileW", reinterpret_cast<void*>(&find_first_file_w)},                            \
         {dll, "FindFirstFileExA", reinterpret_cast<void*>(&find_first_file_ex_a)},                       \
