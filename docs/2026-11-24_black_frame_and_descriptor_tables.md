@@ -629,6 +629,71 @@ powershell -File tmp\run-probe.ps1 -Tag heapva -Seconds 25 `
    `fault 0x302e40000 / heap_base 0x202e40000` = `heap_base + 0x100000000`，证明那些 48 位 base 不是标题
    宿主地址。开关保留，默认关。
 
+---
+
+# 追加：第十轮（2026-11-25 00:20–00:30）—— 表不在 descriptor heap 里，它是标题自己的内存
+
+## 1. 新增探针 / 开关（全部 opt-in，默认关）
+
+| 开关 | 作用 |
+| --- | --- |
+| `LEONIDA_LOG_HEAPID` | 每个 descriptor heap 一行：id、type、槽数、XMem 地址、arena 偏移、GPU handle；前 6 个 heap 还打两侧 slot 0 的字节 |
+| `LEONIDA_LOG_SLOTWRITE` | 每次 `Create*View`/`CopyDescriptors` 写哪个 heap 的哪个槽 |
+| `LEONIDA_XS_TABLE_SYNC` | bind 表之前把标题 XMem 副本整段 memcpy 进 arena（统一内存的写通） |
+| `LEONIDA_XS_CPU_HANDLE_ARENA` | 把 heap 的 CPU handle 直接给 arena 里的真实地址，让标题自己的写入落在 GPU 会读的地方 |
+| `LEONIDA_XS_TABLE_VBASE` | 把表 VA 翻译成窗口，并把表里 V#/T# 的 base 逐个翻译成窗口地址（扫不到的项清零） |
+
+## 2. heap 身份对账的结果
+
+```
+heap 1: type 0 num 1245184 flags 0x1  title 0x4de00f0000 + 0x2600000 -> arena 0xae10000 gpu_handle 0xae10000
+heap 2: type 1 num 128     flags 0x1  ... -> arena 0xd410000 gpu_handle 0xd410000
+heap 3+: type 0/2/3 flags 0x0（非 shader-visible），real 不在 arena 内
+heap 1 GPU handle getter -> 0xae10000（= real − arena_host_base，两者一致）
+```
+
+- **GPU handle 空间 = arena 偏移** 这条成立，getter 与 shim 自算的值完全一致，没有 off-by-base。
+- shim 在整轮里只看到 **63 次**写进 heap 1，槽号都 ≤ 103；两侧 slot 0 的字节：标题副本全 0、arena 也全 0
+  —— **标题根本不往 heap 里写描述符**（它只调 Create*View，写入走的是 arena）。
+- 但标题 bind 的表 VA（0xb94ef00 等）换算成 heap 1 的槽号是 **368504** 起、每帧 +4096。
+  heap 1 的 GPU handle 区确实覆盖这个数（槽上限 1245184），可这个槽**从未被任何描述符 API 写过**。
+  ⇒ 表 VA 不是 heap 的槽，之前 `DescriptorRange` 命中 heap 1 只是**数值上恰好落在它的 handle 区间里**。
+
+## 3. 表到底是什么
+
+在表 VA（0xb94ef00，标题宿主地址，`is_committed` 为真）读到的 64 KiB，按 gfx10 描述符能正常解码：
+
+```
+[rt] vbase +0x2b0: V# 0x8cf584b4 -> 0x313584b4
+[rt] vbase +0x2d0: V# 0xb50516a0 -> 0x314516a0
+[rt] vbase +0x2f0: V# 0x7ff0000  -> 0x31bf0000
+```
+
+即 **V# base 都是"已提交的标题宿主地址"**（0x8cf584b4 / 0xb50516a0 / 0x7ff0000），表本身就在标题内存里，
+是标题自己构建的统一内存描述符表。而 `XS_TABLE_SYNC` 证明 XMem 那份 heap 副本在这些槽上是**分配器残留**
+（全 0 或 -1.0f/1.0f 之类），也就是说标题的表不在 descriptor heap 里。
+
+同时表里也混着一批 base 形如 `0x80800000004` / `0x84400000002` 的项：**既不是标题宿主地址、也不在 arena 内**，
+着色器 `heap_base + base` 读它们就是第十轮那次 device fault（console VA `0x80800000000`）。
+
+## 4. 实验结论
+
+1. `XS_TABLE_VBASE` 全表扫描：第一张表 256 项**全部**成功翻译、0 清零、**不再丢设备**；但跑 25 s 卡在第一次
+   重写不动 —— 256 个 4 MiB 窗口 = 1 GB，而 arena 只有 256 MiB，窗口创建失败/极慢。
+2. `ARENA_MB=1024` + 只扫表头 0x200 字节、其余清零：稳定、无 fault、抓到 3 帧，**画面仍全黑**；
+   因为这几张表的表头项正是那些 `0x808/0x844` 的"不可达 base"，被清零了（只有 1 项翻译成功）。
+3. `XS_CPU_HANDLE_ARENA`（把 CPU handle 指进 arena）：第一帧 present 后进程直接退出，需要单独查；
+   说明标题确实把 CPU handle 当自己的 XMem 内存在用。
+
+## 5. 下一轮（按优先级）
+
+1. **查 `0x80800000004` 这类地址是谁给的**：它既不在标题宿主内存、也不在 arena，最可能是
+   `ID3D12Resource::GetGPUVirtualAddress()` 一类的返回值（标题拿到后写进了自己的描述符表，着色器再
+   `heap_base +` 就爆）。把 shim 里所有返回 GPU 地址的 API 打出来，确认是否漏了"减 heap_base"这一步。
+2. 若确认是"给标题的地址空间不一致"：统一为 console VA（标题宿主地址），标题写的表就与着色器读的同一个数。
+3. 窗口机制要能覆盖多张表：改成固定池 + LRU（bind 时拷进池槽、按需重写描述符），或只翻译"当前绑定着色器
+   真正会读的偏移"（偏移量可从语料 SPIR-V 的 `s_load_dwordx4` 常量里取）。
+
 
 
 

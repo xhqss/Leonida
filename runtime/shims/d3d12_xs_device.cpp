@@ -166,6 +166,7 @@ struct HeapProxy {
     SIZE_T custom_byte_size;
     SIZE_T real_cpu_start;
     DescriptorHeapBackingFree custom_free;
+    int log_id;  // the id LEONIDA_LOG_HEAPID prints, so ranges and handles can be told apart in a log
 };
 
 struct DescriptorRange {
@@ -264,8 +265,44 @@ bool find_descriptor_range(const DeviceProxy* device, SIZE_T ptr, DescriptorRang
     return false;
 }
 
-std::atomic<std::uint64_t> g_hits[kMaxSlots];
-std::atomic<bool> g_first[kMaxSlots];
+// LEONIDA_LOG_SLOTWRITE: which heap and slot a descriptor write names, so a root table's GPU handle can be compared
+// with the slot the layer actually wrote. A handle that names no heap is a console VA used as a host pointer.
+struct HeapWriteStats {
+    std::atomic<std::uint64_t> writes{0};
+    std::atomic<std::uint64_t> max_slot{0};
+};
+HeapWriteStats g_heap_writes[64];
+constexpr unsigned kHeapWriteStats = 64;
+
+void note_descriptor_write(const DeviceProxy* device, SIZE_T handle) {
+    DescriptorRange range{};
+    if (!find_descriptor_range(device, handle, &range) || !range.heap) return;
+    const int id = range.heap->log_id;
+    if (id <= 0 || id >= static_cast<int>(kHeapWriteStats)) return;
+    const std::uint64_t slot = (handle - range.custom_start) / 32;
+    g_heap_writes[id].writes.fetch_add(1, std::memory_order_relaxed);
+    std::uint64_t current = g_heap_writes[id].max_slot.load(std::memory_order_relaxed);
+    while (slot > current && !g_heap_writes[id].max_slot.compare_exchange_weak(current, slot)) {
+    }
+}
+
+void log_descriptor_handle(const DeviceProxy* device, const char* what, SIZE_T handle) {
+    note_descriptor_write(device, handle);
+    if (!std::getenv("LEONIDA_LOG_SLOTWRITE")) return;
+    static std::atomic<int> shown{0};
+    if (shown.fetch_add(1, std::memory_order_relaxed) >= 200) return;
+    DescriptorRange range{};
+    if (find_descriptor_range(device, handle, &range))
+        std::fprintf(stderr, "[rt] %s: heap %d slot %llu handle 0x%llx\n", what,
+                     range.heap ? range.heap->log_id : 0,
+                     static_cast<unsigned long long>((handle - range.custom_start) / 32),
+                     static_cast<unsigned long long>(handle));
+    else
+        std::fprintf(stderr, "[rt] %s: handle 0x%llx names no heap\n", what,
+                     static_cast<unsigned long long>(handle));
+}
+
+std::atomic<std::uint64_t> g_hits[kMaxSlots];std::atomic<bool> g_first[kMaxSlots];
 std::atomic<bool> g_beyond_warned[kMaxSlots];
 std::atomic<std::uint64_t> g_heap_hits[kHeapSlots];
 std::atomic<bool> g_heap_first[kHeapSlots];
@@ -740,6 +777,14 @@ D3D12_CPU_DESCRIPTOR_HANDLE raw_heap_get_cpu_handle(ID3D12DescriptorHeap* real, 
 
 D3D12_CPU_DESCRIPTOR_HANDLE heap_get_cpu_handle(HeapProxy* self) {
     note_heap_slot(9);
+    // LEONIDA_XS_CPU_HANDLE_ARENA: hand the title the CPU handle of the heap's real (arena) backing instead of the
+    // XMem copy the allocation hook supplied. On the console a descriptor heap is unified memory: a title writes
+    // descriptor values into it directly, or copies them from a CPU-only heap with memcpy, and the GPU loads the same
+    // bytes. Here the XMem allocation is a copy at another address while the shader reads heap_base + GPU handle (the
+    // arena), so a title write to the XMem copy is never seen: the heap the shader loads from stays zero. With this on,
+    // the CPU handle and the GPU handle name the same bytes.
+    if (self->custom_cpu_start != 0 && self->real_cpu_start != 0 && std::getenv("LEONIDA_XS_CPU_HANDLE_ARENA"))
+        return D3D12_CPU_DESCRIPTOR_HANDLE{self->real_cpu_start};
     if (self->custom_cpu_start != 0) return D3D12_CPU_DESCRIPTOR_HANDLE{self->custom_cpu_start};
     return raw_heap_get_cpu_handle(self->real, self->real_vtable);
 }
@@ -774,7 +819,22 @@ std::uint64_t WINAPI heap_slot(HeapProxy* self, std::uint64_t a1, std::uint64_t 
         // PR #7021: the address the title's own XMem allocation hook supplied, or the host heap's when there is none.
         return static_cast<std::uint64_t>(heap_get_cpu_handle(self).ptr);
     } else if constexpr (Slot == 10) {
-        return static_cast<std::uint64_t>(heap_get_gpu_handle(self).ptr);
+        // The value the title uses as the heap's GPU handle base: every table VA it passes is this plus a slot offset,
+        // and the shim writes descriptors at real_cpu_start plus the same offset. The two agree only when this getter
+        // returns exactly the arena offset of the layer's heap (real_cpu_start - arena_host_base).
+        const D3D12_GPU_DESCRIPTOR_HANDLE handle = heap_get_gpu_handle(self);
+        if (std::getenv("LEONIDA_LOG_HEAPID")) {
+            static std::atomic<int> shown{0};
+            const SIZE_T arena = leonida::arena_host_base ? reinterpret_cast<SIZE_T>(leonida::arena_host_base) : 0;
+            if (shown.fetch_add(1, std::memory_order_relaxed) < 12)
+                std::fprintf(stderr, "[rt] heap %d GPU handle getter -> 0x%llx (arena offset 0x%llx)\n",
+                             self->log_id, static_cast<unsigned long long>(handle.ptr),
+                             static_cast<unsigned long long>(self->real_cpu_start && arena &&
+                                                                    self->real_cpu_start >= arena
+                                                                ? self->real_cpu_start - arena
+                                                                : 0));
+        }
+        return static_cast<std::uint64_t>(handle.ptr);
     } else {
         note_heap_slot(Slot);
         using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
@@ -819,6 +879,42 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
     proxy->real_cpu_start = real_cpu_start;
     proxy->custom_free = custom_free;
     proxy_add_ref(device);  // the heap keeps its Xbox-ABI device alive for GetDevice
+
+    {
+        static std::atomic<int> heap_ids{0};
+        proxy->log_id = heap_ids.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+    // LEONIDA_LOG_HEAPID: one line per descriptor heap, so a table VA (a GPU handle) and a Create*View destination
+    // (a CPU handle) can be traced back to the heap they name and to the arena offset both must agree on.
+    if (std::getenv("LEONIDA_LOG_HEAPID")) {
+        std::fprintf(stderr,
+                     "[rt] heap %d: title 0x%llx + 0x%llx real 0x%llx -> arena 0x%llx gpu_handle 0x%llx "
+                     "(cpu_handle_arena %d)\n",
+                     proxy->log_id, static_cast<unsigned long long>(custom_cpu_start),
+                     static_cast<unsigned long long>(custom_byte_size),
+                     static_cast<unsigned long long>(real_cpu_start),
+                     static_cast<unsigned long long>(leonida::arena_host_base
+                                                         ? real_cpu_start -
+                                                               reinterpret_cast<SIZE_T>(leonida::arena_host_base)
+                                                         : 0),
+                     static_cast<unsigned long long>(gpu_start),
+                     std::getenv("LEONIDA_XS_CPU_HANDLE_ARENA") ? 1 : 0);
+        // What the heap's first slots hold on both sides: the title's XMem copy (which only the title writes) and the
+        // layer's arena heap (which only Create*View/CopyDescriptors writes). A title that fills descriptors itself
+        // leaves them in the XMem copy; the shader reads the arena heap.
+        if (proxy->log_id <= 6) {
+            std::uint32_t title_words[8] = {}, arena_words[8] = {};
+            if (custom_cpu_start) leonida::copy_committed(reinterpret_cast<std::uint8_t*>(title_words), custom_cpu_start, sizeof(title_words));
+            if (real_cpu_start)
+                std::memcpy(arena_words, reinterpret_cast<const void*>(real_cpu_start), sizeof(arena_words));
+            std::fprintf(stderr, "[rt] heap %d slot 0 title: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                         proxy->log_id, title_words[0], title_words[1], title_words[2], title_words[3],
+                         title_words[4], title_words[5], title_words[6], title_words[7]);
+            std::fprintf(stderr, "[rt] heap %d slot 0 arena: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                         proxy->log_id, arena_words[0], arena_words[1], arena_words[2], arena_words[3],
+                         arena_words[4], arena_words[5], arena_words[6], arena_words[7]);
+        }
+    }
 
     if (custom_cpu_start != 0 &&
         !register_descriptor_range(device, proxy, custom_cpu_start, custom_byte_size, real_cpu_start)) {
@@ -2205,36 +2301,70 @@ void rewrite_table_descriptors(DeviceProxy* device, std::uint64_t va, std::uint8
 // The window count is capped: each base makes a 4 MiB window, and a title with a ring of tables would otherwise
 // allocate a window per frame.
 void rewrite_vsharp_bases(DeviceProxy* device, std::uint64_t va, std::uint8_t* window, std::uint64_t bytes) {
-    constexpr int kWindowCap = 64;
+    // Each translated base makes a 4 MiB window, so only the head of the table is rewritten (the composite VS reads the
+    // V# at +0x00 and the one at +0x40) and the window count is capped; entries past the cap are zeroed rather than
+    // left naming an address the shader cannot reach.
+    constexpr std::uint64_t kScanBytes = 0x200;
+    constexpr int kWindowCap = 128;
     static std::atomic<int> window_count{0};
     const std::uint64_t arena = leonida::arena_host_size;
+    const std::uint64_t scan = std::min(bytes, kScanBytes);
     std::vector<std::uint32_t> table(static_cast<std::size_t>(bytes / 4), 0);
     leonida::copy_committed(reinterpret_cast<std::uint8_t*>(table.data()), va, bytes);
-    const auto log_first = [&](std::uint64_t at, std::uint64_t base, std::uint64_t to, bool zeroed) {
+    int translated = 0, zeroed = 0;
+    const auto log_first = [&](std::uint64_t at, const char* what, std::uint64_t base, std::uint64_t to) {
         static std::atomic<int> shown{0};
-        if (shown.fetch_add(1, std::memory_order_relaxed) < 12)
-            std::fprintf(stderr, "[rt] vbase +0x%llx: base 0x%llx -> %s0x%llx committed %d\n",
-                         static_cast<unsigned long long>(at), static_cast<unsigned long long>(base),
-                         zeroed ? "zero " : "", static_cast<unsigned long long>(to),
-                         leonida::is_committed(reinterpret_cast<const void*>(base)) ? 1 : 0);
+        if (shown.fetch_add(1, std::memory_order_relaxed) < 16)
+            std::fprintf(stderr, "[rt] vbase +0x%llx: %s 0x%llx -> 0x%llx\n",
+                         static_cast<unsigned long long>(at), what, static_cast<unsigned long long>(base),
+                         static_cast<unsigned long long>(to));
     };
-    for (std::uint64_t at = 0; at + 16 <= bytes; at += 32) {
+    for (std::uint64_t at = 0; at + 16 <= scan; at += 16) {
         std::uint32_t* words = table.data() + at / 4;
-        const std::uint64_t base = (std::uint64_t(words[1] & 0xffff) << 32) | (words[0] & 0xfffffffcull);
+        const unsigned type = (words[3] >> 28) & 0xf;
+        if (type >= 8) {
+            const std::uint64_t addr = ((static_cast<std::uint64_t>(words[1] & 0xff) << 32) | words[0]) << 8;
+            if (!addr) continue;
+            if (leonida::is_committed(reinterpret_cast<const void*>(addr)) &&
+                window_count.load(std::memory_order_relaxed) < kWindowCap) {
+                const std::uint64_t window_va = guest_translate(device, addr, 4096);
+                if (!window_va) continue;
+                window_count.fetch_add(1, std::memory_order_relaxed);
+                ++translated;
+                words[0] = std::uint32_t(window_va >> 8);
+                words[1] = (words[1] & ~0xffu) | std::uint32_t((window_va >> 40) & 0xff);
+                log_first(at, "T#", addr, window_va);
+            } else if (addr >= arena) {
+                ++zeroed;
+                std::memset(words, 0, at + 32 <= bytes ? 32 : 16);
+            }
+            continue;
+        }
+        const std::uint64_t base = (static_cast<std::uint64_t>(words[1] & 0xffff) << 32) | (words[0] & 0xfffffffcull);
         if (!base) continue;
-        if (leonida::is_committed(reinterpret_cast<const void*>(base))) {
-            if (window_count.load(std::memory_order_relaxed) >= kWindowCap) continue;
+        if (leonida::is_committed(reinterpret_cast<const void*>(base)) &&
+            window_count.load(std::memory_order_relaxed) < kWindowCap) {
             const std::uint64_t window_va = guest_translate(device, base, 4096);
             if (!window_va) continue;
-            if (window_va != base) window_count.fetch_add(1, std::memory_order_relaxed);
+            window_count.fetch_add(1, std::memory_order_relaxed);
+            ++translated;
             words[0] = std::uint32_t(window_va & 0xfffffffcull) | (words[0] & 3u);
             words[1] = (words[1] & 0xffff0000u) | std::uint32_t((window_va >> 32) & 0xffff);
-            log_first(at, base, window_va, false);
+            log_first(at, "V#", base, window_va);
         } else if (base >= arena) {
+            ++zeroed;
             std::memset(words, 0, 16);
-            log_first(at, base, 0, true);
+            log_first(at, "zero", base, 0);
         }
     }
+    // Past the scan the entries are zeroed too: an entry naming title memory the shader cannot reach is a page fault,
+    // and one naming the arena's numbers reads whatever else lives there. A zero V# has size 0, so its load returns 0.
+    if (scan < bytes) std::memset(table.data() + scan / 4, 0, static_cast<std::size_t>(bytes - scan));
+    static std::atomic<int> rewrites{0};
+    if (rewrites.fetch_add(1, std::memory_order_relaxed) < 8)
+        std::fprintf(stderr, "[rt] vbase table 0x%llx: %d translated, %d zeroed, %d windows so far\n",
+                     static_cast<unsigned long long>(va), translated, zeroed,
+                     window_count.load(std::memory_order_relaxed));
     std::memcpy(window, table.data(), bytes);
 }
 
@@ -3151,6 +3281,35 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                         a2 = shader_address(self->device, a2, 64 << 10);
                     }
                 }
+                if (std::getenv("LEONIDA_XS_TABLE_SYNC")) {
+                    // The heap's CPU handle is the XMem copy the title's allocation hook supplied, while the shader
+                    // reads the arena (heap_base + GPU handle). On the console both are one memory: a title writes
+                    // descriptor values into the heap itself, so a write to the copy is never seen by a shader that
+                    // reads the arena. Copy the table's bytes from the title's copy into the arena just before the
+                    // table is bound, which is when they are needed.
+                    DescriptorRange range{};
+                    if (find_descriptor_range(self->device, SIZE_T(table_va), &range) && range.backing_start &&
+                        leonida::arena_host_base &&
+                        range.real_start >= reinterpret_cast<SIZE_T>(leonida::arena_host_base)) {
+                        const std::uint64_t off = table_va - range.custom_start;
+                        const std::uint64_t bytes = std::min<std::uint64_t>(64 << 10, range.custom_end - table_va);
+                        const std::uint64_t at =
+                            range.real_start - reinterpret_cast<SIZE_T>(leonida::arena_host_base) + off;
+                        if (at + bytes <= leonida::arena_host_size) {
+                            std::memcpy(leonida::arena_host_base + at,
+                                        reinterpret_cast<const void*>(range.backing_start + off),
+                                        static_cast<std::size_t>(bytes));
+                            static std::atomic<int> synced{0};
+                            if (synced.fetch_add(1, std::memory_order_relaxed) < 8)
+                                std::fprintf(stderr,
+                                             "[rt] table sync: 0x%llx <- title 0x%llx (%llu bytes) at arena 0x%llx\n",
+                                             static_cast<unsigned long long>(table_va),
+                                             static_cast<unsigned long long>(range.backing_start + off),
+                                             static_cast<unsigned long long>(bytes),
+                                             static_cast<unsigned long long>(at));
+                        }
+                    }
+                }
                 // LEONIDA_LOG_TABLE3: three-way dump of the memory a shader reads a table from. The composite VS
                 // reads a 16-byte gfx10 V# at table+0x00 and another at table+0x40 (its SPIR-V forms the address
                 // as heap_base + table_va and does s_load_dwordx4 at those offsets), so the question the protocol
@@ -3181,14 +3340,26 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                         const int nth = t3_nth.fetch_add(1, std::memory_order_relaxed) + 1;
                         DescriptorRange range{};
                         const bool in_range = find_descriptor_range(self->device, SIZE_T(table_va), &range);
+                        const int heap_id = in_range && range.heap ? range.heap->log_id : 0;
+                        const std::uint64_t slot = in_range ? (table_va - range.custom_start) / 32 : 0;
                         std::fprintf(stderr,
                                      "[rt] table3 %d: index %llu va 0x%llx handed 0x%llx in_layer 0x%llx backing %d"
-                                     "; range %d custom 0x%llx real 0x%llx backing 0x%llx gpu %d\n",
+                                     "; range %d heap %d slot %llu writes %llu maxslot %llu"
+                                     " custom 0x%llx real 0x%llx backing 0x%llx gpu %d\n",
                                      nth, static_cast<unsigned long long>(a1),
                                      static_cast<unsigned long long>(table_va),
                                      static_cast<unsigned long long>(a2),
                                      static_cast<unsigned long long>(in_layer.ptr), is_backing ? 1 : 0,
-                                     in_range ? 1 : 0, static_cast<unsigned long long>(range.custom_start),
+                                     in_range ? 1 : 0, heap_id, static_cast<unsigned long long>(slot),
+                                     static_cast<unsigned long long>(
+                                         heap_id > 0 && heap_id < static_cast<int>(kHeapWriteStats)
+                                             ? g_heap_writes[heap_id].writes.load(std::memory_order_relaxed)
+                                             : 0),
+                                     static_cast<unsigned long long>(
+                                         heap_id > 0 && heap_id < static_cast<int>(kHeapWriteStats)
+                                             ? g_heap_writes[heap_id].max_slot.load(std::memory_order_relaxed)
+                                             : 0),
+                                     static_cast<unsigned long long>(range.custom_start),
                                      static_cast<unsigned long long>(range.real_start),
                                      static_cast<unsigned long long>(range.backing_start), range.gpu ? 1 : 0);
                         const auto hex20 = [&](const char* tag, const std::uint8_t* base, std::uint64_t offset) {
@@ -3961,6 +4132,9 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     // No output: a capability check, answered by the device (S_FALSE, as on the PC).
     if (!out) return self->real->CreateDescriptorHeap(desc, *riid, nullptr);
 
+    if (desc && std::getenv("LEONIDA_LOG_HEAPID"))
+        std::fprintf(stderr, "[rt] heap desc: type %u num %u flags 0x%x\n", static_cast<unsigned>(desc->Type),
+                     desc->NumDescriptors, static_cast<unsigned>(desc->Flags));
     void* created = nullptr;
     HRESULT hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
     if (FAILED(hr) || !created) return FAILED(hr) ? hr : E_FAIL;
@@ -4018,18 +4192,21 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
 void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(17);
+    log_descriptor_handle(self, "CreateConstantBufferView", dest.ptr);
     self->real->CreateConstantBufferView(desc, translate_cpu_handle(self, dest));
 }
 
 void proxy_create_srv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(18);
+    log_descriptor_handle(self, "CreateShaderResourceView", dest.ptr);
     self->real->CreateShaderResourceView(resource, desc, translate_cpu_handle(self, dest));
 }
 
 void proxy_create_uav(DeviceProxy* self, ID3D12Resource* resource, ID3D12Resource* counter,
                       const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(19);
+    log_descriptor_handle(self, "CreateUnorderedAccessView", dest.ptr);
     self->real->CreateUnorderedAccessView(resource, counter, desc, translate_cpu_handle(self, dest));
 }
 
@@ -4047,6 +4224,7 @@ void proxy_create_dsv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_D
 
 void proxy_create_sampler(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(22);
+    log_descriptor_handle(self, "CreateSampler", dest.ptr);
     self->real->CreateSampler(desc, translate_cpu_handle(self, dest));
 }
 
@@ -4093,6 +4271,7 @@ void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DE
 void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D12_CPU_DESCRIPTOR_HANDLE dest_start,
                                    D3D12_CPU_DESCRIPTOR_HANDLE src_start, D3D12_DESCRIPTOR_HEAP_TYPE type) {
     note_slot(24);
+    log_descriptor_handle(self, "CopyDescriptorsSimple dest", dest_start.ptr);
     self->real->CopyDescriptorsSimple(num_descriptors, translate_cpu_handle(self, dest_start),
                                       translate_cpu_handle(self, src_start), type);
 }
