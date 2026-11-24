@@ -1350,6 +1350,65 @@ their creation." —— 而我们层里**纹理的 `Map` 直接返回 `E_INVALID
 **`PS_BlitColour` 用的是哪个颜色？** 如果那个颜色就是黑，标题是故意清黑（那我们只能等它的
 游戏逻辑产出内容）；如果不是黑，那就是我们把它要的颜色丢了（`LOG_ROOT` 能看根参数）。
 
+---
+
+## 20. 上游进度对比（2026-11-25 08:00，远端 tip `51a6074d2`）
+
+### 20.1 取到上游的方法（以后照抄）
+
+**直连不通，必须走本机代理**；`git` 和 WinHTTP 都没配代理，所以原先 `git fetch` 三次都是
+`Connection was reset` / `Failed to connect ... :443`。代理地址在
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` 的 `ProxyServer`
+（本机 `127.0.0.1:7897`，`ProxyEnable=1`）。**只对这条命令生效，不改任何全局配置**：
+
+```powershell
+git -c http.proxy=http://127.0.0.1:7897 -c https.proxy=http://127.0.0.1:7897 fetch --no-tags origin
+```
+
+### 20.2 他们卡在哪：**stop 13**，我们几天前就过了
+
+`origin/main:docs/retail_boot_chain.md` 的 "Current stop" 在最新 tip 上**仍然是**：
+
+> **13**: right after the first `CreateDescriptorHeap`, the title calls the heap's slot 9
+> (`GetCPUDescriptorHandleForHeapStart`), takes the handle from `rax` and **asserts that it equals a
+> value it already holds**. Hypothesis: a console descriptor heap starts at an address the title chose
+> or can predict, which the PC handle doesn't match.
+
+**这就是本文 §1 里记的 stop 13**，我们用"CPU handle 返回标题自己那份 XMem 地址"（`custom_cpu_start`）
+通过了。⇒ **进度上我们在上游前面**：他们还在启动链第 13 步，我们已经在讨论"每帧 4 个清屏 blit"。
+
+### 20.3 他们的 open lead 里没有我们的问题
+
+`docs/boot_leads.md` 六条：BL-1 TLS index 0、BL-2 feature level、BL-3 replay 命令列表、
+BL-4 描述符字是 32 位 GPU 地址、BL-5 着色器语料数差 195 个、BL-6 帧节拍统计。
+在他们全部 `docs/*.md` 里搜 `black frame|black screen|nothing renders|draws nothing|empty frame`：
+**零命中** —— 他们没走到会看见黑屏的地方。
+
+### 20.4 他们的提交里没有我们的答案，但**我们有两处比他们新**
+
+我们 `HEAD` 落后上游 1,500+ 个提交，但那些几乎全是外围 PR 的合并（CI、文档、GPU 测试结果、
+wine 测试、翻译器的边角修复）。**抽了动到 `runtime/` 的几条**：`4ff9a77f1`（RSSetScissorRects
+超过 16 个只保留前 16）、`39bd93a76`（stencil face mask）、`ccd9c5f36`（multi-viewport）、
+`ab4085fb9`（UAV clear pack16）——**没有一条碰我们的瓶颈**。
+
+反过来，在**最新 tip** 上核对过，他们还没有我们刚做的两件事：
+
+| 我们最近的改动 | 上游同一处 |
+| --- | --- |
+| 纹理 `Map` 给 host 内存（`LEONIDA_XS_TEXTURE_MAP`） | 仍然 `return ... : E_INVALIDARG;` |
+| 想持久化 `pipeline_cache.bin` | `GetPipelineCacheData` / `save_pipeline_cache` 出现 **0** 次（只读） |
+
+（他们的 `fix/vk-pipeline-cache-seed` PR 只是**测试 + 文档**。）
+
+**唯一值得顺手手抄的**：`4ff9a77f1`（`runtime/shims/d3d12_com.cpp` 的 scissor 上限对齐），
+与黑屏无关。
+
+### 20.5 结论
+
+**上游不是修复来源**；我们的参考仍然只有 victory-gta6 / AnyXboxX / five-star-recomp。
+我们真正的瓶颈（每帧 4 个 `PS_BlitColour` 清屏、从不 `Dispatch`、表里没有描述符）
+**上游没有任何信息可以借鉴**。
+
 **稳态的表也复查了一次**（150 秒的 run，`LOG_TABLE4` 在第 44,000 / 46,000 次 bind 采样，
 即启动完全结束之后）：
 
