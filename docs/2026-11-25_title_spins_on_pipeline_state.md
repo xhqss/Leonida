@@ -716,6 +716,8 @@ Vulkan 侧的等价物就是 I3 的"大 buffer + 目录"。
 那是 `DeserializeComputePipelineStateX` 拿来的一段 console compute 程序，语料里没有对应翻译。
 victory-gta6 的经验是这类"程序没翻译"是**成片**的（它们修了 730 个 compute 程序的隐式 mip 采样）。
 ⇒ 值得用 `tools/rdna2spirv.py` 的诊断对这批 kind-6/kind-0 做一次普查，看缺多少、缺在哪。
+**（第五轮做了一半：程序已经导出来并拆开，见 §15.1 —— 它是一个 76 字节的 FLT_MAX 填充内核；
+反汇编在头部错位，所以翻译器拒绝。修的是反汇编，不是翻译器。）**
 
 ---
 
@@ -886,4 +888,109 @@ slot-133 池里 **drawable 的头**（`0x8e3` = 位置从 +16 起、28 字节一
 剩下的不是描述符问题。
 
 **默认配置无回归**：30 s → 2760 presents、0 assert、0 fault（基线 2880–3180）。
+
+### 14.10 决策记录：要不要换 D3D12（用户问的"第六点"，整理成表）
+
+| 路线 | 工作量 | 风险 | 结论 |
+| --- | --- | --- | --- |
+| 继续现在的 Vulkan 层 | 每轮小步 | 每个设计点都和 console 语义有偏差（预生成 SPIR-V / 8-dword FNV 哈希 / 2 GiB arena） | **继续**，但要按 §15 换焦点 |
+| **中间态：保留 Vulkan，把描述符模型换成 five-star-recomp 的 window 模型** | 改 `rdna2spirv.py` 的 `desc_lookup` 入参来源（"哈希标题的 8 个 dword" → "从 window 读 dword 0 当索引"），重生成语料 | 中 | **推荐**（最小改动、模型已被三个库验证） |
+| 整层换 D3D12 | 重写 `d3d12_vulkan_device.cpp` 的全部资源/管线/描述符/障碍物语义 + 把翻译器输出从 SPIR-V 换成 HLSL/DXIL + 重生成 54,820 个程序 | 高，**以周计** | 不建议现在做；参考实现是 five-star-recomp（GPL-3.0，`docs/d3d12x-shim.md` 可直接当规格书） |
+
+**为什么"换后端"看起来诱人**：三个能出画面的实现（victory-gta6、AnyXboxX、five-star-recomp）全是
+D3D12 且都自己编译着色器 —— 描述符槽就是 GPU 内存里的 32 字节记录，着色器直接把 dword 0 当索引读，
+不需要"8-dword FNV 哈希"这种发明。**但 §15 的证据说明当前的黑屏不是描述符或后端造成的**，
+所以换后端不会更快出画面。
+
+---
+
+## 15. 第五轮（2026-11-25 05:20）：slot 67 修了，**但黑屏不是它**
+
+### 15.1 缺的那个程序是什么
+
+`LEONIDA_DUMP_SHADERS` 导出的 payload 用 `tools/fspx_unpack.py --disasm --backend python` 拆开：
+
+- 目录：kind 0（28 B，dispatch state）、kind 1（20 B）、**kind 6（296 B，RDNA2 程序）**、kind 7（120 B）。
+- kind 0 解得：**threads 32×1×1、wave32、8 vgprs、6 user sgprs、LDS 0** —— 都正常。
+- kind 6：真正是代码的只有前 **76 字节**，后面 50 个 dword 全是 `s_nop`(`0xbf9f0000`) 加尾部填充。
+  有效部分是**一个 8 条指令的内核**：
+
+```
+s_mov_b32 s2, s5
+s_mov_b32 s3, 0
+v_lshl_add_u32 v0, s6, 5, v0
+s_load_dwordx4 s[0:3], s[2:3], 64
+v_mov_b32_e32 v1, 0x7f7fffff        ; FLT_MAX
+s_waitcnt lgkmcnt(0)
+buffer_store_dword v1, v0, s[0:3], 0 idxen
+s_endpgm
+```
+
+⇒ **它是"把一段缓冲填成 FLT_MAX"**（深度/hi-Z 或 min/max 清零一类），不是关键内容。
+
+- **它是成片的**（和 §13.5 的猜测一致）：单独跑 `tools/rdna2spirv.py` 时 1 个程序 0 个翻译，
+  失败原因 `s_nor_b64 source` —— 而且那个 `s_nor_b64` 是**反汇编错位**：kind-6 头部
+  dword 0/1 (`0xd580beb7 0x03feb731`) 和 dword 2 (`0x8daff260`) 被当成两条 8 字节 VOP3，
+  解出 `v_nop_e64` / `s_nor_b64 s[47:48], s[96:97], 1.0` 这种不可能的指令。gfx1013 与 gfx1030 结果相同。
+  ⇒ **下一轮要修的是 `tools/fspx_unpack.py`/`shader_disasm.py` 对这个头的处理**（是不是有 prologue
+  没跳过：`.json` 里写的是 `"prologue": false`），不是翻译器缺功能。
+
+### 15.2 `LEONIDA_XS_EMPTY_CS`：先让管线建出来，看标题到底在等什么
+
+新增开关：语料里没有翻译的 compute 程序，**不再拒绝管线**，而是用内置的
+"立刻返回"的 SPIR-V compute 模块（`LocalSize 1 1 1`、无绑定、无 LDS，35 个 dword，`spirv-val` 通过）
+建出管线，并把事件记进日志。理由：一个建不出来的管线是**标题在等的东西** ——
+slot 67 每帧重试 302 次，后面什么都不跑。
+
+**实测（`XS_EMPTY_CS=1`，70 s）**：
+
+| 指标 | 默认 | `XS_EMPTY_CS=1` |
+| --- | --- | --- |
+| `slot 67 ... failed with 0x80070057` | 302 次/40 s | **0** |
+| presents | 2760 / 30 s（92 Hz） | **10620 / 70 s（152 Hz）** |
+| assert / device fault | 0 / 0 | 0 / 0 |
+| **标题碰到的 D3D12 入口点数量** | **85** | **85（完全一样）** |
+
+⇒ **管线建成功了，标题不再重试，帧率还涨了 65% —— 但它的行为一点没变，画面仍然是黑的。**
+所以 slot 67 是**真缺口、真修掉了一块**，但**不是黑屏的原因**。
+
+### 15.3 更锐利的诊断：**标题的 GPU 端根本没开始干活**
+
+把这一轮所有 `first call` 汇总（85 个入口点）能读出三件决定性的事：
+
+1. **从不 dispatch compute**：`list slot 61`（Dispatch）**从未出现**。
+   （建了 compute 管线：slot 62/67；但一次都没 dispatch。）
+2. **从不画索引几何**：只有 `list slot 12`（DrawInstanced），**`list slot 13`（DrawIndexedInstanced）从未出现**。
+   ⇒ 每帧那 4 个 3-vertex 全屏 blit 就是全部。
+3. **从不读文件**：`dstorage.cpp` 是完整实现（真 `ReadFile`），但标题**一次都没 enqueue**；
+   之前 300 s 的采样也是 0 次文件读。DirectStorage 只建了 factory/queue 就再没用过。
+
+再加两个数字：
+
+- `ExecuteCommandLists` 只有 **~0.54 次/秒**（38 次 / 70 s），而 `PresentX` 是 **152 次/秒**
+  ⇒ **呈现线程在没有新工作的情况下空转**，它重复呈现同一份空内容。
+- CPU：97 个线程、**1658%**，其中 **12 个线程各占 ~99%**、1 个占 **384%**，
+  而 GPU 3D 引擎只有 8% ⇒ 一堆线程在**自旋等待**，不是在算东西。
+
+⇒ **结论：标题卡在"资产加载之前"的 CPU 侧**。它把 D3D12 初始化完、画了个空 quad、就再也没往前走；
+GPU 侧（描述符、黑屏）是**症状**，不是原因。§14 花整轮追的描述符链路确实通了，
+但它服务的对象本身没在干活。
+
+### 15.4 下一步（按价值，替换 §14.6）
+
+1. **归因那 13 个满核线程**（最高优先）。`tmp/thread-map.ps1` 这次拿到的
+   `rip=unreadable`（97 个线程全部读不到 RIP），所以还不能归因；先修这个脚本
+   （或改用 `thread-stack.ps1` + `dbghelp`），把 RIP 落到
+   **标题自己 / amdvlk64.dll / 我们的 gta6rt.exe** 三者之一。若多数落在 amdvlk64.dll，
+   那是 152 Hz 无工作呈现把驱动的自旋线程撑着（我们的成本），可以先降 present 频率验证。
+2. **音频三连**：`xapu.dll!XApuConnect`、`chad.dll!XDspConnectWithMaximumStreamLimit`、
+   `xapu.dll!XApuGetResultCount` 都是 `unimplemented`。一个从来不初始化音频的标题
+   很可能不会开始游戏（GTA 的启动序列包含音频设备初始化）。
+   **这是"标题不往前走"最可疑的单点。**
+3. **`xg_xs` 的 `XGSuggestSwizzleMode` / `XGCreateTextureComputer` 返回 E_NOTIMPL**。
+   five-star-recomp 的 `docs/xg.md` + `XgCopier`/`ConsoleAllocationSizes` 是完整参考
+   （我们已经在槽 25 里算 console tile 尺寸，说明布局数学有一部分）。
+   如果标题要靠它们准备流式纹理，这里失败就等于没有纹理可画。
+4. **修 kind-6 头的反汇编**（§15.1），把缺的 compute 程序补进语料 —— 做完再关掉 `XS_EMPTY_CS`。
+5. 描述符链路（§14.9）保持现状，**不要再投入**，除非 1/2/3 有进展。
 

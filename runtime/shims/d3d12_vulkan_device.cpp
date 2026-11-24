@@ -3929,6 +3929,34 @@ public:
         return S_OK;
     }
 
+    // LEONIDA_XS_EMPTY_CS: what a compute pipeline is built from when the corpus has no translation for the program
+    // the title asked for, instead of refusing the pipeline. A program that cannot be translated is one the title is
+    // *waiting* on: device slot 67 (DeserializeComputePipelineStateX) answered E_INVALIDARG and the title asked again
+    // on every frame -- 302 calls in a 40 s run -- so nothing after it ever ran. The module is a valid compute shader
+    // that returns immediately, with LocalSize 1 1 1, no bindings and no workgroup memory, so it creates on any device.
+    // It is a diagnostic: it turns "the title refuses to go on" into "the title goes on with this dispatch doing
+    // nothing", which says what depends on the program.
+    static const std::vector<std::uint32_t>& empty_compute_words() {
+        static const std::vector<std::uint32_t> words = {
+            0x07230203u, 0x00010500u, 0x00070000u, 0x00000005u, 0x00000000u, 0x00020011u, 0x00000001u,
+            0x0003000eu, 0x00000000u, 0x00000001u, 0x0005000fu, 0x00000005u, 0x00000001u, 0x6e69616du,
+            0x00000000u, 0x00060010u, 0x00000001u, 0x00000011u, 0x00000001u, 0x00000001u, 0x00000001u,
+            0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u, 0x00000002u, 0x00050036u, 0x00000002u,
+            0x00000001u, 0x00000000u, 0x00000003u, 0x000200f8u, 0x00000004u, 0x000100fdu, 0x00010038u};
+        return words;
+    }
+
+    static const leonida::ShaderEntry& empty_compute_entry() {
+        static const leonida::ShaderEntry entry = [] {
+            leonida::ShaderEntry e;
+            e.name = "empty_cs";  // not in the index: the module comes from kEmptyComputeModule
+            e.stage = "cs";
+            e.local_size = {1, 1, 1};
+            return e;
+        }();
+        return entry;
+    }
+
     HRESULT create_compute(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc) {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
@@ -3954,6 +3982,8 @@ public:
         bool ambiguous = false;
         const leonida::ShaderEntry* entry = pick_entry(library->program_candidates("cs", program, &ambiguous),
                                                        [](const leonida::ShaderEntry&) { return true; });
+        // LEONIDA_XS_EMPTY_CS: build the pipeline from the no-op module instead of refusing it (see kEmptyComputeModule).
+        const bool empty_program = !entry && std::getenv("LEONIDA_XS_EMPTY_CS") != nullptr;
         if (!entry) {
             const bool fspx = program.kind == leonida::ComputeProgram::Kind::fspx;
             if (ambiguous)
@@ -3968,7 +3998,13 @@ public:
             dump_untranslated_shader("cs", leonida::sha256_hex(program.bytes), program.bytes, nullptr,
                                      desc.CS.pShaderBytecode,
                                      static_cast<std::size_t>(desc.CS.BytecodeLength));
-            return E_INVALIDARG;
+            if (!empty_program) return E_INVALIDARG;
+            static std::atomic<int> empty_logged{0};
+            if (empty_logged.fetch_add(1, std::memory_order_relaxed) < 24)
+                std::fprintf(stderr,
+                             "[rt] d3d12: LEONIDA_XS_EMPTY_CS: building the pipeline from the no-op compute module "
+                             "instead (dispatch does nothing)\n");
+            entry = &empty_compute_entry();
         }
         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
         // shader declares bindings has it in its layout and has it bound at every dispatch.
@@ -3997,7 +4033,7 @@ public:
                 }
             }
         }
-        const std::vector<std::uint32_t> words = library->spirv(*entry);
+        std::vector<std::uint32_t> words = empty_program ? empty_compute_words() : library->spirv(*entry);
         if (words.empty()) {
             std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
             return E_FAIL;
