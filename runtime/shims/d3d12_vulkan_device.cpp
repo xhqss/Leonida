@@ -34,6 +34,7 @@
 #include "../src/vulkan_device_filter.h"
 #include "../src/vulkan13_features.h"
 #include "../src/pipeline_digest.h"
+#include "../src/arena_window.h"
 
 #include <vulkan/vulkan_win32.h>
 #ifdef _MSC_VER
@@ -5489,6 +5490,8 @@ public:
         address.buffer = arena.buffer;
         arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
         arena.size = info.size;
+        leonida::arena_host_base = arena.mapped;  // LEONIDA_DUMP_TABLE reads a root table's bytes through it
+        leonida::arena_host_size = arena.size;
         arena.free[kArenaReserved] = arena.size - kArenaReserved;
         arena.peak_end = kArenaReserved;
         char log[4] = {};
@@ -8373,6 +8376,20 @@ private:
                                                   resource.r9g9b9e5_as_r32_uint());
         if (registered && resource.sparse_image()) state_.context->note_shader_image(resource.id());
         if (leonida::gfx10::multisampled(image.type) && !registered) return;
+        // LEONIDA_LOG_DESC_WRITE: where a T# is written. The shader loads these bytes from the heap's console VA, so a
+        // destination outside the GPU address arena means the shader reads zeros.
+        if (std::getenv("LEONIDA_LOG_DESC_WRITE")) {
+            static std::atomic<int> shown{0};
+            const int nth = shown.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (nth <= 24) {
+                const auto* base = state_.arena.mapped;
+                const auto* dest = reinterpret_cast<const std::uint8_t*>(destination.ptr);
+                const bool in_arena = base && dest >= base && dest < base + state_.arena.size;
+                std::fprintf(stderr, "[rt] write T# %d at %p (in arena %d): %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                             nth, static_cast<const void*>(dest), in_arena ? 1 : 0, words[0], words[1], words[2],
+                             words[3], words[4], words[5], words[6], words[7]);
+            }
+        }
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
     }
 

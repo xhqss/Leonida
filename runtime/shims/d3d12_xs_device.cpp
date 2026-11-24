@@ -25,6 +25,7 @@
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
 #include "../src/guest_memory.h"
+#include "../src/arena_window.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_alloc_size.h"
 #include "d3d12_xs_desc_clean.h"
@@ -2856,21 +2857,43 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 // lists recorded never submitted. Translate it the way the device translated the view when it created it.
                 if (a1) a1 = translate_cpu_handle(self->device, D3D12_CPU_DESCRIPTOR_HANDLE{a1}).ptr;
             } else if constexpr (Slot == 36) {
-                // SetGraphicsRootDescriptorTable(index, table GPU VA): the table holds the title's own console-format
-                // descriptors (a T# is 8 dwords), so what the shader will read can be dumped here when a draw shows
-                // nothing although its vertex data is there.
+                // SetGraphicsRootDescriptorTable(index, table GPU VA): the title builds this table in its own pages
+                // (the shaders add heap_base to every VA they read), so the VA needs the treatment the root descriptor
+                // setters below get, not the raw value.
+                // LEONIDA_XS_TABLE_VA: translate the table VA to a window over the title's pages, as the root
+                // descriptor setters below do. Off by default: with it on the title's menu draws do read their real
+                // console T#s (LEONIDA_LOG_ROOT shows them), but a shader then reads out of bounds and the device is
+                // lost before the second frame (2026-11-24); the faulting read is the next thing to find.
+                const std::uint64_t table_va = a2;
+                if (std::getenv("LEONIDA_XS_TABLE_VA")) a2 = shader_address(self->device, a2, 64 << 10);
                 if (std::getenv("LEONIDA_LOG_ROOT")) {
                     static std::atomic<int> logged{0};
                     const int nth = logged.fetch_add(1, std::memory_order_relaxed) + 1;
                     if (nth <= 40) {
                         std::uint32_t words[8] = {};
-                        leonida::copy_committed(reinterpret_cast<std::uint8_t*>(words), a2, sizeof(words));
+                        leonida::copy_committed(reinterpret_cast<std::uint8_t*>(words), table_va, sizeof(words));
                         std::fprintf(stderr,
-                                     "[rt] root table %d: index %llu at 0x%llx; first descriptor %08x %08x %08x %08x "
-                                     "%08x %08x %08x %08x\n",
+                                     "[rt] root table %d: index %llu at 0x%llx -> 0x%llx; first descriptor %08x %08x "
+                                     "%08x %08x %08x %08x %08x %08x\n",
                                      nth, static_cast<unsigned long long>(a1),
-                                     static_cast<unsigned long long>(a2), words[0], words[1], words[2], words[3],
-                                     words[4], words[5], words[6], words[7]);
+                                     static_cast<unsigned long long>(table_va), static_cast<unsigned long long>(a2),
+                                     words[0], words[1], words[2], words[3], words[4], words[5], words[6],
+                                     words[7]);
+                    }
+                }
+                // LEONIDA_DUMP_TABLE: the table's bytes as the shader reads them, from the GPU address arena's host
+                // mapping (a translated table's window is not in the arena, so this then prints nothing).
+                if (std::getenv("LEONIDA_DUMP_TABLE") && leonida::arena_host_base && a2 < leonida::arena_host_size) {
+                    static std::atomic<int> shown{0};
+                    const int nth = shown.fetch_add(1, std::memory_order_relaxed) + 1;
+                    const std::uint64_t room = leonida::arena_host_size - a2;
+                    if (nth <= 40) {
+                        const auto* words = reinterpret_cast<const std::uint32_t*>(leonida::arena_host_base + a2);
+                        std::fprintf(stderr, "[rt] table %d: index %llu at 0x%llx:", nth,
+                                     static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2));
+                        for (unsigned i = 0; i < 24 && (i + 1) * 4 <= room; ++i)
+                            std::fprintf(stderr, " %08x", words[i]);
+                        std::fprintf(stderr, "\n");
                     }
                 }
             } else if constexpr (Slot == kConsoleSetDescriptorHeaps) {

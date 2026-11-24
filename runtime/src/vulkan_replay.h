@@ -2,6 +2,7 @@
 
 #include "resource_tiling.h"
 #include "pipeline_digest.h"
+#include "replay_progress.h"
 
 // Replays a closed CommandList (command_list.h) into a Vulkan command buffer.
 //
@@ -2604,6 +2605,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
+        if (std::getenv("LEONIDA_LOG_UNSUPPORTED")) {
+            leonida::prepare_command_index() = i;
+            leonida::prepare_command_kind() = command.index();
+        }
         auto& p = out.commands[i];
         const auto bind = [&](ResourceId id) {
             const ResourceBinding* binding = resolve(id);

@@ -6,6 +6,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/replay_progress.h"
 
 #include <algorithm>
 #include <array>
@@ -1777,9 +1778,16 @@ public:
         }
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
-        if (last_result_ != leonida::ReplayResult::success)
+        if (last_result_ != leonida::ReplayResult::success) {
             std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted\n",
                          name(last_result_));
+            // LEONIDA_LOG_UNSUPPORTED: which command could not be replayed.
+            if (std::getenv("LEONIDA_LOG_UNSUPPORTED"))
+                std::fprintf(stderr, "[rt] d3d12: the replay stopped at command %zu (%s, kind %u)\n",
+                             leonida::prepare_command_index(),
+                             leonida::command_kind_name(leonida::prepare_command_kind()),
+                             leonida::prepare_command_kind());
+        }
     }
 
     // A copy list's timestamps go to COPY_QUEUE_TIMESTAMP heaps and every other list's to TIMESTAMP heaps.
