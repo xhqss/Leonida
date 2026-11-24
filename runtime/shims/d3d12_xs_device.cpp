@@ -3125,6 +3125,63 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                         std::fprintf(stderr, "\n");
                     }
                 }
+                // LEONIDA_LOG_TABLE_STABLE: a title rewrites its descriptor pages every frame, so the first bytes seen at
+                // a table VA are often a half-built table. Remembers each table and prints only the words that still
+                // change, then a snapshot that held for four sightings -- which is when its bytes can be read as
+                // descriptors at all.
+                if (std::getenv("LEONIDA_LOG_TABLE_STABLE")) {
+                    struct Seen {
+                        std::uint64_t va;
+                        std::uint32_t words[64];
+                        int count;
+                        bool stable_logged;
+                    };
+                    static Seen seen[16];
+                    static int used = 0;
+                    static std::mutex seen_lock;
+                    std::uint32_t now[64] = {};
+                    leonida::copy_committed(reinterpret_cast<std::uint8_t*>(now), table_va, sizeof(now));
+                    std::lock_guard guard(seen_lock);
+                    const auto inspect = [&] {
+                        Seen* entry = nullptr;
+                        for (int i = 0; i < used; ++i)
+                            if (seen[i].va == table_va) {
+                                entry = &seen[i];
+                                break;
+                            }
+                        if (!entry) {
+                            if (used < 16) {
+                                entry = &seen[used++];
+                                entry->va = table_va;
+                                std::memcpy(entry->words, now, sizeof(now));
+                                entry->count = 1;
+                                entry->stable_logged = false;
+                            }
+                            return;
+                        }
+                        int diffs = 0;
+                        for (int i = 0; i < 64; ++i) {
+                            if (entry->words[i] == now[i]) continue;
+                            if (diffs < 6)
+                                std::fprintf(stderr, "[rt] table 0x%llx word %d: %08x -> %08x\n",
+                                             static_cast<unsigned long long>(table_va), i, entry->words[i], now[i]);
+                            ++diffs;
+                        }
+                        if (diffs) {
+                            std::memcpy(entry->words, now, sizeof(now));
+                            entry->count = 1;
+                            entry->stable_logged = false;
+                            return;
+                        }
+                        if (++entry->count == 4 && !entry->stable_logged) {
+                            entry->stable_logged = true;
+                            std::fprintf(stderr, "[rt] table 0x%llx stable:", (unsigned long long)table_va);
+                            for (int i = 0; i < 32; ++i) std::fprintf(stderr, " %08x", now[i]);
+                            std::fprintf(stderr, "\n");
+                        }
+                    };
+                    inspect();
+                }
                 // LEONIDA_LOG_VSHARP: find where a GFX10 V# really starts. A console descriptor slot is 32 bytes and a
                 // title computes the table VA from the heap start, so the first V# need not be at the address as passed.
                 // Slides a 16-byte decode over [-0x40, +0x100) and scores the fields; prints the plausible windows only.
