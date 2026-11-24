@@ -2165,14 +2165,28 @@ void rewrite_table_descriptors(DeviceProxy* device, std::uint64_t va, std::uint8
                                             : std::min<std::uint64_t>(records, limit));
         }
         std::memcpy(window + at, words, type >= 8 ? 32 : 16);
-        // LEONIDA_LOG_TABLE: what the rewrite made of the first records, and the first bytes of the data they name.
+        // LEONIDA_LOG_TABLE: what the rewrite made of the first records, and three levels of the pointer chain the
+        // title's memory at that address holds, to see where the data (a matrix, floats like 3f800000) really lives.
         if (std::getenv("LEONIDA_LOG_TABLE") && at <= 32) {
-            std::uint32_t sample[4] = {};
-            leonida::copy_committed(reinterpret_cast<std::uint8_t*>(sample), source, 16);
+            std::uint64_t level[3] = {source, 0, 0};
+            std::uint32_t sample[3][4] = {};
+            leonida::copy_committed(reinterpret_cast<std::uint8_t*>(sample[0]), level[0], 16);
+            for (unsigned i = 1; i < 3; ++i) {
+                leonida::copy_committed(reinterpret_cast<std::uint8_t*>(&level[i]), level[i - 1], 8);
+                if (!level[i] || !leonida::is_committed(reinterpret_cast<const void*>(level[i]))) break;
+                leonida::copy_committed(reinterpret_cast<std::uint8_t*>(sample[i]), level[i], 16);
+            }
             std::fprintf(stderr,
-                         "[rt] rewrite +0x%llx: %08x %08x %08x %08x from 0x%llx; data %08x %08x %08x %08x\n",
+                         "[rt] rewrite +0x%llx: %08x %08x %08x %08x from 0x%llx\n"
+                         "[rt]   [0] 0x%llx: %08x %08x %08x %08x\n"
+                         "[rt]   [1] 0x%llx: %08x %08x %08x %08x\n"
+                         "[rt]   [2] 0x%llx: %08x %08x %08x %08x\n",
                          static_cast<unsigned long long>(at), words[0], words[1], words[2], words[3],
-                         static_cast<unsigned long long>(source), sample[0], sample[1], sample[2], sample[3]);
+                         static_cast<unsigned long long>(source), static_cast<unsigned long long>(level[0]),
+                         sample[0][0], sample[0][1], sample[0][2], sample[0][3],
+                         static_cast<unsigned long long>(level[1]), sample[1][0], sample[1][1], sample[1][2],
+                         sample[1][3], static_cast<unsigned long long>(level[2]), sample[2][0], sample[2][1],
+                         sample[2][2], sample[2][3]);
         }
     }
 }
