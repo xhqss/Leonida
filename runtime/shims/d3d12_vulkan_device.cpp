@@ -14,6 +14,7 @@
 #include "d3d12_com_object.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
+#include "../src/debug_draw_shaders.h"
 #include "dxgi_com.h"
 #include "../src/arena_size.h"
 #include "../src/gfx10_descriptors.h"
@@ -3489,6 +3490,19 @@ public:
                 }
             }
             VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            // LEONIDA_DRAW_TINT=vs|ps|both: substitute a full-screen triangle and/or a constant colour for the translated
+            // stages, so a draw that reaches its render target paints every texel it covers. This separates a black
+            // frame's causes -- the draw plumbing, the translated vertex shader (with the root arguments it reads) and
+            // the translated pixel shader -- without having to read any of them.
+            if (const char* tint = std::getenv("LEONIDA_DRAW_TINT")) {
+                const bool all = tint[0] == '1' || std::strcmp(tint, "both") == 0;
+                const bool vertex = all || std::strcmp(tint, "vs") == 0;
+                const bool fragment = all || std::strcmp(tint, "ps") == 0;
+                if ((vertex && stage.bit == VK_SHADER_STAGE_VERTEX_BIT) ||
+                    (fragment && stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT))
+                    stage.words = stage.bit == VK_SHADER_STAGE_VERTEX_BIT ? leonida::debug_fullscreen_vertex()
+                                                                         : leonida::debug_tint_fragment();
+            }
             module_info.codeSize = stage.words.size() * 4;
             module_info.pCode = stage.words.data();
             VkShaderModule module = VK_NULL_HANDLE;
@@ -3643,8 +3657,11 @@ public:
 
         const D3D12_DEPTH_STENCIL_DESC& ds = desc.DepthStencilState;
         VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-        depth.depthTestEnable = ds.DepthEnable;
-        depth.depthWriteEnable = ds.DepthEnable && ds.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
+        // LEONIDA_NO_DEPTH_TEST: a frame of zeros with every state in place can be a depth buffer the title never
+        // clears (it calls ClearDepthStencilView nowhere) holding zeros, which every later fragment fails against.
+        static const bool no_depth_test = std::getenv("LEONIDA_NO_DEPTH_TEST") != nullptr;
+        depth.depthTestEnable = ds.DepthEnable && !no_depth_test;
+        depth.depthWriteEnable = ds.DepthEnable && !no_depth_test && ds.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
         depth.depthCompareOp = compare_op(ds.DepthFunc);
         depth.stencilTestEnable = ds.StencilEnable;
         depth.front = stencil_face(ds.FrontFace, ds.StencilReadMask, ds.StencilWriteMask);

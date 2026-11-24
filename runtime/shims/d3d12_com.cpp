@@ -67,6 +67,23 @@ void remember_scissor(const leonida::Rect& scissor) {
 
 }  // namespace
 
+// LEONIDA_CLEAR_TINT="r,g,b,a" (diagnostic): a clear writes that colour instead of the title's. With the frame black
+// although the draws run, this says whether a clear reaches the texture the present reads: a window that turns the
+// colour has the render-target binding right and the fault in the draws, and one that stays black does not.
+leonida::ClearColor clear_color(const FLOAT* color) {
+    if (std::getenv("LEONIDA_CLEAR_TINT")) {
+        static const leonida::ClearColor tint = [] {
+            leonida::ClearColor value{0.0f, 0.0f, 0.0f, 1.0f};
+            if (const char* text = std::getenv("LEONIDA_CLEAR_TINT"))
+                if (std::sscanf(text, "%f,%f,%f,%f", &value[0], &value[1], &value[2], &value[3]) != 4)
+                    value = {1.0f, 0.0f, 1.0f, 1.0f};
+            return value;
+        }();
+        return tint;
+    }
+    return {color[0], color[1], color[2], color[3]};
+}
+
 struct TileGrid {
     std::uint64_t columns = 0;
     std::uint64_t rows = 0;
@@ -806,7 +823,7 @@ public:
             }
         }
         check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(view.ptr),
-                                        {color[0], color[1], color[2], color[3]}, to_rects(count, rects)));
+                                        clear_color(color), to_rects(count, rects)));
     }
 
     void STDMETHODCALLTYPE ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE view, D3D12_CLEAR_FLAGS flags,

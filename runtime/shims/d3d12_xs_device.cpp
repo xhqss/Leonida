@@ -24,6 +24,7 @@
 // for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
+#include "../src/guest_memory.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_alloc_size.h"
 #include "d3d12_xs_desc_clean.h"
@@ -109,6 +110,9 @@ struct DeviceProxy {
     // itself when it is destroyed.
     std::mutex pending_mutex;
     std::vector<void*> pending_lists;
+    // The 4 MiB windows of title memory that have been copied into a buffer the shader can read (guest_translate), as
+    // GuestWindows*. Created on the first such address; freed in proxy_release.
+    std::atomic<void*> guest_windows{nullptr};
 };
 
 // Freed in proxy_release; defined where the states are complete.
@@ -1869,6 +1873,104 @@ std::uint64_t upload_translate(DeviceProxy* device, std::uint64_t va) {
     return va;
 }
 
+// Title memory used as GPU memory. A root descriptor or a vertex or index view can name an address of the title's own
+// allocator, which no resource covers: title memory is host memory here, so the shader cannot read it as a device
+// address. The 4 MiB window the address lands in is copied into an UPLOAD buffer created through the layer, whose device
+// address the shader can read; the copy is refreshed on every use because the title writes it every frame. VIctory does
+// the same (crates/victory-gpu/src/shadow.rs); XCL instead places title memory in UMA windows, which Vulkan on Windows
+// has no equivalent of.
+struct GuestWindow {
+    ID3D12Resource* resource = nullptr;
+    std::uint8_t* mapped = nullptr;
+    std::uint64_t gpu = 0;
+    std::uint64_t start = 0;
+    std::uint64_t len = 0;
+};
+
+struct GuestWindows {
+    std::mutex lock;
+    std::vector<GuestWindow> windows;
+};
+
+constexpr std::uint64_t kGuestWindowBits = 22;  // 4 MiB, the window size VIctory measured as enough for the title
+constexpr std::uint64_t kGuestWindow = std::uint64_t(1) << kGuestWindowBits;
+
+GuestWindows* guest_windows(DeviceProxy* device) {
+    if (!device) return nullptr;
+    if (auto* existing = static_cast<GuestWindows*>(device->guest_windows.load(std::memory_order_acquire)))
+        return existing;
+    auto* fresh = new (std::nothrow) GuestWindows;
+    if (!fresh) return nullptr;
+    void* expected = nullptr;
+    if (device->guest_windows.compare_exchange_strong(expected, fresh, std::memory_order_acq_rel))
+        return fresh;
+    delete fresh;
+    return static_cast<GuestWindows*>(expected);
+}
+
+// A device address that reads the same bytes as the title address `va`, by copying `bytes` of it into the window's
+// buffer. Zero when the window cannot be made, so the caller keeps the address it had.
+std::uint64_t guest_translate(DeviceProxy* device, std::uint64_t va, std::uint64_t bytes) {
+    if (!device || !va) return 0;
+    if (!leonida::is_committed(reinterpret_cast<const void*>(va))) return 0;  // already a device address
+    GuestWindows* windows = guest_windows(device);
+    if (!windows) return 0;
+    const std::uint64_t start = va & ~(kGuestWindow - 1);
+    std::uint64_t len = kGuestWindow;
+    while (va + bytes > start + len) len <<= 1;
+    std::lock_guard lock(windows->lock);
+    GuestWindow* entry = nullptr;
+    for (GuestWindow& window : windows->windows)
+        if (window.start == start) {
+            entry = &window;
+            break;
+        }
+    if (!entry) {
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = len;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource* resource = nullptr;
+        if (FAILED(device->real->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                         __uuidof(ID3D12Resource),
+                                                         reinterpret_cast<void**>(&resource))) ||
+            !resource)
+            return 0;
+        void* mapped = nullptr;
+        const std::uint64_t gpu = resource->GetGPUVirtualAddress();
+        if (FAILED(resource->Map(0, nullptr, &mapped)) || !mapped || !gpu) {
+            resource->Release();
+            return 0;
+        }
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+            std::fprintf(stderr, "[rt] d3d12_xs: title memory window 0x%llx (%llu bytes) copied for the GPU\n",
+                         static_cast<unsigned long long>(start), static_cast<unsigned long long>(len));
+        windows->windows.push_back(GuestWindow{resource, static_cast<std::uint8_t*>(mapped), gpu, start, len});
+        entry = &windows->windows.back();
+    }
+    const std::uint64_t offset = va - start;
+    const std::uint64_t room = entry->len - offset;
+    leonida::copy_committed(entry->mapped + offset, va, std::min(bytes, room));
+    return entry->gpu + offset;
+}
+
+// The device address a shader must read for the title address `va`: the upload arena's, the title-memory window's, or
+// the address itself when it already is one.
+std::uint64_t shader_address(DeviceProxy* device, std::uint64_t va, std::uint64_t bytes) {
+    const std::uint64_t translated = upload_translate(device, va);
+    if (translated != va) return translated;
+    const std::uint64_t guest = guest_translate(device, va, bytes);
+    return guest ? guest : va;
+}
+
 void destroy_upload_state(void* upload_state) {
     auto* arena = static_cast<UploadArena*>(upload_state);
     if (!arena) return;
@@ -2238,13 +2340,13 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 // The six root descriptor setters (index, GPU VA): an upload-arena CPU pointer becomes the
                 // chunk's device address (d3d12_xs_console_abi.md §5.3 measures slots 41/43/45 for the compute
                 // side; the graphics setters interleave on even slots).
-                a2 = upload_translate(self->device, a2);
+                a2 = shader_address(self->device, a2, 64 << 10);  // a root CBV/SRV/UAV: at most a 64 KiB buffer
             } else if constexpr (Slot == 47) {
                 // IASetIndexBuffer(pView): the view's BufferLocation is a GPU VA; translate in a copy so the
                 // title's struct is not written.
                 if (a1) {
                     auto view = *reinterpret_cast<const D3D12_INDEX_BUFFER_VIEW*>(a1);
-                    view.BufferLocation = upload_translate(self->device, view.BufferLocation);
+                    view.BufferLocation = shader_address(self->device, view.BufferLocation, view.SizeInBytes);
                     return reinterpret_cast<ForwardFn>(real_vtable[pc])(
                         self->real, reinterpret_cast<std::uint64_t>(&view), a2, a3, a4, a5, a6, a7, a8, a9,
                         a10, a11, a12, a13, a14);
@@ -2256,7 +2358,7 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                     const auto* in = reinterpret_cast<const D3D12_VERTEX_BUFFER_VIEW*>(a3);
                     self->vb_scratch.assign(in, in + a2);
                     for (auto& view : self->vb_scratch)
-                        view.BufferLocation = upload_translate(self->device, view.BufferLocation);
+                        view.BufferLocation = shader_address(self->device, view.BufferLocation, view.SizeInBytes);
                     if (std::getenv("LEONIDA_LOG_VB")) {
                         static std::atomic<int> logged{0};
                         if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
@@ -2275,9 +2377,9 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                     const auto* in = reinterpret_cast<const D3D12_STREAM_OUTPUT_BUFFER_VIEW*>(a3);
                     self->so_scratch.assign(in, in + a2);
                     for (auto& view : self->so_scratch) {
-                        view.BufferLocation = upload_translate(self->device, view.BufferLocation);
+                        view.BufferLocation = shader_address(self->device, view.BufferLocation, view.SizeInBytes);
                         view.BufferFilledSizeLocation =
-                            upload_translate(self->device, view.BufferFilledSizeLocation);
+                            shader_address(self->device, view.BufferFilledSizeLocation, 8);
                     }
                     return reinterpret_cast<ForwardFn>(real_vtable[pc])(
                         self->real, a1, a2, reinterpret_cast<std::uint64_t>(self->so_scratch.data()), a4, a5,

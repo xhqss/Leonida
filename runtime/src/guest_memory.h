@@ -13,6 +13,14 @@
 
 namespace leonida {
 
+// Whether `address` is committed, readable title memory. A GPU address the layer handed out is not: it is not a host
+// pointer, so a title address that is one can be told apart from an address that already is a device address.
+inline bool is_committed(const void* address) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(address, &info, sizeof(info)) != sizeof(info)) return false;
+    return info.State == MEM_COMMIT && (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+}
+
 // Copies [address, address + bytes) out of title memory into `to`. Pages that are not committed (or are guarded) stop
 // the copy there: the destination keeps what it had, which is what a GPU read of unmapped memory shows a reader.
 inline void copy_committed(std::uint8_t* to, std::uint64_t address, std::uint64_t bytes) {
