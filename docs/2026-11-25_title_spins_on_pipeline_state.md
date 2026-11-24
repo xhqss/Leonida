@@ -1409,6 +1409,97 @@ wine 测试、翻译器的边角修复）。**抽了动到 `runtime/` 的几条*
 我们真正的瓶颈（每帧 4 个 `PS_BlitColour` 清屏、从不 `Dispatch`、表里没有描述符）
 **上游没有任何信息可以借鉴**。
 
+---
+
+## 21. 交接：下一轮从这里开始（2026-11-25 08:30）
+
+### 21.1 现在的状态（一句话）
+
+标题**启动完成、运行稳定**：读完 3.76 GB → 建完 49,152 个图形 PSO → 稳态每秒 717 个 draw
+（4 个/帧）→ **呈现的帧是纯黑**（实测 `mean rgb 0.00 0.00 0.00`）。
+`Dispatch` 从未出现、`DrawIndexedInstanced` 从未出现、85 个 D3D12 入口点不再增加。
+
+### 21.2 **最重要的一条：现在有一个硬矛盾，下一轮先解决它**
+
+| 事实 | 证据 |
+| --- | --- |
+| 每个 blit 的**顶点缓冲里颜色是白的**（`0xffffffff`），几何是全屏三角形 / 全屏像素矩形 | `LEONIDA_LOG_VB=1`：`view 0 at 0x4de0e4ef30 -> 0x2fc0ef30, 4080 bytes, stride 24; first words bf800000 3f800000 00000000 ffffffff …` ⇒ 顶点 = {pos.xyz, **0xffffffff**, uv.xy}，三个顶点 `(-1,1) (-1,-1) (1,-1)` |
+| `PS_BlitColour` 只读 `in_attr0`（Location 0），不采样任何纹理 | 语料 `PS_BlitColour_6e5520d1_Wrapped.spvasm` 里只有 `OpDecorate %in_attr0 Location 0` + `OpLoad %v4float %out_mrt0` |
+| `VS_Blit` 有 **3 个顶点输入**（Location 0/1/2），颜色来自顶点属性 | 语料 `VS_Blit_6e5520d1_Wrapped.spvasm`：`%vin0/1/2 Location 0/1/2`，输出 `out_param0 Location 0` |
+| **但呈现出来的帧是全零** | `LEONIDA_CAPTURE=… CAPTURE_EVERY=200 CAPTURE_LIMIT=2`，`index.txt` 写着 `mean rgb 0.00 0.00 0.00` |
+
+⇒ **标题在画一个白色的全屏 blit，我们却呈现出纯黑。** 矛盾的落点只有三个：
+
+1. **顶点属性没喂进去**（input layout / 属性 offset 错 ⇒ 插值出 0 ⇒ 黑）；
+2. **blit 画的不是被呈现的那张图**（目标/拷贝路径错）；
+3. **呈现路径自己合成了一张黑图**（`runtime/src/vulkan_present.h` 的 compose/plane 逻辑）。
+
+**建议的下一步（按代价）**：
+- `LEONIDA_LOG_DRAW_PIPELINE=1` + `LOG_REPLAY_DRAW=1` 对照：确认那 4 个 draw 的**目标**和
+  最终被 `PresentX` 呈现的 plane 是不是同一张资源（log 里有 `colour 0 id …` 和
+  `first present plane: … format 28 …`，比对 id/格式）；
+- 若目标是同一张：检查 `VS_Blit` 的 input layout（`shader_meta` 的 `input_signature` 与
+  `d3d12_vulkan_device.cpp` 里 `bindings.push_back(...)` 的 stride/offset 是否对得上
+  **stride 24、颜色在 +12**）；
+- 若目标不是同一张：那是 plane/拷贝的问题，看 `vulkan_present.h`。
+
+### 21.3 本轮新增/可用的工具（全部 opt-in，默认关）
+
+| 开关 | 作用 |
+| --- | --- |
+| `LEONIDA_THREAD_MAP=<秒>` | **进程内**线程采样：挂起→一次 `GetThreadContext`→`RtlVirtualUnwind` 走栈→`GetThreadTimes` 算 CPU%；`gta6rt.exe` 的帧用 dbghelp+PDB 解名。已抓到"13 个线程在 amdvlk 里编译管线" |
+| `LEONIDA_LOG_PSO_COUNT=1` | 槽 86/67 的管线创建普查：`calls / distinct / hits`（证明标题有 48,205/49,152 个**不同**的 PSO） |
+| `LEONIDA_LOG_SLOT67=1` | 每次 slot 67 的程序 sha + root signature + 大小 |
+| `LEONIDA_SLOT_PROFILE=1` | 每秒打印最热的 6 个 device/list 槽（稳态画像：480 WaitFrameEventX / 478 CBV / 717 draws…） |
+| `LEONIDA_LOG_VB=1` | 顶点缓冲地址、翻译后地址、stride、**前 16 个 dword 的真实内容** |
+| `LEONIDA_CAPTURE=<dir>` + `_EVERY` + `_LIMIT` | 把呈现的帧落成 PPM，`index.txt` 里有 `mean rgb`（判断黑/白最快） |
+| `LEONIDA_LOG_TEXTURE_MAP=1` | 纹理 `Map`/`Unmap` 的次数与**影子里的非零字节数** |
+| `LEONIDA_XS_EMPTY_CS=1` | 语料缺 compute 程序时用内置 no-op 模块建管线（**默认关**；不开的话 slot 67 每帧失败） |
+| `LEONIDA_XS_PACE=1` | 按 `SetFrameIntervalX` 的间隔睡到下一帧起点（默认关） |
+| `LEONIDA_DUMP_SHADERS=<dir>` | 导出语料缺的 FSPX payload 与程序 |
+
+### 21.4 已经关闭的线索（别再花时间）
+
+描述符链路（§14/§18.8，稳态表两份都是空的）、纹理 `Map`（§19.2，标题 map 两张纹理但**一字节不写**）、
+`device slot 81` 资源终结器（§18.7，两种回答都不改变行为）、`xg_xs` 的 E_NOTIMPL（§18.4，
+调用点不分支）、音频三连（各只调一次）、帧率/呈现频率（§16.5）、"给足时间"（§18.1，
+8 分钟后计数不再增长）、**上游**（§20，他们还停在 stop 13）。
+
+### 21.5 环境与纪律（本轮踩到的坑）
+
+- **`git fetch` 必须走代理**：`git -c http.proxy=http://127.0.0.1:7897 -c https.proxy=… fetch --no-tags origin`
+  （直连三次都是 `Connection was reset`）。代理地址来自 HKCU `Internet Settings` 的 `ProxyServer`。
+- **`tmp\build-gta6rt.cmd` 开头会 `Stop-Process gta6rt`**：测量跑的时候 build 会杀掉它，
+  `run-probe.ps1` 会报 "exited on its own"（本轮犯了三次）。
+- 构建：`Get-Process gta6rt | Stop-Process -Force; Get-ChildItem runtime\shims,runtime\src -Filter *.cpp | % { $_.LastWriteTime = Get-Date }; cmd /c tmp\build-gta6rt.cmd gta6rt`
+- 跑一次：`powershell -NoProfile -File tmp\run-probe.ps1 -Seconds 30 -Tag <tag> -Set 'XS_EMPTY_CS=1,...'`
+  （日志在 `tmp\<tag>-<hhmmss>.log`）
+- `ctest`：`cd runtime\build-561b65a; E:\temp\wait_work\tools\cmake-4.5.1-windows-x86_64\bin\ctest.exe -j8`
+  —— 固定 6 个既有失败，**不该有新增**。
+- 不要用 PowerShell 写项目文件（`Set-Content` 有 BOM/换行风险），用 `edit`/`write`。
+- 语料在 `E:\temp\wait_work\leonida-work\shaders\spirv-561b65a`，实验后要还原并核对 sha256。
+
+### 21.6 逆向（REA）的现状
+
+按 `E:\xhqss\agent_work\dsh\doc\2026-11-15_rea-on-demand.md` 的约定走 CLI（不注册 MCP）：
+
+```
+$env:GHIDRA_INSTALL_DIR='E:\software\Ghidra'
+rea decompile '…\game_scarlett_master.exe' 0x1424800db --provider ghidra --snapshot tmp\rea\gta6.snap.json --format md
+```
+
+**注意**：`--token-limit` 不能和 `--format json` 一起用（会报 `UNSUPPORTED_OUTPUT_COMBINATION`），
+要把输出重定向到文件。Ghidra 要在会话可用前完成**整个 185 MB PE 的 auto-analysis**
+（"incomplete analysis does not expose partial results"），本轮它还在导入、没有产出。
+下一轮如果要逆向，**先把它跑完存好 snapshot**（一次性的昂贵步骤），再对这几个 RVA 取函数：
+`0x24800db`（slot 67 调用点）、`0x247d413`、`0x249987c`、`0x53ec05e`（那条 8 帧 parked 链）。
+
+### 21.7 一句话给下一个 agent
+
+**别再去碰描述符、别再去追驱动、别再等时间。** 现在手上有一个硬矛盾：
+**顶点缓冲里的颜色是白的，呈现出来是全零**。先证明那 4 个 blit 画进了哪张图、
+present 呈现的是哪张图；如果同一张，就查 `VS_Blit` 的 input layout（stride 24、颜色在 +12）。
+
 **稳态的表也复查了一次**（150 秒的 run，`LOG_TABLE4` 在第 44,000 / 46,000 次 bind 采样，
 即启动完全结束之后）：
 
