@@ -2443,13 +2443,14 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 // nothing although its vertex data is there.
                 if (std::getenv("LEONIDA_LOG_ROOT")) {
                     static std::atomic<int> logged{0};
-                    if (logged.fetch_add(1, std::memory_order_relaxed) < 6) {
+                    const int nth = logged.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (nth <= 40) {
                         std::uint32_t words[8] = {};
                         leonida::copy_committed(reinterpret_cast<std::uint8_t*>(words), a2, sizeof(words));
                         std::fprintf(stderr,
-                                     "[rt] root table: index %llu at 0x%llx; first descriptor %08x %08x %08x %08x "
+                                     "[rt] root table %d: index %llu at 0x%llx; first descriptor %08x %08x %08x %08x "
                                      "%08x %08x %08x %08x\n",
-                                     static_cast<unsigned long long>(a1),
+                                     nth, static_cast<unsigned long long>(a1),
                                      static_cast<unsigned long long>(a2), words[0], words[1], words[2], words[3],
                                      words[4], words[5], words[6], words[7]);
                     }

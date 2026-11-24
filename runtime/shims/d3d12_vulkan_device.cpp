@@ -5942,6 +5942,24 @@ public:
             std::fprintf(stderr, "[rt] d3d12: root signature not understood: %s\n", parsed.error.c_str());
             return E_INVALIDARG;
         }
+        // LEONIDA_LOG_ROOTSIG: the parameters of a signature and the user-SGPR offset each is packed at, so a shader
+        // that reads user SGPRs the signature does not place there (corpus index.json records user_sgpr_reads) can be
+        // compared with the packing.
+        if (std::getenv("LEONIDA_LOG_ROOTSIG")) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+                std::fprintf(stderr, "[rt] root signature: %zu parameter(s)\n", parsed.sig.params.size());
+                std::uint32_t at = 0;
+                for (std::size_t i = 0; i < parsed.sig.params.size() && i < 16; ++i) {
+                    const auto& p = parsed.sig.params[i];
+                    std::fprintf(stderr, "[rt] root signature:  %zu: type %d, %u value(s), packed at user dword %u\n", i,
+                                 int(p.type), p.num_values, at);
+                    at += p.type == rt::rootsig::ParamType::Descriptor ? 2
+                        : p.type == rt::rootsig::ParamType::Table      ? 1
+                                                                      : p.num_values;
+                }
+            }
+        }
         // Two layouts, one per bind point (RootArgumentLayout): graphics keeps pack(), compute takes the console
         // layout pack_stage() measured (D3D-448). The signature is refused only when neither can place it.
         const rt::rootsig::PackResult packed = rt::rootsig::pack(parsed.sig);
