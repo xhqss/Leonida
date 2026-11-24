@@ -313,6 +313,45 @@ void sync_descriptor_back(D3D12_CPU_DESCRIPTOR_HANDLE title_side, D3D12_CPU_DESC
     if (!title_side.ptr || !real.ptr || title_side.ptr == real.ptr) return;
     constexpr std::size_t kSlotBytes = 32;  // one console CBV/SRV/UAV slot: a T#, or a V# padded to eight dwords
     std::memcpy(reinterpret_cast<void*>(title_side.ptr), reinterpret_cast<const void*>(real.ptr), kSlotBytes);
+    // Which bases the layer wrote: a base at or above the arena cannot be reached by the shader's heap_base + base
+    // (that is boot_leads BL-4), and "committed" says whether it is title memory a window could be made of.
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+        const auto* w = reinterpret_cast<const std::uint32_t*>(real.ptr);
+        const unsigned type = (w[3] >> 28) & 0xf;
+        const std::uint64_t base = type >= 8 ? (((static_cast<std::uint64_t>(w[1] & 0xff) << 32) | w[0]) << 8)
+                                            : ((static_cast<std::uint64_t>(w[1] & 0xffff) << 32) | (w[0] & 0xfffffffcull));
+        std::fprintf(stderr,
+                     "[rt] desc sync %d %s: %08x %08x %08x %08x base 0x%llx committed %d arena 0x%llx\n",
+                     logged.load(std::memory_order_relaxed), type >= 8 ? "T#" : "V#", w[0], w[1], w[2], w[3],
+                     static_cast<unsigned long long>(base),
+                     base && leonida::is_committed(reinterpret_cast<const void*>(base)) ? 1 : 0,
+                     static_cast<unsigned long long>(leonida::arena_host_size));
+    }
+}
+
+// LEONIDA_XS_TABLE_SANITIZE: zero the V# entries of a table window whose base is not reachable as heap_base + base.
+// A buffer V# is used as an address, not hashed like a T#, so zeroing one whose base is outside the arena turns its
+// loads into 0 (a zero V# has size 0) instead of a page fault that loses the device. T#s are left alone: their base is
+// a hash key component, never an address the shader adds heap_base to.
+void sanitize_table_window(std::uint8_t* window, std::uint64_t bytes, std::uint64_t table_va) {
+    const std::uint64_t arena = leonida::arena_host_size;
+    int zeroed = 0;
+    for (std::uint64_t at = 0; at + 16 <= bytes; at += 16) {
+        auto* words = reinterpret_cast<std::uint32_t*>(window + at);
+        if ((words[3] >> 28) & 0xf) continue;  // a T# (or something that is not a plain V#)
+        const std::uint64_t base = (static_cast<std::uint64_t>(words[1] & 0xffff) << 32) | (words[0] & 0xfffffffcull);
+        if (!base || base < arena) continue;
+        std::memset(words, 0, 16);
+        ++zeroed;
+        if (zeroed <= 8)
+            std::fprintf(stderr, "[rt] table sanitize: 0x%llx +0x%llx base 0x%llx zeroed\n",
+                         static_cast<unsigned long long>(table_va), static_cast<unsigned long long>(at),
+                         static_cast<unsigned long long>(base));
+    }
+    if (zeroed > 8)
+        std::fprintf(stderr, "[rt] table sanitize: 0x%llx %d V# entries zeroed in all\n",
+                     static_cast<unsigned long long>(table_va), zeroed);
 }
 
 std::atomic<std::uint64_t> g_hits[kMaxSlots];std::atomic<bool> g_first[kMaxSlots];
@@ -2387,7 +2426,25 @@ std::uint64_t shader_address(DeviceProxy* device, std::uint64_t va, std::uint64_
     const std::uint64_t translated = upload_translate(device, va);
     if (translated != va) return translated;
     const std::uint64_t guest = guest_translate(device, va, bytes);
-    return guest ? guest : va;
+    if (guest) return guest;
+    // LEONIDA_LOG_BADVA: an address that no translation covers is handed to the layer as it is, and a shader that adds
+    // heap_base to it reads unmapped memory and loses the device. Name the value and what the address is.
+    if (std::getenv("LEONIDA_LOG_BADVA") && va >= leonida::arena_host_size && va) {
+        static std::atomic<int> shown{0};
+        if (shown.fetch_add(1, std::memory_order_relaxed) < 12) {
+            MEMORY_BASIC_INFORMATION info{};
+            const SIZE_T queried = VirtualQuery(reinterpret_cast<const void*>(va), &info, sizeof(info));
+            std::fprintf(stderr,
+                         "[rt] shader address 0x%llx (bytes %llu): not translatable, committed %d, VirtualQuery %llu "
+                         "state 0x%lx protect 0x%lx\n",
+                         static_cast<unsigned long long>(va), static_cast<unsigned long long>(bytes),
+                         leonida::is_committed(reinterpret_cast<const void*>(va)) ? 1 : 0,
+                         static_cast<unsigned long long>(queried),
+                         queried == sizeof(info) ? static_cast<unsigned long>(info.State) : 0ul,
+                         queried == sizeof(info) ? static_cast<unsigned long>(info.Protect) : 0ul);
+        }
+    }
+    return va;
 }
 
 void destroy_upload_state(void* upload_state) {
@@ -3242,6 +3299,22 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 // a frame's colour target closed as invalid -- 17,929 of 18,000 in a 45 s run, with the draws those
                 // lists recorded never submitted. Translate it the way the device translated the view when it created it.
                 if (a1) a1 = translate_cpu_handle(self->device, D3D12_CPU_DESCRIPTOR_HANDLE{a1}).ptr;
+            } else if constexpr (Slot == 35) {
+                // SetComputeRootDescriptorTable(index, table GPU VA), the compute side of slot 36 (docs/
+                // d3d12_command_objects.md: console 35 -> PC 31). A compute shader reads its descriptors the same way,
+                // so the table needs the same translation; untranslated it reads arena bytes at the raw VA and can
+                // interpret them as a V# whose base is anything, which loses the device.
+                if (std::getenv("LEONIDA_XS_TABLE_VA")) {
+                    constexpr std::uint64_t kTableBytes = 64 << 10;
+                    const std::uint64_t translated = shader_address(self->device, a2, kTableBytes);
+                    if (translated) {
+                        if (std::getenv("LEONIDA_XS_TABLE_SANITIZE")) {
+                            if (std::uint8_t* window = guest_window_bytes(self->device, a2, kTableBytes))
+                                sanitize_table_window(window, kTableBytes, a2);
+                        }
+                        a2 = translated;
+                    }
+                }
             } else if constexpr (Slot == 36) {
                 // SetGraphicsRootDescriptorTable(index, table GPU VA): the title builds this table in its own pages
                 // (the shaders add heap_base to every VA they read), so the VA needs the treatment the root descriptor
@@ -3291,7 +3364,17 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                         }
                         if (translated) a2 = translated;
                     } else if (std::getenv("LEONIDA_XS_TABLE_VA")) {
-                        a2 = shader_address(self->device, a2, 64 << 10);
+                        // A table may be larger than 64 KiB (the first bound ones hold hundreds of descriptors), and a
+                        // tail that is neither copied nor sanitised hands the shader stale bytes as a V#.
+                        constexpr std::uint64_t kTableBytes = 64 << 10;
+                        const std::uint64_t translated = shader_address(self->device, a2, kTableBytes);
+                        if (translated) {
+                            if (std::getenv("LEONIDA_XS_TABLE_SANITIZE")) {
+                                if (std::uint8_t* window = guest_window_bytes(self->device, a2, kTableBytes))
+                                    sanitize_table_window(window, kTableBytes, a2);
+                            }
+                            a2 = translated;
+                        }
                     }
                 }
                 if (std::getenv("LEONIDA_XS_TABLE_SYNC")) {

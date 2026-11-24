@@ -744,6 +744,49 @@ heap"。本项目的实现里，层把描述符写进 **arena**（翻译后的 h
 2. 修好后再看哈希键是否匹配：若仍全走 fallback，说明层的 key 与标题表里的字节还有差异（例如 base 已被改写
    导致 key 不同），届时需要让层用"标题表里的原始字节"作为 key 插表。
 
+---
+
+# 追加：第十二轮（2026-11-25 00:50–01:25）—— 补上 compute 表、消除 device fault，但窗口方案撑不住每帧
+
+## 1. 兄弟库检查
+
+- **xcl** 新增的三条提交正好是同一问题的另一种解法：
+  - `fe7d70b` "memory windows from the descriptor heap, no per-access switch"：把**整个 console 地址空间**做成
+    shader-visible descriptor heap 头部几个 **4 GiB 的 raw UAV 窗口**（`MEM_HEAP_BASE + k`），翻译后的着色器一次
+    `ResourceDescriptorHeap[...]` 就能访问任意窗口，而不是每次访问按窗口展开 switch。
+  - `deb4b92`：窗口视图最多到 **4 GiB − 32 字节**（Win11 23H2 的 D3D12 会拒绝更大的 raw view 并移除设备）。
+  - 结论：console 地址空间本来就是 64 位大空间，正解是**少量巨大窗口**，不是"每个 VA 一个 4 MiB 拷贝"。
+- **VIctory** 新提交主要是 shader 翻译（waterfall 循环、per-lane phi、cmp-lg 等），与当前黑屏无直接关系。
+
+## 2. 本轮改动
+
+1. **console list slot 35 = `SetComputeRootDescriptorTable`**（`docs/d3d12_command_objects.md` 的对照表）之前
+   完全没翻译！compute shader 读到的是 arena 里那个原始 VA 处的字节，随便解出一个 V# 就是大地址。
+   已补：与 slot 36 相同的 `XS_TABLE_VA` 窗口翻译 + `XS_TABLE_SANITIZE`。
+2. `LEONIDA_XS_TABLE_SANITIZE`：把表窗口里 **V# base ≥ arena** 的项清零（T# 不动，它的 base 只是哈希键不是
+   地址），避免 `heap_base + base` 越界丢设备。
+3. `LEONIDA_XS_DESC_SYNC`：`Create*View` / `CopyDescriptors` 后把 arena 里的 32 字节描述符拷回标题的 CPU
+   handle 内存（console 的 descriptor 是值，标题会自己 memcpy），并打印前 32 个描述符的 base/committed 供核对。
+4. `LEONIDA_LOG_BADVA`：`shader_address` 无法翻译、只能原样交给层的地址打印出来（含 VirtualQuery 状态）。
+
+## 3. 实测结果
+
+- **补上 slot 35 后 device fault 从 1 变成 0**（之前 `console VA 0xd1e7dc27000` 的故障消失）——确认那正是
+  compute root table 未翻译导致的。
+- 但同一配置下**每 25 s 只出 1 帧**（默认跑法同时间 1500+ 帧），随后标题进入 "list wait ... answered, no GPU
+  wait" 的循环直到退出。原因很明确：表的 VA 是**环形缓冲**（每帧换一个 VA），每绑定一个新 VA 就
+  `guest_translate` 一次 → **新建一个 4 MiB UPLOAD 窗口**并拷贝 64 KiB，一帧几十次，几十毫秒起步；窗口还会
+  把 arena 吃光，之后 `guest_translate` 失败、地址原样交出去（又回到黑屏）。
+- 结论：**"每个表 VA 一个窗口"的路线在帧率上不成立**，必须改成"固定 scratch 池"。
+
+## 4. 下一轮（实现方案已定）
+
+**固定表 scratch 池**：启动时经层创建一个 CPU 可写、可被着色器寻址的 UPLOAD buffer（例如 16 MiB =
+256 槽 × 64 KiB），拿到它的 GPU VA；绑定表时把标题的表字节 `copy_committed` 拷进第 k 槽、原地 sanitize，
+把 a2 设成 `gpu_va − heap_base + k*64KiB`（即 arena 偏移）。槽号每帧重置，一帧的表远少于 256 个。
+这样每帧只有一次 64 KiB memcpy、零窗口创建，帧率不再被拖垮；对 compute 表（slot 35）同样适用。
+之后再回到"画面是否有内容"和"哈希键是否匹配"。
+
 
 
 
