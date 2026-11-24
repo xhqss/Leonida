@@ -1520,6 +1520,16 @@ class Gen:
         self.emit(f"{r} = OpSelect %uint {self.active_b()} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
         return r
 
+    def exec_bit(self, word):
+        """Bit L of a 32-bit value written to EXEC as data, as this invocation's 0 or 1: a computed value is one
+        bit per lane (`s_lshl_b32 exec_lo, 1, s5` sets lane 3). A value that already holds this lane's bit of a
+        mask (0 or ~0, `lane_masks.py`) gives the same answer, so no caller needs to say which it has."""
+        sh, shr, bit = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{sh} = OpBitwiseAnd %uint {self.wave_lane()} {self.cu(31)}")
+        self.emit(f"{shr} = OpShiftRightLogical %uint {word} {sh}")
+        self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+        return bit
+
     def set_exec(self, mask_u):
         self.emit(f"OpStore %active {self.tmp_bool_nz(mask_u)}")
         self.uses_active = True
@@ -1546,10 +1556,10 @@ class Gen:
         if a["k"] == "special" and a["t"] == "null":
             return                                    # result discarded
         if self.wave64 and a["k"] == "special" and a["t"] in ("exec_lo", "exec_hi"):
-            self.exec_half_write(1 if a["t"] == "exec_hi" else 0, val)
+            self.exec_half_write(1 if a["t"] == "exec_hi" else 0, self.exec_bit(val))
             return
         if a["k"] == "special" and a["t"] in ("exec_lo", "exec"):
-            self.set_exec(val)
+            self.set_exec(self.exec_bit(val))
             return
         if a["k"] == "vgpr" and a.get("n", 1) == 1:
             # VALU writes only land in active lanes. The exception is a lane mask on its way through a VGPR
@@ -4579,6 +4589,60 @@ class Gen:
             return v
         return self.lds_access(addr, byte_off, f)
 
+    def ds_append(self, op, a, mods):
+        """ds_append / ds_consume vD [offset:N]: one LDS add (append) or subtract (consume) of the number of lanes on in
+        EXEC, for the whole wave, at the byte address N; every active lane gets the value before the op, inactive lanes
+        keep vD. Measured natively on RDNA2 gfx1036 (hunt6 hw_append.py, wave32 and wave64 with EXEC across both
+        halves): the address is the offset field alone, M0 (0x4, 0x100, 0x10000, 0x40000, 0x80000) does not move it.
+        The add is done once, by the first active lane of the wave (the wave's EXEC gathered as for s_bcnt1); the old
+        value reaches the other lanes by a subgroup shuffle from that lane, or an exchange round under
+        --wave64-emulate (a wave64 on 32-wide subgroups without it: right in the half of the first active lane only,
+        the known cross-half approximation). The gds form is refused."""
+        if "gds" in mods:
+            raise Unsupported(op + " gds")
+        if not a or a[0]["k"] != "vgpr":
+            raise Unsupported(op + " operands")
+        off = self.mod_int(mods, "offset", 0)
+        lo, hi = self.wave_mask({"k": "special", "t": "exec"})
+        cl, ch, cnt, lz, hz, l, h, h32, fh, first, lane, me, act, do = (self.tmp() for _ in range(14))
+        self.emit(f"{cl} = OpBitCount %uint {lo}")
+        self.emit(f"{ch} = OpBitCount %uint {hi}")
+        self.emit(f"{cnt} = OpIAdd %uint {cl} {ch}")
+        self.emit(f"{lz} = OpINotEqual %bool {lo} {self.cu(0)}")
+        self.emit(f"{hz} = OpINotEqual %bool {hi} {self.cu(0)}")
+        self.emit(f"{l} = OpExtInst %uint %glsl FindILsb {lo}")
+        self.emit(f"{h} = OpExtInst %uint %glsl FindILsb {hi}")
+        self.emit(f"{h32} = OpIAdd %uint {h} {self.cu(32)}")
+        self.emit(f"{fh} = OpSelect %uint {hz} {h32} {self.cu(64)}")      # no lane on: 64, nobody's lane
+        self.emit(f"{first} = OpSelect %uint {lz} {l} {fh}")
+        self.emit(f"{lane} = OpCopyObject %uint {self.wave_lane()}")
+        self.emit(f"{me} = OpIEqual %bool {lane} {first}")
+        self.emit(f"{act} = OpCopyObject %bool {self.active_b()}")
+        self.emit(f"{do} = OpLogicalAnd %bool {me} {act}")
+        lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+        pre = self.current_label_placeholder()
+        self.emit(f"OpSelectionMerge {lbl_end} None")
+        self.emit(f"OpBranchConditional {do} {lbl_do} {lbl_end}")
+        self.emit(f"{lbl_do} = OpLabel")
+        spv = "OpAtomicIAdd" if op == "ds_append" else "OpAtomicISub"
+        r = self.lds_atomic(self.cu(0), off, f"{spv} %uint {{p}} {self.cu(2)} {self.cu(0)} {cnt}")
+        done = self.current_label_placeholder()
+        self.emit(f"OpBranch {lbl_end}")
+        self.emit(f"{lbl_end} = OpLabel")
+        old = self.tmp()
+        self.emit(f"{old} = OpPhi %uint {r} {done} {self.cu(0)} {pre}")
+        if self.emulate:
+            read, _ = self.x_round(data=old)
+            fi = self.tmp()
+            self.emit(f"{fi} = OpBitwiseAnd %uint {first} {self.cu(63)}")
+            val = read(fi)
+        else:
+            self.uses_subgroup = self.uses_ballot = True
+            fi, val = self.tmp(), self.tmp()
+            self.emit(f"{fi} = OpBitwiseAnd %uint {first} {self.cu(63 if self.wave64 else 31)}")
+            self.emit(f"{val} = OpGroupNonUniformShuffle %uint {self.cu(3)} {old} {fi}")
+        self.dst(a[0], val)
+
     def lds_op(self, op, a, mods):
         """LDS (GFX10 DS encoding). Addresses are bytes. offset:N is bytes; read2/write2 offset0/offset1 count
         data-size units (x64 for st64). Writes and atomics run only in active lanes; results land in VGPRs through
@@ -4586,6 +4650,8 @@ class Gen:
         if self.stage not in ("cs", "ms"):
             raise Unsupported(op + " outside compute")
         self.uses_lds = True
+        if op in ("ds_append", "ds_consume"):
+            return self.ds_append(op, a, mods)          # wave-wide: before the per-lane EXEC selection below
         rtn = "_rtn_" in op
         name = op if op == "ds_wrxchg_rtn_b32" else op.replace("_rtn_", "_")
         act = self.active_b()
@@ -6833,8 +6899,20 @@ class Gen:
             d, x = a[0], a[1]
             wide_src = op == "s_quadmask_b64"
             wide_dst = op != "s_quadmask_b32"
-            if self.is_mask_op(x) or (d["k"] == "special" and d.get("t", "").startswith(("exec", "vcc"))):
+            if self.is_mask_op(x):
                 raise Unsupported(op + " on a lane mask")
+            if d["k"] == "special" and d.get("t", "").startswith(("exec", "vcc")):
+                if op != "s_bitreplicate_b64_b32" or d["t"] != "exec":
+                    raise Unsupported(op + " on a lane mask")
+                # EXEC's bit for lane L comes from scalar-source bit L // 2.
+                shift, shifted, bit = (self.tmp() for _ in range(3))
+                lane = self.wave_lane()
+                word = self.src_u(x)
+                self.emit(f"{shift} = OpShiftRightLogical %uint {lane} {self.cu(1)}")
+                self.emit(f"{shifted} = OpShiftRightLogical %uint {word} {shift}")
+                self.emit(f"{bit} = OpBitwiseAnd %uint {shifted} {self.cu(1)}")
+                self.set_exec(bit)
+                return
             if wide_src:
                 lo, hi = self.src64_data(x, op)
                 words = [lo, hi]
@@ -6926,7 +7004,7 @@ class Gen:
                 word = self.wave32_ballot_word(ballot)
                 self.emit(f"{any_} = OpINotEqual %bool {word} {self.cu(0)}")
                 self.emit(f"{lsb} = OpExtInst %uint %glsl FindILsb {word}")
-                self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.cu(0)}")
+                self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.wave32_first_running_lane()}")
                 self.g_shuffle(r, v, first)
                 self.dst(a[0], r)
                 return
@@ -15251,6 +15329,23 @@ def assemble(gen):
         for c in range(gen.cs["tid"] + 1):
             fn += [f"%li{c} = OpCompositeExtract %uint %lci {c}",
                    f"%lip{c} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(c)}", f"OpStore %lip{c} %li{c}"]
+        if gen.cs["tg_size"]:
+            # TG_SIZE_EN (RSRC2 bit 10): the SGPR after the workgroup ids holds the number of waves in the group in
+            # [5:0] and this wave's index in it in [11:6] (Mesa ac_nir_lower_intrinsics_to_args.c, GFX6-10:
+            # load_num_subgroups is tg_size[5:0], load_subgroup_id tg_size[11:6], and a wave64 compute shader's
+            # local invocation index is mbcnt(~0, tg_size & 0xfc0)). Thread i is in wave i / W, as for
+            # s_get_waveid_in_workgroup. The other bits are 0 here. Not measured on hardware.
+            sx, sy, sz = gen.cs["size"]
+            w = 64 if gen.wave64 else 32
+            r = gen.cs["user"] + len(gen.cs["tgid"])
+            fn += ["%tgx = OpCompositeExtract %uint %lci 0", "%tgy = OpCompositeExtract %uint %lci 1",
+                   "%tgz = OpCompositeExtract %uint %lci 2",
+                   f"%tgyx = OpIMul %uint %tgy {gen.cu(sx)}", f"%tgzx = OpIMul %uint %tgz {gen.cu(sx * sy)}",
+                   "%tgi0 = OpIAdd %uint %tgx %tgyx", "%tgi = OpIAdd %uint %tgi0 %tgzx",
+                   f"%tgw = OpShiftRightLogical %uint %tgi {gen.cu(w.bit_length() - 1)}",
+                   f"%tgws = OpShiftLeftLogical %uint %tgw {gen.cu(6)}",
+                   f"%tgv = OpBitwiseOr %uint %tgws {gen.cu(-(-(sx * sy * sz) // w))}",
+                   f"%tgp = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(r)}", "OpStore %tgp %tgv"]
     if gen.frag_inputs:
         fn += ["%fc = OpLoad %v4float %frag_coord"]
         if bary:
@@ -16578,17 +16673,16 @@ def translate(path):
         # the SGPRs all 2,689 CS read before writing: 2,540 stay inside it, the other 149 overshoot only through
         # loop-carried registers of the straight-line check; docs/design.md): USER_SGPR [5:1], TGID_X/Y/Z_EN [9:7],
         # TG_SIZE_EN [10], TIDIG_COMP_CNT [12:11]. Words 0x13C/0x140/0x144 are the thread-group size. Layout (Mesa
-        # radv_shader_args.c): s0..user-1 = user data, then the enabled workgroup ids; v0, v1, v2 = thread id x, y, z
-        # (separate VGPRs on GFX10). An FSPX program (the FidelityFX DLL's shaders) carries the same two fields in its
+        # radv_shader_args.c): s0..user-1 = user data, then the enabled workgroup ids, then with TG_SIZE_EN the
+        # thread-group SGPR; v0, v1, v2 = thread id x, y, z (separate VGPRs on GFX10). An FSPX program (the FidelityFX
+        # DLL's shaders) and a pipeline-library program (docs/shader_library.md) carry the same two fields in their
         # kind-0 entry (docs/fspx.md).
         rsrc2, lx, ly, lz = cs_dispatch_state(path, info["name"])
-        if (rsrc2 >> 10) & 1:
-            raise Unsupported("CS thread-group-size SGPR")
         if not (1 <= lx * ly * lz <= 1024):
             raise Unsupported("CS group size")
         user = (rsrc2 >> 1) & 31
         g.cs = {"user": user, "tgid": [c for c in range(3) if (rsrc2 >> (7 + c)) & 1],
-                "tid": (rsrc2 >> 11) & 3, "size": (lx, ly, lz)}
+                "tid": (rsrc2 >> 11) & 3, "size": (lx, ly, lz), "tg_size": bool((rsrc2 >> 10) & 1)}
         # LDS_SIZE [23:15] in 512-byte units. All 485 LDS-using corpus CS stay inside it; a constant offset past it,
         # which RDNA2 treats as out of range, is bounds-checked below (SHADER-309).
         need = ((rsrc2 >> 15) & 0x1FF) * 128
