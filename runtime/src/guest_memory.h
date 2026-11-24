@@ -38,4 +38,24 @@ inline void copy_committed(std::uint8_t* to, std::uint64_t address, std::uint64_
     }
 }
 
+// Writes `bytes` into title memory at `address`, the way a GPU write into the console's unified memory would land.
+// A page the title has not committed, or one that is not writable, stops the write there: past such a page there is
+// nothing a reader could observe, and writing through it would fault instead.
+inline void write_committed(std::uint64_t address, const std::uint8_t* from, std::uint64_t bytes) {
+    std::uint64_t at = address;
+    const std::uint64_t end = address + bytes;
+    while (at < end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info)) return;
+        if (info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) return;
+        // PAGE_READWRITE / PAGE_WRITECOPY / PAGE_EXECUTE_READWRITE / PAGE_EXECUTE_WRITECOPY are the writable ones.
+        if ((info.Protect & 0xCCu) == 0) return;
+        const auto region_end = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
+        const std::uint64_t stop = std::min<std::uint64_t>(end, region_end);
+        if (stop <= at) return;  // a region that does not advance: nothing more can be written safely
+        std::memcpy(reinterpret_cast<void*>(at), from + (at - address), static_cast<std::size_t>(stop - at));
+        at = stop;
+    }
+}
+
 }  // namespace leonida

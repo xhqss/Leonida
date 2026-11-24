@@ -110,6 +110,12 @@ struct DeviceProxy {
     // itself when it is destroyed.
     std::mutex pending_mutex;
     std::vector<void*> pending_lists;
+    // The real queues the title created, with their types. The console submit (queue slot 35) hands every list it has
+    // seen to one submit call on the queue that made it, while a PC queue refuses a list of another type (the layer
+    // logs "list 0 has type 2, the queue type 0"). Each list therefore goes to a queue of its own type, one of these or
+    // one made on demand. Held with a reference each, released in proxy_release.
+    std::mutex queues_mutex;
+    std::vector<std::pair<ID3D12CommandQueue*, D3D12_COMMAND_LIST_TYPE>> real_queues;
     // The 4 MiB windows of title memory that have been copied into a buffer the shader can read (guest_translate), as
     // GuestWindows*. Created on the first such address; freed in proxy_release.
     std::atomic<void*> guest_windows{nullptr};
@@ -122,6 +128,10 @@ void destroy_upload_state(void* upload_state);
 // The console's submit (queue slot 35): executes the lists recorded since the last submit. Defined with the list proxy,
 // which is what it walks (see console_begin_recording).
 void console_submit_batch(DeviceProxy* device, IUnknown* queue, void** queue_vtable);
+
+// The real queues the console submit executes lists on (see console_submit_batch): released with the device, which
+// holds a reference to each. Defined with the submit.
+void release_real_queues(DeviceProxy* device);
 
 constexpr unsigned kHeapSlots = 11;  // IUnknown + ID3D12Object + DeviceChild + Pageable + GetDesc + 2 handles
 
@@ -419,6 +429,7 @@ unsigned long proxy_release(DeviceProxy* self) {
     if (refs == 0) {
         destroy_present_state(self->present_state);
         destroy_upload_state(self->upload_state.load(std::memory_order_relaxed));
+        release_real_queues(self);
         ID3D12Device* real = self->real;
         delete self;
         if (real) real->Release();
@@ -1993,13 +2004,21 @@ constexpr unsigned kConsoleSetDescriptorHeaps = 32;
 constexpr unsigned kConsoleExecuteBundle = 31;
 constexpr unsigned kConsoleBarrier = 146;
 constexpr unsigned kConsoleAllocateUpload = 148;
+// The newer console layout's Reset: the PC Reset (10) two slots on per console method, which is 139 for the method the
+// title takes a pooled list from. It is also the layout evidence a command list can see for itself (see list_slot).
+constexpr unsigned kConsoleResetNewer = 139;
 
 constexpr unsigned console_to_pc_list_slot(unsigned slot) {
     if (slot <= 26) return slot;               // PC order, measured
     if (slot <= 30) return kListNotForwarded;  // console-only extras
-    if (slot <= 59) return slot - 4;           // PC chain, shifted +4
-    if (slot == 60) return 58;                 // EndEvent (no console SetMarker/BeginEvent)
-    if (slot == 61) return 59;                 // ExecuteIndirect (Package)
+    if (slot <= 55) return slot - 4;           // PC chain 28-51, shifted +4
+    // 56-59 keep their PC numbers: the console's four extras moved PC 52-55 to 28-31, it did not shift the block above
+    // them (sibling layer: ExecuteIndirect is console 59 in the older layout, and PC slot 59 is ExecuteIndirect). The
+    // comment this replaces filed them under the same -4 as the block below, which would have forwarded a title's
+    // ExecuteIndirect to PC 55 (SetPredication).
+    if (slot <= 59) return slot;
+    if (slot == 60) return 58;                 // EndEvent (newer layout; the console has no SetMarker/BeginEvent)
+    if (slot == 61) return 59;                 // ExecuteIndirect (newer layout: the older layout's 59, two slots on)
     if (slot == kConsoleBarrier) return 80;    // D3D12_BARRIER_GROUP (Package; PC GCL7)
     return kListNotForwarded;
 }
@@ -2016,6 +2035,9 @@ struct ListProxy {
     // The allocator CreateCommandList was given, kept for the Reset the console never asks for (console_begin_recording)
     // and for teardown.
     ID3D12CommandAllocator* real_allocator;
+    // The type the title created the list with. The console submit hands every recorded list to one submit call, and a
+    // PC queue refuses a list of another type, so the submit routes each list to a queue of its own type.
+    D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     // The console Close (slot 9) was forwarded: the real list is closed until the next recording call reopens it.
     std::atomic<bool> closed_by_title;
     // This list is in its device's pending_lists.
@@ -2036,6 +2058,27 @@ struct ListStats {
     static inline std::atomic<std::uint64_t> hits[kListSlots];
     static inline std::atomic<bool> first[kListSlots];
 };
+
+// LEONIDA_LOG_SLOTS=1: a cumulative console list slot histogram on stderr every two seconds. Which console methods
+// the title really calls decides which console-only ones are worth modelling — the newer console layout moves
+// Write{32,64}BitValue* / the fills / Reset onto different slots (docs/d3d12_xs_console_abi.md 5.3), and those are
+// the writes a GPU-side counter needs before an indirect draw has anything to dispatch. The counters below exist
+// for the tests (list_slot_hits); this only prints them.
+void dump_list_slot_histogram() {
+    std::fprintf(stderr, "[rt] d3d12_xs: console list slot histogram\n");
+    for (unsigned slot = 0; slot < kListSlots; ++slot) {
+        const std::uint64_t hits = ListStats::hits[slot].load(std::memory_order_relaxed);
+        if (hits) std::fprintf(stderr, "[rt]   slot %u: %llu\n", slot, static_cast<unsigned long long>(hits));
+    }
+}
+
+bool list_slot_histogram_due() {
+    static std::atomic<unsigned long long> next_ms{0};
+    const unsigned long long now = GetTickCount64();
+    unsigned long long expected = next_ms.load(std::memory_order_relaxed);
+    if (now < expected) return false;
+    return next_ms.compare_exchange_strong(expected, now + 2000, std::memory_order_relaxed);
+}
 
 // The list tail (D3D-445). From CopyTextureRegionX on, the newer console layout sits two slots later than the older
 // one (docs/d3d12_xs_console_abi.md 5.3). The table is keyed by the older-layout slot. Only CopyTextureRegionX has a
@@ -2070,6 +2113,8 @@ void note_list_slot(unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint
                     unsigned char console_layout = 0) {
     if (slot >= kListSlots) return;
     ListStats::hits[slot].fetch_add(1, std::memory_order_relaxed);
+    static const bool slot_histogram = std::getenv("LEONIDA_LOG_SLOTS") != nullptr;
+    if (slot_histogram && list_slot_histogram_due()) dump_list_slot_histogram();
     bool expected = false;
     if (ListStats::first[slot].compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
         const char* name = list_tail_name(slot, console_layout);
@@ -2175,6 +2220,51 @@ void console_close_for_submit(ListProxy* self) {
     if (SUCCEEDED(hr)) self->closed_by_title.store(true, std::memory_order_relaxed);
 }
 
+// The queue a list of `type` must be executed on: one the title created with that type, or one made here. The console
+// submit runs every recorded list through a single submit call, while a PC queue refuses a list of another type (the
+// layer logs "list 0 has type 2, the queue type 0" and executes nothing), which is how the title's DMA uploads were
+// never run. The queues are held with a reference each: the title may release one while a list it recorded through it
+// is still pending.
+void record_real_queue(DeviceProxy* device, ID3D12CommandQueue* queue, D3D12_COMMAND_LIST_TYPE type) {
+    if (!device || !queue) return;
+    std::lock_guard lock(device->queues_mutex);
+    for (const auto& entry : device->real_queues)
+        if (entry.first == queue) return;
+    queue->AddRef();
+    device->real_queues.emplace_back(queue, type);
+}
+
+ID3D12CommandQueue* real_queue_for(DeviceProxy* device, D3D12_COMMAND_LIST_TYPE type) {
+    if (!device) return nullptr;
+    std::lock_guard lock(device->queues_mutex);
+    for (const auto& entry : device->real_queues)
+        if (entry.second == type) return entry.first;
+    D3D12_COMMAND_QUEUE_DESC desc{};
+    desc.Type = type;
+    desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    ID3D12CommandQueue* queue = nullptr;
+    if (FAILED(device->real->CreateCommandQueue(&desc, __uuidof(ID3D12CommandQueue),
+                                               reinterpret_cast<void**>(&queue))) ||
+        !queue)
+        return nullptr;
+    device->real_queues.emplace_back(queue, type);
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+        std::fprintf(stderr, "[rt] d3d12_xs: console submit made a queue of type %d (the title had none)\n",
+                     static_cast<int>(type));
+    return queue;
+}
+
+void release_real_queues(DeviceProxy* device) {
+    if (!device) return;
+    std::vector<std::pair<ID3D12CommandQueue*, D3D12_COMMAND_LIST_TYPE>> queues;
+    {
+        std::lock_guard lock(device->queues_mutex);
+        queues.swap(device->real_queues);
+    }
+    for (auto& entry : queues) entry.first->Release();
+}
+
 // Queue slot 35 with LEONIDA_SUBMIT_35=1: the batch is everything the title has closed since the last submit, not the
 // lists in the slot's arguments (see the comment at the slot). A list the title closed is finished; closing one here
 // instead raced with the thread still recording into it, which then saw a closed list and lost its frame. Each finished
@@ -2189,7 +2279,6 @@ void console_submit_batch(DeviceProxy* device, IUnknown* queue, void** queue_vta
         batch.swap(device->pending_lists);
     }
     using ExecuteFn = void(WINAPI*)(IUnknown*, UINT, ID3D12CommandList* const*);
-    auto execute = reinterpret_cast<ExecuteFn>(queue_vtable[10]);
     std::vector<void*> unfinished;
     std::size_t submitted = 0;
     for (void* entry : batch) {
@@ -2200,8 +2289,13 @@ void console_submit_batch(DeviceProxy* device, IUnknown* queue, void** queue_vta
             continue;
         }
         list->pending.store(false, std::memory_order_relaxed);
+        // Each list goes to a queue of its own type: a PC queue refuses a list of another type outright.
+        ID3D12CommandQueue* target = real_queue_for(device, list->type);
+        if (!target) target = static_cast<ID3D12CommandQueue*>(queue);
+        auto** const target_vtable = *reinterpret_cast<void***>(target);
+        auto execute = reinterpret_cast<ExecuteFn>(target_vtable[10]);
         ID3D12CommandList* real = list->real;
-        execute(queue, 1, &real);
+        execute(target, 1, &real);
         ++submitted;
     }
     static std::atomic<int> submits{0};
@@ -2219,6 +2313,255 @@ void console_submit_batch(DeviceProxy* device, IUnknown* queue, void** queue_vta
     if (nth <= 3 || nth % 600 == 0)
         std::fprintf(stderr, "[rt] d3d12_xs: console submit #%d executed %zu of %zu list(s)\n", nth, submitted,
                      batch.size());
+}
+
+// ---- Console-only list methods ---------------------------------------------------------------------------------
+//
+// Past the PC chain the console list holds methods a PC has no equivalent of (docs/d3d12_xs_console_abi.md 5.3). The
+// ones this title records every frame are the memory and fence protocol a GPU-driven frame needs: values written into
+// unified memory (Write{32,64}BitValue*OfPipeX), waits for values (Wait{32,64}BitValueX), fills, copies, and a Reset
+// through slot 139. Dropping them left the title's own counters unwritten and its waits unanswered; xcl measured the
+// same title and found "the title's indirect draws and dispatches never ran" while these slots were misrouted
+// (crates/xcl/src/hle/d3d12x/real.rs).
+//
+// The newer console layout puts every one of them two slots later (older 60->62, 69->71, 70->72, 72->74, 78->80,
+// 81->83), so a slot is mapped to the OLDER layout's numbering before it is handled.
+enum ConsoleListExtension : unsigned {
+    kExtNone = ~0u,
+    kExtCopyMemoryToMemory = 60,
+    kExtFill32 = 61,
+    kExtFill64 = 62,
+    kExtFill128 = 63,
+    kExtDepthBounds = 68,
+    kExtWrite32Bottom = 69,
+    kExtWrite64Bottom = 70,
+    kExtWait32 = 71,
+    kExtWait64 = 72,
+    kExtDispatchX = 78,
+    kExtDrawIndexedX = 81,
+    kExtCopyResourceX = 84,
+    kExtWrite32Top = 88,
+    kExtWrite64Top = 89,
+    kExtWrite32BottomOfShader = 90,
+    kExtKickoffX = 93,
+    kExtSetDepthBias = 94,
+};
+
+// The extension `slot` names, in the older layout's numbering, or kExtNone. An unknown layout answers kExtNone: the
+// same slot means different methods in the two layouts, and taking the wrong one writes a value into whatever address
+// the other layout's method had in its first argument.
+unsigned console_list_extension(unsigned slot, unsigned char layout) {
+    if (layout == kConsoleLayoutNewer) {
+        static const struct {
+            unsigned slot;
+            unsigned extension;
+        } kNewerPairs[] = {
+            {62, kExtCopyMemoryToMemory}, {63, kExtFill32},       {64, kExtFill64},
+            {65, kExtFill128},            {70, kExtDepthBounds},  {71, kExtWrite32Bottom},
+            {72, kExtWrite64Bottom},      {73, kExtWait32},       {74, kExtWait64},
+            {80, kExtDispatchX},          {83, kExtDrawIndexedX}, {86, kExtCopyResourceX},
+            {90, kExtWrite32Top},         {91, kExtWrite64Top},   {92, kExtWrite32BottomOfShader},
+            {95, kExtKickoffX},           {96, kExtSetDepthBias},
+        };
+        for (const auto& pair : kNewerPairs)
+            if (pair.slot == slot) return pair.extension;
+        return kExtNone;
+    }
+    if (layout != kConsoleLayoutOlder || slot < 60) return kExtNone;
+    switch (slot) {
+        case kExtCopyMemoryToMemory:
+        case kExtFill32:
+        case kExtFill64:
+        case kExtFill128:
+        case kExtDepthBounds:
+        case kExtWrite32Bottom:
+        case kExtWrite64Bottom:
+        case kExtWait32:
+        case kExtWait64:
+        case kExtDispatchX:
+        case kExtDrawIndexedX:
+        case kExtCopyResourceX:
+        case kExtWrite32Top:
+        case kExtWrite64Top:
+        case kExtWrite32BottomOfShader:
+        case kExtKickoffX:
+        case kExtSetDepthBias: return slot;
+        default: return kExtNone;
+    }
+}
+
+// List slot 139 in the newer layout: Reset with the allocator, the call the title makes on each list it takes from its
+// pool before recording ((allocator, NULL, 0), sibling layer). Without it the real list stays closed and the layer
+// refuses everything recorded into it.
+HRESULT console_reset_from_title(ListProxy* self, std::uint64_t allocator_word, std::uint64_t initial_pso) {
+    if (!self->real) return E_FAIL;
+    ID3D12CommandAllocator* allocator =
+        allocator_proxy_real_allocator(reinterpret_cast<const void*>(allocator_word));
+    if (!allocator) allocator = self->real_allocator;
+    if (!allocator) return E_FAIL;
+    using ResetFn = HRESULT(WINAPI*)(IUnknown*, ID3D12CommandAllocator*, ID3D12PipelineState*);
+    auto** const vtable = *reinterpret_cast<void***>(self->real);
+    const HRESULT hr = reinterpret_cast<ResetFn>(vtable[10])(
+        self->real, allocator, reinterpret_cast<ID3D12PipelineState*>(static_cast<std::uintptr_t>(initial_pso)));
+    if (SUCCEEDED(hr)) self->closed_by_title.store(false, std::memory_order_relaxed);
+    return hr;
+}
+
+// A value the console runtime writes into unified memory after the commands recorded so far. The address is this
+// process's memory, which is the very bytes the title reads back, so the write happens there; an address that already
+// is a device address goes through the real list's WriteBufferImmediate. A timestamp flag (bottom 1/2, top 4/8) means
+// the runtime writes the clock, not the caller's value.
+void console_write_value(ListProxy* self, std::uint64_t va, std::uint64_t value, unsigned width, bool timestamp) {
+    if (!va) return;
+    if (timestamp) value = static_cast<std::uint64_t>(GetTickCount64());
+    if (leonida::is_committed(reinterpret_cast<const void*>(va))) {
+        std::uint8_t bytes[8] = {};
+        std::memcpy(bytes, &value, sizeof(bytes));
+        leonida::write_committed(va, bytes, width);
+        return;
+    }
+    if (!self->real) return;
+    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER params[2] = {};
+    params[0].Dest = va;
+    params[0].Value = static_cast<UINT>(value);
+    UINT count = 1;
+    if (width == 8) {
+        params[1].Dest = va + 4;
+        params[1].Value = static_cast<UINT>(value >> 32);
+        count = 2;
+    }
+    using Fn = void(WINAPI*)(IUnknown*, UINT, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER*,
+                             const D3D12_WRITEBUFFERIMMEDIATE_MODE*);
+    auto** const vtable = *reinterpret_cast<void***>(self->real);
+    reinterpret_cast<Fn>(vtable[66])(self->real, count, params, nullptr);
+}
+
+// A fill or a copy the console does in unified memory: both ends are title memory here, so it is a memory operation
+// rather than a command.
+void console_fill_value(std::uint64_t va, std::uint64_t bytes, std::uint64_t value, unsigned width) {
+    if (!va || !bytes) return;
+    std::uint8_t pattern[16] = {};
+    std::memcpy(pattern, &value, sizeof(pattern));
+    const std::uint64_t pattern_bytes = width;
+    std::uint8_t chunk[4096];
+    for (std::size_t at = 0; at < sizeof(chunk); at += sizeof(pattern)) std::memcpy(chunk + at, pattern, sizeof(pattern));
+    std::uint64_t done = 0;
+    while (done < bytes) {
+        const std::uint64_t step = std::min<std::uint64_t>(sizeof(chunk), bytes - done);
+        const std::uint64_t stop = done + step - (step % pattern_bytes);  // whole patterns only
+        if (stop <= done) break;
+        leonida::write_committed(va + done, chunk, stop - done);
+        done = stop;
+    }
+}
+
+void console_copy_memory(std::uint64_t dst, std::uint64_t src, std::uint64_t bytes) {
+    if (!dst || !src || !bytes) return;
+    std::uint8_t chunk[4096];
+    std::uint64_t done = 0;
+    while (done < bytes) {
+        const std::uint64_t step = std::min<std::uint64_t>(sizeof(chunk), bytes - done);
+        leonida::copy_committed(chunk, src + done, step);
+        leonida::write_committed(dst + done, chunk, step);
+        done += step;
+    }
+}
+
+// One console-only list method, in the older layout's numbering.
+HRESULT console_extension_call(ListProxy* self, unsigned extension, std::uint64_t a1, std::uint64_t a2,
+                               std::uint64_t a3, std::uint64_t a4) {
+    switch (extension) {
+        case kExtWrite32Bottom:  // (address, value, flush, flags)
+            console_write_value(self, a1, a2, 4, (a4 & 0x3u) != 0);
+            return S_OK;
+        case kExtWrite64Bottom:
+            console_write_value(self, a1, a2, 8, (a4 & 0x3u) != 0);
+            return S_OK;
+        case kExtWrite32Top:  // (address, value, flags)
+        case kExtWrite32BottomOfShader:
+            console_write_value(self, a1, a2, 4, (a3 & 0xCu) != 0);
+            return S_OK;
+        case kExtWrite64Top:
+            console_write_value(self, a1, a2, 8, (a3 & 0xCu) != 0);
+            return S_OK;
+        case kExtWait32:  // (address, value, ...)
+        case kExtWait64: {
+            // The value is one the title itself writes (console_write_value above) or one the GPU would write. One
+            // queue runs the lists in submission order, so the ordering the wait asks for is already what a PC does;
+            // a real GPU-side write into title memory has no zero-copy form in Vulkan on Windows (see GuestWindow), so
+            // this answers as if the value had arrived rather than hanging the frame. The held value is printed with
+            // the wanted one: a wait whose value never becomes right is a frame that will spin on the title's side.
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+                const unsigned width = extension == kExtWait32 ? 4u : 8u;
+                std::uint8_t bytes[8] = {};
+                std::uint64_t holds = 0;
+                leonida::copy_committed(bytes, a1, width);
+                std::memcpy(&holds, bytes, sizeof(holds));
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: list wait on 0x%llx for 0x%llx, holds 0x%llx (answered, no GPU wait)\n",
+                             static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                             static_cast<unsigned long long>(holds));
+            }
+            return S_OK;
+        }
+        case kExtFill32:  // (address, size, value)
+            console_fill_value(a1, a2, a3, 4);
+            return S_OK;
+        case kExtFill64:
+            console_fill_value(a1, a2, a3, 8);
+            return S_OK;
+        case kExtFill128:
+            console_fill_value(a1, a2, a3, 16);
+            return S_OK;
+        case kExtCopyMemoryToMemory:  // (destination, source, size, flags)
+            console_copy_memory(a1, a2, a3);
+            return S_OK;
+        case kExtDepthBounds: {  // the two bounds, as float bits
+            if (self->pc_slot_count <= 62 || !self->real) return S_OK;
+            FLOAT bounds[2];
+            const std::uint32_t words[2] = {static_cast<std::uint32_t>(a1), static_cast<std::uint32_t>(a2)};
+            std::memcpy(bounds, words, sizeof(bounds));
+            using Fn = void(WINAPI*)(IUnknown*, FLOAT, FLOAT);
+            auto** const vtable = *reinterpret_cast<void***>(self->real);
+            reinterpret_cast<Fn>(vtable[62])(self->real, bounds[0], bounds[1]);
+            return S_OK;
+        }
+        case kExtDispatchX: {  // (x, y, z, flags): Dispatch with an extra word
+            if (self->pc_slot_count <= 14 || !self->real) return S_OK;
+            using DispatchFn = void(WINAPI*)(IUnknown*, UINT, UINT, UINT);
+            auto** const vtable = *reinterpret_cast<void***>(self->real);
+            reinterpret_cast<DispatchFn>(vtable[14])(self->real, static_cast<UINT>(a1), static_cast<UINT>(a2),
+                                                     static_cast<UINT>(a3));
+            return S_OK;
+        }
+        case kExtDrawIndexedX: {  // (index address, format, count, flags): the index buffer for one draw
+            if (self->pc_slot_count <= 43 || !self->real) return S_OK;
+            const auto format = static_cast<DXGI_FORMAT>(static_cast<std::uint32_t>(a2));
+            const std::uint64_t count = a3;
+            const std::uint64_t stride = format == DXGI_FORMAT_R32_UINT ? 4 : 2;
+            D3D12_INDEX_BUFFER_VIEW view{};
+            view.BufferLocation = shader_address(self->device, a1, count * stride);
+            view.SizeInBytes = static_cast<UINT>(count * stride);
+            view.Format = format;
+            auto** const vtable = *reinterpret_cast<void***>(self->real);
+            using SetIndexFn = void(WINAPI*)(IUnknown*, const D3D12_INDEX_BUFFER_VIEW*);
+            reinterpret_cast<SetIndexFn>(vtable[43])(self->real, &view);
+            using DrawIndexedFn = void(WINAPI*)(IUnknown*, UINT, UINT, UINT, INT, UINT);
+            reinterpret_cast<DrawIndexedFn>(vtable[13])(self->real, static_cast<UINT>(count), 1, 0, 0, 0);
+            return S_OK;
+        }
+        case kExtCopyResourceX: {  // (destination, source): plain resources on both sides
+            if (self->pc_slot_count <= 17 || !self->real) return S_OK;
+            using CopyFn = void(WINAPI*)(IUnknown*, IUnknown*, IUnknown*);
+            auto** const vtable = *reinterpret_cast<void***>(self->real);
+            reinterpret_cast<CopyFn>(vtable[17])(self->real, reinterpret_cast<IUnknown*>(static_cast<std::uintptr_t>(a1)),
+                                                 reinterpret_cast<IUnknown*>(static_cast<std::uintptr_t>(a2)));
+            return S_OK;
+        }
+        default:  // KickoffX, RSSetDepthBiasX and anything unmeasured: recorded, no PC call
+            return S_OK;
+    }
 }
 
 HRESULT list_query_interface(ListProxy* self, const IID* riid, void** out) {
@@ -2288,6 +2631,25 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
         }
         constexpr unsigned pc = console_to_pc_list_slot(Slot);
         if constexpr (pc == kListNotForwarded) {
+            // A slot past both layouts' modelled tails is the layout evidence a list can see for itself: the newer
+            // layout's Reset sits at 139, and the older layout has no console method out there at all. Learning the
+            // layout here is what lets this title's tail slots (70-75) be read as the newer layout's methods.
+            if constexpr (Slot >= 128) {
+                unsigned char expected = 0;
+                if (self->device->console_layout.compare_exchange_strong(expected, kConsoleLayoutNewer,
+                                                                         std::memory_order_relaxed))
+                    std::fprintf(stderr,
+                                 "[rt] d3d12_xs: the title's console list has the newer layout (list slot %u)\n",
+                                 Slot);
+            }
+            if constexpr (Slot == kConsoleResetNewer) return hr_to_u64(console_reset_from_title(self, a1, a2));
+            const unsigned extension =
+                console_list_extension(Slot, self->device->console_layout.load(std::memory_order_relaxed));
+            if (extension != kExtNone) {
+                console_begin_recording(self);  // these are recording calls: reopen the list the title closed
+                console_note_recording(self);
+                return hr_to_u64(console_extension_call(self, extension, a1, a2, a3, a4));
+            }
             if (std::getenv("LEONIDA_LOG_UNMAPPED")) {
                 static std::atomic<int> shown{0};
                 if (shown.fetch_add(1, std::memory_order_relaxed) < 240)
@@ -2492,8 +2854,10 @@ IUnknown* list_real_or_null(const void* object) {
 }
 
 // Wraps `created` (one reference, owned by the proxy on success, released on failure) and returns `riid` from the
-// proxy through `out`.
-HRESULT wrap_list(IUnknown* created, DeviceProxy* device, IUnknown* allocator, const IID* riid, void** out) {
+// proxy through `out`. `type` is the type the title created the list with: the console submit runs every recorded list
+// through one submit call, and a PC queue refuses a list of another type (console_submit_batch).
+HRESULT wrap_list(IUnknown* created, DeviceProxy* device, IUnknown* allocator, D3D12_COMMAND_LIST_TYPE type,
+                  const IID* riid, void** out) {
     if (!created) return E_FAIL;
     ListProxy* proxy = new (std::nothrow) ListProxy();  // (): the console body starts zeroed
     if (!proxy) {
@@ -2507,6 +2871,7 @@ HRESULT wrap_list(IUnknown* created, DeviceProxy* device, IUnknown* allocator, c
     proxy->pc_slot_count = detect_list_slot_count(created);
     proxy->real_allocator = static_cast<ID3D12CommandAllocator*>(allocator);
     if (proxy->real_allocator) proxy->real_allocator->AddRef();
+    proxy->type = type;
     proxy->pin_cursor_at_limit();
     proxy_add_ref(device);  // the list keeps its Xbox-ABI device alive for GetDevice
 
@@ -2550,7 +2915,8 @@ HRESULT proxy_create_command_list(DeviceProxy* self, std::uint64_t node_mask, st
     if (FAILED(hr)) return hr;
     if (!created) return E_FAIL;
     return wrap_list(static_cast<IUnknown*>(created), self,
-                     reinterpret_cast<IUnknown*>(unwrap_object(allocator)), riid, out);
+                     reinterpret_cast<IUnknown*>(unwrap_object(allocator)),
+                     static_cast<D3D12_COMMAND_LIST_TYPE>(type), riid, out);
 }
 
 // Calls the real device's slot `Slot` with these five words in the positions the thunk received them (see "A thunk
@@ -2592,6 +2958,8 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
     void* created = nullptr;
     const HRESULT hr = self->real->CreateCommandQueue(desc, __uuidof(ID3D12CommandQueue), &created);
     if (FAILED(hr)) return hr;
+    if (!created) return E_FAIL;
+    record_real_queue(self, static_cast<ID3D12CommandQueue*>(created), desc->Type);  // console_submit_batch routes by it
     return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out);
 }
 
@@ -2703,7 +3071,7 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
                                                    __uuidof(ID3D12GraphicsCommandList), &created);
     if (FAILED(hr)) return hr;
-    return wrap_list(static_cast<IUnknown*>(created), self, allocator, riid, out);
+    return wrap_list(static_cast<IUnknown*>(created), self, allocator, type, riid, out);
 }
 
 // Xbox device slot 70: (texture_words, view_desc, destination), no return value. The retail executable's SRV writer
