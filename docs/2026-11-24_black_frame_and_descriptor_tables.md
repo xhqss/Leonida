@@ -168,3 +168,128 @@ mesh 阶段（base s16）仍未覆盖，需要翻译器侧的 per-stage user-dat
 2. 若确认是 V# base 仍是标题 VA：在描述符写入/翻译路径把 V# base 字段改成 `heap_base` 相对值
    （或者让 arena 覆盖它），也就是把 `docs/d3d12_vulkan.md` §3.3 的"V# 必须落在 arena 范围"真正落实。
 3. 每步之后跑完整 `ctest`，保持"只剩那 6 个既有失败"的基线；语料临时改动一律按第 7 节第 2 条处理。
+
+---
+
+# 追加：第二轮（2026-11-24 22:30–23:15）—— 越界读抓到了，表内容对不上
+
+本节覆盖第 9 节的三步。**结论先行：越界读已用 `VK_EXT_device_fault` 抓到，是"标题写进表里的 16 字节
+条目被着色器当 V# 解出来、base 落在 arena 外"；把这类条目清零后设备不再丢，但画面仍是黑的 —— 卡的
+是"标题写的表条目格式"和"着色器期望的 V# 格式"不一致。**
+
+## 1. 新工具：`VK_EXT_device_fault`（`LEONIDA_DEVICE_FAULT=1`）
+
+amdvlk 支持 `VK_EXT_device_fault`（`deviceFault=true`，`deviceFaultVendorBinary=false`）。设备创建时
+按需打开扩展 + `VkPhysicalDeviceFaultFeaturesEXT`；`VulkanContext::mark_device_lost()` 里调用
+`vkGetDeviceFaultInfoEXT` 打印一次故障地址，并同时打印 `heap_base` 和"相对 heap_base 的 console VA"。
+抓到的两类故障（两次运行）：
+
+```
+device fault: GPU page fault detected
+  fault address 0: 0x1520e88e000 (read invalid, precision 0x1000); heap_base 0x202e40000; console VA 0x1500ba4e000
+  fault address 0: 0x80a02e40000 (read invalid, precision 0x1000); heap_base 0x202e40000; console VA 0x80800000000
+```
+
+即着色器算出的读地址 = `heap_base + <某个 48 位 base>`，那个 base 就是表里条目解码出来的 V# base。
+`precision 0x1000` 表示真实地址在 `[reported, reported+0x1000)`，所以第二个故障的 base 是
+`0x80800000004`，第一个是 `0x1500ba4ef00`。
+
+## 2. 关键数字：arena 只有 **256 MB**
+
+`LEONIDA_LOG_SANITIZE` 会打印 `arena 0x10000000`。所以判断"V# 是否可能有效"的判据很硬：
+`base >= 0x10000000` 或 `base + records > 0x10000000` 一定越界。这一条以后可以直接写进校验。
+
+## 3. 表到底存在哪：三个位置都不一样
+
+`LEONIDA_LOG_TABLE=1` 对一个根表同时打印三个来源（前 0x100 字节 + 按 V#/T# 解码 + 越界标记）：
+
+| 位置 | 内容 |
+| --- | --- |
+| **arena 的同一偏移**（`heap_base + table_va`，着色器默认读的） | **全零** |
+| **堆的 XMem backing**（标题自己的堆内存，`custom_cpu_start + 偏移`） | **全零** |
+| **宿主地址 = table VA 数值处**（`copy_committed(table_va)`） | **有数据**（形状像描述符） |
+
+也就是说：标题把描述符表写在"它自己拿到的 GPU handle 数值当宿主地址"的那块内存里（console 统一内存
+的假设），而层把 `Create*View` 写的描述符放在 arena 的堆里。**两边从来不是同一块内存。**
+所以：
+
+- 默认（不翻译表 VA）：着色器读 arena → 全零 → V# 全零 → 黑屏、不崩；
+- `LEONIDA_XS_TABLE_VA=1`：着色器读"窗口拷贝"（标题内存）→ 读到真数据，但其中有些条目解出来是
+  越界 base → 设备丢失。
+
+## 4. `LEONIDA_XS_TABLE_FIX=1`：带消毒的表翻译
+
+`guest_translate()` 增加 `sanitize` 参数：每 4 MiB 窗口拷贝（本来就每次调用都刷新）之后，扫描前
+64 KiB 的 16 字节条目，把解出来 `base >= arena` 或 `base + records > arena` 的 V#（以及越界 T#）
+清零（load 返回 0，等价于 size 为 0 的缓冲区）。
+
+结果：**120 秒稳定，0 个设备丢失，3 帧照常抓到 —— 但帧仍是全黑（mean rgb 0.00 0.00 0.00）**。
+所以"设备丢失"这个次生问题已经压住，黑屏是描述符格式问题。
+
+## 5. draw → 表 的对应关系（这次拿到了）
+
+`LEONIDA_LOG_USERDATA=1` 扩到前 16 个 draw、每个 16 个 user dword。和 `LEONIDA_LOG_TABLE` 对起来：
+
+| draw | 管线 | `s8`（表 VA，已翻译） | 标题表 VA |
+| --- | --- | --- | --- |
+| #1,#2 | `vs-01ac7810…` + `ps-452212…` | `0x2f3eff80` / `0x2f40ff80` | 根 descriptor（不是表） |
+| #3（blit） | `VS_Blit…` + `PS_BlitColour…` | `0x2f96ef00` | `0xb96ef00` |
+| **#4（合成，写送显纹理）** | **`)sga_dr_vs_pos_color_tex…` + `default_ps_tex…`** | **`0x2f96dea0`** | **`0xb96dea0`** |
+
+## 6. 合成表的内容对不上 gfx10 V#
+
+合成 draw 用的表（标题 VA `0xb96dea0`）头 8 个 dword：
+
+```
+00000002 00000844 00000bc6 00210440 | 00000041 00000300 00000048 00000000
+```
+
+按文档 §3.5 的 gfx10 V# 解码（`base = (w1 & 0xffff) << 32 | (w0 & ~3)`）得到
+`base = 0x84400000002`，远在 256 MB 之外；按 T# 解码 `TYPE=0`（不是图像）。别的表里还有
+`08ed1e20 00000000 08ed1e20 00000000`（base 与 num_records 相同）、
+`00000004 00000808 ffffffff 00000000`（`0x808<<32` 正是第二个故障的 base）这类形状。
+**结论：标题写进表里的不是（至少不全是）gfx10 的 16 字节 V#。** 这也解释了 `LEONIDA_LOG_SANITIZE`
+为什么把整表清零。
+
+## 7. 这一轮踩到的坑（新增，按重要性）
+
+1. **只改头文件 + 构建 = amdvlk 里随机崩溃（3–5 秒）**。`runtime/src/vulkan_backend.h` 里加一个
+   `VulkanDeviceFunctions` 成员后，ninja 只重编了 `d3d12_vulkan_device.cpp`（其他 TU 的 depfile 里
+   没有这个头），剩下的 TU 用旧结构体布局 → ODR 破坏 → amdvlk 在 `CreateFence` 附近
+   `c0000005`（偏移 0x1ac64c / 0x160169 随机）。**症状是"游戏 3 秒退出"，不是报错**；对照实验：
+   `git stash` + 重建（全量）后就正常。**规避：动任何 header 之后，先
+   `Get-ChildItem runtime\shims,runtime\src -Filter *.cpp | % { $_.LastWriteTime = Get-Date }` 再构建。**
+2. `is_committed()` 会骗人：宿主地址 0xb800000 恰好是已提交的标题内存，于是
+   `guest_translate(0xb94ef00)` 会把"arena 偏移"当成"标题内存"去拷贝。判断一个 VA 是哪种，不能只看
+   `is_committed`，要先用 heap 的 GPU handle 范围（`LEONIDA_XS_GPU_HANDLE` 注册的那张表）判一次。
+3. `raw_heap_get_gpu_handle` 用"返回值 + 出参"两种约定都试，直接只取返回值会拿到
+   `0x1346cf778` 这种栈地址；其实层里堆的 GPU handle 就等于 `real_cpu_start - arena_host_base`，
+   不用调 slot 10。
+4. 设备丢失后 probe 仍在跑，别把"丢了之后"的日志当正常数据。
+5. `LEONIDA_LOG_TABLE` 会很啰嗦（每张表 17 行），跑探查时记得和其它开关一起只开短时间。
+
+## 8. 当前状态
+
+- 默认跑法仍然稳定黑屏（无设备丢失）；`LEONIDA_XS_TABLE_FIX=1` 也稳定黑屏。
+- 新增开关：`LEONIDA_DEVICE_FAULT`、`LEONIDA_LOG_TABLE`、`LEONIDA_LOG_SANITIZE`、
+  `LEONIDA_XS_GPU_HANDLE`、`LEONIDA_XS_TABLE_FIX`（全部默认关）；`LEONIDA_LOG_USERDATA` 扩到
+  16 个 draw × 16 dword。
+- 二进制里所有新增行为都在 env 开关后面，默认路径不变。
+
+## 9. 下一步（下一位接手者）
+
+1. **搞清标题写表的格式**。三条路，按推荐顺序：
+   a. 反查写表代码：对 0xb96dea0 这个地址下页级写监视（`VirtualProtect` + 异常/写时复制很难，或
+      用 `cdb` 的 `ba w` 断点；本机目前没有 cdb，得先找）；
+   b. 用 xcl / VIctory 的实现对照：它们也处理 console 描述符表，看它们怎么解 16 字节条目
+      （`crates/xcl/src/hle/d3d12x/`、`crates/victory-shader/src/resource.rs`）；
+   c. 从语料侧反推：`tools/rdna2spirv.py` 里 buffer_load 的翻译假定 V# 是 gfx10 布局；找一个**已知能
+      正常出画**的 draw（比如 blit 之前那两个 fetch draw）看它的表条目是不是同一个格式 —— 如果
+      那两个 draw 的表也是这种形状却能出画，说明格式没错、是合成 draw 的绑定参数不同。
+2. 若确认条目是 32 字节（不是 16），把 `sanitize_descriptor_table` 的步长和着色器读取偏移一起改，
+   并用 `LEONIDA_LOG_TABLE` 的 arena/backing 三份对照验证。
+3. 真正的架构解（比逐条修更彻底）：让 shader-visible heap 在层里只有一个存储 —— 让
+   `GetCPUDescriptorHandleForHeapStart` 和 `GetGPUDescriptorHandleForHeapStart` 返回**同一个**标题
+   XMem backing 地址（console 统一内存），`Create*View` 也直接写到 backing，表 VA 就是 backing 地址，
+   着色器用 guest window 读它。这样"标题自己写的"和"层写的"描述符天然是同一块内存。
+   （注意 RTV/DSV 等非 shader-visible heap 不能跟着改，它们的数据是层自己读的。）
