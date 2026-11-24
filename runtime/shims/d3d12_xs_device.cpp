@@ -1284,12 +1284,53 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
 
 struct PresentState {
     ~PresentState() {
-        if (window) DestroyWindow(window);  // the presentation and its window die with the device proxy
+        if (owns_window && window) DestroyWindow(window);  // only the window this state made dies with it
     }
     HWND window = nullptr;
+    bool owns_window = false;  // false: the window is the title's, and outlives the presentation
     std::unique_ptr<rt::d3d12::XboxPresentation> xbox;
     bool tried = false;  // creation is attempted once; a null xbox means this device cannot present
 };
+
+// The window the console's presentation belongs to. PresentX takes no HWND: on the console the title's own window is
+// what the picture appears in, and the retail executable makes it itself ("sgaWindowClass", title "Americas"). So the
+// presenter is put on that window. A window of this layer's own would be a second, hidden window and the title's one
+// would stay blank, which is exactly how a white window was seen with the presentation running at hundreds of frames.
+//
+// The lookup sends no message to any window. The present thread is not the title's window thread, and that thread can
+// be busy (or waiting on the present thread) when the first PresentX comes: GetWindowTextW, or any call that sends a
+// message across threads, would block the present thread there (measured upstream: reading the titles stopped the
+// retail title at its first PresentX). Everything below reads the window manager's own state.
+struct TitleWindowProbe {
+    HWND window = nullptr;
+    long long area = -1;
+};
+
+HWND own_present_window = nullptr;  // the fallback window this layer made, never mistaken for the title's
+
+BOOL CALLBACK find_title_window_proc(HWND window, LPARAM param) {
+    auto* probe = reinterpret_cast<TitleWindowProbe*>(param);
+    DWORD process = 0;
+    if (window == own_present_window || !GetWindowThreadProcessId(window, &process) || process != GetCurrentProcessId())
+        return TRUE;
+    if (!IsWindowVisible(window) || GetWindow(window, GW_OWNER) != nullptr) return TRUE;  // an owned window is a dialog
+    if (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
+    RECT client{};
+    const long long area = GetClientRect(window, &client)
+                               ? static_cast<long long>(client.right - client.left) * (client.bottom - client.top)
+                               : 0;
+    if (area > probe->area) {
+        probe->window = window;
+        probe->area = area;
+    }
+    return TRUE;
+}
+
+HWND find_title_window() {
+    TitleWindowProbe probe;
+    EnumWindows(&find_title_window_proc, reinterpret_cast<LPARAM>(&probe));
+    return probe.window;
+}
 
 void destroy_present_state(void* present_state) {
     delete static_cast<PresentState*>(present_state);
@@ -1307,20 +1348,36 @@ PresentState* present_state_for(DeviceProxy* device) {
     if (!state) return nullptr;
     device->present_state = state;
     state->tried = true;
-    WNDCLASSW window_class{};
-    window_class.lpfnWndProc = present_window_proc;
-    window_class.hInstance = GetModuleHandleW(nullptr);
-    window_class.lpszClassName = L"LeonidaPresentX";
-    if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
-        return state;
-    }
-    state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
-                                  window_class.hInstance, nullptr);
-    if (!state->window) {
-        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
-        return state;
+    if (HWND title_window = find_title_window()) {
+        state->window = title_window;
+        RECT client{};
+        GetClientRect(title_window, &client);
+        std::fprintf(stderr, "[rt] d3d12_xs: PresentX presents into the title's window %p (client %ldx%ld, visible %d)\n",
+                     static_cast<void*>(title_window), client.right - client.left, client.bottom - client.top,
+                     IsWindowVisible(title_window) ? 1 : 0);
+    } else {
+        // No window of the title's (it has not made one yet): make one and show it, so a frame it does present is
+        // visible rather than going into a hidden window.
+        WNDCLASSW window_class{};
+        window_class.lpfnWndProc = present_window_proc;
+        window_class.hInstance = GetModuleHandleW(nullptr);
+        window_class.lpszClassName = L"LeonidaPresentX";
+        if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
+            return state;
+        }
+        state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
+                                        window_class.hInstance, nullptr);
+        if (!state->window) {
+            std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
+            return state;
+        }
+        state->owns_window = true;
+        own_present_window = state->window;
+        ShowWindow(state->window, SW_SHOWNORMAL);
+        std::fprintf(stderr, "[rt] d3d12_xs: no title window yet; PresentX uses its own window %p\n",
+                     static_cast<void*>(state->window));
     }
     auto presenter = rt::d3d12::create_window_presenter(device->real, state->window);
     if (!presenter) {
