@@ -5780,23 +5780,29 @@ HRESULT proxy_create_pipeline_state(DeviceProxy* self, const D3D12_PIPELINE_STAT
     const std::string key =
         leonida::sha256_hex(std::span<const std::uint8_t>(
             static_cast<const std::uint8_t*>(desc->pPipelineStateSubobjectStream), desc->SizeInBytes));
-    static std::mutex create_lock;
+    // The cache is keyed on the whole state, so equal streams are the same pipeline. It is NOT held across the driver
+    // call: the title's ~48,000 states are almost all distinct, so serialising their creation removes the parallelism
+    // the title uses instead of saving anything -- measured, presents fell from 6360 in 30 s to 300 when the mutex was
+    // held across the call. Two threads that race on the same stream both compile; the first one inserted wins and the
+    // other object is dropped after its one reference.
+    static std::mutex cache_lock;
     static std::map<std::string, IUnknown*> cache;
-    static std::atomic<std::uint64_t> created{0};
     static std::atomic<std::uint64_t> hits{0};
-    std::lock_guard<std::mutex> guard(create_lock);
     // LEONIDA_LOG_PSO_COUNT: total calls, distinct streams and cache hits, every 4096 calls. 4096 of total with 4096 of
     // distinct means the title really does have that many states (a precompile pass); a small distinct count means it
     // asks for the same ones again and again.
     if (std::getenv("LEONIDA_LOG_PSO_COUNT")) {
         static std::atomic<std::uint64_t> seen{0};
         const std::uint64_t nth = seen.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (nth % 4096 == 0)
-            std::fprintf(stderr, "[rt] d3d12_xs: graphics PSO census: %llu calls, %llu distinct, %llu hits\n",
-                         static_cast<unsigned long long>(nth), static_cast<unsigned long long>(cache.size()),
+        if (nth % 4096 == 0) {
+            std::lock_guard guard(cache_lock);
+            std::fprintf(stderr, "[rt] d3d12_xs: graphics PSO census: %llu calls, %zu distinct, %llu hits\n",
+                         static_cast<unsigned long long>(nth), cache.size(),
                          static_cast<unsigned long long>(hits.load(std::memory_order_relaxed)));
+        }
     }
     {
+        std::lock_guard guard(cache_lock);
         const auto found = cache.find(key);
         if (found != cache.end()) {
             found->second->AddRef();
@@ -5809,8 +5815,8 @@ HRESULT proxy_create_pipeline_state(DeviceProxy* self, const D3D12_PIPELINE_STAT
     if (SUCCEEDED(made) && *out) {
         auto* state = static_cast<IUnknown*>(*out);
         state->AddRef();  // the cache's own reference
-        cache.emplace(key, state);
-        created.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard guard(cache_lock);
+        if (!cache.emplace(key, state).second) state->Release();  // another thread won the race
     }
     return made;
 }
