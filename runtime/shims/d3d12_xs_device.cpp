@@ -2503,6 +2503,14 @@ HRESULT console_extension_call(ListProxy* self, unsigned extension, std::uint64_
                              static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
                              static_cast<unsigned long long>(holds));
             }
+            // LEONIDA_SATISFY_WAITS=1: put the awaited value there instead of only answering, so a title that reads
+            // the cell itself (rather than trusting the wait) sees the step the GPU would have taken. Diagnostic.
+            if (const char* satisfy = std::getenv("LEONIDA_SATISFY_WAITS"); satisfy && satisfy[0] == '1') {
+                const unsigned width = extension == kExtWait32 ? 4u : 8u;
+                std::uint8_t bytes[8] = {};
+                std::memcpy(bytes, &a2, sizeof(bytes));
+                leonida::write_committed(a1, bytes, width);
+            }
             return S_OK;
         }
         case kExtFill32:  // (address, size, value)
