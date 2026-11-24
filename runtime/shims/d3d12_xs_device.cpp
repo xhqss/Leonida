@@ -1415,11 +1415,11 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
             const HRESULT heap_hr = first->ppResources[0]->GetHeapProperties(&heap, &heap_flags);
             std::fprintf(stderr,
                          "[rt] d3d12_xs: first present plane: %llux%u format %d, %u resource(s), colour space %d, "
-                         "display heap %s, resources %p\n",
+                         "display heap %s, flags 0x%x, resources %p\n",
                          static_cast<unsigned long long>(desc.Width), desc.Height, int(desc.Format),
                          first->ResourceCount, first->ColorSpace,
                          SUCCEEDED(heap_hr) && (heap_flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY) ? "yes" : "no",
-                         static_cast<void*>(first->ppResources[0]));
+                         static_cast<unsigned>(desc.Flags), static_cast<void*>(first->ppResources[0]));
         }
     }
     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
@@ -1470,6 +1470,24 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         note_child_slot<K>(Slot);
         d3d12_trace::record(child_trace_name<K>(Slot));
         return fence_completed_value_address(self, a1, a2, a3);
+    } else if constexpr (K == ChildKind::queue && Slot == 35) {
+        // The console's submit. The title records its drawing into command lists and hands them to the queue here, one
+        // batch per frame; the trace shows no ID3D12CommandQueue::ExecuteCommandLists call anywhere, so acknowledging
+        // this slot with S_OK (the old "console-only" answer) left every list unexecuted and the frame black.
+        // LEONIDA_SUBMIT_35=1 forwards the batch to the real queue's ExecuteCommandLists (PC order: 8 + 2).
+        note_child_slot<K>(Slot);
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 3)
+            std::fprintf(stderr, "[rt] d3d12_xs: queue slot 35 submit: a1 0x%llx a2 0x%llx a3 0x%llx a4 0x%llx\n",
+                         static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                         static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+        if (const char* submit = std::getenv("LEONIDA_SUBMIT_35"); submit && submit[0] == '1' && a1 > 0 && a1 <= 64 &&
+                                     a2 != 0) {
+            using ExecuteFn = void(WINAPI*)(IUnknown*, UINT, ID3D12CommandList* const*);
+            reinterpret_cast<ExecuteFn>(self->real_vtable[10])(self->real, static_cast<UINT>(a1),
+                                                               reinterpret_cast<ID3D12CommandList* const*>(a2));
+        }
+        return hr_to_u64(S_OK);
     } else {
         note_child_slot<K>(Slot);
         if constexpr (K == ChildKind::queue) {

@@ -6096,6 +6096,15 @@ public:
             rd = resource->GetDesc();
         }
         if (rid) {
+            // LEONIDA_LOG_RTV=1: which resource each of the first render-target views is made for, so the texture a
+            // present names can be matched against the ones the title actually renders into (both by pointer).
+            if (std::getenv("LEONIDA_LOG_RTV")) {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1) < 200)
+                    std::fprintf(stderr, "[rt] rtv: resource %p id %llu %llux%u\n", static_cast<void*>(resource),
+                                 static_cast<unsigned long long>(rid), static_cast<unsigned long long>(rd.Width),
+                                 rd.Height);
+            }
             view = {rid, 0, 0, rd.DepthOrArraySize};
             if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
                 view = volume_rtv(rid, rd, desc);
