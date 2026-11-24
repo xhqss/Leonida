@@ -342,3 +342,40 @@ device fault: GPU page fault detected
    # 期望 E231E529E80341216949C62E8127163AD3F7EFDBC8DA29E77247114F41A0BAA3
    ```
 
+---
+
+# 追加：第四轮（2026-11-24 23:30–23:40）—— 把表条目当"指针再解一层"，仍不满足合成 draw
+
+## 1. 这轮做的实验
+
+`LEONIDA_XS_TABLE_REWRITE=1` 里给 `NUM_RECORDS` 加了 clamp（重写后的 records 一律 ≤ 4096），
+这样"改写 base 但 records 是天文数字"的 GPU 挂死消失：带洋红 PS 的 90 秒跑完整抓了 2 帧、不再卡住。
+于是又加了 `LEONIDA_XS_TABLE_INDIRECT=1`：表条目 base 处的标题内存是 `{ptr, 0, ptr, 0}` 形状，
+就再解一层，把 `*(base)` 当真正的数据地址（再 `guest_translate` 成窗口）。
+
+结果（90 s，洋红 PS）：
+
+```
+present: first frame shown ... capture 1
+frame_00001.ppm: min=0 max=0 non-zero 0/15770652   ← 仍是全黑
+rewrite +0x0: 6d03c230 00000000 00001000 00000000 from 0x90d2110; data 0993c230 00000000 0c497e10 00000000
+```
+
+即：链条 `表条目(0x90d2110) → *(0x90d2110)=0x993c230 → 窗口 0x6d03c230` 走通了、不再挂，
+但**合成 draw 仍然一个像素都不写**（洋红 PS 也一样）。说明位置还是退化，或者矩阵根本不在这一层。
+
+## 2. 现状判断（下一轮的起点）
+
+- `LEONIDA_XS_TABLE_FIX` + `LEONIDA_XS_TABLE_REWRITE` + `LEONIDA_XS_TABLE_INDIRECT` 现在**稳定不挂**，
+  但画面仍黑。这条"猜层级"的路已经走到底：再猜下去只是在赌，收益低。
+- 真正的判据还是缺"谁写这张表、写的是什么"。下一步优先级：
+  1. **写监视**：给表页装 `PAGE_GUARD`（VEH 抓 `EXCEPTION_GUARD_PAGE`，记 RIP + 写入方式），
+     拿到写表代码的 RIP→RVA，用 `dumpbin /DISASM` 或项目里的 `tmp/dis.py`（需 capstone，本机现装无）
+     反汇编，看它写的到底是哪种描述符。
+  2. 若确认为"引擎自定义的指针表"（很可能）：修法不在层，而在 `tools/rdna2spirv.py` 的 buffer op
+     翻译——console shader 的 `s_load_dwordx4` 也许应先解一层指针；改翻译器 + 按 `docs/shader_library.md`
+     重生成语料，再用洋红 PS 判定。
+  3. 层侧只保留"窗口拷贝 + base 翻译 + records clamp"的稳定版本，别再叠加猜测性的层级。
+- 稳定跑法不变（默认无设备丢失、无挂死）；语料已还原并核验（`E231E529…BAA3`）。
+
+
