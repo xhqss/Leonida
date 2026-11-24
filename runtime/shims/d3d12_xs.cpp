@@ -118,24 +118,43 @@ HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size,
 }
 
 // Console virtual-memory policy (docs/d3d12_xs_surface.md §2.1 row 4). The PC runtime and the Vulkan allocator own
-// the address space, so there is nothing to configure; the title only reads the result. Measured at the first call
-// (game_scarlett_master.exe+0x1e1cfe5): four register arguments, the first pointing at a 32-byte block the title
-// zeroed and whose word at +4 it filled in, and `test eax, eax / jns` on the result — a success value is what lets
-// the boot path continue, and nothing is written back because the block belongs to the title. Parameter types are
-// therefore left unasserted.
+// the address space, so there is nothing to configure in the console page tables; the title only reads the result.
+// Measured at the first call (game_scarlett_master.exe+0x1e1cfe5): four register arguments, the first pointing at a
+// 32-byte block the title zeroed and whose word at +4 it filled in, and `test eax, eax / jns` on the result — a
+// success value is what lets the boot path continue. The output words at +0x10 and +0x18 are the user-space graphics
+// VA range [lowest, highest]: GPU and CPU virtual addresses share one 64-bit space on the console, so they are the
+// host process's application address range (upstream commit 028001c82 measured the same thing on main). Leaving them
+// zero is what a title reads back from this call today, and a title that sizes its GPU VA allocator from the answer
+// then places its memory outside anything the host maps. Parameter types are left unasserted.
 HRESULT WINAPI configure_virtual_memory(void* first, const void* second, const void* third, uintptr_t fourth) {
     static std::atomic<bool> logged{false};
+    static std::atomic<bool> filled{false};
+    if (first) {
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        const std::uint64_t lowest = static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(info.lpMinimumApplicationAddress));
+        const std::uint64_t highest = static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(info.lpMaximumApplicationAddress));
+        auto* bytes = static_cast<std::uint8_t*>(first);
+        std::memcpy(bytes + 0x10, &lowest, sizeof(lowest));
+        std::memcpy(bytes + 0x18, &highest, sizeof(highest));
+        if (!filled.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX VA range = [0x%llx, 0x%llx]\n",
+                         static_cast<unsigned long long>(lowest), static_cast<unsigned long long>(highest));
+    }
     if (!logged.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,
-                     "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX(%p, %p, %p, 0x%llx): console virtual-memory policy, "
-                     "the PC/Vulkan side owns it; returning S_OK without configuring anything\n",
+                     "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX(%p, %p, %p, 0x%llx): console page-table policy "
+                     "ignored, the user-space VA range is filled in\n",
                      first, second, third, static_cast<unsigned long long>(fourth));
         // The caller zeroes a 32-byte block and fills word +4 before the call; the words are printed because the
-        // library may fill the block in and the title can read it afterwards.
+        // library fills the block in and the title reads it afterwards.
         if (first) {
             const auto* words = static_cast<const uint32_t*>(first);
-            std::fprintf(stderr, "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX block =%08x %08x %08x %08x\n", words[0],
-                         words[1], words[2], words[3]);
+            std::fprintf(stderr, "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX block =%08x %08x %08x %08x %08x %08x "
+                                 "%08x %08x\n",
+                         words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
         }
     }
     return rt::d3d12_trace::result("D3D12ConfigureVirtualMemoryX", S_OK);

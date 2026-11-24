@@ -302,6 +302,19 @@ void log_descriptor_handle(const DeviceProxy* device, const char* what, SIZE_T h
                      static_cast<unsigned long long>(handle));
 }
 
+// LEONIDA_XS_DESC_SYNC: a descriptor the layer wrote into the arena heap is copied back to the title's own memory at
+// the same slot. On the console a view is a value: after Create*View the title may copy the descriptor's bytes itself
+// (into a table it built, or into another heap) with a plain memcpy, and read those bytes back. Here the layer writes
+// the descriptor into the arena (the translated handle) while the title's memory at the handle it passed still holds
+// whatever was there, so a title-side copy carries garbage into the table the shader later loads. Copying the bytes
+// back makes both views of the slot agree.
+void sync_descriptor_back(D3D12_CPU_DESCRIPTOR_HANDLE title_side, D3D12_CPU_DESCRIPTOR_HANDLE real) {
+    if (!std::getenv("LEONIDA_XS_DESC_SYNC")) return;
+    if (!title_side.ptr || !real.ptr || title_side.ptr == real.ptr) return;
+    constexpr std::size_t kSlotBytes = 32;  // one console CBV/SRV/UAV slot: a T#, or a V# padded to eight dwords
+    std::memcpy(reinterpret_cast<void*>(title_side.ptr), reinterpret_cast<const void*>(real.ptr), kSlotBytes);
+}
+
 std::atomic<std::uint64_t> g_hits[kMaxSlots];std::atomic<bool> g_first[kMaxSlots];
 std::atomic<bool> g_beyond_warned[kMaxSlots];
 std::atomic<std::uint64_t> g_heap_hits[kHeapSlots];
@@ -4193,21 +4206,27 @@ void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* 
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(17);
     log_descriptor_handle(self, "CreateConstantBufferView", dest.ptr);
-    self->real->CreateConstantBufferView(desc, translate_cpu_handle(self, dest));
+    const D3D12_CPU_DESCRIPTOR_HANDLE real = translate_cpu_handle(self, dest);
+    self->real->CreateConstantBufferView(desc, real);
+    sync_descriptor_back(dest, real);
 }
 
 void proxy_create_srv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(18);
     log_descriptor_handle(self, "CreateShaderResourceView", dest.ptr);
-    self->real->CreateShaderResourceView(resource, desc, translate_cpu_handle(self, dest));
+    const D3D12_CPU_DESCRIPTOR_HANDLE real = translate_cpu_handle(self, dest);
+    self->real->CreateShaderResourceView(resource, desc, real);
+    sync_descriptor_back(dest, real);
 }
 
 void proxy_create_uav(DeviceProxy* self, ID3D12Resource* resource, ID3D12Resource* counter,
                       const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(19);
     log_descriptor_handle(self, "CreateUnorderedAccessView", dest.ptr);
-    self->real->CreateUnorderedAccessView(resource, counter, desc, translate_cpu_handle(self, dest));
+    const D3D12_CPU_DESCRIPTOR_HANDLE real = translate_cpu_handle(self, dest);
+    self->real->CreateUnorderedAccessView(resource, counter, desc, real);
+    sync_descriptor_back(dest, real);
 }
 
 void proxy_create_rtv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
@@ -4225,7 +4244,9 @@ void proxy_create_dsv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_D
 void proxy_create_sampler(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(22);
     log_descriptor_handle(self, "CreateSampler", dest.ptr);
-    self->real->CreateSampler(desc, translate_cpu_handle(self, dest));
+    const D3D12_CPU_DESCRIPTOR_HANDLE real = translate_cpu_handle(self, dest);
+    self->real->CreateSampler(desc, real);
+    sync_descriptor_back(dest, real);
 }
 
 void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DESCRIPTOR_HANDLE* dest_starts,
@@ -4272,8 +4293,19 @@ void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D1
                                    D3D12_CPU_DESCRIPTOR_HANDLE src_start, D3D12_DESCRIPTOR_HEAP_TYPE type) {
     note_slot(24);
     log_descriptor_handle(self, "CopyDescriptorsSimple dest", dest_start.ptr);
-    self->real->CopyDescriptorsSimple(num_descriptors, translate_cpu_handle(self, dest_start),
-                                      translate_cpu_handle(self, src_start), type);
+    const D3D12_CPU_DESCRIPTOR_HANDLE real_dest = translate_cpu_handle(self, dest_start);
+    const D3D12_CPU_DESCRIPTOR_HANDLE real_src = translate_cpu_handle(self, src_start);
+    if (std::getenv("LEONIDA_XS_DESC_SYNC") && num_descriptors > 0) {
+        const std::size_t bytes = std::size_t(num_descriptors) * 32;
+        // The already-created views only exist in the arena copy, so the source is brought over before the copy.
+        if (real_src.ptr != src_start.ptr && bytes <= std::size_t(1) << 20)
+            std::memmove(reinterpret_cast<void*>(real_src.ptr), reinterpret_cast<const void*>(src_start.ptr), bytes);
+        self->real->CopyDescriptorsSimple(num_descriptors, real_dest, real_src, type);
+        if (real_dest.ptr != dest_start.ptr && bytes <= std::size_t(1) << 20)
+            std::memmove(reinterpret_cast<void*>(dest_start.ptr), reinterpret_cast<const void*>(real_dest.ptr), bytes);
+        return;
+    }
+    self->real->CopyDescriptorsSimple(num_descriptors, real_dest, real_src, type);
 }
 
 // The Xbox slot 62 takes two more words between the description and the IID: (desc, w2, w3, riid, out). Measured

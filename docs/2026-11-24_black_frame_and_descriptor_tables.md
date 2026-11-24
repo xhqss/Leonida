@@ -694,6 +694,56 @@ heap 1 GPU handle getter -> 0xae10000（= real − arena_host_base，两者一�
 3. 窗口机制要能覆盖多张表：改成固定池 + LRU（bind 时拷进池槽、按需重写描述符），或只翻译"当前绑定着色器
    真正会读的偏移"（偏移量可从语料 SPIR-V 的 `s_load_dwordx4` 常量里取）。
 
+---
+
+# 追加：第十一轮（2026-11-25 00:45–00:50）—— 上游同类问题（BL-4）、VA 区间、以及"描述符值"的写回
+
+## 1. 上游检查（分支 `origin/main` = `82a2aabcc`，本地领先 120、落后 1343）
+
+- 上游新增 `docs/boot_leads.md`，其中 **BL-4 与当前问题完全同题**：
+  "a console descriptor word may be a 32-bit GPU address rather than a heap offset … translate a word to the buffer
+  device address … the way root-descriptor addresses already go through the arena"，状态是**开放**（还没人做
+  census）。所以这不是本地漏了某个已修好的补丁，而是上游也还没解决的同一条线。
+- 上游 `028001c82`（VM 选项）里量到：`D3D12ConfigureVirtualMemoryX` 的输出字 `+0x10/+0x18` 是
+  **用户态图形 VA 区间**，主机与 GPU 共用同一 64 位空间，所以就是进程的 application 地址区间。本地原来只记日志、
+  什么都不填 → 已按上游实现移植（`configure_virtual_memory` 现在写 `[0x10000, 0x7ffffffeffff]`）。
+  实测：默认跑法不变（30 s 1800 presents，无 fault），画面仍黑。
+- 其它上游提交（Xbox slot 81/86/108、`CreateCommittedResource3`、`slot 73` IID、`rdna2spirv` 接受 vcc 基址等）
+  与当前症状关系不直接，未合并；本地与上游在 `d3d12_xs_device.cpp` 上已大幅分叉，直接 merge 不可行。
+
+## 2. 关键机理：着色器契约是"描述符字节 = 哈希键"
+
+`runtime/src/descriptor_table.h`（doc §5.1）：翻译后的着色器把从 `heap_base + 表VA` 读到的
+**8 dword 描述符字节**做 FNV-1a，查 set 0 binding 2 的哈希表拿 bindless 索引。所以表里的字节**必须与层在
+Create*View 时写进 heap 的字节逐字节相同**，否则哈希查不到 → 全走 fallback 0。
+
+而 xcl 记录的 console 语义是"descriptor 是值，标题自己在 CPU-only heap 里创建、再用 memcpy 拷进 shader-visible
+heap"。本项目的实现里，层把描述符写进 **arena**（翻译后的 handle），标题从 **XMem CPU handle** 拷 —— 那里是
+分配器残留，于是标题把垃圾拷进自己的表，着色器读到垃圾 → 黑屏。这与"arena 同偏移全 0 / 标题副本是残留"的实测
+完全一致。
+
+## 3. 新开关 `LEONIDA_XS_DESC_SYNC`（描述符写回）
+
+`Create*View`（CBV/SRV/UAV/RTV/DSV/Sampler）与 `CopyDescriptorsSimple` 之后，把 arena 里写好的 32 字节槽
+拷回标题传入的 CPU handle 内存，使两边一致；`CopyDescriptorsSimple` 之前还会把源槽从标题侧拷到 arena。
+配合 `XS_TABLE_VA`（把表 VA 翻译成窗口，让着色器读标题写的表）实测：
+
+```
+（未开写回）fault console VA 0x80800000000
+（开写回）  fault console VA 0x1500ba4e000
+```
+
+故障点变了 ⇒ 着色器读到的描述符**确实变了**（写回生效），剩下的是描述符里 base 的地址空间问题（见下）。
+
+## 4. 下一轮
+
+1. 剩下的 fault 来自 base 形如 `0x1500ba4ef00` 的 V#：这是**标题自己的 console VA**（标题内存里的资源），
+   而着色器做 `heap_base + base`。根因是层的描述符 encode 直接把资源的标题 VA 写进 V#，没有先映射成
+   arena 可达地址 —— **就是上游 BL-4**。修法：在写 V#/T#（或写回前）把标题内存资源的 base 换成
+   `guest_translate`/`upload_translate` 之后的 arena 地址（root descriptor 已经这么做了，描述符没有）。
+2. 修好后再看哈希键是否匹配：若仍全走 fallback，说明层的 key 与标题表里的字节还有差异（例如 base 已被改写
+   导致 key 不同），届时需要让层用"标题表里的原始字节"作为 key 插表。
+
 
 
 
