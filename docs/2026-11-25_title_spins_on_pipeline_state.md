@@ -994,3 +994,99 @@ GPU 侧（描述符、黑屏）是**症状**，不是原因。§14 花整轮追�
 4. **修 kind-6 头的反汇编**（§15.1），把缺的 compute 程序补进语料 —— 做完再关掉 `XS_EMPTY_CS`。
 5. 描述符链路（§14.9）保持现状，**不要再投入**，除非 1/2/3 有进展。
 
+---
+
+## 16. 第六轮（2026-11-25 06:10）：**13 个满核线程是驱动里的管线编译竞争，已修掉**
+
+### 16.1 先做了只有进程内才能做的工具：`LEONIDA_THREAD_MAP`
+
+外部脚本 `tmp/thread-map.ps1` 对 97 个线程**全部**读到 `rip=unreadable`（跨进程 `OpenThread` +
+`GetThreadContext` 拿不到这个进程的上下文），所以归因不了。改成**进程内**采样器
+（`runtime/src/thread_sampler.cpp`，`LEONIDA_THREAD_MAP=<秒>`）：
+
+- 挂起每个其它线程 → **一次** `GetThreadContext` → 立刻恢复；CPU 时间取 `GetThreadTimes` 的差值，
+  所以"谁在烧 CPU"是测出来的而不是猜的；
+- **栈用 `RtlVirtualUnwind` 真走**：loader 早就把每个映射镜像的 `.pdata` 用 `RtlAddFunctionTable`
+  注册过，所以主机 loader 没见过的 console 代码也能 unwind。（先试过裸扫栈，192 和 512 个 dword
+  都找不到一个标题帧，全是 ntdll 的残留值。）
+- 地址解析走 **loader 自己的表**（`find_address`）：宿主的模块列表里根本没有映射进来的镜像，
+  这也是外部脚本读不到 RIP 之外的另一半原因；
+- `gta6rt.exe` 的帧用 **dbghelp + 322 MB 的 PDB** 解成函数名（`SymInitialize(..., TRUE)`）。
+
+### 16.2 它查出来的东西（决定性）
+
+满核的 13 个线程，栈底全是 amdvlk64.dll，**再往下就是我们的层**：
+
+```
+game_scarlett_master.exe+0x24800db      <- 标题调用 slot 67
+gta6rt.exe proxy_slot<67>+0x9
+gta6rt.exe proxy_create_compute_pipeline_from_native_code+0x249
+gta6rt.exe Device::CreateComputePipelineState+0xde
+gta6rt.exe PipelineState::create_compute+0x832      <- vkCreateComputePipelines
+amdvlk64.dll ... (19 帧)
+```
+
+而标题**自己的**线程（98 个里的绝大多数）全部是 parked：栈上是 `game_scarlett_master.exe+0x2215eca`
+（线程引导）加 1~4 个标题帧，`ntdll` 的等待原语在最上。⇒ **烧 CPU 的不是标题，是驱动；
+标题的线程都在睡。** 之前"标题在自旋"的判断（§15.3）**是错的**。
+
+### 16.3 根因：**管线创建没有串行化，也没有去重**
+
+`LEONIDA_LOG_SLOT67` 的普查给出了这个"风暴"的真实形状（一个 25 s 的 run）：
+
+```
+call 13: code 43a0d4fb60d07951 rs 0x7cce7ec0 kind6 384 B
+call 14: code ba4afc9be3028c43 rs 0x7cce7ec0 kind6 576 B
+call 15: code 8ea9ce4b880bbccd rs 0x7cce7ec0 kind6 768 B
+...
+```
+
+同一个 root signature，**每次的程序都不一样**，大小在 384/512/576/640/704/768/832/1024 之间循环。
+⇒ 这是 FSR/upscaler 那一族的**有限**管线集合，**不是重试循环**（所以 §15.2 的 `XS_EMPTY_CS`
+让它"不再重试"的说法要修正：它本来就不是重试）。标题用 **13 个 worker 线程同时**建这些管线，
+而 amdvlk 内部**串行**编译 ⇒ 12 个线程在驱动里**自旋**等锁，一烧就是整场。
+
+**修法**（默认生效，无开关）：`proxy_create_compute_pipeline_from_native_code` 里
+
+1. 一把 `std::mutex` **跨** `CreateComputePipelineState` 调用持有 —— 等锁的线程在内核里**睡**，
+   而不是在驱动里自旋；
+2. 同一把锁下按 `(字节码 sha256, root signature)` 做**管线缓存**：重复的程序直接复用同一个
+   `ID3D12PipelineState`（D3D12 允许一个 PSO 服务任意多次），根本不进驱动。
+
+### 16.4 实测
+
+| 指标 | 修前 | 修后 |
+| --- | --- | --- |
+| CPU（`XS_EMPTY_CS=1`，稳态） | **1609%**（13 线程在驱动里） | **231%** |
+| presents（40 s） | 4800 | **10560**（264 Hz） |
+| presents（默认配置 30 s） | 3060 | **6360**（212 Hz） |
+| assert / device fault | 0 / 0 | 0 / 0 |
+| 标题碰到的 D3D12 入口点 | 85 | **85（没变）** |
+
+⇒ **这是一个真的性能 bug，修完 7 倍 CPU、2 倍帧率**；但入口点集合依旧不变，
+所以**它也不是"标题不往前走"的原因**。描述符、帧率、管线风暴现在都可以从嫌疑名单上划掉。
+
+### 16.5 顺带做掉的：帧节拍 `LEONIDA_XS_PACE`（默认关）
+
+`WaitFrameEventX` 原来立刻返回一个新令牌，所以标题**自由跑**：同一份空帧每秒呈现 106–152 次，
+每次都是一次 submit + present。`LEONIDA_XS_PACE=1` 按标题自己 `SetFrameIntervalX` 要的间隔
+（boot 要 33333 µs）睡到下一个"帧起点"，这才是 console 上 vblank 的形状。
+
+实测：present 从 3720/35 s 降到 **420/30 s**，而 **CPU 一点没降（仍 1437%）** ——
+这条正好**证明** §16.2 的结论：满核与"呈现太频繁"无关，是管线编译竞争。
+
+### 16.6 现在的嫌疑名单（按价值）
+
+1. **标题在等什么**：它的线程全都 parked，最外层是 `game_scarlett_master.exe` 里的等待。
+   下一步用新的采样器把 **`game_scarlett_master.exe` 的 RVA 反汇编**（`tmp/hexdump_rva.py` +
+   `docs/` 里的反汇编笔记）查那 10 个 parked 调用点，尤其是**最深的那个**
+   （`+0x249987c`/`+0x249a3c0` 那条 8 帧链）—— 那是标题主循环在等的东西。
+2. **0 次文件读**仍然成立：标题初始化完 GPU、建完 ~300 个 compute 管线、画 4 个空 blit，
+   **从不发起一次 DirectStorage 请求**。资产加载根本没开始。
+3. 音频三连（`XApuConnect` / `XDspConnect` / `XApuGetResultCount`）各只被调用一次，是初始化，
+   不是轮询 ⇒ 优先级降到 3。
+4. `xg_xs` 的 E_NOTIMPL（`XGSuggestSwizzleMode` / `XGCreateTextureComputer`）仍是候选，
+   但如果资产加载没开始，它还没轮到。
+5. `XS_EMPTY_CS` 还开着（默认关）：语料仍缺那个 FLT_MAX 程序（§15.1），
+   修 `tools/fspx_unpack.py` 的头部反汇编后再补。
+

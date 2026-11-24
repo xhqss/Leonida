@@ -109,6 +109,8 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     # image and keeps the executable's TLS at a helper's index, and this reserve keeps those blocks large enough for
     # both (the file's comment and Loader::relocate_host_tls in pe_loader.cpp explain the sizes).
     src/tls_reserve.cpp
+    # LEONIDA_THREAD_MAP: an in-process sampler for where the threads are (thread_sampler.h).
+    src/thread_sampler.cpp
     shims/registry.cpp
     shims/file_system.cpp
     shims/winhttp_offline.cpp

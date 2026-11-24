@@ -32,6 +32,7 @@
 #include "guest_asserts.h"
 #include "mods.h"
 #include "pe_loader.h"
+#include "thread_sampler.h"
 #include "../shims/d3d12_trace.h"
 #include "../shims/file_system.h"
 #include "../shims/process_shim.h"
@@ -49,8 +50,13 @@ const char* binding_name(rt::Binding b) {
     }
 }
 
-int usage() {
-    std::fprintf(stderr,
+// The loader, for the thread sampler's address resolution (thread_sampler.h): set once, read from the sampler thread.
+rt::Loader*& sampler_loader() {
+    static rt::Loader* loader = nullptr;
+    return loader;
+}
+
+int usage() {    std::fprintf(stderr,
                  "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace FILE]\n"
                  "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE]\n"
                  "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
@@ -148,6 +154,8 @@ int wmain(int argc, wchar_t** argv) {
                                    "this executable (docs/modding.md)\n", leonida::mods::active().size());
     }
     rt::d3d12_trace::set_enabled(trace_d3d12);
+    // LEONIDA_THREAD_MAP: where the process's threads are, from inside (thread_sampler.h). Off by default.
+    rt::thread_sampler::install();
     {
         char skip_asserts[16] = {};
         const DWORD n = GetEnvironmentVariableA("LEONIDA_SKIP_ASSERTS", skip_asserts, sizeof skip_asserts);
@@ -162,6 +170,13 @@ int wmain(int argc, wchar_t** argv) {
     try {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
+        // LEONIDA_THREAD_MAP: the sampler resolves addresses through the loader's own table, which is the only place a
+        // mapped console image can be looked up (the host's module list does not hold one).
+        sampler_loader() = &loader;
+        rt::thread_sampler::set_image_resolver([](std::uint64_t address, std::string& module, std::uint32_t& rva) {
+            const rt::Loader* const loader_here = sampler_loader();
+            return loader_here && loader_here->find_address(address, module, rva);
+        });
         // The mods' archetype swaps (docs/modding.md): hooked here, before any image code runs, when the lookup's RVA
         // for this executable is given. The count of redirected calls shows whether the RVA is the real lookup.
         if (view_mode_getter_rva) {

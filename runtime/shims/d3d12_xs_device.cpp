@@ -4453,10 +4453,39 @@ HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std
 HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t timeout_ms,
                                  std::uint64_t flags, std::uint64_t token_word) {
     (void)event;
-    (void)timeout_ms;
     (void)flags;
     auto* token = reinterpret_cast<std::uint64_t*>(token_word);
     if (!token) return E_POINTER;
+    // LEONIDA_XS_PACE: hold the waiting caller to the interval the title itself asked for with SetFrameIntervalX (the
+    // boot asks for 33333 us, i.e. 30 frames a second). Without it the frame origin is immediate and the title
+    // free-runs: measured 106-152 presents a second on the same frame, each one a submit and a present for the driver.
+    // The console's origin is a vblank, so sleeping to a deadline is the shape of the real thing; the thread that
+    // passes a zero timeout (the render thread taking a token without waiting) is left alone.
+    if (std::getenv("LEONIDA_XS_PACE") && timeout_ms != 0) {
+        const std::uint32_t interval = self->frame_interval_us.load(std::memory_order_relaxed);
+        if (interval > 0) {
+            LARGE_INTEGER frequency{}, now{};
+            QueryPerformanceFrequency(&frequency);
+            QueryPerformanceCounter(&now);
+            static std::mutex deadline_lock;
+            static std::uint64_t deadline = 0;
+            std::lock_guard guard(deadline_lock);
+            const std::uint64_t per_frame =
+                std::max<std::uint64_t>(1, static_cast<std::uint64_t>(frequency.QuadPart) * interval / 1000000ull);
+            // A deadline already in the past (a stall, a load) restarts from now instead of catching up frame by frame.
+            if (deadline == 0 || now.QuadPart > deadline + per_frame) deadline = now.QuadPart;
+            deadline += per_frame;
+            while (now.QuadPart < deadline) {
+                const std::uint64_t left_ms =
+                    (deadline - now.QuadPart) * 1000ull / static_cast<std::uint64_t>(frequency.QuadPart);
+                if (left_ms > 1)
+                    Sleep(static_cast<DWORD>(left_ms - 1));
+                else
+                    SwitchToThread();
+                QueryPerformanceCounter(&now);
+            }
+        }
+    }
     *token = self->frame_tokens->issue();
     return S_OK;
 }
@@ -5290,7 +5319,52 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
     // first call of a slot is announced, so a miss on a later program would otherwise read as the first call's.
     static std::atomic<std::uint64_t> calls{0};
     const std::uint64_t call = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    // LEONIDA_XS_PSO_CACHE: one pipeline per (bytecode, root signature), whatever the title asks for. The title creates
+    // this pipeline again and again from its worker threads -- 302 calls in 40 s, and the busy stacks named in
+    // docs/2026-11-25_title_spins_on_pipeline_state.md section 15.5 put thirteen threads inside
+    // PipelineState::create_compute under this function, i.e. inside the driver's compiler, for the whole session.
+    // Handing back the object the first call produced skips the driver completely: the console's pipeline state is a
+    // value too, and D3D12 lets one ID3D12PipelineState serve any number of calls.
+    const std::string key =
+        leonida::sha256_hex({static_cast<const std::uint8_t*>(pc_desc.CS.pShaderBytecode),
+                             pc_desc.CS.BytecodeLength}) +
+        "|" + std::to_string(reinterpret_cast<std::uintptr_t>(xbox_desc->root_signature));
+    // LEONIDA_LOG_SLOT67: what each call actually differs in. The title compiles hundreds of these and the cache never
+    // hits, so either the program bytes or the root signature changes on every call -- this says which.
+    if (std::getenv("LEONIDA_LOG_SLOT67")) {
+        static std::atomic<int> shown{0};
+        if (shown.fetch_add(1, std::memory_order_relaxed) < 24)
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 67 call %llu: code %s rs %p kind6 %llu B payload %zu B\n",
+                         static_cast<unsigned long long>(call), key.substr(0, 16).c_str(),
+                         static_cast<void*>(xbox_desc->root_signature),
+                         static_cast<unsigned long long>(xbox_desc->kind6_size), payload.size());
+    }
+    // One creation inside the driver at a time, and the cache under the same lock. The title compiles its pipelines
+    // from a pool of worker threads -- thirteen of them were inside PipelineState::create_compute at the same moment in
+    // the measured run -- and a driver that serialises pipeline creation anyway turns that into thirteen threads
+    // spinning inside amdvlk64.dll for the whole session (1600% of a core, docs section 15.5). Waiting here blocks the
+    // thread instead of spinning in there, and the cache means a repeat never reaches the driver at all.
+    static std::mutex create_lock;
+    static std::map<std::string, IUnknown*> cache;
+    std::lock_guard<std::mutex> create_guard(create_lock);
+    {
+        const auto found = cache.find(key);
+        if (found != cache.end()) {
+            found->second->AddRef();
+            *out = found->second;
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+                std::fprintf(stderr, "[rt] d3d12_xs: slot 67 reuses the pipeline of %s (call %llu)\n",
+                             key.substr(0, 16).c_str(), static_cast<unsigned long long>(call));
+            return S_OK;
+        }
+    }
     const HRESULT hr = self->real->CreateComputePipelineState(&pc_desc, *riid, out);
+    if (SUCCEEDED(hr) && *out) {
+        auto* created = static_cast<IUnknown*>(*out);
+        created->AddRef();  // the cache's own reference
+        cache.emplace(key, created);
+    }
     if (FAILED(hr)) {
         std::fprintf(stderr,
                      "[rt] d3d12_xs: slot 67 call %llu failed with 0x%08lx (kind 0 %llu B, kind 1 %llu B, kind 6 %llu B, "
