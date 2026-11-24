@@ -4374,6 +4374,24 @@ void log_slot70_null_once(const char* why, std::uint64_t texture_words, std::uin
                      static_cast<unsigned long long>(texture_words), static_cast<unsigned long long>(view_desc));
 }
 
+// LEONIDA_LOG_SLOT70: how many raw-word views resolve and how many become a null view. One null view is a texture a
+// shader can never sample, so a title that asks for these every frame and gets nulls has no textures at all -- and
+// the first line the null path logs cannot tell a one-off from every call.
+void note_slot70_outcome(bool ok, const char* why) {
+    if (!std::getenv("LEONIDA_LOG_SLOT70")) return;
+    static std::atomic<unsigned long long> good{0}, bad{0};
+    static std::atomic<unsigned long long> next_dump{0};
+    (ok ? good : bad).fetch_add(1, std::memory_order_relaxed);
+    const unsigned long long at = GetTickCount64();
+    unsigned long long expected = next_dump.load(std::memory_order_relaxed);
+    if (at < expected || !next_dump.compare_exchange_strong(expected, at + 2000, std::memory_order_relaxed)) return;
+    const unsigned long long created = good.exchange(0, std::memory_order_relaxed);
+    const unsigned long long nulled = bad.exchange(0, std::memory_order_relaxed);
+    if (created || nulled)
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 70 in the last 2 s: %llu view(s) written, %llu null view(s)%s\n",
+                     created, nulled, why && *why ? " (last reason logged once)" : "");
+}
+
 void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words, std::uint64_t view_desc,
                                  std::uint64_t destination) {
     note_slot(70);
@@ -4386,22 +4404,70 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
     const char* why = parse_raw_srv(texture_words, view_desc, shape);
     if (why || !self->resource_provider) {
         log_slot70_null_once(why ? why : "no resource provider", texture_words, view_desc);
+        note_slot70_outcome(false, why);
         write_null_srv(self, destination);
         return;
     }
+    // The address in the title's description is a console VA, and for an upload buffer it is the *host* address of the
+    // chunk the title was handed: the registry keys resources by the console VA the layer reports (a chunk's device
+    // address minus heap_base), so the address needs the same translation a root descriptor gets. Untranslated, every
+    // one of these views named an address no resource holds and became a null view -- measured 400 a second on
+    // 1.0.2.1 -- and a null view is a buffer no shader can ever read.
+    std::uint64_t va = upload_translate(self, shape.va);
     std::uint64_t start = 0, size = 0;
-    ID3D12Resource* resource = self->resource_provider(self->real, shape.va, shape.resource.Width, &start, &size);
-    if (!resource || shape.va < start || shape.va - start >= size) {
+    ID3D12Resource* resource = self->resource_provider(self->real, va, shape.resource.Width, &start, &size);
+    if (!resource || va < start || va - start >= size) {
+        // LEONIDA_SLOT70_WINDOW: a placed resource in a heap the title allocated itself lives at its console VA, which
+        // here is a host address of the title's own memory: the layer serves those bytes through a 4 MiB window
+        // (guest_translate), and that window is a layer resource like any other, so the same lookup finds it once the
+        // copy exists. Without this a buffer the title placed in its own heap names nothing, and every view built from
+        // it is a null view -- measured at 400 a second on 1.0.2.1, all of them null, and 0 with this on.
+        // Opt-in: the title's addresses advance a window per frame, and every window is a 4 MiB host-visible buffer
+        // that is never given back, so the copy costs about 800 MB/s of memory and halves the frame rate. Bounding the
+        // windows (a pool whose slots cannot be reused while the GPU may still read them) is the work that makes this
+        // the default.
+        const bool windowed = std::getenv("LEONIDA_SLOT70_WINDOW") != nullptr;
+        if (resource) {
+            resource->Release();
+            resource = nullptr;
+        }
+        const std::uint64_t window_va =
+            windowed ? guest_translate(self, shape.va, std::min<std::uint64_t>(shape.resource.Width, 4096)) : 0;
+        if (window_va) {
+            va = window_va;
+            resource = self->resource_provider(self->real, va, std::min<std::uint64_t>(shape.resource.Width, 4096),
+                                               &start, &size);
+        }
+    }
+    // LEONIDA_LOG_SLOT70=2: the address and width of every raw-word view that does not resolve, so the reason can be
+    // read: an arena offset no resource covers (the title named the wrong thing), title memory a mirror would have to
+    // carry (its own buffer), or an address from another space entirely.
+    if (std::getenv("LEONIDA_LOG_SLOT70") && (!resource || va < start || va - start >= size)) {
+        static std::atomic<unsigned long long> shown{0};
+        const unsigned long long nth = shown.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (nth <= 8 || nth % 500 == 0)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 70 unresolved #%llu: va 0x%llx (title 0x%llx) width %llu, resource %d, "
+                         "committed %d, arena 0x%llx\n",
+                         nth, static_cast<unsigned long long>(va),
+                         static_cast<unsigned long long>(shape.va),
+                         static_cast<unsigned long long>(shape.resource.Width), resource ? 1 : 0,
+                         leonida::is_committed(reinterpret_cast<const void*>(shape.va)) ? 1 : 0,
+                         static_cast<unsigned long long>(leonida::arena_host_size));
+    }
+    if (!resource || va < start || va - start >= size) {
         if (resource) resource->Release();
         log_slot70_null_once("no buffer holds the address", texture_words, view_desc);
+        note_slot70_outcome(false, "no buffer holds the address");
         write_null_srv(self, destination);
         return;
     }
-    const std::uint64_t offset = shape.va - start;
+    const std::uint64_t offset = va - start;
     const std::uint64_t elements = std::min<std::uint64_t>(shape.resource.Width, size - offset) / 4;
     if (offset % 4 || !elements || elements > UINT32_MAX) {
         resource->Release();
         log_slot70_null_once("address or width is not 4-byte aligned or too large", texture_words, view_desc);
+        note_slot70_outcome(false, "address or width is not 4-byte aligned or too large");
         write_null_srv(self, destination);
         return;
     }
@@ -4414,6 +4480,7 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
     view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     self->real->CreateShaderResourceView(resource, &view, D3D12_CPU_DESCRIPTOR_HANDLE{destination});
     resource->Release();
+    note_slot70_outcome(true, nullptr);
     static std::atomic<bool> logged{false};
     if (first_call(logged))
         std::fprintf(stderr, "[rt] d3d12_xs: slot 70 wrote a raw buffer view (va 0x%llx, first element %llu, %u elements)\n",

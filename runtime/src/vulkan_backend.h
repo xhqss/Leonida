@@ -12,6 +12,7 @@
 #include "binary_occlusion_spirv.h"
 #include "buffer_va_index.h"
 #include "guest_memory.h"
+#include "layer_profile.h"
 #include "occlusion_sum_spirv.h"
 #include "queue_holds.h"
 #include "retire_tickets.h"
@@ -2316,6 +2317,8 @@ private:
     }
 
     ReplayResult execute_now(std::span<const CommandList* const> lists) {
+        // LEONIDA_PROFILE_LAYER: how long one batch takes, drivers included (see layer_profile.h).
+        const leonida::layer_profile::Scope profile_scope(leonida::layer_profile::submit_slot);
         if (context_.is_device_lost() || !wait_for_room()) return ReplayResult::unsupported;
         if (std::getenv("LEONIDA_LOG_HELD")) {
             std::size_t commands = 0;

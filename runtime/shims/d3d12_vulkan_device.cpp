@@ -35,6 +35,7 @@
 #include "../src/vulkan13_features.h"
 #include "../src/pipeline_digest.h"
 #include "../src/arena_window.h"
+#include "../src/layer_profile.h"
 
 #include <vulkan/vulkan_win32.h>
 #ifdef _MSC_VER
@@ -1376,6 +1377,9 @@ struct DeviceState {
     VkDeviceMemory allocate(const VkMemoryRequirements& requirements, VkMemoryPropertyFlags required,
                             VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags* chosen = nullptr,
                             bool device_address = false, std::uint32_t* chosen_type = nullptr) const {
+        // LEONIDA_PROFILE_LAYER: a driver allocation is expensive (AMDVLK takes a global lock and sets up page
+        // tables), so a per-frame one shows up here as a large average with an idle GPU.
+        const leonida::layer_profile::Scope profile_scope(leonida::layer_profile::allocate_slot);
         VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
         flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
         for (const std::uint32_t i :
@@ -4023,6 +4027,8 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
+        // LEONIDA_PROFILE_LAYER: a compute pipeline costs what a graphics one does (layer_profile.h).
+        const leonida::layer_profile::Scope pipeline_scope(leonida::layer_profile::pipeline_slot);
         if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
             VK_SUCCESS)
             return E_FAIL;
@@ -4145,6 +4151,8 @@ private:
         // compiles shaders on its own worker threads, so a slow load shows up as CPU on those threads and only the
         // build wall time here says whether the title is waiting on compilation.
         const bool timed = std::getenv("LEONIDA_LOG_PIPELINE_TIME") != nullptr;
+        // LEONIDA_PROFILE_LAYER: the same build, timed for the per-slot report (see layer_profile.h).
+        const leonida::layer_profile::Scope pipeline_scope(leonida::layer_profile::pipeline_slot);
         LARGE_INTEGER started{};
         if (timed) QueryPerformanceCounter(&started);
         const VkResult built = device_.context->vk.vkCreateGraphicsPipelines(

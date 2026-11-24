@@ -398,6 +398,9 @@ public:
 
     VkResult submit(const ResourceBinding* binding, ResourceId source, bool vsync, const PresentRect* source_rect,
                     bool srgb, bool tear = false, const PresentPlanes* planes = nullptr) {
+        // LEONIDA_PROFILE_LAYER: a present that waits for the swapchain is the usual reason a title runs at a
+        // fraction of its frame rate with an idle GPU (see layer_profile.h).
+        const leonida::layer_profile::Scope profile_scope(leonida::layer_profile::present_slot);
         wait_for_room();
         std::lock_guard lock(present_mutex_);
         // `binding` null and `planes` null: clear instead of blit; `planes`: compose them (`binding`, `source`,

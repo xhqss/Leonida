@@ -223,3 +223,99 @@ user data: 0 0 0 0 0 0 0 0 | 0b96dea0 0 0 0 | 0 0 0 0     draw #4
       Where-Object { $_.CookedValue -gt 1 } | Format-Table InstanceName, CookedValue
   pwsh -NoProfile -File tmp\thread-sample.ps1 -ProcessId <pid> -Top 10    # 必须用 pwsh 7，5.1 读不了带中文的脚本
   ```
+
+---
+
+## 8. 追加：第二轮的下一步做完了 —— 层的同步开销被排除，找到一个系统性错误
+
+### 8.1 `LEONIDA_PROFILE_LAYER`：层自己一点都不忙
+
+新探针（`runtime/src/layer_profile.h`）给四个"真的要碰驱动"的操作加了计时，每 2 秒打印
+调用数 / 平均 / 最差（毫秒）。稳定期实测：
+
+```
+[rt] profile: submit       878 calls,    0.13 ms each, worst    0.38 ms
+[rt] profile: present      439 calls,    0.60 ms each, worst    2.01 ms
+（allocate / pipeline 只有在启动期才出现）
+```
+
+也就是说层每秒约 440 次 submit × 0.13 ms + 220 次 present × 0.60 ms ≈ **0.2 个核**。
+而同一进程实测 CPU **12–13 核**、且 300 秒内线性增长（3692 s / 300 s = 12.3 核），
+**永不衰减**；GPU 3D 引擎 8%。⇒ 那些 CPU 全部烧在 `amdvlk64.dll` 自己的线程里，
+**不是 layer 的同步开销**，也不是"PSO 编译积压"（管线创建在头 ~10 秒的洪水之后完全停止）。
+
+`tmp/thread-map.ps1` 把 96 个线程全部映射到 RIP：13 个在 100%，其中 6 个卡在
+`amdvlk64.dll` 同一个 2 条指令的自旋循环里（`+0x77fe224` / `+0x77fe228`），
+另有 1 个在 `ntdll` 里空转，其余在 amdvlk 各处。这是驱动内部的线程池行为，
+**它的浪费是真的，但它不是"没有画面"的原因**（标题仍在 200 presents/s 地出帧）。
+
+### 8.2 找到真正的系统性错误：**每一个 raw-word SRV 都是 null view**
+
+设备 slot 70（Xbox "从原始描述符字创建 SRV"）每秒被调用 **400–500 次**。
+`LEONIDA_LOG_SLOT70` 的计数结果是：
+
+```
+[rt] d3d12_xs: slot 70 in the last 2 s: 0 view(s) written, 576 null view(s)
+[rt] d3d12_xs: slot 70 in the last 2 s: 0 view(s) written, 443 null view(s)
+...
+```
+
+**成功率 0%。** 每次调用都落到 `write_null_srv`。null view 是着色器永远读不到的缓冲区。
+
+原因（`LEONIDA_LOG_SLOT70=2` 打印的地址）：
+
+```
+slot 70 unresolved #1: va 0x4de0bf0000 (title 0x4de0bf0000) width 182452224, resource 0, committed 1
+slot 70 unresolved #2: va 0x80001b80 width 160, resource 0
+slot 70 unresolved #3: va 0x4de0c2de20 width 128, resource 0
+```
+
+`0x4de0bf0000` + 182,452,224 字节正是标题放在**它自己 XMem 堆**里的那个 placed buffer
+（`slot 133 placed resource at VA 0x4de0bf0000`）。层的 `buffer_vas_` 按**层的 console VA**
+（arena 偏移）索引，而标题给的是**它自己的主机地址**：两个地址空间，查不到，
+所以 `resource_provider` 返回空 → null view。
+
+### 8.3 已经落地的修法（opt-in）与代价
+
+在 slot 70 里补上"标题内存窗口"回退：直接查失败时，用 `guest_translate` 把那些标题字节
+拷进一个 4 MiB 窗口，再按窗口的 console VA 查一次（窗口本身就是一个 layer 资源）。
+
+`LEONIDA_SLOT70_WINDOW=1` 时的效果：
+
+```
+[rt] d3d12_xs: slot 70 in the last 2 s: 520 view(s) written, 38 null view(s)
+[rt] d3d12_xs: slot 70 in the last 2 s: 477 view(s) written, 0 null view(s)
+```
+
+**从 0 成功变成每秒 ~450 个真 view、0 个 null。** 这是本轮唯一真正"修好一个功能"的改动。
+
+但**默认关**，因为代价太大：标题的地址每帧前进一个窗口（`0x4de0c00000` → `0x4de1000000` …），
+每个窗口是一个 4 MiB 的 host-visible buffer 且**永不释放** ⇒ 约 800 MB/s 的内存增长，
+实测 presents 从 ~106/s 掉到 ~52/s。要把它变成默认，需要**给窗口做有界池**
+（槽位在 GPU 可能还在读时不能复用），这是下一件该做的事。
+
+`XS_TABLE_MIRROR` + `XS_DESC_SYNC` 这个组合也试过了：表字节进 arena 之后合成 VS 立刻按真描述符
+解出 `0x80800000004` 这类 base → **device fault**（`console VA 0x80800000000`）。
+所以"镜像表"必须先解决"表里的 V# 不是按 gfx10 写的"这件事，和 §8.2 是同一个地址空间问题的两面。
+
+### 8.4 现在的优先级
+
+1. **给标题内存窗口做有界池**，让 `LEONIDA_SLOT70_WINDOW` 能默认打开（现在它每次新建一个
+   4 MiB buffer，是纯泄漏）。一个可用的做法：池固定 N 个 4 MiB 窗口，按"提交序号"回收——
+   记录每个槽位最后一次被哪一次提交引用，只有当那次提交的 fence 已经完成才复用。
+2. **把同样的窗口回退用到描述符表上**（`XS_TABLE_*`），表 VA 就是标题地址；这和 §8.2 是同一套
+   翻译，只是对象从 buffer 变成表。
+3. 然后才回到"表里的 V#/T# 是不是 gfx10 编码"（§6.2）——用 `LEONIDA_FALLBACK_TINT` 判读。
+4. `amdvlk` 那 12 个自旋线程：确定是不是驱动 bug（例如同一次 `vkQueueSubmit` 的锁竞争）。
+   如果它确实只是浪费，那么它不阻塞进度，可以在最后处理。
+
+### 8.5 本轮新增开关
+
+| 名字 | 位置 | 作用 |
+| --- | --- | --- |
+| `LEONIDA_PROFILE_LAYER` | `runtime/src/layer_profile.h` | submit / present / allocate / pipeline 的调用数、平均与最差耗时（每 2 s） |
+| `LEONIDA_LOG_SLOT70` | `d3d12_xs_device.cpp` | `=1` 打印 raw-word view 的成功/null 计数；`=2` 还打印解析不到的地址、宽度、是否 committed |
+| `LEONIDA_SLOT70_WINDOW` | `d3d12_xs_device.cpp` | 用标题内存窗口回退解析 raw-word view 的地址（有内存代价，见 §8.3） |
+| `tmp/thread-map.ps1` | `tmp/` | 把进程**全部**线程映射到 模块+RVA，并按地址聚合计数（找自旋/锁竞争） |
+| `tmp/thread-stack.ps1` | `tmp/` | 读最热线程的栈切片，统计栈上各模块的返回地址数（判断是不是层调进去的） |
+
