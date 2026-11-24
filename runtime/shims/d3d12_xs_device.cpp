@@ -5342,11 +5342,11 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
                          static_cast<void*>(xbox_desc->root_signature),
                          static_cast<unsigned long long>(xbox_desc->kind6_size), payload.size());
     }
-    // One creation inside the driver at a time, and the cache under the same lock. The title compiles its pipelines
-    // from a pool of worker threads -- thirteen of them were inside PipelineState::create_compute at the same moment in
-    // the measured run -- and a driver that serialises pipeline creation anyway turns that into thirteen threads
-    // spinning inside amdvlk64.dll for the whole session (1600% of a core, docs section 15.5). Waiting here blocks the
-    // thread instead of spinning in there, and the cache means a repeat never reaches the driver at all.
+    // One creation inside the driver at a time, and the cache under the same lock. Measured both ways on this side:
+    // with the lock the run holds 231% of a core and 10560 presents in 40 s; without it the thirteen worker threads
+    // are back inside amdvlk spinning and it is 1332% of a core and 5460 presents in 60 s. The graphics side is the
+    // opposite (its states are almost all distinct, so serialising them only removes parallelism, see
+    // proxy_create_pipeline_state): the two sides are not the same workload and are not treated the same.
     static std::mutex create_lock;
     static std::map<std::string, IUnknown*> cache;
     std::lock_guard<std::mutex> create_guard(create_lock);
