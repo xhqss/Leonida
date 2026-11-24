@@ -2751,15 +2751,19 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 a2 = shader_address(self->device, a2, 64 << 10);  // a root CBV/SRV/UAV: at most a 64 KiB buffer
                 if (std::getenv("LEONIDA_LOG_ROOT")) {
                     static std::atomic<int> logged{0};
-                    if (logged.fetch_add(1, std::memory_order_relaxed) < 6) {
-                        std::uint32_t words[8] = {};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 2) {
+                        std::uint32_t words[32] = {};
                         leonida::copy_committed(reinterpret_cast<std::uint8_t*>(words), source, sizeof(words));
                         std::fprintf(stderr,
-                                     "[rt] root descriptor %u: 0x%llx -> 0x%llx; first words %08x %08x %08x %08x "
-                                     "%08x %08x %08x %08x\n",
+                                     "[rt] root descriptor %u: 0x%llx -> 0x%llx; 32 words %08x %08x %08x %08x %08x "
+                                     "%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x "
+                                     "%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
                                      unsigned(Slot), static_cast<unsigned long long>(source),
                                      static_cast<unsigned long long>(a2), words[0], words[1], words[2], words[3],
-                                     words[4], words[5], words[6], words[7]);
+                                     words[4], words[5], words[6], words[7], words[8], words[9], words[10],
+                                     words[11], words[12], words[13], words[14], words[15], words[16], words[17],
+                                     words[18], words[19], words[20], words[21], words[22], words[23], words[24],
+                                     words[25], words[26], words[27], words[28], words[29], words[30], words[31]);
                     }
                 }
             } else if constexpr (Slot == 47) {

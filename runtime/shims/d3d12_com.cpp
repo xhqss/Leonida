@@ -1370,9 +1370,12 @@ private:
         if (!p) return;
         const std::uint32_t first = first_dword(state, *p);
         write(state, first, std::uint32_t(va));
-        // In the compute layout a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
-        // live below 4 GiB); a root view keeps both halves. The graphics layout gives every address two dwords.
-        if (!(is_compute(state) && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
+        // A console layout gives a descriptor table ONE dword, the 32-bit VA of its first descriptor (the heaps live
+        // below 4 GiB); a root view keeps both halves in every layout, and the root-order graphics fallback gives a
+        // table two dwords as well.
+        const bool console_layout = is_compute(state) || (state.layout && state.layout->graphics_console);
+        if (!(console_layout && type == rt::rootsig::ParamType::Table))
+            write(state, first + 1, std::uint32_t(va >> 32));
     }
 
     D3D12_COMMAND_LIST_TYPE type_;

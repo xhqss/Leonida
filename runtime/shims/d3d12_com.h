@@ -358,8 +358,11 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
 // Where each root parameter's arguments go in the 32 user-data dwords the translated shaders read (docs section
 // 3.5). Built when a Vulkan device creates the root signature. A signature can be bound at either bind point, so it
 // carries both layouts:
-//   - graphics: rt::rootsig::pack() (from s0, two dwords per table; D3D-448 keeps it until per-stage user-data windows
-//     exist, because a mesh shader (s16) and a pixel shader (s8) share one push-constant block);
+//   - graphics: rt::rootsig::pack_stage(Stage::Vertex), the console layout every translated vertex, pixel and geometry
+//     shader reads (from s8, one dword per table; docs/d3d12_vulkan.md section 3.5). A signature this layout cannot
+//     place falls back to rt::rootsig::pack() (from s0, two dwords per table), and graphics_console says which one it
+//     got. A mesh shader reads from s16 and needs per-stage user-data windows that the translator does not emit yet;
+//     a pipeline with a mesh stage is not covered by either layout.
 //   - compute: rt::rootsig::pack_stage(Stage::Compute), the measured console layout (from s4, one dword per table).
 // A layout that refuses the signature is marked unusable; binding the signature there invalidates the list.
 struct RootArgumentLayout {
@@ -373,6 +376,9 @@ struct RootArgumentLayout {
     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
     bool graphics_ok = true;
     bool compute_ok = true;
+    // True when the graphics offsets are the console layout (one dword per descriptor table); false for the pack()
+    // fallback, which gives every address two dwords.
+    bool graphics_console = false;
 };
 
 // For the command list: the argument layout of a root signature from a Vulkan device, and the id it records for a

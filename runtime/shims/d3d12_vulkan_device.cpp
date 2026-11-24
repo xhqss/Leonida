@@ -3379,6 +3379,8 @@ public:
         const leonida::Depth24Bias depth24_bias{desc.RasterizerState.DepthBias,
                                                 desc.RasterizerState.SlopeScaledDepthBias,
                                                 desc.RasterizerState.DepthBiasClamp};
+        const bool log_stage_names = std::getenv("LEONIDA_LOG_SHADERHASH") != nullptr;
+        std::string stage_names;  // LEONIDA_LOG_SHADERHASH: filled per stage, printed with the pipeline handle
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
             stage.fssm = leonida::fssm_program(
@@ -3402,11 +3404,14 @@ public:
             }
             // LEONIDA_LOG_SHADERHASH: the translated stage a pipeline uses, by the FSSM hash the corpus names it with,
             // so the .spvasm of a shader that draws nothing can be read (shaders/spirv-*/<hash>.spvasm).
-            if (std::getenv("LEONIDA_LOG_SHADERHASH")) {
-                static std::atomic<int> logged{0};
-                if (logged.fetch_add(1, std::memory_order_relaxed) < 12)
-                    std::fprintf(stderr, "[rt] pipeline %s: %s (%u binding(s))\n", stage.name, stage.entry->name.c_str(),
-                                 stage.entry->binding_count);
+            if (log_stage_names) {
+                stage_names += stage.name;
+                stage_names += '=';
+                stage_names += stage.entry->name;
+                stage_names += '(';
+                stage_names += std::to_string(stage.entry->binding_count);
+                stage_names += " bindings) ";
+                recipe_.stage_names = stage_names;
             }
             if (stage.entry->binding_count) {
                 if (!device_.bindless) {
@@ -3435,6 +3440,17 @@ public:
             }
             stage.words = library->spirv(*stage.entry);
             if (stage.words.empty()) return E_FAIL;
+            // LEONIDA_LOG_MODULE: which bytes a pipeline's stage was built from, so a patched corpus module can be told
+            // apart from the one the runtime actually reads.
+            if (std::getenv("LEONIDA_LOG_MODULE")) {
+                static std::atomic<int> shown{0};
+                if (shown.fetch_add(1, std::memory_order_relaxed) < 400) {
+                    const std::string module_hash = leonida::sha256_hex(
+                        {reinterpret_cast<const std::uint8_t*>(stage.words.data()), stage.words.size() * 4});
+                    std::fprintf(stderr, "[rt] module %s: %zu words, sha256 %s\n", stage.entry->name.c_str(),
+                                 stage.words.size(), module_hash.substr(0, 16).c_str());
+                }
+            }
             const auto inner = leonida::conservative_raster::inner_coverage_requirements(stage.words);
             if (!inner.valid) return E_INVALIDARG;
             if (inner.fully_covered &&
@@ -4001,6 +4017,7 @@ private:
     // What a graphics pipeline is made from, so variants can be built at draw time.
     struct Recipe {
         bool mesh = false;  // no vertex input or input assembly state, and no dynamic topology or strides
+        std::string stage_names;  // LEONIDA_LOG_SHADERHASH: "vs=<hash>(n bindings) ..." for the pipeline log
         std::vector<VkPipelineShaderStageCreateInfo> stages;
         // One per entry of create_graphics's stage table (VS, GS, PS), static_assert there; what `stages` chain.
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[3]{};
@@ -4125,7 +4142,25 @@ private:
                                  g_pipeline_states_live.load(std::memory_order_relaxed));
             }
         }
-        if (built != VK_SUCCESS) return VK_NULL_HANDLE;
+        if (built != VK_SUCCESS) {
+            // LEONIDA_LOG_PIPELINE_FAIL: the driver refused a pipeline (a feature a translated module needs, a limit,
+            // a shader it could not compile); a draw then has no pipeline and paints nothing.
+            if (std::getenv("LEONIDA_LOG_PIPELINE_FAIL")) {
+                static std::atomic<int> failures{0};
+                const int nth = failures.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (nth <= 5 || nth % 5000 == 0)
+                    std::fprintf(stderr, "[rt] d3d12: vkCreateGraphicsPipelines failed: %d, failure %d: %s\n",
+                                 int(built), nth, recipe_.stage_names.c_str());
+            }
+            return VK_NULL_HANDLE;
+        }
+        // LEONIDA_LOG_SHADERHASH: which translated stages a pipeline handle is built from, so a draw logged by
+        // LEONIDA_LOG_REPLAY_DRAW names its shaders by the corpus hash they are stored under.
+        if (std::getenv("LEONIDA_LOG_SHADERHASH")) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 200000)
+                std::fprintf(stderr, "[rt] pipeline %p: %s\n", static_cast<void*>(pipeline), recipe_.stage_names.c_str());
+        }
         return pipeline;
     }
 
@@ -6012,50 +6047,68 @@ public:
             std::fprintf(stderr, "[rt] d3d12: root signature not understood: %s\n", parsed.error.c_str());
             return E_INVALIDARG;
         }
+        // Two layouts, one per bind point (RootArgumentLayout): graphics takes the console layout of the stage every
+        // translated vertex, pixel and geometry shader reads from -- pack_stage(Stage::Vertex): base s8, one dword per
+        // descriptor table -- because that is where the shaders look for their root arguments (corpus index.json
+        // `user_sgpr_reads`: the lowest pointer SGPR is s8 in 1,660 of 2,236 VS and 9,830 of 12,101 PS). A signature
+        // that layout cannot place falls back to the root-order pack() (from s0, two dwords per table). Compute takes
+        // pack_stage(Stage::Compute) (D3D-448). The signature is refused only when neither bind point can place it.
+        const rt::rootsig::PackResult packed = rt::rootsig::pack(parsed.sig);
+        const rt::rootsig::StagePackResult vertex = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Vertex);
+        const rt::rootsig::StagePackResult compute = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Compute);
+        const bool graphics_console = vertex.ok;
+        const bool graphics_ok = vertex.ok || packed.ok;
+        if (!graphics_ok && !compute.ok) {
+            std::fprintf(stderr, "[rt] d3d12: root signature refused: %s (compute: %s)\n", vertex.error.c_str(),
+                         compute.error.c_str());
+            return E_INVALIDARG;
+        }
+        if (!graphics_ok)
+            std::fprintf(stderr, "[rt] d3d12: root signature usable for compute only: %s\n", vertex.error.c_str());
+        if (graphics_ok && !graphics_console)
+            std::fprintf(stderr,
+                         "[rt] d3d12: root signature keeps the root-order graphics layout (from user dword 0), not "
+                         "the console one the shaders read (base s8): %s\n", vertex.error.c_str());
+        if (!compute.ok)
+            std::fprintf(stderr, "[rt] d3d12: root signature usable for graphics only: %s\n", compute.error.c_str());
+        RootArgumentLayout layout;
+        layout.flags = parsed.sig.flags;
+        layout.graphics_ok = graphics_ok;
+        layout.compute_ok = compute.ok;
+        layout.graphics_console = graphics_console;
+        for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
+            std::uint32_t first = UINT32_MAX;
+            if (graphics_console) {
+                first = vertex.first_sgpr[i];
+            } else {
+                for (std::uint32_t d = 0; packed.ok && d < packed.dword_count; ++d)
+                    if (packed.provenance[d].param_index == i) {
+                        first = d;
+                        break;
+                    }
+            }
+            layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
+                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr});
+        }
         // LEONIDA_LOG_ROOTSIG: the parameters of a signature and the user-SGPR offset each is packed at, so a shader
         // that reads user SGPRs the signature does not place there (corpus index.json records user_sgpr_reads) can be
         // compared with the packing.
         if (std::getenv("LEONIDA_LOG_ROOTSIG")) {
             static std::atomic<int> logged{0};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
-                std::fprintf(stderr, "[rt] root signature: %zu parameter(s)\n", parsed.sig.params.size());
-                std::uint32_t at = 0;
+                std::fprintf(stderr, "[rt] root signature: %zu parameter(s), graphics layout %s\n",
+                             parsed.sig.params.size(),
+                             layout.graphics_console ? "console (base s8, one dword per table)"
+                                                     : "root-order (from s0, two dwords per table)");
                 for (std::size_t i = 0; i < parsed.sig.params.size() && i < 16; ++i) {
                     const auto& p = parsed.sig.params[i];
-                    std::fprintf(stderr, "[rt] root signature:  %zu: type %d, %u value(s), packed at user dword %u\n", i,
-                                 int(p.type), p.num_values, at);
-                    at += p.type == rt::rootsig::ParamType::Descriptor ? 2
-                        : p.type == rt::rootsig::ParamType::Table      ? 1
-                                                                      : p.num_values;
+                    std::fprintf(stderr,
+                                 "[rt] root signature:  %zu: type %d, %u value(s), graphics user dword %u, compute "
+                                 "user sgpr %u\n",
+                                 i, int(p.type), p.num_values, layout.parameters[i].user_offset,
+                                 layout.parameters[i].compute_offset);
                 }
             }
-        }
-        // Two layouts, one per bind point (RootArgumentLayout): graphics keeps pack(), compute takes the console
-        // layout pack_stage() measured (D3D-448). The signature is refused only when neither can place it.
-        const rt::rootsig::PackResult packed = rt::rootsig::pack(parsed.sig);
-        const rt::rootsig::StagePackResult compute = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Compute);
-        if (!packed.ok && !compute.ok) {
-            std::fprintf(stderr, "[rt] d3d12: root signature refused: %s (compute: %s)\n", packed.error.c_str(),
-                         compute.error.c_str());
-            return E_INVALIDARG;
-        }
-        if (!packed.ok)
-            std::fprintf(stderr, "[rt] d3d12: root signature usable for compute only: %s\n", packed.error.c_str());
-        if (!compute.ok)
-            std::fprintf(stderr, "[rt] d3d12: root signature usable for graphics only: %s\n", compute.error.c_str());
-        RootArgumentLayout layout;
-        layout.flags = parsed.sig.flags;
-        layout.graphics_ok = packed.ok;
-        layout.compute_ok = compute.ok;
-        for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
-            std::uint32_t first = UINT32_MAX;
-            for (std::uint32_t d = 0; packed.ok && d < packed.dword_count; ++d)
-                if (packed.provenance[d].param_index == i) {
-                    first = d;
-                    break;
-                }
-            layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
-                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr});
         }
         register_static_samplers(parsed.sig);
         auto* signature = new RootSignature(

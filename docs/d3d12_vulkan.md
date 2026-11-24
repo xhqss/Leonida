@@ -1730,12 +1730,15 @@ below 4 GiB). A parameter that does not fit goes, with every later one, to the s
 - **Vertex/pixel/geometry s8 and mesh s16: a hypothesis.** It rests on the census above only; no signature
   confirms these bases, and visibility is not modelled (every parameter takes its place in every stage).
 
-The runtime uses the console layout for the **compute** bind point only. Graphics keeps `pack()`: every stage of a
+The runtime uses the console layout at **both** bind points: compute as above, and graphics with the vertex stage's
+base s8 (`pack_stage(Stage::Vertex)`); a signature that layout cannot place falls back to `pack()` (from s0, two
+dwords per table) and logs which one it got. The reason graphics used to keep `pack()` was that every stage of a
 pipeline reads `s0..s31` from one push-constant block at offset 0 (`tools/rdna2spirv.py`, `ShaderUserData` in
 `runtime/src/vulkan_replay.h`), so a mesh shader (base s16) and a pixel shader (base s8) in one pipeline would need
-the same root argument at two offsets. That needs per-stage user-data windows in the translator's push-constant
-contract (D3D-448 follow-up). A root signature carries both layouts; one that only one of them can place is
-created, and binding it at the other bind point invalidates the command list (`Close` returns `E_INVALIDARG`).
+the same root argument at two offsets. Vertex, pixel and geometry shaders all read from s8, so one block at that base
+serves them; a pipeline with a mesh stage still needs per-stage user-data windows in the translator's push-constant
+contract (D3D-448 follow-up) and is not covered. A root signature carries both layouts; one that only one of them can
+place is created, and binding it at the other bind point invalidates the command list (`Close` returns `E_INVALIDARG`).
 `s0..s3` of a compute dispatch are the driver's block; the layer leaves them zero (109 CS read `s1` as a constant,
 42 `s3`; their meaning is open).
 
