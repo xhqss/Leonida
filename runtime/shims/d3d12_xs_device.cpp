@@ -4721,11 +4721,25 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     static std::atomic<bool> desc_logged{false};
     if (desc && first_call(desc_logged)) {
         const auto* words = reinterpret_cast<const std::uint32_t*>(desc);
+        // The console form of CreateDescriptorHeap may carry the heap's console address and size in the two qwords
+        // after the 16-byte PC description (upstream #313, reported by 3630610ca). Print them when that tail is
+        // readable: a non-zero, arena-sized address there is the value the title later expects the heap's CPU handle to
+        // equal (docs/retail_boot_chain.md stop 13), and it is what this shim is missing.
+        std::uint64_t tail_address = 0, tail_size = 0;
+        const auto* tail = reinterpret_cast<const std::uint8_t*>(desc) + sizeof(D3D12_DESCRIPTOR_HEAP_DESC);
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(tail, &info, sizeof(info)) == sizeof(info) && info.State == MEM_COMMIT &&
+            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0)
+            std::memcpy(&tail_address, tail, sizeof(tail_address));
+        if (VirtualQuery(tail + sizeof(tail_address), &info, sizeof(info)) == sizeof(info) &&
+            info.State == MEM_COMMIT && (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0)
+            std::memcpy(&tail_size, tail + sizeof(tail_address), sizeof(tail_size));
         std::fprintf(stderr,
                      "[rt] d3d12_xs: slot 14 heap desc: type %u descriptors %u flags 0x%x node mask 0x%x (raw %08x %08x "
-                     "%08x %08x)\n",
+                     "%08x %08x); tail +0x10 0x%llx +0x18 0x%llx\n",
                      static_cast<unsigned>(desc->Type), desc->NumDescriptors, static_cast<unsigned>(desc->Flags),
-                     desc->NodeMask, words[0], words[1], words[2], words[3]);
+                     desc->NodeMask, words[0], words[1], words[2], words[3],
+                     static_cast<unsigned long long>(tail_address), static_cast<unsigned long long>(tail_size));
     }
     // No output: a capability check, answered by the device (S_FALSE, as on the PC).
     if (!out) return self->real->CreateDescriptorHeap(desc, *riid, nullptr);
