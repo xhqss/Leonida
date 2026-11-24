@@ -383,7 +383,16 @@ public:
         }
         vk_.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
                                  nullptr, 0, nullptr, std::uint32_t(barriers.size()), barriers.data());
-        const VkClearColorValue zero{};
+        VkClearColorValue zero{};
+        // LEONIDA_FALLBACK_TINT: clear the 1x1 fallbacks to magenta instead of zero. A T#/S# the hash table does not
+        // resolve samples index 0, so a frame that turns magenta where content belongs says the lookup missed, while a
+        // frame that stays black says the sampled index resolved and its image really is black.
+        const char* tint = std::getenv("LEONIDA_FALLBACK_TINT");
+        if (tint && tint[0] && tint[0] != '0') {
+            zero.float32[0] = 1.0f;
+            zero.float32[2] = 1.0f;
+            zero.float32[3] = 1.0f;
+        }
         for (const auto& barrier : barriers)
             vk_.vkCmdClearColorImage(command_buffer, barrier.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1,
                                      &barrier.subresourceRange);

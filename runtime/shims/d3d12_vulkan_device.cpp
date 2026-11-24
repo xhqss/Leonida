@@ -1739,6 +1739,11 @@ public:
     D3D12_GPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE GetGPUDescriptorHandleForHeapStart() override {
         if (!(desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) return {0};
         if (!in_arena_) log_once("shader-visible heap without a GPU address arena; flags", int(desc_.Flags));
+        // LEONIDA_XS_GPU_HANDLE_ARENA: on the console a heap's CPU and GPU handles are the same address, because the
+        // heap's slots are memory a shader reads. Handing out the arena's host mapping as the GPU handle makes that
+        // true here as well: the title's own writes to `handle + n * size` land in the very slots the shader loads,
+        // and the table VA it later binds is that same number (the shim turns it back into an arena offset).
+        if (in_arena_ && std::getenv("LEONIDA_XS_GPU_HANDLE_ARENA")) return {reinterpret_cast<SIZE_T>(cpu_)};
         return {in_arena_ ? UINT64(arena_offset_) : 0};
     }
 
@@ -6166,6 +6171,29 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid,
                                                           void** out) override {
+        // LEONIDA_LOG_PSO_SPAM: whether the title is asking for the same pipeline over and over. A run that builds
+        // thousands of pipelines a second and keeps them all live is not rendering: it is retrying something. The
+        // count of distinct descriptions among the last window says which: one repeated description means the title
+        // never accepts the pipeline it got, many distinct ones mean it is enumerating variants.
+        if (std::getenv("LEONIDA_LOG_PSO_SPAM") && desc) {
+            static std::mutex spam_mutex;
+            static std::map<std::string, unsigned> spam_keys;
+            static unsigned long long spam_calls = 0;
+            static unsigned spam_distinct = 0;
+            static unsigned long long spam_next = 1;
+            const std::string key = pipeline_key(*desc);
+            std::lock_guard lock(spam_mutex);
+            ++spam_calls;
+            if (spam_keys.emplace(key, 0).second) ++spam_distinct;
+            ++spam_keys[key];
+            if (spam_calls >= spam_next) {
+                std::fprintf(stderr,
+                             "[rt] d3d12: pipeline spam: %llu CreateGraphicsPipelineState, %u distinct descriptions "
+                             "in all, %zu tracked; first key %.16s\n",
+                             spam_calls, spam_distinct, spam_keys.size(), key.c_str());
+                spam_next = spam_calls * 2;
+            }
+        }
         if (!out) return E_POINTER;
         *out = nullptr;
         if (!desc) return E_INVALIDARG;
@@ -6306,6 +6334,20 @@ public:
         pipeline->attach_device(identity());
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
                                          : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as);
+        // LEONIDA_LOG_PIPELINE_UNIQUE also reports what the title is told: a run that retries CreatePipelineState
+        // thousands of times a second either gets a failure back or keeps every pipeline alive, and the two need
+        // different fixes.
+        if (std::getenv("LEONIDA_LOG_PIPELINE_UNIQUE")) {
+            static std::atomic<unsigned long long> good{0};
+            static std::atomic<unsigned long long> bad{0};
+            static std::atomic<unsigned long long> next_report{1};
+            (FAILED(hr) ? bad : good).fetch_add(1, std::memory_order_relaxed);
+            const unsigned long long total = good.load(std::memory_order_relaxed) + bad.load(std::memory_order_relaxed);
+            unsigned long long expected = next_report.load(std::memory_order_relaxed);
+            if (total >= expected && next_report.compare_exchange_strong(expected, total * 2, std::memory_order_relaxed))
+                std::fprintf(stderr, "[rt] d3d12: CreatePipelineState results: %llu created, %llu failed\n",
+                             good.load(std::memory_order_relaxed), bad.load(std::memory_order_relaxed));
+        }
         if (FAILED(hr)) {
             pipeline->Release();
             return d3d12_trace::result(method, hr);

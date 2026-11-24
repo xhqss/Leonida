@@ -29,6 +29,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_alloc_size.h"
 #include "d3d12_xs_desc_clean.h"
+#include "write_watch.h"
 #include "../src/frame_pacer.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
@@ -356,6 +357,67 @@ void sanitize_table_window(std::uint8_t* window, std::uint64_t bytes, std::uint6
                      static_cast<unsigned long long>(table_va), zeroed);
 }
 
+// LEONIDA_XS_TABLE_MIRROR / LEONIDA_XS_MIRROR_BASES: copy the title's own bytes into the GPU address arena at the same
+// offset, so the shader's `heap_base + va` reaches them with no address rewritten.
+//
+// A console descriptor table is title memory, and the title passes its address as the console VA (CPU and GPU share one
+// address space). The arena stands in for that space and its offsets are the same numbers, so as long as the arena is
+// large enough to hold the VA, the bytes can be mirrored in place: the shader reads heap_base + va and gets exactly what
+// the title wrote. That is what makes a title's hand-built table work -- no window, no rewritten descriptor, and the
+// descriptor bytes stay identical to the ones the bindless table was keyed with.
+//
+// LEONIDA_XS_MIRROR_BASES also mirrors the 4 KiB behind each V# in the table: a V# base is an address a shader loads
+// from (the composite VS reads its 4x4 position matrix from one), so those bytes have to be in the arena too. A T# base
+// is a hash key, never an address, so it is left alone.
+constexpr std::uint64_t kMirrorTableBytes = 64 << 10;
+constexpr std::uint64_t kMirrorBaseBytes = 4 << 10;
+
+// Mirrors [va, va + bytes) into the arena at the same offset; false when it cannot be (not title memory, or past the
+// arena). `what` names the caller in the log line.
+bool mirror_title_bytes(std::uint64_t va, std::uint64_t bytes) {
+    if (!va || !leonida::arena_host_base || !leonida::arena_host_size || va >= leonida::arena_host_size) return false;
+    if (!leonida::is_committed(reinterpret_cast<const void*>(va))) return false;
+    const std::uint64_t room = leonida::arena_host_size - va;
+    const std::uint64_t n = std::min(bytes, room);
+    if (!n) return false;
+    leonida::copy_committed(leonida::arena_host_base + va, va, n);
+    return true;
+}
+
+// The VA a shader must be handed for the root table `table_va`: the VA itself once its bytes (and, with
+// LEONIDA_XS_MIRROR_BASES, the bytes behind its V#s) are in the arena, 0 when the table could not be mirrored.
+std::uint64_t mirror_table(DeviceProxy* device, std::uint64_t table_va, const char* what) {
+    if (!device) return 0;
+    const std::uint64_t bytes =
+        std::min<std::uint64_t>(kMirrorTableBytes, leonida::arena_host_size - std::min(table_va, leonida::arena_host_size));
+    if (!bytes || !mirror_title_bytes(table_va, bytes)) return 0;
+    static std::atomic<int> logged{0};
+    const int nth = logged.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (nth <= 8)
+        std::fprintf(stderr, "[rt] table mirror %s: 0x%llx (%llu bytes) into the arena at the same offset\n", what,
+                     static_cast<unsigned long long>(table_va), static_cast<unsigned long long>(bytes));
+    if (!std::getenv("LEONIDA_XS_MIRROR_BASES")) return table_va;
+    // The descriptors are a 32-byte grid and a V# is worth mirroring only when its base is title memory the shader
+    // would read: one V# can be the position matrix (64 bytes), another a vertex buffer. Each base takes a page.
+    static std::atomic<int> bases{0};
+    const auto* words = reinterpret_cast<const std::uint32_t*>(leonida::arena_host_base + table_va);
+    int mirrored = 0;
+    for (std::uint64_t at = 0; at + 32 <= bytes; at += 32) {
+        const std::uint32_t* w = words + at / 4;
+        if ((w[3] >> 28) & 0xf) continue;  // a T#: its base is a hash key, not an address
+        const std::uint64_t base = (std::uint64_t(w[1] & 0xffff) << 32) | (w[0] & 0xfffffffcull);
+        if (!base || !mirror_title_bytes(base, kMirrorBaseBytes)) continue;
+        ++mirrored;
+        if (bases.fetch_add(1, std::memory_order_relaxed) < 12)
+            std::fprintf(stderr, "[rt] table mirror %s: +0x%llx V# base 0x%llx mirrored\n", what,
+                         static_cast<unsigned long long>(at), static_cast<unsigned long long>(base));
+    }
+    if (nth <= 8)
+        std::fprintf(stderr, "[rt] table mirror %s: 0x%llx %d V# base(s) mirrored\n", what,
+                     static_cast<unsigned long long>(table_va), mirrored);
+    return table_va;
+}
+
 // LEONIDA_XS_TABLE_SCRATCH: a fixed, mapped scratch buffer for bound descriptor tables.
 //
 // A table VA is not a stable address: the title cycles through a ring of table pages, so translating each new VA into
@@ -511,9 +573,65 @@ const char* slot_name(unsigned slot) {
     }
 }
 
+// LEONIDA_SLOT_PROFILE: where the title's D3D12 calls actually go. A title that has stopped rendering is not silent --
+// it keeps calling a handful of entry points in a loop. Counting each console slot and printing the top ones every
+// second names the loop, which no single-call log can do without drowning in output.
+struct SlotProfile {
+    std::atomic<unsigned long long> device[kMaxSlots];
+    std::atomic<unsigned long long> list[kMaxSlots];
+    std::atomic<unsigned long long> next_dump{0};
+    std::atomic<bool> on{false};
+
+    SlotProfile() {
+        for (auto& slot : device) slot.store(0, std::memory_order_relaxed);
+        for (auto& slot : list) slot.store(0, std::memory_order_relaxed);
+    }
+};
+
+SlotProfile& slot_profile() {
+    static auto* profile = [] {
+        auto* fresh = new SlotProfile;
+        const char* enabled = std::getenv("LEONIDA_SLOT_PROFILE");
+        fresh->on.store(enabled && enabled[0] && enabled[0] != '0', std::memory_order_relaxed);
+        return fresh;
+    }();
+    return *profile;
+}
+
+void count_slot_call(bool is_list, unsigned slot) {
+    SlotProfile& profile = slot_profile();
+    if (!profile.on.load(std::memory_order_relaxed) || slot >= kMaxSlots) return;
+    (is_list ? profile.list[slot] : profile.device[slot]).fetch_add(1, std::memory_order_relaxed);
+    const unsigned long long now = GetTickCount64();
+    unsigned long long expected = profile.next_dump.load(std::memory_order_relaxed);
+    if (now < expected || !profile.next_dump.compare_exchange_strong(expected, now + 1000, std::memory_order_relaxed))
+        return;
+    std::fprintf(stderr, "[rt] d3d12_xs: slot profile, last second (device / list):\n");
+    for (int kind = 0; kind < 2; ++kind) {
+        auto& counts = kind ? profile.list : profile.device;
+        for (int shown = 0; shown < 6; ++shown) {
+            unsigned best = kMaxSlots;
+            unsigned long long most = 0;
+            for (unsigned slot = 0; slot < kMaxSlots; ++slot) {
+                const unsigned long long count = counts[slot].load(std::memory_order_relaxed);
+                if (count > most) {
+                    most = count;
+                    best = slot;
+                }
+            }
+            if (best == kMaxSlots || !most) break;
+            std::fprintf(stderr, "[rt] d3d12_xs:   %s slot %u (%s): %llu\n", kind ? "list" : "device", best,
+                         kind ? "list" : slot_name(best), most);
+            counts[best].store(0, std::memory_order_relaxed);
+        }
+        for (unsigned slot = 0; slot < kMaxSlots; ++slot) counts[slot].store(0, std::memory_order_relaxed);
+    }
+}
+
 void note_slot(unsigned slot) {
     if (slot >= kMaxSlots) return;
     count_hit(g_hits[slot]);
+    count_slot_call(false, slot);
     const bool first = first_call(g_first[slot]);
     if (first) {
         std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) first call\n", slot, slot_name(slot));
@@ -2254,6 +2372,17 @@ GuestWindows* guest_windows(DeviceProxy* device) {
     return static_cast<GuestWindows*>(expected);
 }
 
+// LEONIDA_XS_GPU_HANDLE_ARENA: a root table's GPU VA can be a pointer into the arena's own host mapping, because that
+// is the value GetGPUDescriptorHandleForHeapStart hands out (the console's CPU and GPU handles are one address). The
+// shader adds heap_base to a console VA, so the same bytes are named by the arena offset: subtract the mapping's base.
+// Any other VA is left alone.
+std::uint64_t arena_offset_of(std::uint64_t va) {
+    const auto base = reinterpret_cast<std::uint64_t>(leonida::arena_host_base);
+    if (!std::getenv("LEONIDA_XS_GPU_HANDLE_ARENA") || !base || !leonida::arena_host_size) return va;
+    if (va < base || va - base >= leonida::arena_host_size) return va;
+    return va - base;
+}
+
 // A device address that reads the same bytes as the title address `va`, by copying `bytes` of it into the window's
 // buffer. Zero when the window cannot be made, so the caller keeps the address it had.
 std::uint64_t guest_translate(DeviceProxy* device, std::uint64_t va, std::uint64_t bytes, bool sanitize = false) {
@@ -2649,6 +2778,7 @@ void note_list_slot(unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint
                     unsigned char console_layout = 0) {
     if (slot >= kListSlots) return;
     ListStats::hits[slot].fetch_add(1, std::memory_order_relaxed);
+    count_slot_call(true, slot);
     static const bool slot_histogram = std::getenv("LEONIDA_LOG_SLOTS") != nullptr;
     if (slot_histogram && list_slot_histogram_due()) dump_list_slot_histogram();
     bool expected = false;
@@ -3375,7 +3505,12 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 // d3d12_command_objects.md: console 35 -> PC 31). A compute shader reads its descriptors the same way,
                 // so the table needs the same translation; untranslated it reads arena bytes at the raw VA and can
                 // interpret them as a V# whose base is anything, which loses the device.
-                if (std::getenv("LEONIDA_XS_TABLE_SCRATCH")) {
+                a2 = arena_offset_of(a2);
+                if (std::getenv("LEONIDA_XS_TABLE_MIRROR")) {
+                    // The table is already at its own console VA; mirroring its bytes into the arena at the same offset
+                    // is all the translation it needs.
+                    mirror_table(self->device, a2, "compute");
+                } else if (std::getenv("LEONIDA_XS_TABLE_SCRATCH")) {
                     const std::uint64_t scratch = table_scratch_copy(self->device, a2, "compute");
                     if (scratch) a2 = scratch;
                 } else if (std::getenv("LEONIDA_XS_TABLE_VA")) {
@@ -3397,6 +3532,15 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 // descriptor setters below do. Off by default: with it on the title's menu draws do read their real
                 // console T#s (LEONIDA_LOG_ROOT shows them), but a shader then reads out of bounds and the device is
                 // lost before the second frame (2026-11-24); the faulting read is the next thing to find.
+                a2 = arena_offset_of(a2);
+                if (rt::write_watch::enabled()) {
+                    // LEONIDA_WATCH_WRITE: the table a shader reads was written by the title (or not at all) before
+                    // this call, so watch the pages of the next tables in the ring instead of this one.
+                    std::uint64_t pages[4] = {};
+                    for (unsigned i = 0; i < 4; ++i)
+                        pages[i] = (a2 + std::uint64_t(0x20000) * (30 * (i + 1))) & ~std::uint64_t{0xfff};
+                    rt::write_watch::start(pages, 4);
+                }
                 const std::uint64_t table_va = a2;
                 // LEONIDA_XS_HEAP_VA: on the console CPU and GPU share one address space, so a descriptor-table GPU VA
                 // can be the *CPU* address of the heap backing the title allocated (its own pages), not the GPU handle
@@ -3410,7 +3554,12 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                             leonida::arena_host_size;
                 const std::uint64_t heap_va =
                     is_backing ? in_layer.ptr - reinterpret_cast<SIZE_T>(leonida::arena_host_base) : a2;
-                if (std::getenv("LEONIDA_XS_TABLE_VBASE")) {
+                if (std::getenv("LEONIDA_XS_TABLE_MIRROR")) {
+                    // LEONIDA_XS_TABLE_MIRROR: the table is already title memory at its own console VA, and the arena's
+                    // offsets are the same numbers, so copying its bytes to that same offset is the whole translation:
+                    // the shader's heap_base + va lands on the title's own descriptors and needs nothing rewritten.
+                    mirror_table(self->device, table_va, "graphics");
+                } else if (std::getenv("LEONIDA_XS_TABLE_VBASE")) {
                     // The title's own table, copied into a window and with its V# bases turned into the device
                     // addresses of windows over the title memory they name (see rewrite_vsharp_bases).
                     const std::uint64_t translated = guest_translate(self->device, a2, 64 << 10, false);
@@ -3591,6 +3740,111 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                              committed ? 1 : 0, head[0], head[1], head[2], head[3]);
                             }
                         }
+                    }
+                }
+                // LEONIDA_LOG_TABLE4: sample a root table well into the run, not just in the first frames. The table3
+                // dump only ever sees the first distinct VAs (the title cycles a ring, one set per frame), so it says
+                // nothing about the steady state the menu is drawn in. This prints the whole 320-byte head of one
+                // table every `stride` binds, each 32-byte slot decoded both ways, plus what the address is mapped as.
+                if (const char* const table4 = std::getenv("LEONIDA_LOG_TABLE4")) {
+                    static std::atomic<std::uint64_t> t4_binds{0};
+                    static std::atomic<int> t4_shown{0};
+                    const std::uint64_t bind = t4_binds.fetch_add(1, std::memory_order_relaxed) + 1;
+                    const std::uint64_t stride = std::strtoull(table4, nullptr, 10) ? std::strtoull(table4, nullptr, 10) : 3000;
+                    if ((bind == 1 || bind % stride == 0) && t4_shown.fetch_add(1, std::memory_order_relaxed) < 24) {
+                        MEMORY_BASIC_INFORMATION info{};
+                        const SIZE_T queried = VirtualQuery(reinterpret_cast<const void*>(table_va), &info, sizeof(info));
+                        std::fprintf(stderr,
+                                     "[rt] table4 bind %llu: va 0x%llx handed 0x%llx arena 0x%llx; query %llu base 0x%llx "
+                                     "size 0x%llx state 0x%lx protect 0x%lx type 0x%lx\n",
+                                     static_cast<unsigned long long>(bind),
+                                     static_cast<unsigned long long>(table_va),
+                                     static_cast<unsigned long long>(a2),
+                                     static_cast<unsigned long long>(leonida::arena_host_size),
+                                     static_cast<unsigned long long>(queried),
+                                     queried == sizeof(info) ? static_cast<unsigned long long>(
+                                                                   reinterpret_cast<std::uint64_t>(info.AllocationBase))
+                                                             : 0ull,
+                                     queried == sizeof(info) ? static_cast<unsigned long long>(info.RegionSize) : 0ull,
+                                     queried == sizeof(info) ? static_cast<unsigned long>(info.State) : 0ul,
+                                     queried == sizeof(info) ? static_cast<unsigned long>(info.Protect) : 0ul,
+                                     queried == sizeof(info) ? static_cast<unsigned long>(info.Type) : 0ul);
+                        std::uint32_t t[80] = {};
+                        leonida::copy_committed(reinterpret_cast<std::uint8_t*>(t), table_va, sizeof(t));
+                        std::uint32_t g[80] = {};
+                        const bool have_arena = leonida::arena_host_base && a2 + sizeof(g) <= leonida::arena_host_size;
+                        if (have_arena) std::memcpy(g, leonida::arena_host_base + a2, sizeof(g));
+                        for (int slot = 0; slot < 10; ++slot) {
+                            const std::uint32_t* w = t + slot * 8;
+                            const std::uint32_t* r = g + slot * 8;
+                            const unsigned type = (w[3] >> 28) & 0xf;
+                            const std::uint64_t base =
+                                type >= 8 ? (((std::uint64_t(w[1] & 0xff) << 32) | w[0]) << 8)
+                                          : ((std::uint64_t(w[1] & 0xffff) << 32) | (w[0] & 0xfffffffcull));
+                            std::fprintf(stderr,
+                                         "[rt] table4 bind %llu slot %d title %08x %08x %08x %08x| arena %08x %08x "
+                                         "%08x %08x | %s base 0x%llx committed %d\n",
+                                         static_cast<unsigned long long>(bind), slot, w[0], w[1], w[2], w[3],
+                                         have_arena ? r[0] : 0u, have_arena ? r[1] : 0u, have_arena ? r[2] : 0u,
+                                         have_arena ? r[3] : 0u, type >= 8 ? "T#" : "V#",
+                                         static_cast<unsigned long long>(base),
+                                         base && leonida::is_committed(reinterpret_cast<const void*>(base)) ? 1 : 0);
+                        }
+                        // A census of the whole 64 KiB table, in 32-byte slots: how many are zero, how many are the
+                        // `{ptr, 0, ptr, 0}` pair shape (the title's own bookkeeping, which is not a descriptor), how
+                        // many look like a T# (a type in dword 3's top nibble) and how many are anything else. Only a
+                        // census over the whole table can say whether the title ever put real descriptors in it.
+                        std::vector<std::uint32_t> all(kMirrorTableBytes / 4, 0);
+                        const std::uint64_t whole =
+                            table_va < leonida::arena_host_size
+                                ? std::min<std::uint64_t>(kMirrorTableBytes, leonida::arena_host_size - table_va)
+                                : 0;
+                        leonida::copy_committed(reinterpret_cast<std::uint8_t*>(all.data()), table_va, whole);
+                        unsigned slots = 0, zeros = 0, pairs = 0, tsharps = 0, other = 0, shown = 0;
+                        for (std::uint64_t at = 0; at + 32 <= whole; at += 32) {
+                            const std::uint32_t* w = all.data() + at / 4;
+                            ++slots;
+                            if (!w[0] && !w[1] && !w[2] && !w[3]) {
+                                ++zeros;
+                                continue;
+                            }
+                            if (!w[1] && w[0] == w[2] && !w[3]) {
+                                ++pairs;
+                                continue;
+                            }
+                            if ((w[3] >> 28) & 0xf) {
+                                ++tsharps;
+                                if (tsharps <= 6) {
+                                    const std::uint64_t addr =
+                                        ((static_cast<std::uint64_t>(w[1] & 0xff) << 32) | w[0]) << 8;
+                                    std::fprintf(stderr,
+                                                 "[rt] table4 bind %llu +0x%llx T#: %08x %08x %08x %08x %08x %08x "
+                                                 "%08x %08x (address 0x%llx)\n",
+                                                 static_cast<unsigned long long>(bind),
+                                                 static_cast<unsigned long long>(at), w[0], w[1], w[2], w[3], w[4],
+                                                 w[5], w[6], w[7], static_cast<unsigned long long>(addr));
+                                }
+                                continue;
+                            }
+                            ++other;
+                            if (shown < 12) {
+                                ++shown;
+                                const std::uint64_t base =
+                                    (std::uint64_t(w[1] & 0xffff) << 32) | (w[0] & 0xfffffffcull);
+                                std::fprintf(stderr,
+                                             "[rt] table4 bind %llu +0x%llx other: %08x %08x %08x %08x V# base 0x%llx "
+                                             "committed %d\n",
+                                             static_cast<unsigned long long>(bind),
+                                             static_cast<unsigned long long>(at), w[0], w[1], w[2], w[3],
+                                             static_cast<unsigned long long>(base),
+                                             base && leonida::is_committed(reinterpret_cast<const void*>(base)) ? 1 : 0);
+                            }
+                        }
+                        std::fprintf(stderr,
+                                     "[rt] table4 bind %llu census of 0x%llx: %u slots, %u zero, %u {ptr,ptr} pairs, "
+                                     "%u T#, %u other\n",
+                                     static_cast<unsigned long long>(bind),
+                                     static_cast<unsigned long long>(table_va), slots, zeros, pairs, tsharps, other);
                     }
                 }
                 if (std::getenv("LEONIDA_LOG_ROOT")) {
