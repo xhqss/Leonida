@@ -363,3 +363,98 @@ presents 从 ~106/s 掉到 ~52/s。所以那一版是 opt-in。
 | `tmp/thread-map.ps1` | `tmp/` | 把进程**全部**线程映射到 模块+RVA，并按地址聚合计数（找自旋/锁竞争） |
 | `tmp/thread-stack.ps1` | `tmp/` | 读最热线程的栈切片，统计栈上各模块的返回地址数（判断是不是层调进去的） |
 
+---
+
+## 9. 上游调研（2026-11-25 03:45，离线读 `origin/main`）
+
+本地 `origin/main` = `6293c1c4f`（2026-11-24 13:38 -0500），本地 `HEAD` 领先 **129**、落后 **1394**。
+
+### 9.1 同题结论：**上游的同一个卡点仍然 open**
+
+- `docs/boot_leads.md` 的 **BL-4「descriptor words are 32-bit GPU addresses」状态仍是 open**，
+  内容和上一份接手文档引的一样，并且给了实现方案：
+  "census the descriptor words the title writes (count how many are valid addresses inside the arena and
+  how many are not). If the census holds, translate a word to the buffer device address or bindless index it…"。
+  ⇒ **我们不是漏了某个已合并的上游补丁；这一条上游也没做完。**
+- `docs/retail_boot_chain.md` 的当前 stop 是 **13**，描述与我们的观察同一处：
+  "right after the first `CreateDescriptorHeap`, the title calls the heap's slot 9
+  (`GetCPUDescriptorHandleForHeapStart`), takes the handle from `rax` and asserts that it equals a value it
+  already holds. Hypothesis: a console descriptor heap starts at an address the title chose or can predict,
+  which the PC handle doesn't match"。
+
+### 9.2 同一区域里上游**已经落地**的东西（可直接参考/摘取）
+
+| 提交 | 内容 | 对本地的意义 |
+| --- | --- | --- |
+| `3630610ca` | console 形态的 `CreateDescriptorHeap`：16 字节 PC desc **之后** `+0x10`/`+0x18` 是堆的 console 地址与字节数；把它作为堆的 CPU/GPU 起点上报 | **本轮已用它验证了本地标题**（见 §9.3） |
+| `a7ffc53c1` / `37246f11d` | 把 slot-14 的 console 堆创建走注册处理器；只有 descriptor size 相符时才采用该布局 | 后续接 `3630610ca` 时要用 |
+| `da6270710` | **slot 133 placed buffer 按"标题放置的区间"登记，slot 70 先在这张表里查** —— 正是本轮 §8.2 那个 bug 的正式修法（完整 buffer、真实资源，优于本地的 4 KiB 快照池） | 值得摘；本轮尝试 cherry-pick，3 个文件冲突，已回退（见 §9.4） |
+| `1d8d1d355` / `bc14ec5dd` / `d030b9912` | 上面那条的评审后续：锁内取引用、按 entry id 删除、mock 测试 | 一起摘才有完整语义 |
+| `f9c68577e` | slot 133 的**纹理**用标题地址回答 `GetGPUVirtualAddress` | 和"标题地址优先"同一思路 |
+| `9c8522d22` / `f9d20bf9b` | slot 70 的 raw-buffer view / null view 两条路径（本地已有） | 已对齐 |
+
+### 9.3 本轮的新测量：标题确实传了堆地址，而且和我们拿到的一致
+
+slot 14 的第一次调用（`LEONIDA_LOG_HEAPID` 之外新加的一行）：
+
+```
+[rt] d3d12_xs: slot 14 heap desc: type 0 descriptors 1245184 flags 0x1 node mask 0x1
+      (raw 00000000 00130000 00000001 00000001); tail +0x10 0x4de00f0000 +0x18 0x2600000
+```
+
+- `+0x18` = `0x2600000` = 1,245,184 × 32 = **正好是这个堆的字节数**（和 PC desc 里的
+  `NumDescriptors` 完全对得上）⇒ 上游那个"console 扩展布局"在**我们这个标题上也成立**。
+- `+0x10` = `0x4de00f0000`，而 shim 的 XMem 分配钩子给回的 backing 也是 `0x4de00f0000`
+  ⇒ 这一项**已经对齐**（`heap_get_cpu_handle` 现在返回的正是 `custom_cpu_start`）。
+- 所以 stop 13 那个断言**不是**"CPU handle 值不对"这么简单；本轮把断言现场读出来了，见 §9.5。
+
+### 9.4 cherry-pick 尝试（已回退）
+
+`git cherry-pick -n da6270710` 在 `d3d12_xs_device.cpp`（4 处）、`.h`（1 处）、
+`xs_proxy_mock_test.cpp`（3 处）冲突，因为本地这个文件已经大幅分叉。本轮**已把这些冲突改动全部回退**
+（`git reset --hard` 到本轮自己最后的提交 `54b5c58f6`；只丢弃了我这次 cherry-pick 产生的冲突标记，
+没有丢弃任何原本的工作）。要摘这条，建议按"手抄 registry"的方式重做，而不是直接 pick：
+
+1. 在 `DeviceProxy` 里加一张 `console_va 区间 → ID3D12Resource*` 的表（不持引用，
+   用 `SetPrivateDataInterface` 在资源析构时删条目，正如上游做的）；
+2. slot 133 的三条创建路径（placed-at-VA 处理器、`CreateCommittedResource3`、`CreateCommittedResource`）
+   都登记"标题放的区间"；
+3. slot 70 先查这张表，再退回 `resource_provider`；
+4. 然后就可以把本地的 4 KiB 快照池（§8.3）删掉 —— 上游版本给出的是完整 buffer 的精确 view。
+
+### 9.5 那个唯一的 guest 断言，现在有内容了
+
+`assert_registers` 现在会 dump `rsi/rdi/rbp` 指向的记录。**每次运行都一样**：
+
+```
+assert skipped: int3 in guest code at game_scarlett_master.exe+0x344196
+assert registers: rcx 8efa26d567000000 rdx 0 r8 d62f40 r9 0 rax 4e7f6b8 rbx 13
+assert pointer registers: rsi 4e7f730 rdi 4e7f6b8 rbp ffffffcd rsp 4e7f680
+assert at rsi: ffffffff ffffffff 00010000 00000000 00000003 00000000 00000000 00000000
+assert at rdi: ffffffff ffffffff 00010000 00000000 04e7fc76 00000000 00000001 00000000
+```
+
+断言指令是（手工反汇编，见 §6.1）：
+
+```
+140344190  83 7e 04 00   cmp dword [rsi+4], 0
+140344194  74 01         je  +1
+140344196  cc            int3
+```
+
+`rsi` 那个记录的第 2 个 dword 是 **`0xffffffff`**（标题要它是 0），前两个 dword 都是 `-1`，
+后面是 `0x00010000`、`0`、`3`。也就是说：**标题在检查一个"描述符值"的第 2 个 dword 必须为 0，
+而它读到的是 `-1`** —— 这是一次"我拿到的描述符不对"的自检，就在第一次
+`CreateDescriptorHeap` + `GetCPUDescriptorHandleForHeapStart` 之后、swapchain 创建之前。
+和上游 stop 13 是同一处、同一类判断。
+
+⇒ **下一步的判据很明确**：让这个记录的第 2 个 dword 变成 0（即让标题读到的描述符是它期望的形状），
+或者找出 `0xffffffff` 是从哪块内存读进这个栈记录的。前两个 dword 都是 `-1`，很像"未初始化的堆槽"
+（本地 `write_null_srv`、或标题自己 memset 成 -1 的哨兵）。这条比 §8.5 的两个分支更容易直接验证。
+
+**一个已经排除的可能（别重复做）**：它**不是** slot 70 的 null-view 描述符。
+`LEONIDA_SLOT70_ZERO_NULL=1`（把 null view 改成写 32 个零 dword）之后，断言**在同样位置照样触发**、
+记录内容一字不差。第一次在 20 秒窗口里"没看到断言"是假象——断言发生在 swapchain 创建之前，
+那次 `Select-String -Last 6` 把日志行截掉了；60 秒运行里它照旧出现一次。
+（保留该开关只为记录这个否定结果，并作为"无资源"的更便宜表达方式。）
+
