@@ -275,24 +275,34 @@ slot 70 unresolved #3: va 0x4de0c2de20 width 128, resource 0
 （arena 偏移）索引，而标题给的是**它自己的主机地址**：两个地址空间，查不到，
 所以 `resource_provider` 返回空 → null view。
 
-### 8.3 已经落地的修法（opt-in）与代价
+### 8.3 已经落地的修法（默认开启，无帧率代价）
 
-在 slot 70 里补上"标题内存窗口"回退：直接查失败时，用 `guest_translate` 把那些标题字节
-拷进一个 4 MiB 窗口，再按窗口的 console VA 查一次（窗口本身就是一个 layer 资源）。
-
-`LEONIDA_SLOT70_WINDOW=1` 时的效果：
-
-```
-[rt] d3d12_xs: slot 70 in the last 2 s: 520 view(s) written, 38 null view(s)
-[rt] d3d12_xs: slot 70 in the last 2 s: 477 view(s) written, 0 null view(s)
-```
-
-**从 0 成功变成每秒 ~450 个真 view、0 个 null。** 这是本轮唯一真正"修好一个功能"的改动。
-
-但**默认关**，因为代价太大：标题的地址每帧前进一个窗口（`0x4de0c00000` → `0x4de1000000` …），
+在 slot 70 里补上"标题内存"回退。**第一版用 `guest_translate` 的 4 MiB 窗口**：功能上立刻正确
+（下面第一组数字），但标题的地址每帧前进一个窗口（`0x4de0c00000` → `0x4de1000000` …），
 每个窗口是一个 4 MiB 的 host-visible buffer 且**永不释放** ⇒ 约 800 MB/s 的内存增长，
-实测 presents 从 ~106/s 掉到 ~52/s。要把它变成默认，需要**给窗口做有界池**
-（槽位在 GPU 可能还在读时不能复用），这是下一件该做的事。
+presents 从 ~106/s 掉到 ~52/s。所以那一版是 opt-in。
+
+**第二版换成一个固定槽位池**（`raw_slot_copy`）：一个 1 MiB 的 mapped upload buffer，
+切成 256 个 4 KiB 槽位；每次调用把需要的那几 KiB 拷进下一个槽位，view 直接建在池 buffer 上
+（`FirstElement = slot * 1024`）。池的总开销固定 1 MiB，**没有任何新分配**；
+一个槽位要经过 256 次调用才会绕回来（实测 ~450 次/秒 ⇒ 约 0.57 s），远大于 GPU 落后帧的时间。
+现在**默认开启**（`LEONIDA_SLOT70_WINDOW=0` 可关掉做 A/B）。
+
+效果：
+
+```
+第一版（窗口）： slot 70 in the last 2 s: 520 view(s) written, 38 null view(s)   presents ~52/s
+                 之后       : 477 view(s) written, 0 null view(s)
+第二版（槽位池）： 447 view(s) written, 0 null view(s)                            presents 104/s (= 基线)
+```
+
+**从 0 成功变成每秒 ~450 个真 view、0 个 null，且帧率与基线一致。** 这是本轮唯一真正
+"修好一个功能"的改动；它让标题终于能把**放在自己堆里的 buffer** 作为 raw SRV 绑给着色器
+（之前那些全是 null view）。
+
+已知的边界（写在代码注释里）：view 只覆盖前 4 KiB（最多 1024 个元素），比标题声明的
+`Width` 小；而且数据是**调用那一刻**的快照，标题随后再写那块内存不会反映过来。
+比"整块 null"好，但仍不是完整语义。
 
 `XS_TABLE_MIRROR` + `XS_DESC_SYNC` 这个组合也试过了：表字节进 arena 之后合成 VS 立刻按真描述符
 解出 `0x80800000004` 这类 base → **device fault**（`console VA 0x80800000000`）。
@@ -300,14 +310,15 @@ slot 70 unresolved #3: va 0x4de0c2de20 width 128, resource 0
 
 ### 8.4 现在的优先级
 
-1. **给标题内存窗口做有界池**，让 `LEONIDA_SLOT70_WINDOW` 能默认打开（现在它每次新建一个
-   4 MiB buffer，是纯泄漏）。一个可用的做法：池固定 N 个 4 MiB 窗口，按"提交序号"回收——
-   记录每个槽位最后一次被哪一次提交引用，只有当那次提交的 fence 已经完成才复用。
-2. **把同样的窗口回退用到描述符表上**（`XS_TABLE_*`），表 VA 就是标题地址；这和 §8.2 是同一套
-   翻译，只是对象从 buffer 变成表。
+1. **把同样的"标题地址 → 层资源"翻译用到描述符表上**（`XS_TABLE_*`）：表 VA 就是标题地址，
+   和 §8.2 是同一套翻译，只是对象从 buffer 变成表。这一条打通之后，合成 draw 的 T# 才有可能命中。
+2. **给 raw view 池补上完整语义**：现在只覆盖前 4 KiB 且是快照。要覆盖标题声明的完整 `Width`，
+   需要按需把更多字节拷进更大的池（例如 64 KiB × 64 槽 = 4 MiB），或者按"提交序号"回收。
 3. 然后才回到"表里的 V#/T# 是不是 gfx10 编码"（§6.2）——用 `LEONIDA_FALLBACK_TINT` 判读。
-4. `amdvlk` 那 12 个自旋线程：确定是不是驱动 bug（例如同一次 `vkQueueSubmit` 的锁竞争）。
-   如果它确实只是浪费，那么它不阻塞进度，可以在最后处理。
+4. `amdvlk` 那 12 个自旋线程：`LEONIDA_PROFILE_LAYER` 抓到过
+   `pipeline 4 calls, 4935.97 ms each, worst 18897.40 ms` —— 单次 `vkCreatePipelines` 阻塞
+   最多 19 秒，所以那 12 核里至少有一部分是真正的 shader 编译，不只是空转。如果要优化，
+   应该查那几条为什么这么慢（缓存未命中？巨型 PSO？）。
 
 ### 8.5 本轮新增开关
 

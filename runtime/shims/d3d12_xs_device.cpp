@@ -4367,6 +4367,69 @@ void write_null_srv(DeviceProxy* self, std::uint64_t destination) {
     self->real->CreateShaderResourceView(nullptr, &null_view, D3D12_CPU_DESCRIPTOR_HANDLE{destination});
 }
 
+// LEONIDA_SLOT70_WINDOW: a raw-word SRV names a buffer by the console VA of title memory, whose bytes live in the
+// title's own heap and not in the arena. guest_translate serves such an address through a 4 MiB window, but the title's
+// addresses advance about a window per frame and no window is ever given back: measured at 400-500 calls a second that
+// is ~800 MB/s of host-visible memory and it halves the frame rate. A fixed pool is enough instead, because the view is
+// built right here: each call copies the bytes it needs into the next slot of one mapped upload buffer and points the
+// view at that slot. The pool costs 1 MiB whatever the title does; a slot comes round again only after kRawSlots calls
+// (about half a second at the measured rate), by which time the frames that used it are finished.
+struct RawViewPool {
+    std::mutex lock;
+    ID3D12Resource* resource = nullptr;
+    std::uint8_t* cpu = nullptr;
+    unsigned next = 0;
+};
+
+constexpr unsigned kRawSlotBytes = 4096;
+constexpr unsigned kRawSlots = 256;
+
+RawViewPool& raw_view_pool() {
+    static auto* pool = new RawViewPool;
+    return *pool;
+}
+
+// The resource and slot offset holding a copy of `bytes` of title memory at `va`; null when the pool cannot be made.
+ID3D12Resource* raw_slot_copy(DeviceProxy* device, std::uint64_t va, std::uint64_t bytes, unsigned& slot) {
+    if (!device || !va) return nullptr;
+    RawViewPool& pool = raw_view_pool();
+    std::lock_guard lock(pool.lock);
+    if (!pool.resource) {
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = std::uint64_t(kRawSlotBytes) * kRawSlots;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource* resource = nullptr;
+        void* cpu = nullptr;
+        if (FAILED(device->real->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                         __uuidof(ID3D12Resource),
+                                                         reinterpret_cast<void**>(&resource))) ||
+            !resource || FAILED(resource->Map(0, nullptr, &cpu)) || !cpu) {
+            if (resource) resource->Release();
+            return nullptr;
+        }
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+            std::fprintf(stderr, "[rt] d3d12_xs: raw view pool: %u x %u bytes at console VA 0x%llx\n", kRawSlots,
+                         kRawSlotBytes, static_cast<unsigned long long>(resource->GetGPUVirtualAddress()));
+        pool.resource = resource;
+        pool.cpu = static_cast<std::uint8_t*>(cpu);
+    }
+    slot = pool.next % kRawSlots;
+    ++pool.next;
+    std::uint8_t* dest = pool.cpu + std::size_t(slot) * kRawSlotBytes;
+    std::memset(dest, 0, kRawSlotBytes);
+    leonida::copy_committed(dest, va, std::min<std::uint64_t>(bytes, kRawSlotBytes));
+    return pool.resource;
+}
+
 void log_slot70_null_once(const char* why, std::uint64_t texture_words, std::uint64_t view_desc) {
     static std::atomic<bool> logged{false};
     if (first_call(logged))
@@ -4426,17 +4489,32 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
         // that is never given back, so the copy costs about 800 MB/s of memory and halves the frame rate. Bounding the
         // windows (a pool whose slots cannot be reused while the GPU may still read them) is the work that makes this
         // the default.
-        const bool windowed = std::getenv("LEONIDA_SLOT70_WINDOW") != nullptr;
+        // On by default: the pool is 1 MiB whatever the title does and the measured frame rate is unchanged (104 Hz
+        // against 104 Hz), while without it every one of these views is a buffer no shader can read. LEONIDA_SLOT70_WINDOW=0
+        // turns it off for an A/B run.
+        const char* windowed_env = std::getenv("LEONIDA_SLOT70_WINDOW");
+        const bool windowed = !(windowed_env && windowed_env[0] == '0');
         if (resource) {
             resource->Release();
             resource = nullptr;
         }
-        const std::uint64_t window_va =
-            windowed ? guest_translate(self, shape.va, std::min<std::uint64_t>(shape.resource.Width, 4096)) : 0;
-        if (window_va) {
-            va = window_va;
-            resource = self->resource_provider(self->real, va, std::min<std::uint64_t>(shape.resource.Width, 4096),
-                                               &start, &size);
+        if (windowed) {
+            // Cheap and bounded: a 4 KiB copy into a fixed slot of one upload buffer, no window and no allocation.
+            unsigned slot = 0;
+            if (ID3D12Resource* pool = raw_slot_copy(self, shape.va, shape.resource.Width, slot)) {
+                D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+                view.Format = DXGI_FORMAT_R32_TYPELESS;
+                view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                view.Shader4ComponentMapping = shape.view.Shader4ComponentMapping;
+                view.Buffer.FirstElement = slot * (kRawSlotBytes / 4);
+                view.Buffer.NumElements = std::min<std::uint64_t>(shape.resource.Width, kRawSlotBytes) / 4;
+                view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+                if (view.Buffer.NumElements) {
+                    self->real->CreateShaderResourceView(pool, &view, D3D12_CPU_DESCRIPTOR_HANDLE{destination});
+                    note_slot70_outcome(true, nullptr);
+                    return;
+                }
+            }
         }
     }
     // LEONIDA_LOG_SLOT70=2: the address and width of every raw-word view that does not resolve, so the reason can be
